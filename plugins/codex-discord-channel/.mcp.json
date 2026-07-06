@@ -2,7 +2,7 @@
   "mcpServers": {
     "codex-discord-channel": {
       "cwd": ".",
-      "command": "node",
+      "command": "/home/zheng/.nvm/versions/node/v22.22.2/bin/node",
       "args": [
         "./src/mcp-server.js"
       ],

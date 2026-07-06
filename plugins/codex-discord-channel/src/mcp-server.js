@@ -94,8 +94,13 @@ async function callTool(context, name, args = {}) {
       stateDir: context.config.paths.stateDir,
       accessPath: context.config.paths.accessPath,
       ownerPath: context.config.paths.ownerPath,
+      envLoaded: context.config.envLoaded,
       tokenConfigured: context.config.tokenConfigured,
+      proxyConfigured: Boolean(context.config.proxyUrl),
+      insecureTls: context.config.insecureTls,
+      loginDisabled: context.config.loginDisabled,
       discordStarted: context.discordState.started,
+      discordReason: context.discordState.reason || null,
       currentOwner: owner,
       thisOwnerId: context.config.ownerId,
     };

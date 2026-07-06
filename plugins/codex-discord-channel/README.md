@@ -19,3 +19,11 @@ npm run import:bridge -- --instance codex01 --fetch-bot-id
 ```
 
 The import script converts an existing bridge `state.json` to `access.json` and reuses the existing `.env` without printing token values.
+
+## Runtime Notes
+
+Healthy status should report `tokenConfigured: true`, `proxyConfigured: true` when a proxy is needed, and `discordStarted: true`.
+
+The status tool exposes only non-secret diagnostics. It may show `discordReason`, `envLoaded`, `proxyConfigured`, `insecureTls`, and `loginDisabled`, but it must not print token or proxy values.
+
+Inbound Discord messages are normalized, access-checked, and handed to the delivery boundary. Codex does not currently provide a Claude-style host notification API, so the plugin does not promise automatic Discord-to-transcript delivery.

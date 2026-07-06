@@ -23,6 +23,35 @@ codex plugin add codex-discord-channel@personal
 
 Use a new Codex thread after installing so the plugin MCP server is loaded.
 
+## Usage
+
+After starting a new Codex session, ask for the channel status:
+
+```text
+Use $codex-discord-channel to show status.
+```
+
+Expected healthy status:
+
+```json
+{
+  "instance": "codex01",
+  "tokenConfigured": true,
+  "proxyConfigured": true,
+  "discordStarted": true
+}
+```
+
+Send a message through the owned bot:
+
+```text
+Use $codex-discord-channel to send "..." to channel <discord-channel-id>.
+```
+
+If `discordStarted` is false, check `discordReason`, `envLoaded`, `proxyConfigured`, and `insecureTls` in the status output. The status intentionally reports only booleans and paths, never token or proxy values.
+
+Current limitation: inbound Discord messages can be filtered and normalized by the plugin, but Codex does not yet provide a host API that lets an MCP server push those messages into the active transcript. This means Discord-to-console auto delivery is not the same as Claude Code's channel integration yet.
+
 ## Instance Config
 
 Default instance state:
@@ -38,6 +67,9 @@ Example `.env`:
 ```env
 DISCORD_INSTANCE=codex01
 DISCORD_BOT_TOKEN=replace-with-local-token
+DISCORD_BOT_USER_ID=replace-with-bot-user-id
+DISCORD_PROXY_URL=http://127.0.0.1:8080
+DISCORD_INSECURE_TLS=true
 ```
 
 Do not commit `.env`.
