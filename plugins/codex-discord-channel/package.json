@@ -20,7 +20,7 @@
     "codex-discord-channel": "bin/codex-discord-channel"
   },
   "scripts": {
-    "syntax": "node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js",
+    "syntax": "node --check bin/codex-discord-channel && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js",
     "test": "node --test tests/unit/*.test.js",
     "smoke": "node scripts/smoke.js",
     "import:bridge": "node scripts/import-bridge-state.js",

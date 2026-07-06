@@ -3,11 +3,15 @@
 
 const { loadConfig } = require('../src/config');
 const { configureNetwork } = require('../src/discord-client');
+const { createDelivery } = require('../src/delivery');
+const { startDiscordClient } = require('../src/discord-client');
+const { claimOwner, createOwner } = require('../src/owner-state');
 
 function usage() {
   process.stderr.write([
     'Usage:',
     '  codex-discord-channel              # run MCP server',
+    '  codex-discord-channel gateway      # run Discord gateway without MCP stdio',
     '  codex-discord-channel send --channel CHANNEL_ID [--reply-to MESSAGE_ID]',
     '',
     'The send command reads message text from stdin.',
@@ -87,6 +91,32 @@ async function sendViaRest(args) {
   process.stdout.write(`${JSON.stringify({ channelId: body.channel_id, messageId: body.id })}\n`);
 }
 
+function makeLogger() {
+  return (level, message, meta) => {
+    const suffix = meta === undefined ? '' : ` ${JSON.stringify(meta)}`;
+    process.stderr.write(`${new Date().toISOString()} ${level} ${message}${suffix}\n`);
+  };
+}
+
+async function runGateway() {
+  const logger = makeLogger();
+  const config = loadConfig();
+  claimOwner(config.paths.ownerPath, createOwner(config));
+  const delivery = createDelivery(config, logger);
+  const discordState = await startDiscordClient({ config, delivery, logger });
+  if (!discordState.started) {
+    throw new Error(`Discord gateway did not start: ${discordState.reason || 'unknown'}`);
+  }
+  const keepAlive = setInterval(() => {}, 2 ** 30);
+  const stop = () => {
+    clearInterval(keepAlive);
+    if (discordState.client?.destroy) discordState.client.destroy();
+    process.exit(0);
+  };
+  process.once('SIGTERM', stop);
+  process.once('SIGINT', stop);
+}
+
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   if (!command) {
@@ -100,6 +130,10 @@ async function main() {
       return;
     }
     await sendViaRest(args);
+    return;
+  }
+  if (command === 'gateway') {
+    await runGateway();
     return;
   }
   if (command === '-h' || command === '--help') {
