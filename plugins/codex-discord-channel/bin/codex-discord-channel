@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+'use strict';
+
+require('../src/mcp-server').main().catch((error) => {
+  process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+  process.exit(1);
+});

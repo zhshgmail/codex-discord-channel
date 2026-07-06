@@ -1,0 +1,38 @@
+{
+  "name": "codex-discord-channel",
+  "version": "0.1.0",
+  "description": "Claude-style Discord channel ownership for Codex sessions.",
+  "author": {
+    "name": "zhshgmail",
+    "url": "https://github.com/zhshgmail"
+  },
+  "homepage": "https://github.com/zhshgmail/codex-discord-channel",
+  "repository": "https://github.com/zhshgmail/codex-discord-channel",
+  "license": "MIT",
+  "keywords": [
+    "discord",
+    "codex",
+    "channel",
+    "mcp",
+    "session"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Discord Channel",
+    "shortDescription": "Bind a Discord bot instance to the active Codex session.",
+    "longDescription": "A session-local Discord channel plugin for Codex. It mirrors the Claude Code Discord plugin ownership model, keeps one active owner per bot instance, and avoids TTY injection.",
+    "developerName": "zhshgmail",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Messaging",
+      "Automation"
+    ],
+    "defaultPrompt": [
+      "Use $codex-discord-channel to check Discord channel status.",
+      "Claim this Codex session as the Discord bot owner.",
+      "Send a Discord reply from this Codex session."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
