@@ -44,3 +44,19 @@ test('loadConfig captures proxy and insecure TLS settings', () => {
   assert.equal(config.proxyUrl, 'http://127.0.0.1:8080');
   assert.equal(config.insecureTls, true);
 });
+
+test('loadConfig captures TTY delivery settings', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    CODEX_DISCORD_DELIVERY_MODE: 'tty',
+    CODEX_DISCORD_TTY: '/dev/pts/7',
+    CODEX_DISCORD_TTY_USE_SUDO: 'true',
+    CODEX_DISCORD_TTY_PROMPT_FORMAT: 'compact',
+    CODEX_DISCORD_TTY_SUBMIT_SEQUENCE: 'lf',
+  });
+  assert.equal(config.deliveryMode, 'tty');
+  assert.equal(config.tty, '/dev/pts/7');
+  assert.equal(config.ttyUseSudo, true);
+  assert.equal(config.ttyPromptFormat, 'compact');
+  assert.equal(config.ttySubmitSequence, 'lf');
+});

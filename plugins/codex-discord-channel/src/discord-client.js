@@ -68,6 +68,9 @@ async function startDiscordClient({ config, delivery, logger }) {
 
   client.on(Events.MessageCreate, async (message) => {
     try {
+      if (message.author?.id && client.user?.id && message.author.id === client.user.id) {
+        return;
+      }
       if (!isCurrentOwner(config.paths.ownerPath, config.ownerId)) {
         log(logger, 'INFO', 'Ignoring Discord message because this process is no longer owner', {
           channelId: message.channelId,
@@ -87,7 +90,7 @@ async function startDiscordClient({ config, delivery, logger }) {
         });
         return;
       }
-      const result = delivery.deliver(normalized);
+      const result = await delivery.deliver(normalized);
       log(logger, 'INFO', 'Discord message delivery result', {
         status: result.status,
         reason: result.reason,

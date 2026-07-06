@@ -20,6 +20,11 @@ function parseBool(value, fallback = false) {
   return /^(1|true|yes|on)$/i.test(String(value).trim());
 }
 
+function parseInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function loadEnvFile(file, env) {
   if (!file || !fs.existsSync(file)) return false;
   const text = fs.readFileSync(file, 'utf8');
@@ -57,6 +62,8 @@ function loadConfig(inputEnv = process.env, options = {}) {
     '';
   const cwd = env.CODEX_CWD || options.cwd || process.cwd();
   const ownerId = env.CODEX_DISCORD_OWNER_ID || `${os.hostname()}:${process.pid}:${Date.now()}`;
+  const deliveryMode = String(env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'tty').toLowerCase();
+  const ttyPromptFormat = String(env.CODEX_DISCORD_TTY_PROMPT_FORMAT || env.CODEX_TTY_PROMPT_FORMAT || 'minimal').toLowerCase();
 
   return {
     env,
@@ -68,6 +75,17 @@ function loadConfig(inputEnv = process.env, options = {}) {
     proxyUrl,
     insecureTls: parseBool(env.DISCORD_INSECURE_TLS, env.NODE_TLS_REJECT_UNAUTHORIZED === '0'),
     loginDisabled: parseBool(env.DISCORD_CHANNEL_DISABLE_LOGIN, false),
+    deliveryMode,
+    tty: env.CODEX_DISCORD_TTY || env.CODEX_TTY || '',
+    ttyPid: env.CODEX_DISCORD_TTY_PID || env.CODEX_TTY_PID || '',
+    ttyUseSudo: parseBool(env.CODEX_DISCORD_TTY_USE_SUDO || env.CODEX_TTY_USE_SUDO, true),
+    ttyPromptFormat: ['full', 'compact', 'minimal', 'plain'].includes(ttyPromptFormat) ? ttyPromptFormat : 'minimal',
+    ttySubmit: parseBool(env.CODEX_DISCORD_TTY_SUBMIT || env.CODEX_TTY_SUBMIT, true),
+    ttySubmitSequence: env.CODEX_DISCORD_TTY_SUBMIT_SEQUENCE || env.CODEX_TTY_SUBMIT_SEQUENCE || 'cr',
+    ttySplitSubmit: parseBool(env.CODEX_DISCORD_TTY_SPLIT_SUBMIT || env.CODEX_TTY_SPLIT_SUBMIT, true),
+    ttySubmitDelayMs: parseInteger(env.CODEX_DISCORD_TTY_SUBMIT_DELAY_MS || env.CODEX_TTY_SUBMIT_DELAY_MS, 500),
+    ttyInjectTimeoutMs: parseInteger(env.CODEX_DISCORD_TTY_INJECT_TIMEOUT_MS || env.CODEX_TTY_INJECT_TIMEOUT_MS, 15000),
+    parentPid: process.ppid,
     ownerId,
     cwd,
     hostname: os.hostname(),
@@ -79,6 +97,7 @@ function loadConfig(inputEnv = process.env, options = {}) {
 module.exports = {
   loadConfig,
   loadEnvFile,
+  parseInteger,
   parseBool,
   stripQuotes,
 };

@@ -9,10 +9,10 @@ The plugin lives at `plugins/codex-discord-channel` and is exposed through the r
 - Claims one active owner for a Discord bot instance when the MCP server starts.
 - Stores local state under `$HOME/.codex/channels/discord/<instance>` by default.
 - Uses a Claude-compatible access model for DMs and guild channels.
-- Avoids TTY injection entirely.
+- Delivers accepted Discord messages into the owning interactive Codex session terminal.
 - Exposes MCP tools for status, owner claim/read, and Discord send.
 
-Codex does not currently expose a confirmed Claude-style host channel notification API. Until that exists, inbound Discord messages are normalized at the delivery boundary and reported as `unsupported` instead of being silently injected into a terminal.
+Codex does not currently expose a confirmed Claude-style host channel notification API. Until that exists, this plugin uses a session-local TTY delivery path so the active terminal session receives DM messages and guild messages that mention the bot.
 
 ## Local Install
 
@@ -38,6 +38,7 @@ Expected healthy status:
   "instance": "codex01",
   "tokenConfigured": true,
   "proxyConfigured": true,
+  "deliveryMode": "tty",
   "discordStarted": true
 }
 ```
@@ -50,7 +51,7 @@ Use $codex-discord-channel to send "..." to channel <discord-channel-id>.
 
 If `discordStarted` is false, check `discordReason`, `envLoaded`, `proxyConfigured`, and `insecureTls` in the status output. The status intentionally reports only booleans and paths, never token or proxy values.
 
-Current limitation: inbound Discord messages can be filtered and normalized by the plugin, but Codex does not yet provide a host API that lets an MCP server push those messages into the active transcript. This means Discord-to-console auto delivery is not the same as Claude Code's channel integration yet.
+Inbound delivery requires an interactive Codex terminal. The status output reports `deliveryMode`, `ttyConfigured`, `ttyPidConfigured`, `ttyUseSudo`, and `ttyPromptFormat` so routing failures are visible without printing secrets.
 
 ## Instance Config
 
@@ -70,6 +71,9 @@ DISCORD_BOT_TOKEN=replace-with-local-token
 DISCORD_BOT_USER_ID=replace-with-bot-user-id
 DISCORD_PROXY_URL=http://127.0.0.1:8080
 DISCORD_INSECURE_TLS=true
+CODEX_DISCORD_DELIVERY_MODE=tty
+# Optional explicit route; normally the plugin uses the parent Codex process TTY.
+# CODEX_DISCORD_TTY=/dev/pts/7
 ```
 
 Do not commit `.env`.

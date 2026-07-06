@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex Discord Channel",
     "shortDescription": "Bind a Discord bot instance to the active Codex session.",
-    "longDescription": "A session-local Discord channel plugin for Codex. It mirrors the Claude Code Discord plugin ownership model, keeps one active owner per bot instance, and avoids TTY injection.",
+    "longDescription": "A session-local Discord channel plugin for Codex. It mirrors the Claude Code Discord plugin ownership model, keeps one active owner per bot instance, and delivers accepted Discord messages into the owning terminal session.",
     "developerName": "zhshgmail",
     "category": "Productivity",
     "capabilities": [

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a standalone Codex plugin that provides Claude-style Discord session ownership for Codex without TTY injection.
+**Goal:** Build a standalone Codex plugin that provides Claude-style Discord session ownership for Codex.
 
-**Architecture:** The plugin is a marketplace repo with one plugin under `plugins/codex-discord-channel`. It ships a Node MCP server that owns a Discord bot instance for the current process, uses Claude-compatible access state, exposes safe Discord reply/read tools, and keeps the Codex delivery adapter isolated so a future native channel API can replace the placeholder path.
+**Architecture:** The plugin is a marketplace repo with one plugin under `plugins/codex-discord-channel`. It ships a Node MCP server that owns a Discord bot instance for the current process, uses Claude-compatible access state, exposes safe Discord reply/read tools, and delivers accepted messages into the active session terminal. The Codex delivery adapter remains isolated so a future native channel API can replace the TTY path.
 
 **Tech Stack:** Node.js 22, CommonJS, stdio JSON-RPC MCP handling, `discord.js`, `node:test`, Codex plugin manifest and marketplace files.
 
@@ -20,7 +20,8 @@
 - Create `plugins/codex-discord-channel/src/config.js`: env loading and runtime config.
 - Create `plugins/codex-discord-channel/src/access-state.js`: Claude-compatible access model and decisions.
 - Create `plugins/codex-discord-channel/src/owner-state.js`: single active owner claim/supersede checks.
-- Create `plugins/codex-discord-channel/src/delivery.js`: normalized Discord envelope and bounded delivery result.
+- Create `plugins/codex-discord-channel/src/tty-detect.js`: interactive Codex TTY discovery.
+- Create `plugins/codex-discord-channel/src/delivery.js`: normalized Discord envelope, TTY prompt, and bounded delivery result.
 - Create `plugins/codex-discord-channel/src/discord-client.js`: Discord Gateway and REST wiring.
 - Create `plugins/codex-discord-channel/src/mcp-server.js`: MCP tools/resources and lifecycle.
 - Create `plugins/codex-discord-channel/scripts/smoke.js`: local validation beyond plugin manifest checks.
@@ -109,9 +110,9 @@ Cover DM pairing policy, allowlisted DM, guild channel disabled, guild mention r
 
 Return structured decisions with `allowed`, `reason`, and `requiresPairingCode` fields.
 
-- [ ] **Step 3: Implement delivery envelope**
+- [ ] **Step 3: Implement delivery envelope and TTY delivery**
 
-Build a stable text envelope with Discord channel, message, author, and attachment metadata. Return `unsupported` when no Codex channel push API is configured.
+Build a stable text envelope with Discord channel, message, author, and attachment metadata. In default `tty` delivery mode, inject a prompt into the owning Codex session terminal. Return `failed` if no usable TTY is available, and `unsupported` only when delivery is explicitly disabled.
 
 ### Task 4: MCP Server and Discord Client
 
@@ -131,7 +132,7 @@ Start Discord only when `DISCORD_BOT_TOKEN` or `DISCORD_TOKEN` is set. If absent
 
 - [ ] **Step 3: Wire inbound handler**
 
-On `messageCreate`, refresh access, check current owner, normalize message, and call delivery boundary. Never write to TTY.
+On `messageCreate`, refresh access, check current owner, ignore the bot's own messages, normalize the Discord message, and call the delivery boundary.
 
 ### Task 5: Docs, Validation, and GitHub
 
@@ -142,7 +143,7 @@ On `messageCreate`, refresh access, check current owner, normalize message, and 
 
 - [ ] **Step 1: Write README**
 
-Document Claude-style target behavior, current Codex host limitation, install commands, env files, and validation commands.
+Document Claude-style target behavior, current Codex host limitation, TTY delivery mode, install commands, env files, and validation commands.
 
 - [ ] **Step 2: Add smoke validation**
 

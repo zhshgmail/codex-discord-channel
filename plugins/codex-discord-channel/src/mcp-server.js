@@ -99,6 +99,11 @@ async function callTool(context, name, args = {}) {
       proxyConfigured: Boolean(context.config.proxyUrl),
       insecureTls: context.config.insecureTls,
       loginDisabled: context.config.loginDisabled,
+      deliveryMode: context.config.deliveryMode,
+      ttyConfigured: Boolean(context.config.tty),
+      ttyPidConfigured: Boolean(context.config.ttyPid),
+      ttyUseSudo: context.config.ttyUseSudo,
+      ttyPromptFormat: context.config.ttyPromptFormat,
       discordStarted: context.discordState.started,
       discordReason: context.discordState.reason || null,
       currentOwner: owner,
@@ -133,7 +138,7 @@ async function handleRequest(context, message) {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        'Use this plugin to claim a Discord bot instance for the current Codex session. It mirrors Claude Code Discord channel ownership, avoids TTY injection, and exposes safe status/send tools.',
+        'Use this plugin to claim a Discord bot instance for the current Codex session and deliver accepted Discord messages into the active session terminal.',
     });
     return;
   }

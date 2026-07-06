@@ -12,8 +12,8 @@ Use this skill when the user wants a Discord bot instance to be owned by the cur
 - This plugin mirrors Claude Code's Discord channel ownership semantics.
 - One process owns one Discord instance through `owner.json`.
 - A newer session using the same instance overwrites the owner.
-- The plugin does not use TTY injection.
-- Until Codex exposes a native channel notification API, inbound Discord messages are normalized but not pushed into the active host transcript.
+- Accepted inbound Discord messages are delivered into the owning local Codex TUI through the session TTY.
+- Until Codex exposes a native channel notification API, the TTY delivery adapter is the exact-console path.
 
 ## Local State
 
@@ -41,5 +41,7 @@ Use the plugin MCP tools when available:
 - `discord_channel_read_owner`
 - `discord_channel_claim_owner`
 - `discord_channel_send`
+
+Healthy status for local Discord-to-session routing should show `deliveryMode: "tty"` and `discordStarted: true`.
 
 If the MCP tools are unavailable, inspect the plugin package at `plugins/codex-discord-channel`.
