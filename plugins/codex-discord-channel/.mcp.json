@@ -5,7 +5,11 @@
       "command": "node",
       "args": [
         "./src/mcp-server.js"
-      ]
+      ],
+      "env": {
+        "DISCORD_INSTANCE": "codex01",
+        "DISCORD_CONFIG_DIR": "/home/zheng/.codex/channels/discord/codex01"
+      }
     }
   }
 }
