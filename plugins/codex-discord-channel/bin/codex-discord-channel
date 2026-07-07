@@ -3,18 +3,19 @@
 
 const { loadConfig } = require('../src/config');
 const { configureNetwork } = require('../src/discord-client');
-const { createDelivery } = require('../src/delivery');
+const { createDelivery, resolveReplyTarget } = require('../src/delivery');
 const { startDiscordClient } = require('../src/discord-client');
 const { claimOwner, createOwner } = require('../src/owner-state');
+const { clearPid, writePid } = require('../src/receiver-state');
 
 function usage() {
   process.stderr.write([
     'Usage:',
     '  codex-discord-channel              # run MCP server',
     '  codex-discord-channel gateway      # run Discord gateway without MCP stdio',
-    '  codex-discord-channel send --channel CHANNEL_ID [--reply-to MESSAGE_ID]',
+    '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID]',
     '',
-    'The send command reads message text from stdin.',
+    'The send command reads message text from stdin. Without --channel it replies to the last accepted inbound Discord message.',
   ].join('\n'));
   process.stderr.write('\n');
 }
@@ -51,26 +52,26 @@ function readStdin() {
 }
 
 async function sendViaRest(args) {
-  if (!args.channelId) throw new Error('--channel is required');
   const content = (await readStdin()).trim();
   if (!content) throw new Error('stdin message content is required');
 
   const config = loadConfig();
+  const target = resolveReplyTarget(args, config);
   if (!config.tokenConfigured) {
     throw new Error(`Discord token is not configured in ${config.paths.envFile}`);
   }
   configureNetwork(config, () => {});
 
   const payload = { content };
-  if (args.replyTo) {
+  if (target.replyTo) {
     payload.message_reference = {
-      message_id: args.replyTo,
-      channel_id: args.channelId,
+      message_id: target.replyTo,
+      channel_id: target.channelId,
       fail_if_not_exists: false,
     };
   }
 
-  const response = await fetch(`https://discord.com/api/v10/channels/${args.channelId}/messages`, {
+  const response = await fetch(`https://discord.com/api/v10/channels/${target.channelId}/messages`, {
     method: 'POST',
     headers: {
       Authorization: `Bot ${config.token}`,
@@ -98,10 +99,17 @@ function makeLogger() {
   };
 }
 
+function enabled(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || '').trim());
+}
+
 async function runGateway() {
   const logger = makeLogger();
   const config = loadConfig();
-  claimOwner(config.paths.ownerPath, createOwner(config));
+  writePid(config.paths.gatewayPidPath, process.pid);
+  if (enabled(config.env.CODEX_DISCORD_GATEWAY_CLAIM_OWNER)) {
+    claimOwner(config.paths.ownerPath, createOwner(config));
+  }
   const delivery = createDelivery(config, logger);
   const discordState = await startDiscordClient({ config, delivery, logger });
   if (!discordState.started) {
@@ -110,6 +118,9 @@ async function runGateway() {
   const keepAlive = setInterval(() => {}, 2 ** 30);
   const stop = () => {
     clearInterval(keepAlive);
+    try {
+      clearPid(config.paths.gatewayPidPath, process.pid);
+    } catch {}
     if (discordState.client?.destroy) discordState.client.destroy();
     process.exit(0);
   };
@@ -143,7 +154,16 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-  process.exit(1);
-});
+module.exports = {
+  main,
+  parseSendArgs,
+  readStdin,
+  sendViaRest,
+};
+
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+    process.exit(1);
+  });
+}

@@ -61,7 +61,12 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.http_proxy ||
     '';
   const cwd = env.CODEX_CWD || options.cwd || process.cwd();
-  const ownerId = env.CODEX_DISCORD_OWNER_ID || `${os.hostname()}:${process.pid}:${Date.now()}`;
+  const ownerId =
+    env.CODEX_DISCORD_OWNER_ID ||
+    env.CODEX_THREAD_ID ||
+    env.CODEX_SESSION_ID ||
+    env.CODEX_TARGET_THREAD_ID ||
+    `${os.hostname()}:${process.pid}:${Date.now()}`;
   const deliveryMode = String(env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'tty').toLowerCase();
   const ttyPromptFormat = String(env.CODEX_DISCORD_TTY_PROMPT_FORMAT || env.CODEX_TTY_PROMPT_FORMAT || 'minimal').toLowerCase();
 
@@ -79,7 +84,7 @@ function loadConfig(inputEnv = process.env, options = {}) {
     tty: env.CODEX_DISCORD_TTY || env.CODEX_TTY || '',
     ttyPid: env.CODEX_DISCORD_TTY_PID || env.CODEX_TTY_PID || '',
     ttyUseSudo: parseBool(env.CODEX_DISCORD_TTY_USE_SUDO || env.CODEX_TTY_USE_SUDO, true),
-    ttyPromptFormat: ['full', 'compact', 'minimal', 'plain'].includes(ttyPromptFormat) ? ttyPromptFormat : 'minimal',
+    ttyPromptFormat: ['full', 'compact', 'minimal', 'plain', 'display'].includes(ttyPromptFormat) ? ttyPromptFormat : 'minimal',
     ttySubmit: parseBool(env.CODEX_DISCORD_TTY_SUBMIT || env.CODEX_TTY_SUBMIT, true),
     ttySubmitSequence: env.CODEX_DISCORD_TTY_SUBMIT_SEQUENCE || env.CODEX_TTY_SUBMIT_SEQUENCE || 'cr',
     ttySplitSubmit: parseBool(env.CODEX_DISCORD_TTY_SPLIT_SUBMIT || env.CODEX_TTY_SPLIT_SUBMIT, true),
@@ -89,7 +94,7 @@ function loadConfig(inputEnv = process.env, options = {}) {
     ownerId,
     cwd,
     hostname: os.hostname(),
-    pid: process.pid,
+    pid: parseInteger(env.CODEX_DISCORD_OWNER_PID || env.CODEX_OWNER_PID, process.pid),
     startedAt: new Date().toISOString(),
   };
 }

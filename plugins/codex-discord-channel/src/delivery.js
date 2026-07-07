@@ -64,6 +64,68 @@ function buildReplyCommand(normalized, config = {}) {
   return `printf '%s' 'REPLY_TEXT_HERE' | ${envPrefix ? `${envPrefix} ` : ''}${command}`;
 }
 
+function getLastInboundPath(config = {}) {
+  return config.paths?.lastInboundPath || (
+    config.paths?.stateDir ? path.join(config.paths.stateDir, 'last-inbound.json') : ''
+  );
+}
+
+function inboundContext(normalized) {
+  return {
+    version: 1,
+    source: normalized.source || (normalized.guildId ? 'guild' : 'dm'),
+    channelId: normalized.channelId || '',
+    guildId: normalized.guildId || null,
+    messageId: normalized.messageId || '',
+    authorId: normalized.authorId || '',
+    authorName: normalized.authorName || '',
+    authorIsBot: Boolean(normalized.authorIsBot),
+    content: normalized.content || '',
+    attachments: Array.isArray(normalized.attachments) ? normalized.attachments : [],
+    receivedAt: new Date().toISOString(),
+  };
+}
+
+function writeLastInboundContext(normalized, config = {}, deps = {}) {
+  const file = getLastInboundPath(config);
+  if (!file) return null;
+  const fsImpl = deps.fs || fs;
+  const context = inboundContext(normalized);
+  fsImpl.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fsImpl.writeFileSync(temp, `${JSON.stringify(context, null, 2)}\n`, { mode: 0o600 });
+  fsImpl.renameSync(temp, file);
+  return context;
+}
+
+function readLastInboundContext(config = {}, deps = {}) {
+  const file = getLastInboundPath(config);
+  if (!file) return null;
+  const fsImpl = deps.fs || fs;
+  if (!fsImpl.existsSync(file)) return null;
+  const text = fsImpl.readFileSync(file, 'utf8');
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== 'object') return null;
+  return parsed;
+}
+
+function resolveReplyTarget(args = {}, config = {}, deps = {}) {
+  const channelId = typeof args.channelId === 'string' ? args.channelId.trim() : '';
+  const replyTo = typeof args.replyTo === 'string' ? args.replyTo.trim() : '';
+  if (channelId) {
+    return { channelId, replyTo, usedLastInbound: false };
+  }
+  const context = readLastInboundContext(config, deps);
+  if (!context?.channelId) {
+    throw new Error('channelId is required and no last inbound Discord context is available.');
+  }
+  return {
+    channelId: String(context.channelId).trim(),
+    replyTo: replyTo || String(context.messageId || '').trim(),
+    usedLastInbound: true,
+  };
+}
+
 function terminalSafeText(text) {
   return String(text)
     .replace(/\r\n/g, '\n')
@@ -81,6 +143,15 @@ function decodeSubmitSequence(value) {
 
 function formatTtyPrompt(normalized, envelope, config = {}) {
   if (config.ttyPromptFormat === 'plain') return normalized.content || envelope;
+  if (config.ttyPromptFormat === 'display') {
+    const source = normalized.source === 'dm' || !normalized.guildId ? 'DM' : 'group';
+    const author = normalized.authorName || normalized.authorId || 'unknown';
+    const content = normalized.content || '(attachments only)';
+    const attachmentText = normalized.attachments?.length
+      ? `\n\nattachments:\n${normalized.attachments.map((item) => `- ${item.name || item.id}: ${item.url}`).join('\n')}`
+      : '';
+    return `Discord ${source} from ${author}:\n\n${content}${attachmentText}`;
+  }
   const replyCommand = buildReplyCommand(normalized, config);
 
   const header = [
@@ -245,6 +316,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       }
 
       try {
+        writeLastInboundContext(normalized, config, deps);
         const tty = await injectIntoTty(normalized, envelope, config, deps);
         logger('INFO', 'Injected Discord message into Codex session TTY', {
           tty,
@@ -283,6 +355,9 @@ module.exports = {
   formatTtyPrompt,
   injectIntoTty,
   normalizeDiscordMessage,
+  readLastInboundContext,
+  resolveReplyTarget,
   resolveCodexTty,
   terminalSafeText,
+  writeLastInboundContext,
 };

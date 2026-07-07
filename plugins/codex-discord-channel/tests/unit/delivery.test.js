@@ -1,8 +1,19 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
-const { createDelivery, escapeAttr, formatEnvelope, normalizeDiscordMessage } = require('../../src/delivery');
+const {
+  createDelivery,
+  escapeAttr,
+  formatEnvelope,
+  formatTtyPrompt,
+  normalizeDiscordMessage,
+  readLastInboundContext,
+  resolveReplyTarget,
+} = require('../../src/delivery');
 
 test('escapeAttr escapes unsafe attribute characters', () => {
   assert.equal(escapeAttr('"x<&'), '&quot;x&lt;&amp;');
@@ -89,4 +100,90 @@ test('tty delivery injects Discord prompt into the session terminal', async () =
   assert.match(writes[0].text, /codex-discord-channel' send --channel 'c1' --reply-to 'm1'/);
   assert.match(writes[0].text, /<@bot> hello/);
   assert.equal(writes[1].text, '\r');
+});
+
+test('display prompt shows only source, author, and content', () => {
+  const prompt = formatTtyPrompt({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'hello',
+    attachments: [],
+  }, '<channel channel_id="c1">hello</channel>', { ttyPromptFormat: 'display' });
+
+  assert.match(prompt, /Discord DM from Alice:/);
+  assert.match(prompt, /hello/);
+  assert.doesNotMatch(prompt, /channelId/);
+  assert.doesNotMatch(prompt, /replyTo/);
+  assert.doesNotMatch(prompt, /codex-discord-channel/);
+  assert.doesNotMatch(prompt, /<channel/);
+});
+
+test('tty delivery persists last inbound reply context outside the terminal prompt', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const writes = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'display',
+    ttySubmitSequence: 'none',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+    },
+  }, () => {}, {
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  const result = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'hello',
+    attachments: [],
+  });
+
+  assert.equal(result.status, 'delivered');
+  assert.equal(writes.length, 1);
+  assert.doesNotMatch(writes[0].text, /channelId/);
+  const context = readLastInboundContext({
+    paths: { lastInboundPath: path.join(dir, 'last-inbound.json') },
+  });
+  assert.equal(context.channelId, 'c1');
+  assert.equal(context.messageId, 'm1');
+  assert.equal(context.authorName, 'Alice');
+});
+
+test('resolveReplyTarget defaults missing channel to last inbound context', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-reply-'));
+  const lastInboundPath = path.join(dir, 'last-inbound.json');
+  fs.writeFileSync(lastInboundPath, JSON.stringify({
+    channelId: 'c1',
+    messageId: 'm1',
+  }));
+
+  assert.deepEqual(resolveReplyTarget({ channelId: '', replyTo: '' }, {
+    paths: { lastInboundPath },
+  }), {
+    channelId: 'c1',
+    replyTo: 'm1',
+    usedLastInbound: true,
+  });
+
+  assert.deepEqual(resolveReplyTarget({ channelId: 'c2', replyTo: '' }, {
+    paths: { lastInboundPath },
+  }), {
+    channelId: 'c2',
+    replyTo: '',
+    usedLastInbound: false,
+  });
 });

@@ -37,3 +37,48 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   assert.equal(result.content[0].text.includes('secret-token'), false);
   assert.equal(result.content[0].text.includes('127.0.0.1:8080'), false);
 });
+
+test('send tool defaults to last inbound Discord message when channelId is omitted', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'last-inbound.json'), JSON.stringify({
+    channelId: 'c1',
+    messageId: 'm1',
+  }));
+
+  const sends = [];
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const context = {
+    config,
+    discordState: {
+      started: true,
+      client: {
+        channels: {
+          async fetch(channelId) {
+            return {
+              async send(payload) {
+                sends.push({ channelId, payload });
+                return { channelId, id: 'sent1' };
+              },
+            };
+          },
+        },
+      },
+    },
+    claim() {
+      throw new Error('not used');
+    },
+  };
+
+  const result = await callTool(context, 'discord_channel_send', { content: 'hello back' });
+  assert.equal(result.structuredContent.channelId, 'c1');
+  assert.equal(result.structuredContent.messageId, 'sent1');
+  assert.deepEqual(sends, [{
+    channelId: 'c1',
+    payload: {
+      content: 'hello back',
+      reply: { messageReference: 'm1', failIfNotExists: false },
+    },
+  }]);
+});

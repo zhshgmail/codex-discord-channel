@@ -74,13 +74,6 @@ function mentionsBot(content, botUserId, patterns = []) {
 }
 
 function decideAccess(state, message) {
-  if (message.authorIsBot) {
-    const group = message.channelId ? state.groups[message.channelId] : null;
-    if (!group || group.allowBots !== true) {
-      return { allowed: false, reason: 'bot_author_denied' };
-    }
-  }
-
   if (message.source === 'dm') {
     if (state.dmPolicy === 'open') return { allowed: true, reason: 'dm_open' };
     if (state.allowFrom.includes(message.authorId)) return { allowed: true, reason: 'dm_allowlisted' };
@@ -92,6 +85,10 @@ function decideAccess(state, message) {
 
   const group = state.groups[message.channelId];
   if (!group) return { allowed: false, reason: 'guild_channel_not_enabled' };
+
+  if (message.authorIsBot && group.allowBots !== true) {
+    return { allowed: false, reason: 'bot_author_denied' };
+  }
 
   if (group.allowFrom.length > 0 && !group.allowFrom.includes(message.authorId)) {
     return { allowed: false, reason: 'guild_sender_denied' };

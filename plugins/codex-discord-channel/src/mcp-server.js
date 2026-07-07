@@ -2,7 +2,7 @@
 
 const readline = require('node:readline');
 const { loadConfig } = require('./config');
-const { createDelivery } = require('./delivery');
+const { createDelivery, resolveReplyTarget } = require('./delivery');
 const { sendDiscordMessage, startDiscordClient } = require('./discord-client');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
 
@@ -65,11 +65,11 @@ function toolList() {
       inputSchema: {
         type: 'object',
         properties: {
-          channelId: { type: 'string', description: 'Discord channel id.' },
+          channelId: { type: 'string', description: 'Optional Discord channel id. Defaults to the last accepted inbound Discord message.' },
           content: { type: 'string', description: 'Message text to send.' },
           replyTo: { type: 'string', description: 'Optional Discord message id to reply to.' },
         },
-        required: ['channelId', 'content'],
+        required: ['content'],
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -123,7 +123,8 @@ async function callTool(context, name, args = {}) {
   }
 
   if (name === 'discord_channel_send') {
-    const sent = await sendDiscordMessage(context.discordState.client, args);
+    const target = resolveReplyTarget(args, context.config);
+    const sent = await sendDiscordMessage(context.discordState.client, { ...args, ...target });
     return textResult(`Sent Discord message ${sent.messageId}.`, sent);
   }
 

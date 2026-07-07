@@ -2,7 +2,7 @@
 
 const { decideAccess, loadAccessState } = require('./access-state');
 const { normalizeDiscordMessage } = require('./delivery');
-const { isCurrentOwner } = require('./owner-state');
+const { isActiveDiscordReceiver } = require('./receiver-state');
 
 function log(logger, level, message, meta) {
   if (typeof logger === 'function') logger(level, message, meta);
@@ -71,8 +71,11 @@ async function startDiscordClient({ config, delivery, logger }) {
       if (message.author?.id && client.user?.id && message.author.id === client.user.id) {
         return;
       }
-      if (!isCurrentOwner(config.paths.ownerPath, config.ownerId)) {
-        log(logger, 'INFO', 'Ignoring Discord message because this process is no longer owner', {
+      const receiver = isActiveDiscordReceiver(config);
+      if (!receiver.active) {
+        log(logger, 'INFO', 'Ignoring Discord message because another gateway process is active', {
+          reason: receiver.reason,
+          activePid: receiver.pid,
           channelId: message.channelId,
           messageId: message.id,
         });

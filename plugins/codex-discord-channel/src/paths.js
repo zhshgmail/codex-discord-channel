@@ -48,6 +48,8 @@ function resolvePaths(env = process.env) {
     envFile: expandPath(firstNonEmpty(env.DISCORD_ENV_FILE, path.join(stateDir, '.env')), env),
     accessPath: expandPath(firstNonEmpty(env.DISCORD_ACCESS_FILE, path.join(stateDir, 'access.json')), env),
     ownerPath: expandPath(firstNonEmpty(env.DISCORD_OWNER_FILE, path.join(stateDir, 'owner.json')), env),
+    gatewayPidPath: expandPath(firstNonEmpty(env.DISCORD_GATEWAY_PID_FILE, path.join(stateDir, 'session-gateway.pid')), env),
+    lastInboundPath: expandPath(firstNonEmpty(env.DISCORD_LAST_INBOUND_FILE, path.join(stateDir, 'last-inbound.json')), env),
   };
 }
 

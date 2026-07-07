@@ -59,6 +59,38 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+function uniq(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    if (typeof value !== 'string' || value.trim() === '' || seen.has(value)) continue;
+    out.push(value);
+    seen.add(value);
+  }
+  return out;
+}
+
+function mergeAccess(base, overlay) {
+  const result = {
+    ...base,
+    ...overlay,
+    allowFrom: uniq([...(base.allowFrom || []), ...(overlay.allowFrom || [])]),
+    mentionPatterns: uniq([...(base.mentionPatterns || []), ...(overlay.mentionPatterns || [])]),
+    groups: { ...(base.groups || {}) },
+  };
+  for (const [channelId, group] of Object.entries(overlay.groups || {})) {
+    const existing = result.groups[channelId] || {};
+    result.groups[channelId] = {
+      ...existing,
+      ...group,
+      requireMention: existing.requireMention === false || group.requireMention === false ? false : group.requireMention !== undefined ? group.requireMention : existing.requireMention,
+      allowFrom: uniq([...(existing.allowFrom || []), ...(group.allowFrom || [])]),
+      allowBots: Boolean(existing.allowBots || group.allowBots),
+    };
+  }
+  return result;
+}
+
 function bridgeStateToAccess(state, sourcePath) {
   return {
     version: 1,
@@ -125,11 +157,14 @@ async function main() {
   const source = args.from ? path.resolve(args.from) : destination;
   const sourceEnvPath = path.join(source, '.env');
   const sourceStatePath = path.join(source, 'state.json');
+  const sourceAccessPath = path.join(source, 'access.json');
   const destinationEnvPath = path.join(destination, '.env');
   const destinationAccessPath = path.join(destination, 'access.json');
 
   if (!fs.existsSync(sourceEnvPath)) throw new Error(`Missing bridge env file: ${sourceEnvPath}`);
-  if (!fs.existsSync(sourceStatePath)) throw new Error(`Missing bridge state file: ${sourceStatePath}`);
+  if (!fs.existsSync(sourceStatePath) && !fs.existsSync(sourceAccessPath)) {
+    throw new Error(`Missing bridge state/access file: ${sourceStatePath} or ${sourceAccessPath}`);
+  }
   if (fs.existsSync(destinationAccessPath) && !args.force) {
     throw new Error(`Refusing to overwrite ${destinationAccessPath}; pass --force to replace it.`);
   }
@@ -142,8 +177,17 @@ async function main() {
 
   setEnvValue(destinationEnvPath, 'DISCORD_INSTANCE', args.instance || resolvePaths(env).instance);
 
-  const state = readJson(sourceStatePath);
-  const access = bridgeStateToAccess(state, sourceStatePath);
+  const stateAccess = fs.existsSync(sourceStatePath)
+    ? bridgeStateToAccess(readJson(sourceStatePath), sourceStatePath)
+    : bridgeStateToAccess({}, sourceStatePath);
+  const sourceAccess = fs.existsSync(sourceAccessPath) ? readJson(sourceAccessPath) : {};
+  const access = mergeAccess(stateAccess, sourceAccess);
+  access.importedFrom = {
+    kind: 'discord-codex-bridge',
+    statePath: fs.existsSync(sourceStatePath) ? sourceStatePath : null,
+    accessPath: fs.existsSync(sourceAccessPath) ? sourceAccessPath : null,
+    importedAt: new Date().toISOString(),
+  };
   fs.writeFileSync(destinationAccessPath, `${JSON.stringify(access, null, 2)}\n`, { mode: 0o600 });
 
   let botUserId = '';

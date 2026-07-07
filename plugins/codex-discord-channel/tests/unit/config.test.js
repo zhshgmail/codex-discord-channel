@@ -60,3 +60,36 @@ test('loadConfig captures TTY delivery settings', () => {
   assert.equal(config.ttyPromptFormat, 'compact');
   assert.equal(config.ttySubmitSequence, 'lf');
 });
+
+test('loadConfig accepts display prompt format', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    CODEX_DISCORD_TTY_PROMPT_FORMAT: 'display',
+  });
+  assert.equal(config.ttyPromptFormat, 'display');
+});
+
+test('loadConfig uses Codex thread id as stable owner id', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    CODEX_THREAD_ID: 'thread-123',
+  });
+  assert.equal(config.ownerId, 'thread-123');
+});
+
+test('explicit Discord owner id overrides Codex thread id', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    CODEX_DISCORD_OWNER_ID: 'manual-owner',
+    CODEX_THREAD_ID: 'thread-123',
+  });
+  assert.equal(config.ownerId, 'manual-owner');
+});
+
+test('loadConfig accepts explicit owner pid for session binding metadata', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    CODEX_DISCORD_OWNER_PID: '3547805',
+  });
+  assert.equal(config.pid, 3547805);
+});

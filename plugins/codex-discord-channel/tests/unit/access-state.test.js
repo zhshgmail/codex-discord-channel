@@ -23,6 +23,13 @@ test('allowlisted DM sender is accepted', () => {
   assert.equal(decision.reason, 'dm_allowlisted');
 });
 
+test('allowlisted bot DM sender is accepted', () => {
+  const state = normalizeAccessState({ allowFrom: ['bot2'] });
+  const decision = decideAccess(state, { source: 'dm', authorId: 'bot2', authorIsBot: true, content: 'hi' });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'dm_allowlisted');
+});
+
 test('disabled guild channel is denied', () => {
   const decision = decideAccess(defaultAccessState(), {
     source: 'guild',
