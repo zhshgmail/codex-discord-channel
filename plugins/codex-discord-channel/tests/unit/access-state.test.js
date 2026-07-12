@@ -89,6 +89,22 @@ test('guild reply to another author does not satisfy the mention requirement', (
   assert.equal(decision.reason, 'guild_mention_required');
 });
 
+test('guild reply with no normalized replied author still requires a mention', () => {
+  const state = normalizeAccessState({ groups: { c1: {} } });
+  const decision = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'u1',
+    authorIsBot: false,
+    content: 'follow-up without a visible mention',
+    botUserId: 'bot',
+    repliedToAuthorId: '',
+  });
+
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'guild_mention_required');
+});
+
 test('guild channel can disable mention requirement', () => {
   const state = normalizeAccessState({ groups: { c1: { requireMention: false } } });
   const decision = decideAccess(state, {

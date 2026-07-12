@@ -68,6 +68,24 @@ test('normalizeDiscordMessage records replied author only for a message referenc
   assert.equal(missingReference.repliedToAuthorId, '');
 });
 
+test('normalizeDiscordMessage fails closed when referenced reply author metadata is absent or null', () => {
+  const missingRepliedUser = normalizeDiscordMessage({
+    channelId: 'c1',
+    id: 'm3',
+    reference: { messageId: 'm0' },
+    mentions: {},
+  });
+  const nullRepliedUser = normalizeDiscordMessage({
+    channelId: 'c1',
+    id: 'm4',
+    reference: { messageId: 'm0' },
+    mentions: { repliedUser: null },
+  });
+
+  assert.equal(missingRepliedUser.repliedToAuthorId, '');
+  assert.equal(nullRepliedUser.repliedToAuthorId, '');
+});
+
 test('off delivery returns unsupported without pretending host push exists', async () => {
   const delivery = createDelivery({ deliveryMode: 'off' }, () => {});
   const result = await delivery.deliver({
