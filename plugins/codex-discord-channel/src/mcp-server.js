@@ -9,6 +9,7 @@ const { claimOwner, createOwner, readOwner } = require('./owner-state');
 
 const SERVER_NAME = 'Codex Discord Channel';
 const SERVER_VERSION = '0.2.0';
+const MAX_TOOL_RESULT_BYTES = 64 * 1024;
 
 function makeLogger() {
   return (level, message, meta) => {
@@ -34,6 +35,25 @@ function textResult(text, structuredContent = {}) {
     content: [{ type: 'text', text }],
     structuredContent,
   };
+}
+
+function historyToolResult(history) {
+  return textResult(JSON.stringify(history), {
+    channel: {
+      id: history.channelId,
+      name: history.channelName,
+    },
+    source: history.source,
+    page: {
+      hasMore: history.hasMore,
+      nextBefore: history.nextBefore,
+    },
+    messageCount: history.messages.length,
+  });
+}
+
+function historyToolResultFits(history) {
+  return Buffer.byteLength(JSON.stringify(historyToolResult(history)), 'utf8') <= MAX_TOOL_RESULT_BYTES;
 }
 
 function toolList() {
@@ -172,8 +192,9 @@ async function callTool(context, name, args = {}) {
       args: historyArgsWithDefaultChannel(args, context.config),
       config: context.config,
       client: context.discordState.client,
+      fitsOutput: historyToolResultFits,
     });
-    return textResult(JSON.stringify(history, null, 2), history);
+    return historyToolResult(history);
   }
 
   throw new Error(`Unknown tool: ${name}`);
@@ -201,7 +222,8 @@ async function handleRequest(context, message) {
   }
   if (method === 'tools/call') {
     try {
-      const result = await callTool(context, params?.name, params?.arguments || {});
+      const args = params != null && Object.hasOwn(params, 'arguments') ? params.arguments : {};
+      const result = await callTool(context, params?.name, args);
       sendResult(id, result);
     } catch (error) {
       sendError(id, -32602, error instanceof Error ? error.message : String(error));

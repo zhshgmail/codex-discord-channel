@@ -104,17 +104,21 @@ function outputBytes(value) {
   return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }
 
-function fitFirstMessage(result, normalized, messageId) {
+function fitsDefaultOutput(value) {
+  return outputBytes(value) <= MAX_OUTPUT_BYTES;
+}
+
+function fitFirstMessage(result, normalized, messageId, fitsOutput) {
   const candidate = () => ({
     ...result,
     messages: [normalized],
     hasMore: true,
     nextBefore: messageId,
   });
-  while (outputBytes(candidate()) > MAX_OUTPUT_BYTES && normalized.attachments.length > 0) {
+  while (!fitsOutput(candidate()) && normalized.attachments.length > 0) {
     normalized.attachments.pop();
   }
-  while (outputBytes(candidate()) > MAX_OUTPUT_BYTES && normalized.content.length > 0) {
+  while (!fitsOutput(candidate()) && normalized.content.length > 0) {
     normalized.content = normalized.content.slice(0, Math.floor(normalized.content.length / 2));
   }
   return candidate();
@@ -144,7 +148,7 @@ async function fetchMessages(target, options) {
   }
 }
 
-async function readDiscordHistory({ args, config, client }) {
+async function readDiscordHistory({ args, config, client, fitsOutput = fitsDefaultOutput }) {
   const validated = validateHistoryArgs(args);
   if (!validated.channelId) throw new Error('history_target_not_allowed');
 
@@ -187,10 +191,10 @@ async function readDiscordHistory({ args, config, client }) {
       hasMore: true,
       nextBefore: messageId,
     };
-    if (result.messages.length === 0 && outputBytes(candidate) > MAX_OUTPUT_BYTES) {
-      candidate = fitFirstMessage(result, normalized, messageId);
+    if (result.messages.length === 0 && !fitsOutput(candidate)) {
+      candidate = fitFirstMessage(result, normalized, messageId, fitsOutput);
     }
-    if (outputBytes(candidate) > MAX_OUTPUT_BYTES) {
+    if (!fitsOutput(candidate)) {
       budgetTruncated = true;
       break;
     }

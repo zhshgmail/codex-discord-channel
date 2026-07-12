@@ -6,14 +6,14 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { loadConfig } = require('../../src/config');
-const { callTool, toolList } = require('../../src/mcp-server');
+const { callTool, handleRequest, toolList } = require('../../src/mcp-server');
 
 const CHANNEL_ID = '100000000000000001';
 const GUILD_ID = '200000000000000001';
 const USER_ID = '300000000000000001';
 const BOT_ID = '900000000000000001';
 
-function historyContext({ inbound = null, fetchError = null } = {}) {
+function historyContext({ inbound = null, fetchError = null, messages = null } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
   fs.mkdirSync(stateDir, { recursive: true });
@@ -45,18 +45,15 @@ function historyContext({ inbound = null, fetchError = null } = {}) {
                 async fetch(options) {
                   calls.push(options);
                   if (fetchError) throw fetchError;
-                  return new Map([[
-                    '500000000000000001',
-                    {
-                      id: '500000000000000001',
-                      channelId,
-                      guildId: GUILD_ID,
-                      createdTimestamp: 1,
-                      author: { id: USER_ID, username: 'Alice', bot: false },
-                      content: 'hello from history',
-                      attachments: new Map(),
-                    },
-                  ]]);
+                  return new Map((messages || [{
+                    id: '500000000000000001',
+                    channelId,
+                    guildId: GUILD_ID,
+                    createdTimestamp: 1,
+                    author: { id: USER_ID, username: 'Alice', bot: false },
+                    content: 'hello from history',
+                    attachments: new Map(),
+                  }]).map((message) => [message.id, message]));
                 },
               },
             };
@@ -69,6 +66,21 @@ function historyContext({ inbound = null, fetchError = null } = {}) {
     },
   };
   return { calls, context };
+}
+
+async function captureHandleRequest(context, message) {
+  const originalWrite = process.stdout.write;
+  let output = '';
+  process.stdout.write = (chunk) => {
+    output += String(chunk);
+    return true;
+  };
+  try {
+    await handleRequest(context, message);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  return JSON.parse(output.trim());
 }
 
 test('history tool discovery exposes a strict bounded read-only schema', () => {
@@ -113,13 +125,53 @@ test('history tool returns structured authorized history for explicit arguments'
     limit: 1,
   });
 
-  assert.equal(result.structuredContent.channelId, CHANNEL_ID);
-  assert.equal(result.structuredContent.messages[0].content, 'hello from history');
+  assert.equal(result.structuredContent.channel.id, CHANNEL_ID);
+  assert.equal(result.structuredContent.messageCount, 1);
   assert.deepEqual(fixture.calls, [
     { channelId: CHANNEL_ID },
     { limit: 2, before: '500000000000000002' },
   ]);
-  assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+  assert.equal(JSON.parse(result.content[0].text).messages[0].content, 'hello from history');
+  assert.equal(result.content[0].text, JSON.stringify(JSON.parse(result.content[0].text)));
+  assert.equal(Object.hasOwn(result.structuredContent, 'messages'), false);
+});
+
+test('history CallToolResult stays within 64 KiB and exposes message data exactly once', async () => {
+  const attachments = new Map(Array.from({ length: 10 }, (_, index) => [String(index), {
+    id: String(index),
+    name: `attachment-${index}`,
+    size: 123,
+    contentType: 'text/plain',
+    url: `https://example.test/${'u'.repeat(2000)}`,
+  }]));
+  const messages = Array.from({ length: 6 }, (_, index) => ({
+    id: `50000000000000000${6 - index}`,
+    channelId: CHANNEL_ID,
+    guildId: GUILD_ID,
+    createdTimestamp: 6 - index,
+    author: { id: USER_ID, username: 'Alice', bot: false },
+    content: '\u0000'.repeat(30000),
+    attachments,
+  }));
+  const fixture = historyContext({ messages });
+
+  const result = await callTool(fixture.context, 'discord_channel_read_history', {
+    channelId: CHANNEL_ID,
+    limit: 6,
+  });
+
+  const history = JSON.parse(result.content[0].text);
+  assert.ok(Buffer.byteLength(JSON.stringify(result), 'utf8') <= 64 * 1024);
+  assert.ok(history.messages.length > 0);
+  assert.equal(history.hasMore, true);
+  assert.equal(history.nextBefore, history.messages.at(-1).messageId);
+  assert.equal(result.content[0].text, JSON.stringify(history));
+  assert.deepEqual(result.structuredContent, {
+    channel: { id: CHANNEL_ID, name: 'general' },
+    source: 'guild',
+    page: { hasMore: true, nextBefore: history.nextBefore },
+    messageCount: history.messages.length,
+  });
 });
 
 test('history tool defaults a missing channelId from last inbound context', async () => {
@@ -127,11 +179,40 @@ test('history tool defaults a missing channelId from last inbound context', asyn
 
   const result = await callTool(fixture.context, 'discord_channel_read_history', { limit: 1 });
 
-  assert.equal(result.structuredContent.channelId, CHANNEL_ID);
+  assert.equal(result.structuredContent.channel.id, CHANNEL_ID);
   assert.deepEqual(fixture.calls, [
     { channelId: CHANNEL_ID },
     { limit: 2 },
   ]);
+});
+
+test('history JSON-RPC defaults only an absent arguments property', async () => {
+  const inbound = { channelId: CHANNEL_ID, messageId: '500000000000000009' };
+  const absent = historyContext({ inbound });
+  const success = await captureHandleRequest(absent.context, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: { name: 'discord_channel_read_history' },
+  });
+
+  assert.equal(JSON.parse(success.result.content[0].text).channelId, CHANNEL_ID);
+  assert.deepEqual(absent.calls, [
+    { channelId: CHANNEL_ID },
+    { limit: 21 },
+  ]);
+
+  for (const args of [null, false, 0, '']) {
+    const malformed = historyContext({ inbound });
+    const response = await captureHandleRequest(malformed.context, {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'discord_channel_read_history', arguments: args },
+    });
+    assert.equal(response.error?.message, 'invalid_history_args');
+    assert.deepEqual(malformed.calls, []);
+  }
 });
 
 test('history tool rejects an explicit null channelId instead of defaulting it', async () => {
