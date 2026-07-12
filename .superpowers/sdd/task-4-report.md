@@ -92,3 +92,26 @@ with the Task 3 defaulting fix in `src/history.js`, `src/mcp-server.js`, and
 `tests/unit/mcp-server.test.js`. That commit was preserved without rewrite or
 revert. This report is committed separately as documentation only; the
 combined-worktree check above includes the Task 3 fix.
+
+## Documentation Findings Follow-up
+
+Updated the requested documentation surfaces to include the additional
+`invalid_history_args` history error and describe history failures as stable
+sanitized errors rather than as a closed error list.
+
+Reply-audience delivery and rejection semantics, including the fresh-session
+smoke steps, are now explicitly scoped to enabled groups with
+`requireMention: true`. The documentation also states that groups with
+`requireMention: false` accept all otherwise-authorized group messages.
+
+No production code or tests were modified for this follow-up.
+
+Follow-up verification from the repository root:
+
+```bash
+git diff --check
+cd plugins/codex-discord-channel && npm run check
+```
+
+Both commands exited 0. The package check passed syntax, 73 unit tests, and
+the local smoke check.

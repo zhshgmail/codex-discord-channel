@@ -14,10 +14,12 @@ Use this skill when the user wants a Discord bot instance to be owned by the cur
 - A newer session using the same instance overwrites the owner.
 - Accepted inbound Discord messages are delivered into the owning local Codex TUI through the session TTY.
 - Until Codex exposes a native channel notification API, the TTY delivery adapter is the exact-console path.
-- In enabled guild channels, reply delivery is the union of the referenced
-  author, agents mentioned by the referenced message, and agents explicitly
-  mentioned by the new reply. Every bot evaluates this union independently;
-  normal channel, sender, bot, and `requireMention` gates still apply.
+- In enabled guild channels with `requireMention: true`, reply delivery is the
+  union of the referenced author, agents mentioned by the referenced message,
+  and agents explicitly mentioned by the new reply. Every bot evaluates this
+  union independently; normal channel, sender, and bot gates still apply. When
+  `requireMention: false`, reply-audience and mention checks do not gate
+  delivery; all otherwise-authorized group messages are accepted.
 
 ## Local State
 
@@ -68,9 +70,10 @@ ID; parent authorization is not inherited. DM history requires `dmPolicy:
 result, except the active bot's own messages stay visible; `requireMention`
 does not filter history. Group DMs, categories, voice channels, and forum
 containers are disallowed. The tool omits embeds, components, reactions, and
-attachment bodies; serialized output is capped at 64 KiB. Handle only the
-sanitized errors `history_target_not_allowed`, `history_channel_inaccessible`,
-and `history_fetch_failed`; never surface raw Discord errors.
+attachment bodies; serialized output is capped at 64 KiB. Handle the sanitized
+errors `invalid_history_args`, `history_target_not_allowed`,
+`history_channel_inaccessible`, and `history_fetch_failed`; never surface raw
+Discord errors.
 
 ## New-Session Handoff
 
@@ -83,12 +86,16 @@ instead of expecting a closed MCP transport to hot-reload. In that new session:
    confirm ownership moved to the new session without changing the instance.
 2. Call `discord_channel_status` and confirm the exact-console TTY route and
    Discord startup state are healthy.
-3. Smoke an allowed DM and guild message, a direct reply to this bot, and an
-   inherited reply to a peer message that mentioned this bot; each accepted
-   event must appear in the exact visible new console.
-4. Confirm a peer reply that does not mention this bot is rejected unless the
-   current reply explicitly mentions it. Read authorized guild and DM history,
-   paginate it, and verify a denied channel has a sanitized error.
+3. Smoke an allowed DM. In an allowed group with `requireMention: true`, smoke
+   a guild message, a direct reply to this bot, and an inherited reply to a peer
+   message that mentioned this bot; each accepted event must appear in the
+   exact visible new console.
+4. With `requireMention: true`, confirm a peer reply that does not mention this
+   bot is rejected unless the current reply explicitly mentions it. In an
+   allowed group with `requireMention: false`, confirm all otherwise-authorized
+   group messages are accepted, including one with no mention or reply
+   audience. Read authorized guild and DM history, paginate it, and verify a
+   denied channel has a sanitized error.
 
 Do not report or persist `.env` values, tokens, proxy URLs, or raw Discord
 errors. This handoff does not itself authorize deployment or service restart.

@@ -14,14 +14,16 @@ The plugin lives at `plugins/codex-discord-channel` and is exposed through the r
 
 ### Guild Reply Audience
 
-For an enabled guild channel, a reply is an implicit mention only for the union
-of: the referenced message author, bot agents explicitly mentioned in the
-referenced message, and bot agents explicitly mentioned in the new reply. Each
-agent evaluates that union independently. Therefore a reply to a peer's message
-reaches `codex01` only when the peer's message mentioned `codex01` or the new
-reply explicitly mentions it. Missing, deleted, or inaccessible references add
-no implicit audience. Existing channel, sender, bot, and `requireMention`
-checks still apply.
+For an enabled guild channel with `requireMention: true`, a reply is an
+implicit mention only for the union of: the referenced message author, bot
+agents explicitly mentioned in the referenced message, and bot agents
+explicitly mentioned in the new reply. Each agent evaluates that union
+independently. Therefore a reply to a peer's message reaches `codex01` only
+when the peer's message mentioned `codex01` or the new reply explicitly
+mentions it. Missing, deleted, or inaccessible references add no implicit
+audience. Existing channel, sender, and bot checks still apply. When
+`requireMention: false`, reply-audience and mention checks do not gate delivery;
+all otherwise-authorized group messages are accepted.
 
 ### Bounded History
 
@@ -44,11 +46,12 @@ an allowlisted counterparty. Guild `allowFrom` and `allowBots` filter returned
 messages, while the active bot's own messages remain visible. `requireMention`
 does not filter history. Group DMs, categories, voice channels, and forum
 containers are rejected. Results omit embeds, components, reactions, and
-attachment bodies; output is bounded to 64 KiB. Stable errors are
-`history_target_not_allowed`, `history_channel_inaccessible`, and
-`history_fetch_failed`; raw Discord errors are not exposed.
+attachment bodies; output is bounded to 64 KiB. Stable sanitized errors include
+`invalid_history_args`, `history_target_not_allowed`,
+`history_channel_inaccessible`, and `history_fetch_failed`; raw Discord errors
+are not exposed.
 
-Codex does not currently expose a confirmed Claude-style host channel notification API. Until that exists, this plugin uses a session-local TTY delivery path so the active terminal session receives DM messages and guild messages that mention the bot.
+Codex does not currently expose a confirmed Claude-style host channel notification API. Until that exists, this plugin uses a session-local TTY delivery path so the active terminal session receives accepted DM messages and guild messages according to the configured group access policy.
 
 ## Local Install
 
@@ -77,11 +80,15 @@ session.
 3. Call `discord_channel_status`; confirm `deliveryMode: "tty"`, a configured
    TTY, and `discordStarted: true`. The systemd gateway must still be active.
 4. In a real allowed DM, send a message and confirm it reaches the visible new
-   Codex console. In an allowed guild channel, verify a direct reply to a
-   `codex01` message reaches that console without a new mention.
-5. Verify an inherited reply: reply to a peer message that mentioned `codex01`
-   and confirm delivery. Also confirm a reply to a peer message that did not
-   mention `codex01` is rejected unless the reply explicitly mentions it.
+   Codex console. In an allowed guild channel with `requireMention: true`,
+   verify a direct reply to a `codex01` message reaches that console without a
+   new mention.
+5. With `requireMention: true`, verify an inherited reply: reply to a peer
+   message that mentioned `codex01` and confirm delivery. Also confirm a reply
+   to a peer message that did not mention `codex01` is rejected unless the
+   reply explicitly mentions it. In an allowed group with `requireMention:
+   false`, verify that all otherwise-authorized group messages are accepted,
+   including one with no mention or reply audience.
 6. Call `discord_channel_read_history` for an authorized guild channel and a
    real DM channel. Verify cursor pagination using `nextBefore`, and verify an
    inaccessible channel returns only its stable sanitized error.

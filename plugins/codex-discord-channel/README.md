@@ -40,13 +40,15 @@ CODEX_DISCORD_TTY_PROMPT_FORMAT=minimal
 
 ## Reply Audience
 
-In an enabled guild channel, a reply produces an implicit mention audience that
-is the union of the referenced message author, agents mentioned by the
-referenced message, and agents explicitly mentioned by the new reply. Each bot
-evaluates that audience for itself after the normal channel, sender, bot, and
-`requireMention` gates. A reply to an unrelated peer remains rejected unless
-the peer message or the reply itself mentions this bot. A missing, deleted, or
-inaccessible reference contributes no implicit audience.
+In an enabled guild channel with `requireMention: true`, a reply produces an
+implicit mention audience that is the union of the referenced message author,
+agents mentioned by the referenced message, and agents explicitly mentioned by
+the new reply. Each bot evaluates that audience for itself after the normal
+channel, sender, and bot gates. A reply to an unrelated peer remains rejected
+unless the peer message or the reply itself mentions this bot. A missing,
+deleted, or inaccessible reference contributes no implicit audience. When
+`requireMention: false`, reply-audience and mention checks do not gate delivery;
+all otherwise-authorized group messages are accepted.
 
 ## History Tool
 
@@ -67,9 +69,10 @@ allowlisted counterparty. Guild `allowFrom` and `allowBots` filter messages,
 but this bot's own messages are retained; `requireMention` does not filter
 history. Unsupported targets, including group DMs, categories, voice channels,
 and forum containers, are rejected. Output excludes embeds, components,
-reactions, and attachment bodies and is limited to 64 KiB. The only history
-errors exposed to MCP clients are `history_target_not_allowed`,
-`history_channel_inaccessible`, and `history_fetch_failed`.
+reactions, and attachment bodies and is limited to 64 KiB. Stable sanitized
+history errors exposed to MCP clients include `invalid_history_args`,
+`history_target_not_allowed`, `history_channel_inaccessible`, and
+`history_fetch_failed`.
 
 ## Fresh Codex Session Smoke
 
@@ -84,12 +87,16 @@ restart, or alter the live gateway as part of these documentation checks.
    `discord_channel_read_owner`, and `discord_channel_status`. Confirm the
    owner now identifies the new session, `deliveryMode` is `tty`, its TTY is
    configured, and Discord is started.
-4. Smoke an allowed DM, an allowed guild message, a direct reply to this bot,
-   and an inherited reply to a peer message that mentioned this bot. Confirm
-   each accepted input reaches the exact visible new Codex console.
-5. Confirm a peer reply that neither references nor explicitly mentions this
-   bot stays rejected. Read authorized guild and DM history, paginate with
-   `nextBefore`, and confirm a denied channel returns a sanitized stable error.
+4. Smoke an allowed DM. In an allowed group with `requireMention: true`, smoke
+   an allowed guild message, a direct reply to this bot, and an inherited reply
+   to a peer message that mentioned this bot. Confirm each accepted input
+   reaches the exact visible new Codex console.
+5. With `requireMention: true`, confirm a peer reply that neither references
+   nor explicitly mentions this bot stays rejected. In an allowed group with
+   `requireMention: false`, confirm all otherwise-authorized group messages are
+   accepted, including a message with no mention or reply audience. Read
+   authorized guild and DM history, paginate with `nextBefore`, and confirm a
+   denied channel returns a sanitized stable error.
 
 Capture only non-secret evidence: message IDs, tool results, owner instance,
 and status booleans. Do not expose `.env` values, token values, proxy URLs, or
