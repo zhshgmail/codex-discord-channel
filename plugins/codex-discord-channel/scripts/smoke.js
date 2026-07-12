@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { toolList } = require('../src/mcp-server');
+const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
 const PLUGIN_VERSION = '0.2.0+codex.20260712064059';
@@ -27,6 +27,7 @@ assert(manifest.version === PLUGIN_VERSION, 'manifest version mismatch');
 assert(manifest.mcpServers === './.mcp.json', 'manifest must point at .mcp.json');
 assert(mcp.mcpServers['codex-discord-channel'], 'missing MCP server config');
 assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
+assert(SERVER_VERSION === PACKAGE_VERSION, 'MCP server version mismatch');
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');
 
 const historyTool = toolList().find((tool) => tool.name === 'discord_channel_read_history');
@@ -38,6 +39,9 @@ assert(historyTool.annotations?.readOnlyHint === true, 'history tool must be rea
 assert(historyTool.annotations?.destructiveHint === false, 'history tool must be non-destructive');
 assert(historyTool.annotations?.idempotentHint === true, 'history tool must be idempotent');
 assert(historyTool.annotations?.openWorldHint === true, 'history tool must declare external Discord access');
+
+const mcpServerSource = fs.readFileSync(path.join(root, 'src', 'mcp-server.js'), 'utf8');
+assert(mcpServerSource.includes(`const SERVER_VERSION = '${PACKAGE_VERSION}';`), 'MCP server version mismatch');
 
 const binPath = path.join(root, 'bin', 'codex-discord-channel');
 const mode = fs.statSync(binPath).mode;

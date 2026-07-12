@@ -8,7 +8,7 @@ const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
 
 const SERVER_NAME = 'Codex Discord Channel';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.2.0';
 
 function makeLogger() {
   return (level, message, meta) => {
@@ -238,6 +238,7 @@ async function main() {
 }
 
 module.exports = {
+  SERVER_VERSION,
   callTool,
   handleRequest,
   main,
