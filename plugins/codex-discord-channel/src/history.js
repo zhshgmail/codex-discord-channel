@@ -127,11 +127,16 @@ async function fetchTarget(client, channelId) {
   }
 }
 
+function isDiscordPermissionError(error) {
+  return error?.status === 403 || error?.statusCode === 403 || error?.code === 50013;
+}
+
 async function fetchMessages(target, options) {
   try {
     if (typeof target.messages?.fetch !== 'function') throw new Error('unsupported channel');
     return await target.messages.fetch(options);
-  } catch {
+  } catch (error) {
+    if (isDiscordPermissionError(error)) throw new Error('history_channel_inaccessible');
     throw new Error('history_fetch_failed');
   }
 }

@@ -2,8 +2,9 @@
 
 const readline = require('node:readline');
 const { loadConfig } = require('./config');
-const { createDelivery, resolveReplyTarget } = require('./delivery');
+const { createDelivery, readLastInboundContext, resolveReplyTarget } = require('./delivery');
 const { sendDiscordMessage, startDiscordClient } = require('./discord-client');
+const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
 
 const SERVER_NAME = 'Codex Discord Channel';
@@ -59,6 +60,29 @@ function toolList() {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     {
+      name: 'discord_channel_read_history',
+      title: 'Read Discord Channel History',
+      description: 'Read bounded recent history from an authorized Discord channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          channelId: {
+            type: 'string',
+            pattern: '^[1-9]\\d{16,19}$',
+            description: 'Optional Discord channel id. Defaults to the last accepted inbound Discord message.',
+          },
+          before: {
+            type: 'string',
+            pattern: '^[1-9]\\d{16,19}$',
+            description: 'Optional exclusive Discord message id cursor.',
+          },
+          limit: { type: 'integer', minimum: 1, maximum: 25, default: 20 },
+        },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    {
       name: 'discord_channel_send',
       title: 'Send Discord Message',
       description: 'Send a Discord message through the session-owned bot.',
@@ -74,6 +98,21 @@ function toolList() {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
   ];
+}
+
+function historyArgsWithDefaultChannel(args, config) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
+  if (typeof args.channelId === 'string' && args.channelId.trim() !== '') return args;
+
+  let inbound;
+  try {
+    inbound = readLastInboundContext(config);
+  } catch {
+    throw new Error('history_target_not_allowed');
+  }
+  const channelId = typeof inbound?.channelId === 'string' ? inbound.channelId.trim() : '';
+  if (!channelId) throw new Error('history_target_not_allowed');
+  return { ...args, channelId };
 }
 
 function makeContext(config, discordState) {
@@ -126,6 +165,15 @@ async function callTool(context, name, args = {}) {
     const target = resolveReplyTarget(args, context.config);
     const sent = await sendDiscordMessage(context.discordState.client, { ...args, ...target });
     return textResult(`Sent Discord message ${sent.messageId}.`, sent);
+  }
+
+  if (name === 'discord_channel_read_history') {
+    const history = await readDiscordHistory({
+      args: historyArgsWithDefaultChannel(args, context.config),
+      config: context.config,
+      client: context.discordState.client,
+    });
+    return textResult(JSON.stringify(history, null, 2), history);
   }
 
   throw new Error(`Unknown tool: ${name}`);
