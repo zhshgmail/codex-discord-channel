@@ -154,3 +154,79 @@ syntax, 73 tests, and smoke.
   `invalid_history_args`; absent `channelId` and `before` remain optional.
 - Cover `null`, numeric, empty, and whitespace-only explicit `channelId`
   values at the MCP boundary, asserting no Discord fetch occurs.
+
+## Final Review Fixes: MCP Result Budget And Arguments Presence
+
+### RED
+
+Command, run after adding the boundary regressions and before production edits:
+
+```bash
+node --test tests/unit/mcp-server.test.js
+```
+
+Result: exit 1, 7 passing and 4 failing tests.
+
+- The large authorized history regression failed because
+  `Buffer.byteLength(JSON.stringify(result), 'utf8')` exceeded 64 KiB.
+- The JSON-RPC regression failed because explicit `null`, `false`, `0`, and
+  empty-string `params.arguments` values returned success instead of
+  `invalid_history_args` and entered the Discord fetch path.
+- Two existing success assertions also failed because they now require the
+  bounded non-message `structuredContent` shape used by the regression.
+
+### GREEN
+
+Focused history/MCP command:
+
+```bash
+node --test tests/unit/mcp-server.test.js tests/unit/history.test.js
+```
+
+Result: exit 0, 21 passing and 0 failing tests.
+
+Full repository gate from `plugins/codex-discord-channel`:
+
+```bash
+npm run check
+```
+
+Result: exit 0; syntax passed, 75 tests passed, and smoke passed.
+
+Plugin validator from `plugins/codex-discord-channel`:
+
+```bash
+python3 /home/zheng/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+```
+
+Result: exit 0; plugin validation passed. Running the same command from the
+repository root is invalid because the manifest is intentionally under the
+plugin directory.
+
+Diff gate before the implementation commit:
+
+```bash
+git diff --check
+```
+
+Result: exit 0 with no output.
+
+### Changes
+
+- Budget history candidates against the complete MCP `CallToolResult`, not
+  only the inner history object.
+- Serialize full history once as compact content JSON and expose only bounded
+  channel, source, page, and message-count metadata in `structuredContent`.
+- Preserve the existing truncation cursor and sanitization paths while fitting
+  oversized first messages against the real response wrapper.
+- Default `params.arguments` only when the property is absent; explicit
+  malformed falsy values now reach `validateHistoryArgs` and fail before any
+  Discord fetch.
+
+Implementation commit:
+`0f95545c3386cad41d0103a16f3b39ea89cef203`
+
+### Final Concerns
+
+No known implementation blocker. Plugin validation must be invoked from
+`plugins/codex-discord-channel`, where `.codex-plugin/plugin.json` resides.
