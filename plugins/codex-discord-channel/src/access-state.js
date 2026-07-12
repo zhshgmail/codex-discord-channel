@@ -73,16 +73,7 @@ function mentionsBot(content, botUserId, patterns = []) {
   });
 }
 
-function decideAccess(state, message) {
-  if (message.source === 'dm') {
-    if (state.dmPolicy === 'open') return { allowed: true, reason: 'dm_open' };
-    if (state.allowFrom.includes(message.authorId)) return { allowed: true, reason: 'dm_allowlisted' };
-    if (state.dmPolicy === 'pairing') {
-      return { allowed: false, reason: 'dm_pairing_required', requiresPairingCode: true };
-    }
-    return { allowed: false, reason: 'dm_closed' };
-  }
-
+function decideGuildEnvelopeAccess(state, message) {
   const group = state.groups[message.channelId];
   if (!group) return { allowed: false, reason: 'guild_channel_not_enabled' };
 
@@ -94,6 +85,23 @@ function decideAccess(state, message) {
     return { allowed: false, reason: 'guild_sender_denied' };
   }
 
+  return { allowed: true, reason: 'guild_envelope_allowed' };
+}
+
+function decideAccess(state, message) {
+  if (message.source === 'dm') {
+    if (state.dmPolicy === 'open') return { allowed: true, reason: 'dm_open' };
+    if (state.allowFrom.includes(message.authorId)) return { allowed: true, reason: 'dm_allowlisted' };
+    if (state.dmPolicy === 'pairing') {
+      return { allowed: false, reason: 'dm_pairing_required', requiresPairingCode: true };
+    }
+    return { allowed: false, reason: 'dm_closed' };
+  }
+
+  const envelopeDecision = decideGuildEnvelopeAccess(state, message);
+  if (!envelopeDecision.allowed) return envelopeDecision;
+
+  const group = state.groups[message.channelId];
   const currentMessageMentionsBot = mentionsBot(message.content, message.botUserId, state.mentionPatterns);
   const replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
   const referencedMessageMentionsBot = mentionsBot(
@@ -171,6 +179,7 @@ function allowHistoryMessage(state, target, message, botUserId) {
 module.exports = {
   allowHistoryMessage,
   decideAccess,
+  decideGuildEnvelopeAccess,
   decideHistoryTarget,
   defaultAccessState,
   ensureAccessFile,

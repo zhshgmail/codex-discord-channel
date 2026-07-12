@@ -1,6 +1,6 @@
 'use strict';
 
-const { decideAccess, loadAccessState } = require('./access-state');
+const { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require('./access-state');
 const { normalizeDiscordMessage } = require('./delivery');
 const { isActiveDiscordReceiver } = require('./receiver-state');
 
@@ -46,11 +46,13 @@ async function resolveReferencedMessage(message, accessState) {
   if (
     !message.guildId ||
     !message.reference?.messageId ||
-    !Object.hasOwn(accessState.groups, String(message.channelId || '')) ||
     typeof message.fetchReference !== 'function'
   ) {
     return null;
   }
+
+  const envelopeDecision = decideGuildEnvelopeAccess(accessState, normalizeDiscordMessage(message));
+  if (!envelopeDecision.allowed) return null;
 
   try {
     return await message.fetchReference();

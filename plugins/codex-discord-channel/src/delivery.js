@@ -15,7 +15,7 @@ function normalizeDiscordMessage(message, referencedMessage = null) {
     : Array.from(message.attachments?.values?.() || []);
   const hasReference = Boolean(message.reference?.messageId);
   const repliedToAuthorId = hasReference
-    ? String(referencedMessage?.author?.id || message.mentions?.repliedUser?.id || '')
+    ? String(referencedMessage?.author?.id || '')
     : '';
   const repliedToContent = hasReference && typeof referencedMessage?.content === 'string'
     ? referencedMessage.content

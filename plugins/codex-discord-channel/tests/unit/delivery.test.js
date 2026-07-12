@@ -49,14 +49,7 @@ test('normalizeDiscordMessage maps message shape', () => {
   assert.equal(normalized.attachments[0].name, 'x.txt');
 });
 
-test('normalizeDiscordMessage records replied author only for a message reference', () => {
-  const repliedToBot = normalizeDiscordMessage({
-    channelId: 'c1',
-    id: 'm1',
-    author: { id: 'u1', username: 'Alice', bot: false },
-    reference: { messageId: 'm0' },
-    mentions: { repliedUser: { id: 'bot' } },
-  });
+test('normalizeDiscordMessage does not record replied author without a message reference', () => {
   const missingReference = normalizeDiscordMessage({
     channelId: 'c1',
     id: 'm2',
@@ -64,7 +57,6 @@ test('normalizeDiscordMessage records replied author only for a message referenc
     mentions: { repliedUser: { id: 'bot' } },
   });
 
-  assert.equal(repliedToBot.repliedToAuthorId, 'bot');
   assert.equal(missingReference.repliedToAuthorId, '');
 });
 
@@ -102,7 +94,7 @@ test('normalizeDiscordMessage uses resolved reference author and content', () =>
   assert.equal(normalized.repliedToContent, 'asking <@bot> and another agent');
 });
 
-test('normalizeDiscordMessage keeps replied-user fallback without resolved content', () => {
+test('normalizeDiscordMessage ignores replied-user metadata without a resolved reference', () => {
   const normalized = normalizeDiscordMessage({
     channelId: 'c1',
     id: 'm1',
@@ -110,7 +102,7 @@ test('normalizeDiscordMessage keeps replied-user fallback without resolved conte
     mentions: { repliedUser: { id: 'bot' } },
   }, null);
 
-  assert.equal(normalized.repliedToAuthorId, 'bot');
+  assert.equal(normalized.repliedToAuthorId, '');
   assert.equal(normalized.repliedToContent, '');
 });
 
