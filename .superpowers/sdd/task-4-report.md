@@ -43,6 +43,12 @@ Updated the manifest, `package.json`, and root package-lock entry to the
 requested package versions. The smoke test then passed and verifies the release
 metadata and history tool contract.
 
+The final runtime version alignment was also verified red first. A new smoke
+assertion failed with `Error: MCP server version mismatch` while
+`SERVER_VERSION` was `0.1.0`. `src/mcp-server.js` now exports and initializes
+with `SERVER_VERSION = '0.2.0'`; smoke checks both that exported runtime value
+and its source declaration against the package version.
+
 ## Verification
 
 Commands run from `plugins/codex-discord-channel`:
@@ -72,13 +78,13 @@ or pull request was performed, by task instruction.
 - `plugins/codex-discord-channel/scripts/smoke.js`
 - `plugins/codex-discord-channel/skills/codex-discord-channel/SKILL.md`
 
-## Remaining Concern
+## Version Alignment
 
-Per coordination instruction, `plugins/codex-discord-channel/src/mcp-server.js`
-was not edited. Its runtime `SERVER_VERSION` remains `0.1.0`, so MCP
-`initialize` still advertises that value even though the manifest/package
-release metadata is `0.2.0`. A later integration fix must update that constant
-and add or adjust its assertion.
+The plugin manifest declares `0.2.0+codex.20260712064059`, while
+`package.json`, `package-lock.json`, and the MCP runtime `SERVER_VERSION` all
+declare `0.2.0`.
+
+The runtime version and smoke alignment is recorded in commit `12e4668`.
 
 While this report was being staged, a concurrent process created commit
 `5f59fa4` containing the Task 4 metadata/documentation/smoke changes together
