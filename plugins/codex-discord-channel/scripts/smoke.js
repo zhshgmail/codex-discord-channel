@@ -2,8 +2,11 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
+const PLUGIN_VERSION = '0.2.0+codex.20260712064059';
+const PACKAGE_VERSION = '0.2.0';
 
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(root, relativePath), 'utf8'));
@@ -20,9 +23,21 @@ const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
 
 assert(manifest.name === 'codex-discord-channel', 'manifest name mismatch');
+assert(manifest.version === PLUGIN_VERSION, 'manifest version mismatch');
 assert(manifest.mcpServers === './.mcp.json', 'manifest must point at .mcp.json');
 assert(mcp.mcpServers['codex-discord-channel'], 'missing MCP server config');
+assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');
+
+const historyTool = toolList().find((tool) => tool.name === 'discord_channel_read_history');
+assert(historyTool, 'missing discord_channel_read_history tool');
+assert(historyTool.inputSchema?.additionalProperties === false, 'history tool schema must reject unknown properties');
+assert(historyTool.inputSchema?.properties?.limit?.minimum === 1, 'history tool minimum limit mismatch');
+assert(historyTool.inputSchema?.properties?.limit?.maximum === 25, 'history tool maximum limit mismatch');
+assert(historyTool.annotations?.readOnlyHint === true, 'history tool must be read-only');
+assert(historyTool.annotations?.destructiveHint === false, 'history tool must be non-destructive');
+assert(historyTool.annotations?.idempotentHint === true, 'history tool must be idempotent');
+assert(historyTool.annotations?.openWorldHint === true, 'history tool must declare external Discord access');
 
 const binPath = path.join(root, 'bin', 'codex-discord-channel');
 const mode = fs.statSync(binPath).mode;

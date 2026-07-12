@@ -102,7 +102,7 @@ function toolList() {
 
 function historyArgsWithDefaultChannel(args, config) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
-  if (typeof args.channelId === 'string' && args.channelId.trim() !== '') return args;
+  if (Object.hasOwn(args, 'channelId')) return args;
 
   let inbound;
   try {

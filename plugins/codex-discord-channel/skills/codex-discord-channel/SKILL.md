@@ -14,6 +14,10 @@ Use this skill when the user wants a Discord bot instance to be owned by the cur
 - A newer session using the same instance overwrites the owner.
 - Accepted inbound Discord messages are delivered into the owning local Codex TUI through the session TTY.
 - Until Codex exposes a native channel notification API, the TTY delivery adapter is the exact-console path.
+- In enabled guild channels, reply delivery is the union of the referenced
+  author, agents mentioned by the referenced message, and agents explicitly
+  mentioned by the new reply. Every bot evaluates this union independently;
+  normal channel, sender, bot, and `requireMention` gates still apply.
 
 ## Local State
 
@@ -40,8 +44,53 @@ Use the plugin MCP tools when available:
 - `discord_channel_status`
 - `discord_channel_read_owner`
 - `discord_channel_claim_owner`
+- `discord_channel_read_history`
 - `discord_channel_send`
 
 Healthy status for local Discord-to-session routing should show `deliveryMode: "tty"` and `discordStarted: true`.
+
+## History Reads
+
+Use `discord_channel_read_history` for bounded, read-only, idempotent history:
+
+```json
+{
+  "channelId": "optional channel snowflake; defaults to the last accepted inbound channel",
+  "before": "optional exclusive message snowflake cursor",
+  "limit": "optional integer from 1 to 25; default 20"
+}
+```
+
+Results are newest first. Continue with `before: nextBefore` only when
+`hasMore` is true. Guild history requires the exact enabled channel or thread
+ID; parent authorization is not inherited. DM history requires `dmPolicy:
+"open"` or an allowlisted counterparty. Guild sender/bot allowlists filter the
+result, except the active bot's own messages stay visible; `requireMention`
+does not filter history. Group DMs, categories, voice channels, and forum
+containers are disallowed. The tool omits embeds, components, reactions, and
+attachment bodies; serialized output is capped at 64 KiB. Handle only the
+sanitized errors `history_target_not_allowed`, `history_channel_inaccessible`,
+and `history_fetch_failed`; never surface raw Discord errors.
+
+## New-Session Handoff
+
+After a release is installed, retain the same `codex01` bot and state path
+`$HOME/.codex/channels/discord/codex01`; leave
+`codex-discord-channel@codex01.service` active. Start a **new** Codex session
+instead of expecting a closed MCP transport to hot-reload. In that new session:
+
+1. Call `discord_channel_claim_owner`, then `discord_channel_read_owner`, and
+   confirm ownership moved to the new session without changing the instance.
+2. Call `discord_channel_status` and confirm the exact-console TTY route and
+   Discord startup state are healthy.
+3. Smoke an allowed DM and guild message, a direct reply to this bot, and an
+   inherited reply to a peer message that mentioned this bot; each accepted
+   event must appear in the exact visible new console.
+4. Confirm a peer reply that does not mention this bot is rejected unless the
+   current reply explicitly mentions it. Read authorized guild and DM history,
+   paginate it, and verify a denied channel has a sanitized error.
+
+Do not report or persist `.env` values, tokens, proxy URLs, or raw Discord
+errors. This handoff does not itself authorize deployment or service restart.
 
 If the MCP tools are unavailable, inspect the plugin package at `plugins/codex-discord-channel`.

@@ -1,6 +1,6 @@
 {
   "name": "codex-discord-channel",
-  "version": "0.1.0+codex.20260706100450",
+  "version": "0.2.0+codex.20260712064059",
   "description": "Claude-style Discord channel ownership for Codex sessions.",
   "author": {
     "name": "zhshgmail",

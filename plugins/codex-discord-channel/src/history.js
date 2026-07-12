@@ -14,13 +14,16 @@ function invalidHistoryArgs() {
 }
 
 function ownString(args, key) {
-  if (!Object.hasOwn(args, key)) return '';
+  if (!Object.hasOwn(args, key)) return null;
   if (typeof args[key] !== 'string') invalidHistoryArgs();
-  return args[key].trim();
+  const value = args[key].trim();
+  if (!value) invalidHistoryArgs();
+  return value;
 }
 
 function validateSnowflake(value) {
-  if (value && (!SNOWFLAKE_PATTERN.test(value) || BigInt(value) > MAX_SNOWFLAKE)) invalidHistoryArgs();
+  if (value === null) return '';
+  if (!SNOWFLAKE_PATTERN.test(value) || BigInt(value) > MAX_SNOWFLAKE) invalidHistoryArgs();
   return value;
 }
 

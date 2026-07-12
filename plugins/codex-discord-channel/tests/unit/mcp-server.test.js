@@ -134,6 +134,38 @@ test('history tool defaults a missing channelId from last inbound context', asyn
   ]);
 });
 
+test('history tool rejects an explicit null channelId instead of defaulting it', async () => {
+  const fixture = historyContext({ inbound: { channelId: CHANNEL_ID, messageId: '500000000000000009' } });
+
+  await assert.rejects(
+    callTool(fixture.context, 'discord_channel_read_history', { channelId: null }),
+    (error) => error.message === 'invalid_history_args',
+  );
+  assert.deepEqual(fixture.calls, []);
+});
+
+test('history tool rejects an explicit numeric channelId instead of defaulting it', async () => {
+  const fixture = historyContext({ inbound: { channelId: CHANNEL_ID, messageId: '500000000000000009' } });
+
+  await assert.rejects(
+    callTool(fixture.context, 'discord_channel_read_history', { channelId: 123 }),
+    (error) => error.message === 'invalid_history_args',
+  );
+  assert.deepEqual(fixture.calls, []);
+});
+
+test('history tool rejects explicit blank channelId values instead of defaulting them', async () => {
+  for (const channelId of ['', '   ']) {
+    const fixture = historyContext({ inbound: { channelId: CHANNEL_ID, messageId: '500000000000000009' } });
+
+    await assert.rejects(
+      callTool(fixture.context, 'discord_channel_read_history', { channelId }),
+      (error) => error.message === 'invalid_history_args',
+    );
+    assert.deepEqual(fixture.calls, []);
+  }
+});
+
 test('history tool sanitizes Discord permission and general fetch failures', async () => {
   const permissionSecret = 'permission-secret-fixture';
   const permissionError = Object.assign(new Error(permissionSecret), { status: 403 });

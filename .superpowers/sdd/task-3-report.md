@@ -106,3 +106,51 @@ No implementation blocker or known Task 3 defect. An optional independent
 review process could not run temp-file tests in its read-only sandbox and was
 stopped at the user's checkpoint; the requested self-review and all local
 verification gates completed successfully.
+
+## Review Fix: Explicit History Channel Validation
+
+### Finding
+
+`historyArgsWithDefaultChannel` used value truthiness to decide whether to
+read `last-inbound.json`. Consequently, explicit malformed `channelId` values
+such as `null`, numbers, empty strings, and whitespace-only strings were
+silently replaced with the last inbound channel before validation.
+
+### TDD Evidence
+
+RED, after adding MCP regression tests with a valid last-inbound fixture:
+
+```bash
+node --test tests/unit/mcp-server.test.js
+```
+
+Result: exit 1, 6 passing and 3 failing. Each new test reported `Missing
+expected rejection.`, proving malformed explicit values were defaulted and
+read successfully.
+
+GREEN, after the minimal validation change:
+
+```bash
+node --test tests/unit/mcp-server.test.js tests/unit/history.test.js
+```
+
+Result: exit 0, 19 passing and 0 failing.
+
+Full verification:
+
+```bash
+npm test
+npm run check
+```
+
+Result: both exit 0. `npm test` passed 73 tests; `npm run check` passed
+syntax, 73 tests, and smoke.
+
+### Changes
+
+- Default the history channel only when `channelId` is not an own argument
+  property.
+- Reject present non-string and blank snowflake fields with
+  `invalid_history_args`; absent `channelId` and `before` remain optional.
+- Cover `null`, numeric, empty, and whitespace-only explicit `channelId`
+  values at the MCP boundary, asserting no Discord fetch occurs.
