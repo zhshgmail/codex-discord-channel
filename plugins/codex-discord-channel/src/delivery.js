@@ -13,6 +13,9 @@ function normalizeDiscordMessage(message) {
   const attachments = Array.isArray(message.attachments)
     ? message.attachments
     : Array.from(message.attachments?.values?.() || []);
+  const repliedToAuthorId = message.reference?.messageId
+    ? String(message.mentions?.repliedUser?.id || '')
+    : '';
   return {
     source: message.guildId ? 'guild' : 'dm',
     channelId: message.channelId,
@@ -21,6 +24,7 @@ function normalizeDiscordMessage(message) {
     authorId: message.author?.id || message.authorId || '',
     authorName: message.author?.username || message.authorName || '',
     authorIsBot: Boolean(message.author?.bot || message.authorIsBot),
+    repliedToAuthorId,
     content: message.content || '',
     attachments: attachments.map((attachment) => ({
       id: attachment.id,

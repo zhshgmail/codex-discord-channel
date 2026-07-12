@@ -49,6 +49,25 @@ test('normalizeDiscordMessage maps message shape', () => {
   assert.equal(normalized.attachments[0].name, 'x.txt');
 });
 
+test('normalizeDiscordMessage records replied author only for a message reference', () => {
+  const repliedToBot = normalizeDiscordMessage({
+    channelId: 'c1',
+    id: 'm1',
+    author: { id: 'u1', username: 'Alice', bot: false },
+    reference: { messageId: 'm0' },
+    mentions: { repliedUser: { id: 'bot' } },
+  });
+  const missingReference = normalizeDiscordMessage({
+    channelId: 'c1',
+    id: 'm2',
+    author: { id: 'u1', username: 'Alice', bot: false },
+    mentions: { repliedUser: { id: 'bot' } },
+  });
+
+  assert.equal(repliedToBot.repliedToAuthorId, 'bot');
+  assert.equal(missingReference.repliedToAuthorId, '');
+});
+
 test('off delivery returns unsupported without pretending host push exists', async () => {
   const delivery = createDelivery({ deliveryMode: 'off' }, () => {});
   const result = await delivery.deliver({

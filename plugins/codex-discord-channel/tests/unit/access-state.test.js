@@ -57,6 +57,38 @@ test('guild channel requires mention by default', () => {
   assert.equal(decision.reason, 'guild_mention_required');
 });
 
+test('guild reply to the active bot satisfies the mention requirement', () => {
+  const state = normalizeAccessState({ groups: { c1: {} } });
+  const decision = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'u1',
+    authorIsBot: false,
+    content: 'follow-up without a visible mention',
+    botUserId: 'bot',
+    repliedToAuthorId: 'bot',
+  });
+
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'guild_allowed');
+});
+
+test('guild reply to another author does not satisfy the mention requirement', () => {
+  const state = normalizeAccessState({ groups: { c1: {} } });
+  const decision = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'u1',
+    authorIsBot: false,
+    content: 'follow-up without a visible mention',
+    botUserId: 'bot',
+    repliedToAuthorId: 'u2',
+  });
+
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'guild_mention_required');
+});
+
 test('guild channel can disable mention requirement', () => {
   const state = normalizeAccessState({ groups: { c1: { requireMention: false } } });
   const decision = decideAccess(state, {
@@ -90,6 +122,32 @@ test('bot-authored messages are denied unless channel allows bots', () => {
     botUserId: 'bot',
   });
   assert.equal(allowed.allowed, true);
+});
+
+test('bot reply to the active bot remains subject to allowBots and allowFrom', () => {
+  const deniedByAllowBots = decideAccess(normalizeAccessState({ groups: { c1: {} } }), {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'bot2',
+    authorIsBot: true,
+    content: 'follow-up without a visible mention',
+    botUserId: 'bot',
+    repliedToAuthorId: 'bot',
+  });
+  const deniedByAllowFrom = decideAccess(normalizeAccessState({
+    groups: { c1: { allowBots: true, allowFrom: ['bot3'] } },
+  }), {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'bot2',
+    authorIsBot: true,
+    content: 'follow-up without a visible mention',
+    botUserId: 'bot',
+    repliedToAuthorId: 'bot',
+  });
+
+  assert.equal(deniedByAllowBots.reason, 'bot_author_denied');
+  assert.equal(deniedByAllowFrom.reason, 'guild_sender_denied');
 });
 
 test('mentionsBot detects Discord mention or configured pattern', () => {

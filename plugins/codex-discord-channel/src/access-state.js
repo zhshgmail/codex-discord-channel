@@ -94,7 +94,8 @@ function decideAccess(state, message) {
     return { allowed: false, reason: 'guild_sender_denied' };
   }
 
-  if (group.requireMention && !mentionsBot(message.content, message.botUserId, state.mentionPatterns)) {
+  const replyMentionsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+  if (group.requireMention && !mentionsBot(message.content, message.botUserId, state.mentionPatterns) && !replyMentionsBot) {
     return { allowed: false, reason: 'guild_mention_required' };
   }
 
