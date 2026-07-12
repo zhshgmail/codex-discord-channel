@@ -102,8 +102,65 @@ function decideAccess(state, message) {
   return { allowed: true, reason: 'guild_allowed' };
 }
 
+const GUILD_HISTORY_CHANNEL_TYPES = new Set([0, 5, 10, 11, 12]);
+
+function dmCounterpartyId(target, botUserId) {
+  if (target.recipient?.id) return String(target.recipient.id);
+  const recipients = Array.from(target.recipients?.values?.() || []);
+  const counterparty = recipients.find((recipient) => String(recipient?.id || '') !== botUserId);
+  return String(counterparty?.id || '');
+}
+
+function decideHistoryTarget(state, target, botUserId) {
+  if (!target || typeof target !== 'object') {
+    return { allowed: false, reason: 'history_target_not_allowed' };
+  }
+
+  if (target.type === 1 && !target.guildId) {
+    const counterpartyId = dmCounterpartyId(target, botUserId);
+    if (!counterpartyId) return { allowed: false, reason: 'history_target_not_allowed' };
+    if (state.dmPolicy === 'open') {
+      return { allowed: true, reason: 'dm_open', source: 'dm', counterpartyId };
+    }
+    if (state.allowFrom.includes(counterpartyId)) {
+      return { allowed: true, reason: 'dm_allowlisted', source: 'dm', counterpartyId };
+    }
+    return { allowed: false, reason: 'history_target_not_allowed' };
+  }
+
+  const channelId = String(target.id || '');
+  if (
+    target.guildId &&
+    GUILD_HISTORY_CHANNEL_TYPES.has(target.type) &&
+    Object.hasOwn(state.groups, channelId)
+  ) {
+    return { allowed: true, reason: 'guild_channel_enabled', source: 'guild' };
+  }
+  return { allowed: false, reason: 'history_target_not_allowed' };
+}
+
+function allowHistoryMessage(state, target, message, botUserId) {
+  const targetDecision = decideHistoryTarget(state, target, botUserId);
+  if (!targetDecision.allowed) return false;
+
+  const authorId = String(message?.author?.id || '');
+  if (!authorId) return false;
+  if (authorId === botUserId) return true;
+
+  if (targetDecision.source === 'dm') {
+    return authorId === targetDecision.counterpartyId;
+  }
+
+  const group = state.groups[String(target.id)];
+  if (message.author?.bot && group.allowBots !== true) return false;
+  if (group.allowFrom.length > 0 && !group.allowFrom.includes(authorId)) return false;
+  return true;
+}
+
 module.exports = {
+  allowHistoryMessage,
   decideAccess,
+  decideHistoryTarget,
   defaultAccessState,
   ensureAccessFile,
   loadAccessState,
