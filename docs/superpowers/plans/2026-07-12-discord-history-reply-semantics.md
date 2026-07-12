@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Accept direct replies to the active Discord bot as implicit mentions and expose authorized bounded channel/DM history through MCP.
+**Goal:** Propagate guild replies to the referenced author, agents mentioned by the referenced message, and agents explicitly mentioned by the current message, while exposing authorized bounded channel/DM history through MCP.
 
-**Architecture:** Extend normalized inbound messages with the referenced author ID while preserving existing access-check order. Add a focused history service that validates input, reloads access policy, authorizes the target, fetches through the authenticated discord.js client, filters/normalizes messages, enforces a byte budget, and returns sanitized errors through MCP.
+**Architecture:** Resolve an enabled guild message's reference through discord.js, extend normalized inbound messages with the referenced author ID and content, and preserve existing access-check order while evaluating the union reply audience. Add a focused history service that validates input, reloads access policy, authorizes the target, fetches through the authenticated discord.js client, filters/normalizes messages, enforces a byte budget, and returns sanitized errors through MCP.
 
 **Tech Stack:** Node.js 22, CommonJS, discord.js 14, `node:test`, MCP JSON-RPC over stdio.
 
@@ -13,7 +13,7 @@
 - Follow `docs/superpowers/specs/2026-07-12-discord-history-reply-semantics-design.md`.
 - No production behavior change may be written before a focused failing test is observed.
 - Keep `discord-codex-bridge` disabled and never print Discord token/proxy values.
-- Preserve exact channel, sender, and bot access controls.
+- Preserve exact channel, sender, and bot access controls. Reply delivery is the union of the referenced author, referenced-message mentions, and current-message mentions.
 - History returns at most 25 messages and at most 64 KiB serialized output.
 
 ---
@@ -27,12 +27,12 @@
 - Modify: `plugins/codex-discord-channel/src/access-state.js`
 
 **Interfaces:**
-- Produces: normalized `repliedToAuthorId: string`.
-- Produces: `decideAccess(state, message)` acceptance when `message.repliedToAuthorId === message.botUserId` after all sender gates pass.
+- Produces: normalized `repliedToAuthorId: string` and `repliedToContent: string`.
+- Produces: `decideAccess(state, message)` acceptance when the current content mentions the active bot, the referenced author is the active bot, or the referenced content mentions the active bot, after all sender gates pass.
 
 - [ ] **Step 1: Add failing normalization and access tests**
 
-Add cases proving a direct reply to the active bot is accepted without text mention, while replies to another author and bot-authored replies that fail `allowBots`/`allowFrom` remain denied.
+Add cases proving a direct reply to the active bot is accepted without text mention; a reply to a peer message that mentioned the active bot is accepted; a peer message that did not mention the active bot remains denied; and bot-authored replies that fail `allowBots`/`allowFrom` remain denied.
 
 - [ ] **Step 2: Run focused tests and observe the intended failures**
 
