@@ -94,8 +94,19 @@ function decideAccess(state, message) {
     return { allowed: false, reason: 'guild_sender_denied' };
   }
 
-  const replyMentionsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
-  if (group.requireMention && !mentionsBot(message.content, message.botUserId, state.mentionPatterns) && !replyMentionsBot) {
+  const currentMessageMentionsBot = mentionsBot(message.content, message.botUserId, state.mentionPatterns);
+  const replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+  const referencedMessageMentionsBot = mentionsBot(
+    message.repliedToContent,
+    message.botUserId,
+    state.mentionPatterns,
+  );
+  if (
+    group.requireMention &&
+    !currentMessageMentionsBot &&
+    !replyAuthorIsBot &&
+    !referencedMessageMentionsBot
+  ) {
     return { allowed: false, reason: 'guild_mention_required' };
   }
 

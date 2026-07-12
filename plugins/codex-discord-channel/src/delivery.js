@@ -9,12 +9,16 @@ function escapeAttr(value) {
   return String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
 }
 
-function normalizeDiscordMessage(message) {
+function normalizeDiscordMessage(message, referencedMessage = null) {
   const attachments = Array.isArray(message.attachments)
     ? message.attachments
     : Array.from(message.attachments?.values?.() || []);
-  const repliedToAuthorId = message.reference?.messageId
-    ? String(message.mentions?.repliedUser?.id || '')
+  const hasReference = Boolean(message.reference?.messageId);
+  const repliedToAuthorId = hasReference
+    ? String(referencedMessage?.author?.id || message.mentions?.repliedUser?.id || '')
+    : '';
+  const repliedToContent = hasReference && typeof referencedMessage?.content === 'string'
+    ? referencedMessage.content
     : '';
   return {
     source: message.guildId ? 'guild' : 'dm',
@@ -25,6 +29,7 @@ function normalizeDiscordMessage(message) {
     authorName: message.author?.username || message.authorName || '',
     authorIsBot: Boolean(message.author?.bot || message.authorIsBot),
     repliedToAuthorId,
+    repliedToContent,
     content: message.content || '',
     attachments: attachments.map((attachment) => ({
       id: attachment.id,

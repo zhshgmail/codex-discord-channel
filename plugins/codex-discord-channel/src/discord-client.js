@@ -42,6 +42,23 @@ function configureNetwork(config, logger) {
   }
 }
 
+async function resolveReferencedMessage(message, accessState) {
+  if (
+    !message.guildId ||
+    !message.reference?.messageId ||
+    !Object.hasOwn(accessState.groups, String(message.channelId || '')) ||
+    typeof message.fetchReference !== 'function'
+  ) {
+    return null;
+  }
+
+  try {
+    return await message.fetchReference();
+  } catch {
+    return null;
+  }
+}
+
 async function startDiscordClient({ config, delivery, logger }) {
   if (!config.tokenConfigured || config.loginDisabled) {
     log(logger, 'INFO', 'Discord login disabled or token missing');
@@ -82,7 +99,8 @@ async function startDiscordClient({ config, delivery, logger }) {
         return;
       }
       const accessState = loadAccessState(config.paths.accessPath);
-      const normalized = normalizeDiscordMessage(message);
+      const referencedMessage = await resolveReferencedMessage(message, accessState);
+      const normalized = normalizeDiscordMessage(message, referencedMessage);
       normalized.botUserId = client.user?.id || config.botUserId || '';
       const decision = decideAccess(accessState, normalized);
       if (!decision.allowed) {
@@ -138,6 +156,7 @@ async function sendDiscordMessage(client, args) {
 
 module.exports = {
   configureNetwork,
+  resolveReferencedMessage,
   sendDiscordMessage,
   startDiscordClient,
 };

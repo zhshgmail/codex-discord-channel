@@ -86,6 +86,34 @@ test('normalizeDiscordMessage fails closed when referenced reply author metadata
   assert.equal(nullRepliedUser.repliedToAuthorId, '');
 });
 
+test('normalizeDiscordMessage uses resolved reference author and content', () => {
+  const normalized = normalizeDiscordMessage({
+    channelId: 'c1',
+    id: 'm1',
+    reference: { messageId: 'm0' },
+    author: { id: 'u1', username: 'Alice', bot: false },
+    mentions: { repliedUser: { id: 'stale-author' } },
+  }, {
+    author: { id: 'peer' },
+    content: 'asking <@bot> and another agent',
+  });
+
+  assert.equal(normalized.repliedToAuthorId, 'peer');
+  assert.equal(normalized.repliedToContent, 'asking <@bot> and another agent');
+});
+
+test('normalizeDiscordMessage keeps replied-user fallback without resolved content', () => {
+  const normalized = normalizeDiscordMessage({
+    channelId: 'c1',
+    id: 'm1',
+    reference: { messageId: 'm0' },
+    mentions: { repliedUser: { id: 'bot' } },
+  }, null);
+
+  assert.equal(normalized.repliedToAuthorId, 'bot');
+  assert.equal(normalized.repliedToContent, '');
+});
+
 test('off delivery returns unsupported without pretending host push exists', async () => {
   const delivery = createDelivery({ deliveryMode: 'off' }, () => {});
   const result = await delivery.deliver({
@@ -186,6 +214,7 @@ test('tty delivery persists last inbound reply context outside the terminal prom
     authorId: 'u1',
     authorName: 'Alice',
     content: 'hello',
+    repliedToContent: 'private referenced audience text',
     attachments: [],
   });
 
@@ -198,6 +227,8 @@ test('tty delivery persists last inbound reply context outside the terminal prom
   assert.equal(context.channelId, 'c1');
   assert.equal(context.messageId, 'm1');
   assert.equal(context.authorName, 'Alice');
+  assert.equal(Object.hasOwn(context, 'repliedToContent'), false);
+  assert.doesNotMatch(writes[0].text, /private referenced audience text/);
 });
 
 test('resolveReplyTarget defaults missing channel to last inbound context', () => {
