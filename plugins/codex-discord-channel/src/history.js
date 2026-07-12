@@ -63,11 +63,11 @@ function normalizeAttachments(attachments) {
   }));
 }
 
-function resolvedReply(message, target, fetchedById) {
+function resolvedReply(message, state, target, fetchedById, botUserId) {
   const reference = message.reference;
   if (!reference?.messageId || String(reference.channelId || '') !== String(target.id || '')) return null;
   const referenced = fetchedById.get(String(reference.messageId));
-  if (!referenced?.author?.id) return null;
+  if (!referenced?.author?.id || !allowHistoryMessage(state, target, referenced, botUserId)) return null;
   return {
     messageId: String(referenced.id),
     authorId: String(referenced.author.id),
@@ -75,7 +75,7 @@ function resolvedReply(message, target, fetchedById) {
   };
 }
 
-function normalizeHistoryMessage(message, target, fetchedById) {
+function normalizeHistoryMessage(message, state, target, fetchedById, botUserId) {
   let createdAt = '';
   if (message.createdAt instanceof Date) {
     createdAt = message.createdAt.toISOString();
@@ -93,7 +93,7 @@ function normalizeHistoryMessage(message, target, fetchedById) {
     authorIsBot: Boolean(message.author?.bot),
     content: boundedString(message.content, MAX_CONTENT_LENGTH),
     attachments: normalizeAttachments(message.attachments),
-    replyTo: resolvedReply(message, target, fetchedById),
+    replyTo: resolvedReply(message, state, target, fetchedById, botUserId),
   };
 }
 
@@ -171,7 +171,7 @@ async function readDiscordHistory({ args, config, client }) {
 
   let budgetTruncated = false;
   for (const item of allowed) {
-    const normalized = normalizeHistoryMessage(item, target, fetchedById);
+    const normalized = normalizeHistoryMessage(item, state, target, fetchedById, botUserId);
     const messageId = String(item.id || '');
     let candidate = {
       ...result,

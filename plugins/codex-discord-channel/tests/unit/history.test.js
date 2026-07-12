@@ -179,6 +179,56 @@ test('readDiscordHistory resolves only same-channel references present in the fe
   assert.equal(result.messages[1].replyTo, null);
 });
 
+test('readDiscordHistory hides a reply reference authored by a denied sender', async () => {
+  const deniedReference = message('500000000000000001', {
+    author: { id: '300000000000000002', username: 'Mallory', bot: false },
+  });
+  const allowedReply = message('500000000000000002', {
+    reference: { channelId: CHANNEL_ID, messageId: deniedReference.id },
+  });
+  const fixture = historyFixture({
+    access: {
+      groups: { [CHANNEL_ID]: { requireMention: true, allowFrom: [USER_ID] } },
+    },
+    messages: [allowedReply, deniedReference],
+  });
+
+  const result = await readDiscordHistory({
+    args: { channelId: CHANNEL_ID, limit: 2 },
+    config: fixture.config,
+    client: fixture.client,
+  });
+
+  assert.equal(result.messages.length, 1);
+  assert.equal(result.messages[0].replyTo, null);
+});
+
+test('readDiscordHistory hides a reply reference authored by a denied bot', async () => {
+  const deniedReference = message('500000000000000001', {
+    author: { id: '800000000000000001', username: 'OtherBot', bot: true },
+  });
+  const allowedReply = message('500000000000000002', {
+    reference: { channelId: CHANNEL_ID, messageId: deniedReference.id },
+  });
+  const fixture = historyFixture({
+    access: {
+      groups: {
+        [CHANNEL_ID]: { requireMention: true, allowFrom: [USER_ID], allowBots: false },
+      },
+    },
+    messages: [allowedReply, deniedReference],
+  });
+
+  const result = await readDiscordHistory({
+    args: { channelId: CHANNEL_ID, limit: 2 },
+    config: fixture.config,
+    client: fixture.client,
+  });
+
+  assert.equal(result.messages.length, 1);
+  assert.equal(result.messages[0].replyTo, null);
+});
+
 test('readDiscordHistory bounds content, attachments, and total serialized output to 64 KiB', async () => {
   const attachments = new Map(Array.from({ length: 20 }, (_, index) => {
     const id = `6000000000000000${String(index).padStart(2, '0')}`;

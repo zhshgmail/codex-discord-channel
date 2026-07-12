@@ -78,6 +78,46 @@ node --test tests/unit/history.test.js tests/unit/access-state.test.js
 
 Result: exit 0, 24 passing, 0 failing.
 
+### RED 3: Resolved Reference Authorization
+
+Command after adding the two regression tests and before changing production
+code:
+
+```bash
+node --test tests/unit/history.test.js
+```
+
+Result: exit 1, 8 passing and 2 failing.
+
+- `readDiscordHistory hides a reply reference authored by a denied sender`
+  expected `replyTo` to be `null`, but received the denied sender's
+  `messageId`, `authorId`, and `authorName`.
+- `readDiscordHistory hides a reply reference authored by a denied bot`
+  expected `replyTo` to be `null`, but received the denied bot's `messageId`,
+  `authorId`, and `authorName`.
+
+The failures showed that `resolvedReply` used raw same-page fetched messages
+without applying `allowHistoryMessage` to the referenced message.
+
+### GREEN 3: Resolved Reference Authorization
+
+Focused command after requiring the referenced message to pass the existing
+history policy with the current state, target, and active bot ID:
+
+```bash
+node --test tests/unit/history.test.js tests/unit/access-state.test.js
+```
+
+Result: exit 0, 26 passing, 0 failing.
+
+Full suite command after the fix:
+
+```bash
+npm test
+```
+
+Result: exit 0, 56 passing, 0 failing.
+
 ### Final Verification
 
 Focused command from the final implementation state:
@@ -120,7 +160,8 @@ Result: exit 0.
     open/allowlist behavior, own-bot inclusion, and guild sender/bot filtering.
 - `plugins/codex-discord-channel/tests/unit/history.test.js`
   - Covers validation, pagination, filtering, references, metadata caps,
-    serialized byte limits, progress under truncation, and sanitized failures.
+    serialized byte limits, progress under truncation, sanitized failures, and
+    references to denied guild senders and denied bots.
 
 Implementation commit:
 `e1c42515db9f9b4dcfbec14bec18d2baf345b2e7 Add authorized Discord history service`
@@ -132,6 +173,8 @@ Implementation commit:
   thread parent's authorization.
 - Confirmed active-bot messages remain visible before guild `allowBots` and
   `allowFrom` filtering, while other bots and denied senders remain filtered.
+- Confirmed resolved references now use the same policy gate as returned
+  messages while retaining same-channel and fetched-page constraints.
 - Confirmed `requireMention` does not filter authorized history.
 - Confirmed one channel fetch and one `limit + 1` message fetch per read.
 - Confirmed raw errors and message content are not logged or returned in errors.
