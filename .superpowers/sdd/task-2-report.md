@@ -126,7 +126,7 @@ Focused command from the final implementation state:
 node --test tests/unit/history.test.js tests/unit/access-state.test.js
 ```
 
-Result: exit 0, 24 passing, 0 failing.
+Result: exit 0, 26 passing, 0 failing.
 
 Full suite command from the final implementation state:
 
@@ -134,7 +134,7 @@ Full suite command from the final implementation state:
 npm test
 ```
 
-Result: exit 0, 54 passing, 0 failing.
+Result: exit 0, 56 passing, 0 failing.
 
 Syntax command:
 
@@ -163,8 +163,9 @@ Result: exit 0.
     serialized byte limits, progress under truncation, sanitized failures, and
     references to denied guild senders and denied bots.
 
-Implementation commit:
+Implementation commits:
 `e1c42515db9f9b4dcfbec14bec18d2baf345b2e7 Add authorized Discord history service`
+`54ab26cad5b402983fa599054beab47c32325ef1 Fix history reply reference authorization`
 
 ## Self-Review
 
