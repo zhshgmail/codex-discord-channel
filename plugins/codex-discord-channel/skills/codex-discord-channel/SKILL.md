@@ -12,8 +12,11 @@ Use this skill when the user wants a Discord bot instance to be owned by the cur
 - This plugin mirrors Claude Code's Discord channel ownership semantics.
 - One process owns one Discord instance through `owner.json`.
 - A newer session using the same instance overwrites the owner.
-- Accepted inbound Discord messages are delivered into the owning local Codex TUI through the session TTY.
-- Until Codex exposes a native channel notification API, the TTY delivery adapter is the exact-console path.
+- Accepted inbound Discord messages are persisted in a FIFO queue for the owning session.
+- Queue mutations are cross-process serialized, with pending and completed Discord identities deduplicated.
+- The current Codex TUI exposes no verifiable composer/modal focus signal, so the shipping runtime does not inject raw TTY keystrokes.
+- An uncertain prior TTY outcome blocks automatic replay and keeps later items queued for explicit reconciliation.
+- Structured app-server delivery into the exact owned thread is the required exact-console migration path; it must omit model and effort overrides.
 - In enabled guild channels with `requireMention: true`, reply delivery is the
   union of the referenced author, agents mentioned by the referenced message,
   and agents explicitly mentioned by the new reply. Every bot evaluates this
@@ -35,6 +38,7 @@ Expected files:
 .env
 access.json
 owner.json
+pending-delivery.json
 ```
 
 Do not print Discord tokens. Do not commit `.env`.
@@ -49,7 +53,7 @@ Use the plugin MCP tools when available:
 - `discord_channel_read_history`
 - `discord_channel_send`
 
-Healthy status for local Discord-to-session routing should show `deliveryMode: "tty"` and `discordStarted: true`.
+Receiver health should show `discordStarted: true`. Until structured delivery is available, status also reports `deliverySafety: "queue_only"` and `composerReadinessSignal: "unavailable"`; inspect `deliveryQueueDepth` and `deliveryBlockedReason` rather than claiming inbound transcript delivery.
 
 ## History Reads
 

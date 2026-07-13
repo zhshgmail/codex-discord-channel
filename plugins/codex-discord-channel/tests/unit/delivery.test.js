@@ -121,7 +121,8 @@ test('off delivery returns unsupported without pretending host push exists', asy
   assert.equal(result.reason, 'delivery_disabled');
 });
 
-test('tty delivery injects Discord prompt into the session terminal', async () => {
+test('explicit verified flush injects a queued Discord prompt into the session terminal', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
   const writes = [];
   const delivery = createDelivery({
     deliveryMode: 'tty',
@@ -129,14 +130,24 @@ test('tty delivery injects Discord prompt into the session terminal', async () =
     ttyPromptFormat: 'minimal',
     ttySubmitSequence: 'cr',
     ttySubmitDelayMs: 0,
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
   }, () => {}, {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
     ttyExists: () => true,
     runTtyInjector: async (tty, data) => {
       writes.push({ tty, text: data.toString('utf8') });
     },
   });
 
-  const result = await delivery.deliver({
+  const queued = await delivery.deliver({
     channelId: 'c1',
     guildId: 'g1',
     messageId: 'm1',
@@ -146,8 +157,12 @@ test('tty delivery injects Discord prompt into the session terminal', async () =
     attachments: [],
   });
 
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.reason, 'composer_readiness_unavailable');
+  assert.equal(writes.length, 0);
+  const result = await delivery.flush();
   assert.equal(result.status, 'delivered');
-  assert.equal(result.reason, 'tty_injected');
+  assert.equal(result.reason, 'queue_flushed');
   assert.equal(result.tty, '/dev/pts/9');
   assert.equal(writes.length, 2);
   assert.equal(writes[0].tty, '/dev/pts/9');
@@ -157,6 +172,720 @@ test('tty delivery injects Discord prompt into the session terminal', async () =
   assert.match(writes[0].text, /codex-discord-channel' send --channel 'c1' --reply-to 'm1'/);
   assert.match(writes[0].text, /<@bot> hello/);
   assert.equal(writes[1].text, '\r');
+});
+
+test('tty delivery queues durably when composer readiness cannot be verified', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  const logs = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, (...entry) => logs.push(entry), {
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  const result = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'do not type into a popup',
+    attachments: [],
+  });
+
+  assert.equal(result.status, 'queued');
+  assert.equal(result.reason, 'composer_readiness_unavailable');
+  assert.equal(result.queueDepth, 1);
+  assert.equal(writes.length, 0);
+  assert.equal(fs.statSync(queuePath).mode & 0o777, 0o600);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
+  assert.equal(persisted.blocked.reason, 'composer_readiness_unavailable');
+  assert.equal(logs.some(([level]) => level === 'ERROR'), true);
+});
+
+test('receiver enqueue never waits for or invokes the composer readiness seam', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  let readinessCalls = 0;
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
+  }, () => {}, {
+    getComposerReadiness: async () => {
+      readinessCalls += 1;
+      return new Promise(() => {});
+    },
+  });
+  let timeout;
+
+  const result = await Promise.race([
+    delivery.deliver({
+      source: 'dm',
+      channelId: 'c1',
+      guildId: null,
+      messageId: 'm1',
+      authorId: 'u1',
+      authorName: 'Alice',
+      content: 'persist without draining',
+      attachments: [],
+    }),
+    new Promise((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('receiver enqueue waited for readiness')), 30);
+    }),
+  ]);
+  clearTimeout(timeout);
+
+  assert.equal(result.status, 'queued');
+  assert.equal(result.reason, 'composer_readiness_unavailable');
+  assert.equal(readinessCalls, 0);
+});
+
+test('a stalled explicit readiness check does not block receiver persistence', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const config = {
+    deliveryMode: 'tty',
+    deliveryQueueLockTimeoutMs: 20,
+    deliveryQueueLockRetryMs: 1,
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  };
+  let readinessStarted;
+  let finishReadiness;
+  const started = new Promise((resolve) => { readinessStarted = resolve; });
+  const readiness = new Promise((resolve) => { finishReadiness = resolve; });
+  const delivery = createDelivery(config, () => {}, {
+    getComposerReadiness: async () => {
+      readinessStarted();
+      return readiness;
+    },
+  });
+  const message = (messageId) => ({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId,
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: messageId,
+    attachments: [],
+  });
+
+  await delivery.deliver(message('m1'));
+  const draining = delivery.flush();
+  await started;
+  const receiving = delivery.deliver(message('m2'));
+  let admissionTimeout;
+  const admission = await Promise.race([
+    receiving.then((result) => ({ result })),
+    new Promise((resolve) => {
+      admissionTimeout = setTimeout(() => resolve({ timedOut: true }), 30);
+    }),
+  ]);
+  finishReadiness({ ready: false, reason: 'composer_not_ready' });
+  await Promise.all([draining, receiving]);
+  clearTimeout(admissionTimeout);
+
+  assert.equal(admission.timedOut, undefined);
+  assert.equal(admission.result.status, 'queued');
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1', 'm2']);
+});
+
+test('a stalled explicit injector does not block receiver persistence', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const config = {
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'none',
+    deliveryQueueLockTimeoutMs: 20,
+    deliveryQueueLockRetryMs: 1,
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  };
+  let injectionStarted;
+  let finishInjection;
+  const started = new Promise((resolve) => { injectionStarted = resolve; });
+  const injection = new Promise((resolve) => { finishInjection = resolve; });
+  const drainer = createDelivery(config, () => {}, {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async () => {
+      injectionStarted();
+      return injection;
+    },
+  });
+  const receiver = createDelivery(config, () => {});
+  const message = (messageId) => ({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId,
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: messageId,
+    attachments: [],
+  });
+
+  await drainer.deliver(message('m1'));
+  const draining = drainer.flush();
+  await started;
+  const result = await receiver.deliver(message('m2'));
+  const persistedWhileStalled = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  finishInjection();
+  await draining;
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'delivery_outcome_uncertain');
+  assert.deepEqual(
+    persistedWhileStalled.items.map((item) => item.normalized.messageId),
+    ['m1', 'm2'],
+  );
+});
+
+test('concurrent explicit flushers claim a queue head only once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  const config = {
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'none',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  };
+  const deps = {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    },
+  };
+  const first = createDelivery(config, () => {}, deps);
+  const second = createDelivery(config, () => {}, deps);
+
+  await first.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'once',
+    attachments: [],
+  });
+  const results = await Promise.all([first.flush(), second.flush()]);
+
+  assert.equal(writes.length, 1);
+  assert.equal(results.filter((result) => result.status === 'delivered').length, 1);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items, []);
+});
+
+test('tty delivery deduplicates concurrent receiver instances by Discord message identity', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const config = {
+    deliveryMode: 'tty',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  };
+  const first = createDelivery(config, () => {});
+  const second = createDelivery(config, () => {});
+  const normalized = {
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'enqueue once',
+    attachments: [],
+  };
+
+  const results = await Promise.all([
+    first.deliver(normalized),
+    second.deliver(normalized),
+  ]);
+
+  assert.deepEqual(results.map((result) => result.status), ['queued', 'queued']);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
+  assert.equal(fs.existsSync(`${queuePath}.lock`), false);
+});
+
+test('tty delivery reclaims an expired queue lock even when its pid was reused', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const lockPath = `${queuePath}.lock`;
+  fs.mkdirSync(lockPath, { recursive: true });
+  fs.writeFileSync(path.join(lockPath, 'owner.json'), JSON.stringify({
+    pid: 999999,
+    token: 'abandoned',
+    acquiredAt: '2026-07-13T00:00:00.000Z',
+  }));
+  const old = new Date(Date.now() - 1000);
+  fs.utimesSync(lockPath, old, old);
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    deliveryQueueLockStaleMs: 5,
+    deliveryQueueLockLiveLeaseMs: 10,
+    deliveryQueueLockTimeoutMs: 30,
+    deliveryQueueLockRetryMs: 1,
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, () => {}, {
+    isProcessAlive: () => true,
+  });
+
+  const result = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'survive pid reuse',
+    attachments: [],
+  });
+
+  assert.equal(result.status, 'queued');
+  assert.equal(fs.existsSync(lockPath), false);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
+});
+
+test('tty delivery does not replay a completed Discord identity from another receiver', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  const config = {
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'none',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  };
+  const deps = {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  };
+  const first = createDelivery(config, () => {}, deps);
+  const second = createDelivery(config, () => {}, deps);
+  const normalized = {
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'inject once',
+    attachments: [],
+  };
+
+  const queued = await first.deliver(normalized);
+  const delivered = await first.flush();
+  const duplicate = await second.deliver(normalized);
+
+  assert.equal(queued.status, 'queued');
+  assert.equal(delivered.status, 'delivered');
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(writes.length, 1);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items, []);
+  assert.deepEqual(
+    persisted.completed.map((item) => [item.channelId, item.messageId]),
+    [['c1', 'm1']],
+  );
+});
+
+test('tty delivery fails loudly without injecting when queue persistence fails', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const invalidParent = path.join(dir, 'not-a-directory');
+  fs.writeFileSync(invalidParent, 'occupied');
+  const writes = [];
+  const logs = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(invalidParent, 'pending-delivery.json'),
+    },
+  }, (...entry) => logs.push(entry), {
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  const result = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'must not be injected',
+    attachments: [],
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'delivery_queue_persist_failed');
+  assert.equal(writes.length, 0);
+  assert.equal(logs.some(([level, message]) => level === 'ERROR' && message.includes('persist')), true);
+});
+
+test('tty delivery rejects a positive readiness assertion without source evidence', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const writes = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
+  }, () => {}, {
+    getComposerReadiness: async () => ({ ready: true }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  const queued = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'uncertain readiness must stay queued',
+    attachments: [],
+  });
+
+  assert.equal(queued.status, 'queued');
+  const result = await delivery.flush();
+  assert.equal(result.status, 'queued');
+  assert.equal(result.reason, 'composer_readiness_unverified');
+  assert.equal(writes.length, 0);
+});
+
+test('tty delivery blocks the FIFO after a partially injected message', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const logs = [];
+  const writes = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttySplitSubmit: true,
+    ttySubmitSequence: 'cr',
+    ttySubmitDelayMs: 0,
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, (...entry) => logs.push(entry), {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+      if (writes.length === 2) throw new Error('submit ioctl denied');
+    },
+  });
+
+  const queued = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'retain me',
+    attachments: [],
+  });
+
+  assert.equal(queued.status, 'queued');
+  const result = await delivery.flush();
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'delivery_outcome_uncertain');
+  assert.equal(writes.length, 2);
+  let persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
+  assert.equal(persisted.blocked.reason, 'delivery_outcome_uncertain');
+  assert.equal(logs.some(([level]) => level === 'ERROR'), true);
+
+  const retry = await delivery.flush();
+  assert.equal(retry.status, 'failed');
+  assert.equal(retry.reason, 'delivery_outcome_uncertain');
+  assert.equal(writes.length, 2);
+
+  const next = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm2',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'queue behind uncertain head',
+    attachments: [],
+  });
+  assert.equal(next.status, 'failed');
+  assert.equal(next.reason, 'delivery_outcome_uncertain');
+  assert.equal(writes.length, 2);
+  persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1', 'm2']);
+  assert.equal(persisted.blocked.reason, 'delivery_outcome_uncertain');
+});
+
+test('tty delivery does not retry after injection succeeds but queue commit fails', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  let injectionCompleted = false;
+  let rejectQueueCommit = true;
+  const fsImpl = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'renameSync') {
+        return (source, destination) => {
+          if (rejectQueueCommit && injectionCompleted && destination === queuePath) {
+            throw new Error('simulated queue commit failure');
+          }
+          return target.renameSync(source, destination);
+        };
+      }
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'none',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, () => {}, {
+    fs: fsImpl,
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+      injectionCompleted = true;
+    },
+  });
+
+  const queued = await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm1',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'commit once',
+    attachments: [],
+  });
+
+  assert.equal(queued.status, 'queued');
+  const result = await delivery.flush();
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'delivery_outcome_uncertain');
+  assert.equal(writes.length, 1);
+  let persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
+  assert.equal(persisted.blocked.reason, 'delivery_in_progress');
+
+  rejectQueueCommit = false;
+  const retry = await delivery.flush();
+  assert.equal(retry.status, 'failed');
+  assert.equal(retry.reason, 'delivery_outcome_uncertain');
+  assert.equal(writes.length, 1);
+  persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
+  assert.equal(persisted.blocked.reason, 'delivery_outcome_uncertain');
+});
+
+test('tty delivery flushes the persistent queue FIFO only after verified readiness', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  const config = {
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'none',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  };
+  const blockedDelivery = createDelivery(config, () => {}, {
+    getComposerReadiness: async () => ({ ready: false, reason: 'composer_popup_active' }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+  const readyDelivery = createDelivery(config, () => {}, {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+  const message = (messageId, content) => ({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId,
+    authorId: 'u1',
+    authorName: 'Alice',
+    content,
+    attachments: [],
+  });
+
+  await blockedDelivery.deliver(message('m1', 'first'));
+  await blockedDelivery.deliver(message('m2', 'second'));
+  assert.equal(writes.length, 0);
+
+  const result = await readyDelivery.flush();
+
+  assert.equal(result.status, 'delivered');
+  assert.equal(result.reason, 'queue_flushed');
+  assert.equal(result.deliveredCount, 2);
+  assert.equal(result.queueDepth, 0);
+  assert.deepEqual(writes.map((write) => write.text), ['first', 'second']);
+  assert.equal(writes.some((write) => write.text.startsWith('\x1b')), false);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items, []);
+  assert.equal(persisted.blocked, null);
+});
+
+test('tty delivery serializes concurrent receiver calls without duplicate injection', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'none',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, () => {}, {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+  const message = (messageId, content) => ({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId,
+    authorId: 'u1',
+    authorName: 'Alice',
+    content,
+    attachments: [],
+  });
+
+  const results = await Promise.all([
+    delivery.deliver(message('m1', 'first')),
+    delivery.deliver(message('m2', 'second')),
+  ]);
+
+  assert.deepEqual(results.map((result) => result.status), ['queued', 'queued']);
+  assert.deepEqual(writes, []);
+  const flushed = await delivery.flush();
+  assert.equal(flushed.status, 'delivered');
+  assert.equal(flushed.deliveredCount, 2);
+  assert.deepEqual(writes.map((write) => write.text), ['first', 'second']);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items, []);
 });
 
 test('display prompt shows only source, author, and content', () => {
@@ -192,13 +921,18 @@ test('tty delivery persists last inbound reply context outside the terminal prom
       lastInboundPath: path.join(dir, 'last-inbound.json'),
     },
   }, () => {}, {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
     ttyExists: () => true,
     runTtyInjector: async (tty, data) => {
       writes.push({ tty, text: data.toString('utf8') });
     },
   });
 
-  const result = await delivery.deliver({
+  const queued = await delivery.deliver({
     source: 'dm',
     channelId: 'c1',
     guildId: null,
@@ -210,6 +944,9 @@ test('tty delivery persists last inbound reply context outside the terminal prom
     attachments: [],
   });
 
+  assert.equal(queued.status, 'queued');
+  assert.equal(writes.length, 0);
+  const result = await delivery.flush();
   assert.equal(result.status, 'delivered');
   assert.equal(writes.length, 1);
   assert.doesNotMatch(writes[0].text, /channelId/);

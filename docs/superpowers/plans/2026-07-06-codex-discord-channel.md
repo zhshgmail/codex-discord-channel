@@ -1,10 +1,12 @@
 # Codex Discord Channel Implementation Plan
 
+> Safety update (2026-07-13): automatic TTY injection is superseded by the fail-closed queue described in [`docs/tty-delivery-safety.md`](../../tty-delivery-safety.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a standalone Codex plugin that provides Claude-style Discord session ownership for Codex.
 
-**Architecture:** The plugin is a marketplace repo with one plugin under `plugins/codex-discord-channel`. It ships a Node MCP server that owns a Discord bot instance for the current process, uses Claude-compatible access state, exposes safe Discord reply/read tools, and delivers accepted messages into the active session terminal. The Codex delivery adapter remains isolated so a future native channel API can replace the TTY path.
+**Architecture:** The plugin is a marketplace repo with one plugin under `plugins/codex-discord-channel`. It ships a Node MCP server that owns a Discord bot instance for the current process, uses Claude-compatible access state, exposes safe Discord reply/read tools, and persistently queues accepted messages while no verifiable host delivery API exists. The Codex delivery adapter remains isolated so a future structured channel API can replace the legacy TTY path.
 
 **Tech Stack:** Node.js 22, CommonJS, stdio JSON-RPC MCP handling, `discord.js`, `node:test`, Codex plugin manifest and marketplace files.
 

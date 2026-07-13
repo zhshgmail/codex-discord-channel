@@ -275,6 +275,14 @@ test('status reports non-secret Discord startup diagnostics', async () => {
     'DISCORD_PROXY_URL=http://127.0.0.1:8080',
     'DISCORD_INSECURE_TLS=true',
   ].join('\n'));
+  fs.writeFileSync(path.join(stateDir, 'pending-delivery.json'), JSON.stringify({
+    version: 1,
+    items: [{ normalized: { messageId: 'm1', content: 'queued-secret-content' } }],
+    blocked: {
+      reason: 'composer_readiness_unavailable',
+      at: '2026-07-13T00:00:00.000Z',
+    },
+  }));
 
   const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
   const context = {
@@ -292,8 +300,62 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   assert.equal(result.structuredContent.insecureTls, true);
   assert.equal(result.structuredContent.discordStarted, false);
   assert.equal(result.structuredContent.discordReason, 'startup_failed');
+  assert.equal(result.structuredContent.deliverySafety, 'queue_only');
+  assert.equal(result.structuredContent.composerReadinessSignal, 'unavailable');
+  assert.equal(result.structuredContent.deliveryQueueDepth, 1);
+  assert.equal(result.structuredContent.deliveryBlockedReason, 'composer_readiness_unavailable');
+  assert.equal(result.structuredContent.deliveryBlockedAt, '2026-07-13T00:00:00.000Z');
+  assert.equal(result.structuredContent.deliveryQueuePath, path.join(stateDir, 'pending-delivery.json'));
   assert.equal(result.content[0].text.includes('secret-token'), false);
   assert.equal(result.content[0].text.includes('127.0.0.1:8080'), false);
+  assert.equal(result.content[0].text.includes('queued-secret-content'), false);
+});
+
+test('status sanitizes malformed delivery queue errors', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, 'pending-delivery.json'),
+    '{"version":1,"items":[{"normalized":{"content":"queued-secret-content"}}],BROKEN',
+  );
+
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const context = {
+    config,
+    discordState: { started: false, client: null, reason: 'startup_failed' },
+    claim() {
+      throw new Error('not used');
+    },
+  };
+
+  const result = await callTool(context, 'discord_channel_status');
+  assert.equal(result.structuredContent.deliveryBlockedReason, 'delivery_queue_unreadable');
+  assert.equal(
+    result.structuredContent.deliveryQueueError,
+    'Unable to read persistent Discord delivery queue.',
+  );
+  assert.equal(JSON.stringify(result).includes('queued-secret-content'), false);
+});
+
+test('status reports when inbound persistence is disabled', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({
+    HOME: home,
+    DISCORD_INSTANCE: 'codex01',
+    CODEX_DISCORD_DELIVERY_MODE: 'off',
+  }, { cwd: '/workspace' });
+  const context = {
+    config,
+    discordState: { started: false, client: null, reason: 'token_missing' },
+    claim() {
+      throw new Error('not used');
+    },
+  };
+
+  const result = await callTool(context, 'discord_channel_status');
+  assert.equal(result.structuredContent.deliverySafety, 'persistence_disabled');
+  assert.equal(result.structuredContent.composerReadinessSignal, 'not_applicable');
 });
 
 test('send tool defaults to last inbound Discord message when channelId is omitted', async () => {

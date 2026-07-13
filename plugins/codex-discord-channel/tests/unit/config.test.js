@@ -22,6 +22,14 @@ test('loadConfig resolves default instance state path', () => {
   const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'Codex 01' }, { cwd: '/workspace' });
   assert.equal(config.paths.instance, 'codex-01');
   assert.equal(config.paths.stateDir, path.join(home, '.codex', 'channels', 'discord', 'codex-01'));
+  assert.equal(config.paths.deliveryQueuePath, path.join(
+    home,
+    '.codex',
+    'channels',
+    'discord',
+    'codex-01',
+    'pending-delivery.json',
+  ));
   assert.equal(config.cwd, '/workspace');
 });
 

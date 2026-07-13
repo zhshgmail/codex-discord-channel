@@ -9,7 +9,7 @@ The plugin lives at `plugins/codex-discord-channel` and is exposed through the r
 - Claims one active owner for a Discord bot instance when the MCP server starts.
 - Stores local state under `$HOME/.codex/channels/discord/<instance>` by default.
 - Uses a Claude-compatible access model for DMs and guild channels.
-- Delivers accepted Discord messages into the owning interactive Codex session terminal.
+- Persists accepted Discord messages in a durable FIFO queue for the owning Codex session.
 - Exposes MCP tools for status, owner claim/read, bounded history reads, and Discord send.
 
 ### Guild Reply Audience
@@ -51,7 +51,7 @@ attachment bodies; output is bounded to 64 KiB. Stable sanitized errors include
 `history_channel_inaccessible`, and `history_fetch_failed`; raw Discord errors
 are not exposed.
 
-Codex does not currently expose a confirmed Claude-style host channel notification API. Until that exists, this plugin uses a session-local TTY delivery path so the active terminal session receives accepted DM messages and guild messages according to the configured group access policy.
+Codex CLI 0.144.1 does not expose its private composer/modal focus state. The plugin therefore keeps TTY delivery fail-closed: accepted messages remain in a durable FIFO queue and raw keystrokes are not injected. See [TTY Delivery Safety Boundary](docs/tty-delivery-safety.md).
 
 ## Local Install
 
@@ -113,6 +113,8 @@ Expected healthy status:
   "tokenConfigured": true,
   "proxyConfigured": true,
   "deliveryMode": "tty",
+  "deliverySafety": "queue_only",
+  "composerReadinessSignal": "unavailable",
   "discordStarted": true
 }
 ```
@@ -125,7 +127,7 @@ Use $codex-discord-channel to send "..." to channel <discord-channel-id>.
 
 If `discordStarted` is false, check `discordReason`, `envLoaded`, `proxyConfigured`, and `insecureTls` in the status output. The status intentionally reports only booleans and paths, never token or proxy values.
 
-Inbound delivery requires an interactive Codex terminal. The status output reports `deliveryMode`, `ttyConfigured`, `ttyPidConfigured`, `ttyUseSudo`, and `ttyPromptFormat` so routing failures are visible without printing secrets.
+The Discord receiver continues accepting access-approved messages while delivery is blocked. Each message is persisted in `pending-delivery.json`; queue mutations are cross-process serialized and deduplicated by Discord identity. Status reports queue depth, blocked reason, timestamp, path, and sanitized read errors without printing queued content. The receiver never calls or waits on the internal drain seam. The current TUI has no verifiable composer-ready signal, so queued messages do not auto-flush through `TIOCSTI`. An uncertain prior TTY outcome blocks automatic replay and preserves all later FIFO items for explicit reconciliation.
 
 ## Instance Config
 
@@ -135,6 +137,7 @@ Default instance state:
 $HOME/.codex/channels/discord/default/.env
 $HOME/.codex/channels/discord/default/access.json
 $HOME/.codex/channels/discord/default/owner.json
+$HOME/.codex/channels/discord/default/pending-delivery.json
 ```
 
 Example `.env`:
@@ -146,7 +149,7 @@ DISCORD_BOT_USER_ID=replace-with-bot-user-id
 DISCORD_PROXY_URL=http://127.0.0.1:8080
 DISCORD_INSECURE_TLS=true
 CODEX_DISCORD_DELIVERY_MODE=tty
-# Optional explicit route; normally the plugin uses the parent Codex process TTY.
+# Reserved for a future verified-readiness adapter; current runtime remains queue-only.
 # CODEX_DISCORD_TTY=/dev/pts/7
 ```
 

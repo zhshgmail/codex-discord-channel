@@ -2,7 +2,7 @@
 
 This package is the Codex plugin payload for `codex-discord-channel`.
 
-It mirrors the Claude Code Discord plugin ownership model for local Codex TUI sessions: the MCP server claims one Discord bot instance for the current session, keeps ownership in `owner.json`, and delivers accepted inbound Discord messages into the owning terminal session.
+It mirrors the Claude Code Discord plugin ownership model for local Codex TUI sessions: the MCP server claims one Discord bot instance for the current session, keeps ownership in `owner.json`, and persistently queues accepted inbound Discord messages for safe delivery.
 
 ## Checks
 
@@ -26,13 +26,15 @@ Healthy status should report `tokenConfigured: true`, `proxyConfigured: true` wh
 
 The status tool exposes only non-secret diagnostics. It may show `discordReason`, `envLoaded`, `proxyConfigured`, `insecureTls`, and `loginDisabled`, but it must not print token or proxy values.
 
-Inbound Discord messages are normalized, access-checked, and handed to the delivery boundary. The default `tty` delivery mode injects a prompt into the active Codex terminal. If Codex later exposes a native channel notification API, that can replace the TTY delivery adapter without changing Discord access or ownership logic.
+Inbound Discord messages are normalized, access-checked, and atomically persisted to `pending-delivery.json`. Queue mutations are locked across processes and deduplicated by Discord channel and message id. Codex CLI 0.144.1 does not export a verifiable composer/modal focus signal, so the shipping `tty` runtime is deliberately queue-only and performs no raw-key injection. The receiver never calls or waits on the internal drain seam. It logs blocked delivery at `ERROR` and exposes non-secret queue diagnostics through the status tool. Any ambiguous prior TTY outcome permanently blocks automatic replay until it is explicitly reconciled.
+
+The required migration is structured app-server delivery into the exact owned thread, with model and effort overrides omitted. Until the visible TUI and plugin can prove they share that endpoint and thread, queued messages must remain pending. See the repository's `docs/tty-delivery-safety.md`.
 
 Useful local `.env` delivery keys:
 
 ```env
 CODEX_DISCORD_DELIVERY_MODE=tty
-# Optional explicit target. If unset, the plugin uses the parent Codex process TTY.
+# Reserved for a future verified-readiness adapter; current runtime remains queue-only.
 # CODEX_DISCORD_TTY=/dev/pts/7
 CODEX_DISCORD_TTY_USE_SUDO=true
 CODEX_DISCORD_TTY_PROMPT_FORMAT=minimal

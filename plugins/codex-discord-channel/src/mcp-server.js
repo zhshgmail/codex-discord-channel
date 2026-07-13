@@ -2,7 +2,12 @@
 
 const readline = require('node:readline');
 const { loadConfig } = require('./config');
-const { createDelivery, readLastInboundContext, resolveReplyTarget } = require('./delivery');
+const {
+  createDelivery,
+  readDeliveryQueueStatus,
+  readLastInboundContext,
+  resolveReplyTarget,
+} = require('./delivery');
 const { sendDiscordMessage, startDiscordClient } = require('./discord-client');
 const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
@@ -148,6 +153,9 @@ function makeContext(config, discordState) {
 async function callTool(context, name, args = {}) {
   if (name === 'discord_channel_status') {
     const owner = readOwner(context.config.paths.ownerPath);
+    const deliveryQueue = readDeliveryQueueStatus(context.config);
+    const deliveryMode = String(context.config.deliveryMode || '').toLowerCase();
+    const persistenceEnabled = deliveryMode === 'tty';
     const payload = {
       instance: context.config.paths.instance,
       stateDir: context.config.paths.stateDir,
@@ -163,6 +171,9 @@ async function callTool(context, name, args = {}) {
       ttyPidConfigured: Boolean(context.config.ttyPid),
       ttyUseSudo: context.config.ttyUseSudo,
       ttyPromptFormat: context.config.ttyPromptFormat,
+      deliverySafety: persistenceEnabled ? 'queue_only' : 'persistence_disabled',
+      composerReadinessSignal: persistenceEnabled ? 'unavailable' : 'not_applicable',
+      ...deliveryQueue,
       discordStarted: context.discordState.started,
       discordReason: context.discordState.reason || null,
       currentOwner: owner,
@@ -208,7 +219,7 @@ async function handleRequest(context, message) {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        'Use this plugin to claim a Discord bot instance for the current Codex session and deliver accepted Discord messages into the active session terminal.',
+        'Use this plugin to claim a Discord bot instance, inspect the persistent inbound queue, and send Discord replies. Inbound TTY delivery is queue-only until the host exposes verifiable structured delivery.',
     });
     return;
   }
