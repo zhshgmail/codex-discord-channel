@@ -3,6 +3,7 @@
 const readline = require('node:readline');
 const { loadConfig } = require('./config');
 const {
+  autoSubmitCompatibilityState,
   createDelivery,
   readDeliveryQueueStatus,
   readLastInboundContext,
@@ -156,6 +157,10 @@ async function callTool(context, name, args = {}) {
     const deliveryQueue = readDeliveryQueueStatus(context.config);
     const deliveryMode = String(context.config.deliveryMode || '').toLowerCase();
     const persistenceEnabled = deliveryMode === 'tty';
+    const autoSubmit = autoSubmitCompatibilityState(context.config);
+    const autoSubmitCompat = persistenceEnabled && autoSubmit.enabled;
+    const autoSubmitPreconditionFailed = persistenceEnabled &&
+      autoSubmit.configured && !autoSubmit.enabled;
     const payload = {
       instance: context.config.paths.instance,
       stateDir: context.config.paths.stateDir,
@@ -171,8 +176,23 @@ async function callTool(context, name, args = {}) {
       ttyPidConfigured: Boolean(context.config.ttyPid),
       ttyUseSudo: context.config.ttyUseSudo,
       ttyPromptFormat: context.config.ttyPromptFormat,
-      deliverySafety: persistenceEnabled ? 'queue_only' : 'persistence_disabled',
-      composerReadinessSignal: persistenceEnabled ? 'unavailable' : 'not_applicable',
+      ttyAutoSubmitCompat: Boolean(context.config.ttyAutoSubmitCompat),
+      ttyAutoSubmitEffective: autoSubmitCompat,
+      ttyAutoSubmitBlockedReason: autoSubmitPreconditionFailed ? autoSubmit.reason : null,
+      deliverySafety: persistenceEnabled
+        ? (
+          autoSubmitCompat
+            ? 'auto_submit_compat'
+            : (autoSubmitPreconditionFailed ? 'auto_submit_precondition_failed' : 'queue_only')
+        )
+        : 'persistence_disabled',
+      composerReadinessSignal: persistenceEnabled
+        ? (
+          autoSubmitCompat
+            ? 'operator_opt_in_unverified'
+            : (autoSubmitPreconditionFailed ? 'precondition_failed' : 'unavailable')
+        )
+        : 'not_applicable',
       ...deliveryQueue,
       discordStarted: context.discordState.started,
       discordReason: context.discordState.reason || null,
@@ -219,7 +239,7 @@ async function handleRequest(context, message) {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        'Use this plugin to claim a Discord bot instance, inspect the persistent inbound queue, and send Discord replies. Inbound TTY delivery is queue-only until the host exposes verifiable structured delivery.',
+        'Use this plugin to claim a Discord bot instance, inspect the persistent inbound queue, and send Discord replies. TTY delivery defaults to queue-only; explicit auto-submit compatibility is an unverified operator opt-in.',
     });
     return;
   }

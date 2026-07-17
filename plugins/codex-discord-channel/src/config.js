@@ -87,6 +87,10 @@ function loadConfig(inputEnv = process.env, options = {}) {
     ttyPromptFormat: ['full', 'compact', 'minimal', 'plain', 'display'].includes(ttyPromptFormat) ? ttyPromptFormat : 'minimal',
     ttySubmit: parseBool(env.CODEX_DISCORD_TTY_SUBMIT || env.CODEX_TTY_SUBMIT, true),
     ttySubmitSequence: env.CODEX_DISCORD_TTY_SUBMIT_SEQUENCE || env.CODEX_TTY_SUBMIT_SEQUENCE || 'cr',
+    ttyAutoSubmitCompat: parseBool(
+      env.CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT || env.CODEX_TTY_AUTO_SUBMIT_COMPAT,
+      false,
+    ),
     ttyInjectTimeoutMs: parseInteger(env.CODEX_DISCORD_TTY_INJECT_TIMEOUT_MS || env.CODEX_TTY_INJECT_TIMEOUT_MS, 15000),
     parentPid: process.ppid,
     ownerId,

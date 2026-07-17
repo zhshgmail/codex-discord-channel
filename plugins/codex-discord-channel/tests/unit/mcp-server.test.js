@@ -302,6 +302,9 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   assert.equal(result.structuredContent.discordReason, 'startup_failed');
   assert.equal(result.structuredContent.deliverySafety, 'queue_only');
   assert.equal(result.structuredContent.composerReadinessSignal, 'unavailable');
+  assert.equal(result.structuredContent.ttyAutoSubmitCompat, false);
+  assert.equal(result.structuredContent.ttyAutoSubmitEffective, false);
+  assert.equal(result.structuredContent.ttyAutoSubmitBlockedReason, null);
   assert.equal(result.structuredContent.deliveryQueueDepth, 1);
   assert.equal(result.structuredContent.deliveryBlockedReason, 'composer_readiness_unavailable');
   assert.equal(result.structuredContent.deliveryBlockedAt, '2026-07-13T00:00:00.000Z');
@@ -356,6 +359,56 @@ test('status reports when inbound persistence is disabled', async () => {
   const result = await callTool(context, 'discord_channel_status');
   assert.equal(result.structuredContent.deliverySafety, 'persistence_disabled');
   assert.equal(result.structuredContent.composerReadinessSignal, 'not_applicable');
+});
+
+test('status identifies explicit unverified auto-submit compatibility mode', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({
+    HOME: home,
+    DISCORD_INSTANCE: 'codex01',
+    CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT: 'true',
+  }, { cwd: '/workspace' });
+  const context = {
+    config,
+    discordState: { started: true, client: null, reason: null },
+    claim() {
+      throw new Error('not used');
+    },
+  };
+
+  const result = await callTool(context, 'discord_channel_status');
+  assert.equal(result.structuredContent.ttyAutoSubmitCompat, true);
+  assert.equal(result.structuredContent.ttyAutoSubmitEffective, true);
+  assert.equal(result.structuredContent.ttyAutoSubmitBlockedReason, null);
+  assert.equal(result.structuredContent.deliverySafety, 'auto_submit_compat');
+  assert.equal(result.structuredContent.composerReadinessSignal, 'operator_opt_in_unverified');
+});
+
+test('status reports an invalid auto-submit compatibility precondition', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({
+    HOME: home,
+    DISCORD_INSTANCE: 'codex01',
+    CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT: 'true',
+    CODEX_DISCORD_TTY_SUBMIT_SEQUENCE: 'none',
+  }, { cwd: '/workspace' });
+  const context = {
+    config,
+    discordState: { started: true, client: null, reason: null },
+    claim() {
+      throw new Error('not used');
+    },
+  };
+
+  const result = await callTool(context, 'discord_channel_status');
+  assert.equal(result.structuredContent.ttyAutoSubmitCompat, true);
+  assert.equal(result.structuredContent.ttyAutoSubmitEffective, false);
+  assert.equal(
+    result.structuredContent.ttyAutoSubmitBlockedReason,
+    'auto_submit_requires_submit_sequence',
+  );
+  assert.equal(result.structuredContent.deliverySafety, 'auto_submit_precondition_failed');
+  assert.equal(result.structuredContent.composerReadinessSignal, 'precondition_failed');
 });
 
 test('send tool defaults to last inbound Discord message when channelId is omitted', async () => {

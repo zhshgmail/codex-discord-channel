@@ -9,7 +9,7 @@ It mirrors the Claude Code Discord plugin ownership model for local Codex TUI se
 ```bash
 npm install
 npm run check
-python3 /home/zheng/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/validate_plugin.py" .
 ```
 
 ## Import Existing Bridge State
@@ -26,7 +26,25 @@ Healthy status should report `tokenConfigured: true`, `proxyConfigured: true` wh
 
 The status tool exposes only non-secret diagnostics. It may show `discordReason`, `envLoaded`, `proxyConfigured`, `insecureTls`, and `loginDisabled`, but it must not print token or proxy values.
 
-Inbound Discord messages are normalized, access-checked, and atomically persisted to `pending-delivery.json`. Queue mutations are locked across processes and deduplicated by Discord channel and message id. Codex CLI 0.144.1 does not export a verifiable composer/modal focus signal, so the shipping `tty` runtime is deliberately queue-only and performs no raw-key injection. The receiver never calls or waits on the internal drain seam. It logs blocked delivery at `ERROR` and exposes non-secret queue diagnostics through the status tool. Any ambiguous prior TTY outcome permanently blocks automatic replay until it is explicitly reconciled.
+Inbound Discord messages are normalized, access-checked, and atomically
+persisted to `pending-delivery.json`. Queue mutations are locked across
+processes and deduplicated by Discord channel and message id. Codex CLI 0.144.1
+does not export a verifiable composer/modal focus signal, so `tty` delivery
+defaults to queue-only and performs no raw-key injection. It logs blocked
+delivery at `ERROR` and exposes non-secret queue diagnostics through the status
+tool.
+
+`CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true` explicitly restores immediate
+legacy delivery for an operator-managed TUI. The receiver persists first,
+FIFO-claims the queue head, and submits one sanitized bracketed-paste frame in
+one injector process. It commits completion only after the injector succeeds;
+an ambiguous injector or queue-commit result blocks replay until explicit
+reconciliation. This compatibility mode cannot detect popups, focused widgets,
+or existing composer drafts, so it can paste or submit into the wrong TUI
+state. It never sends Escape or changes model or reasoning settings.
+Compatibility mode requires TTY submit to be enabled and the submit sequence
+to be `cr`, `lf`, or `crlf`; disabled submit or `none` remains queued with
+`auto_submit_requires_submit_sequence` and performs no injection.
 
 The required migration is structured app-server delivery into the exact owned thread, with model and effort overrides omitted. Until the visible TUI and plugin can prove they share that endpoint and thread, queued messages must remain pending. See the repository's `docs/tty-delivery-safety.md`.
 
@@ -34,10 +52,13 @@ Useful local `.env` delivery keys:
 
 ```env
 CODEX_DISCORD_DELIVERY_MODE=tty
-# Reserved for a future verified-readiness adapter; current runtime remains queue-only.
 # CODEX_DISCORD_TTY=/dev/pts/7
 CODEX_DISCORD_TTY_USE_SUDO=true
 CODEX_DISCORD_TTY_PROMPT_FORMAT=minimal
+# Explicit compatibility opt-in; default false. See the safety warning above.
+# CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true
+# CODEX_DISCORD_TTY_SUBMIT=true
+# CODEX_DISCORD_TTY_SUBMIT_SEQUENCE=cr
 ```
 
 ## Reply Audience
@@ -88,11 +109,16 @@ restart, or alter the live gateway as part of these documentation checks.
 3. In the new session call `discord_channel_claim_owner`,
    `discord_channel_read_owner`, and `discord_channel_status`. Confirm the
    owner now identifies the new session, `deliveryMode` is `tty`, its TTY is
-   configured, and Discord is started.
-4. Smoke an allowed DM. In an allowed group with `requireMention: true`, smoke
-   an allowed guild message, a direct reply to this bot, and an inherited reply
-   to a peer message that mentioned this bot. Confirm each accepted input
-   reaches the exact visible new Codex console.
+   configured, and Discord is started. Visible TTY delivery additionally
+   requires `ttyAutoSubmitCompat: true`, `ttyAutoSubmitEffective: true`,
+   `deliverySafety: "auto_submit_compat"`, and
+   `composerReadinessSignal: "operator_opt_in_unverified"`.
+4. Close popups and account for any existing composer draft before smoking an
+   allowed DM. In an allowed group with `requireMention: true`, smoke an allowed
+   guild message, a direct reply to this bot, and an inherited reply to a peer
+   message that mentioned this bot. Confirm each accepted input reaches the
+   exact visible new Codex console. In default queue-only mode, verify durable
+   queue acceptance instead of visible delivery.
 5. With `requireMention: true`, confirm a peer reply that neither references
    nor explicitly mentions this bot stays rejected. In an allowed group with
    `requireMention: false`, confirm all otherwise-authorized group messages are

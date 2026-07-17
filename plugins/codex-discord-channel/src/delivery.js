@@ -411,7 +411,7 @@ function completedQueue(queue, next) {
   };
 }
 
-async function flushDeliveryQueue(config, logger = () => {}, deps = {}) {
+async function flushDeliveryQueue(config, logger = () => {}, deps = {}, options = {}) {
   let deliveredCount = 0;
   let tty = '';
 
@@ -421,6 +421,19 @@ async function flushDeliveryQueue(config, logger = () => {}, deps = {}) {
       deps,
       () => readDeliveryQueue(config, deps),
     );
+    const stopAfterCompleted = options.stopAfter && snapshot.completed.some((item) => (
+      item.channelId === options.stopAfter.channelId &&
+      item.messageId === options.stopAfter.messageId
+    ));
+    if (stopAfterCompleted) {
+      return {
+        status: 'delivered',
+        reason: 'queue_flushed',
+        deliveredCount,
+        queueDepth: snapshot.items.length,
+        ...(tty ? { tty } : {}),
+      };
+    }
     if (snapshot.items.length === 0) {
       return {
         status: deliveredCount > 0 ? 'delivered' : 'idle',
@@ -624,6 +637,19 @@ async function flushDeliveryQueue(config, logger = () => {}, deps = {}) {
       readinessSource: readiness.source,
       queueDepth: committed.queueDepth,
     });
+    if (
+      options.stopAfter &&
+      next.normalized.channelId === options.stopAfter.channelId &&
+      next.normalized.messageId === options.stopAfter.messageId
+    ) {
+      return {
+        status: 'delivered',
+        reason: 'queue_flushed',
+        deliveredCount,
+        queueDepth: committed.queueDepth,
+        tty,
+      };
+    }
   }
 }
 
@@ -696,6 +722,18 @@ function decodeSubmitSequence(value) {
   if (normalized === 'lf' || normalized === 'enter') return '\n';
   if (normalized === 'crlf') return '\r\n';
   return '\r';
+}
+
+function autoSubmitCompatibilityState(config = {}) {
+  const configured = Boolean(config.ttyAutoSubmitCompat);
+  const submitSequence = config.ttySubmit === false
+    ? ''
+    : decodeSubmitSequence(config.ttySubmitSequence);
+  return {
+    configured,
+    enabled: configured && submitSequence !== '',
+    reason: configured && submitSequence === '' ? 'auto_submit_requires_submit_sequence' : null,
+  };
 }
 
 function formatTtyPrompt(normalized, envelope, config = {}) {
@@ -831,6 +869,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
+function autoSubmitCompatibilityDeps(deps = {}) {
+  if (typeof deps.getComposerReadiness === 'function') return deps;
+  return {
+    ...deps,
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'auto_submit_compat',
+      evidence: 'explicit_operator_opt_in',
+    }),
+  };
+}
+
 async function injectIntoTty(normalized, envelope, config = {}, deps = {}) {
   const tty = resolveCodexTty(config, deps);
   const prompt = terminalSafeText(formatTtyPrompt(normalized, envelope, config));
@@ -845,6 +895,8 @@ async function injectIntoTty(normalized, envelope, config = {}, deps = {}) {
 function createDelivery(config, logger = () => {}, deps = {}) {
   let admissionOperations = Promise.resolve();
   let drainOperations = Promise.resolve();
+  const autoSubmit = autoSubmitCompatibilityState(config);
+  const drainDeps = autoSubmit.enabled ? autoSubmitCompatibilityDeps(deps) : deps;
   const serializeAdmission = (operation) => {
     const result = admissionOperations.then(operation, operation);
     admissionOperations = result.catch(() => {});
@@ -857,32 +909,32 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   };
   const delivery = {
     flush() {
-      return serializeDrain(() => flushDeliveryQueue(config, logger, deps));
+      return serializeDrain(() => flushDeliveryQueue(config, logger, drainDeps));
     },
-    deliver(normalized) {
-      return serializeAdmission(async () => {
-        const envelope = formatEnvelope(normalized);
-        const mode = String(config.deliveryMode || 'tty').toLowerCase();
-        if (mode === 'off' || mode === 'unsupported' || mode === 'log') {
-          logger('WARN', 'Discord inbound delivery is disabled', {
-            channelId: normalized.channelId,
-            messageId: normalized.messageId,
-          });
-          return {
-            status: 'unsupported',
-            reason: 'delivery_disabled',
-            envelope,
-          };
-        }
+    async deliver(normalized) {
+      const envelope = formatEnvelope(normalized);
+      const mode = String(config.deliveryMode || 'tty').toLowerCase();
+      if (mode === 'off' || mode === 'unsupported' || mode === 'log') {
+        logger('WARN', 'Discord inbound delivery is disabled', {
+          channelId: normalized.channelId,
+          messageId: normalized.messageId,
+        });
+        return {
+          status: 'unsupported',
+          reason: 'delivery_disabled',
+          envelope,
+        };
+      }
 
-        if (mode !== 'tty') {
-          return {
-            status: 'unsupported',
-            reason: 'unknown_delivery_mode',
-            envelope,
-          };
-        }
+      if (mode !== 'tty') {
+        return {
+          status: 'unsupported',
+          reason: 'unknown_delivery_mode',
+          envelope,
+        };
+      }
 
+      const admission = await serializeAdmission(async () => {
         let queueResult;
         try {
           queueResult = await withDeliveryQueueLock(
@@ -899,10 +951,12 @@ function createDelivery(config, logger = () => {}, deps = {}) {
             queuePath: getDeliveryQueuePath(config),
           });
           return {
-            status: 'failed',
-            reason: 'delivery_queue_persist_failed',
-            error: message,
-            envelope,
+            result: {
+              status: 'failed',
+              reason: 'delivery_queue_persist_failed',
+              error: message,
+              envelope,
+            },
           };
         }
 
@@ -915,55 +969,95 @@ function createDelivery(config, logger = () => {}, deps = {}) {
             error: error instanceof Error ? error.message : String(error),
           });
         }
+        return { queueResult };
+      });
 
-        if (queueResult.duplicate === 'completed') {
-          logger('INFO', 'Ignored a Discord message identity that was already delivered', {
-            channelId: normalized.channelId,
-            messageId: normalized.messageId,
-          });
-          return {
-            status: 'duplicate',
-            reason: 'discord_message_already_completed',
-            queueDepth: queueResult.queue.items.length,
-            envelope,
-          };
-        }
+      if (admission.result) return admission.result;
+      const { queueResult } = admission;
 
-        if (isDeliveryOutcomeUncertain(queueResult.queue)) {
-          logger('ERROR', 'Discord message is queued behind a prior uncertain TTY delivery outcome', {
-            channelId: normalized.channelId,
-            messageId: normalized.messageId,
-            queueDepth: queueResult.queue.items.length,
-            queuePath: getDeliveryQueuePath(config),
-          });
-          return {
-            status: 'failed',
-            reason: DELIVERY_OUTCOME_UNCERTAIN,
-            queueDepth: queueResult.queue.items.length,
-            envelope,
-          };
-        }
-
-        logger('ERROR', 'Discord message is queued because composer readiness is not verifiable', {
+      if (queueResult.duplicate === 'completed') {
+        logger('INFO', 'Ignored a Discord message identity that was already delivered', {
           channelId: normalized.channelId,
           messageId: normalized.messageId,
-          reason: 'composer_readiness_unavailable',
+        });
+        return {
+          status: 'duplicate',
+          reason: 'discord_message_already_completed',
+          queueDepth: queueResult.queue.items.length,
+          envelope,
+        };
+      }
+
+      const blockedReason = queueResult.queue.blocked?.reason;
+      if (
+        blockedReason === DELIVERY_OUTCOME_UNCERTAIN ||
+        (blockedReason === DELIVERY_IN_PROGRESS && !autoSubmit.enabled)
+      ) {
+        logger('ERROR', 'Discord message is queued behind a prior uncertain TTY delivery outcome', {
+          channelId: normalized.channelId,
+          messageId: normalized.messageId,
           queueDepth: queueResult.queue.items.length,
           queuePath: getDeliveryQueuePath(config),
         });
         return {
-          status: 'queued',
-          reason: 'composer_readiness_unavailable',
+          status: 'failed',
+          reason: DELIVERY_OUTCOME_UNCERTAIN,
           queueDepth: queueResult.queue.items.length,
           envelope,
         };
+      }
+
+      if (autoSubmit.configured && !autoSubmit.enabled) {
+        logger('ERROR', 'Discord message remains queued because auto-submit has no submit sequence', {
+          channelId: normalized.channelId,
+          messageId: normalized.messageId,
+          reason: autoSubmit.reason,
+          queueDepth: queueResult.queue.items.length,
+          queuePath: getDeliveryQueuePath(config),
+        });
+        return {
+          status: 'failed',
+          reason: autoSubmit.reason,
+          queueDepth: queueResult.queue.items.length,
+          envelope,
+        };
+      }
+
+      if (autoSubmit.enabled) {
+        logger('WARN', 'Auto-submitting queued Discord message without verified composer state', {
+          channelId: normalized.channelId,
+          messageId: normalized.messageId,
+          queueDepth: queueResult.queue.items.length,
+          queuePath: getDeliveryQueuePath(config),
+        });
+        return serializeDrain(() => flushDeliveryQueue(
+          config,
+          logger,
+          drainDeps,
+          { stopAfter: normalized },
+        ));
+      }
+
+      logger('ERROR', 'Discord message is queued because composer readiness is not verifiable', {
+        channelId: normalized.channelId,
+        messageId: normalized.messageId,
+        reason: 'composer_readiness_unavailable',
+        queueDepth: queueResult.queue.items.length,
+        queuePath: getDeliveryQueuePath(config),
       });
+      return {
+        status: 'queued',
+        reason: 'composer_readiness_unavailable',
+        queueDepth: queueResult.queue.items.length,
+        envelope,
+      };
     },
   };
   return delivery;
 }
 
 module.exports = {
+  autoSubmitCompatibilityState,
   createDelivery,
   buildReplyCommand,
   decodeSubmitSequence,

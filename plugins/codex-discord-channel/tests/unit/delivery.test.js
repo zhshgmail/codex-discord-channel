@@ -22,6 +22,19 @@ function framedPaste(text, submit = '') {
   return `${BRACKETED_PASTE_START}${text}${BRACKETED_PASTE_END}${submit}`;
 }
 
+function discordMessage(messageId, content) {
+  return {
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId,
+    authorId: 'u1',
+    authorName: 'Alice',
+    content,
+    attachments: [],
+  };
+}
+
 test('escapeAttr escapes unsafe attribute characters', () => {
   assert.equal(escapeAttr('"x<&'), '&quot;x&lt;&amp;');
 });
@@ -180,6 +193,220 @@ test('explicit verified flush atomically pastes and submits one queued Discord p
   assert.equal(writes[0].text.startsWith(BRACKETED_PASTE_START), true);
   assert.equal(writes[0].text.endsWith(`${BRACKETED_PASTE_END}\r`), true);
   assert.equal((writes[0].text.match(/\r/g) || []).length, 1);
+});
+
+test('configured auto-submit compatibility persists and atomically delivers during receive', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    ttyAutoSubmitCompat: true,
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'cr',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, () => {}, {
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  const result = await delivery.deliver(discordMessage('m-auto', 'deliver now'));
+
+  assert.equal(result.status, 'delivered');
+  assert.equal(result.reason, 'queue_flushed');
+  assert.equal(result.deliveredCount, 1);
+  assert.deepEqual(writes, [{
+    tty: '/dev/pts/9',
+    text: framedPaste('deliver now', '\r'),
+  }]);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items, []);
+  assert.deepEqual(persisted.completed.map((item) => item.messageId), ['m-auto']);
+  assert.equal(persisted.blocked, null);
+});
+
+test('auto-submit compatibility persists the next inbound message while the head injector is stalled', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const writes = [];
+  let activeInjectors = 0;
+  let maxActiveInjectors = 0;
+  let firstInjectionStarted;
+  let finishFirstInjection;
+  const firstStarted = new Promise((resolve) => { firstInjectionStarted = resolve; });
+  const firstPending = new Promise((resolve) => { finishFirstInjection = resolve; });
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    ttyAutoSubmitCompat: true,
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'cr',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, () => {}, {
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      activeInjectors += 1;
+      maxActiveInjectors = Math.max(maxActiveInjectors, activeInjectors);
+      writes.push({ tty, text: data.toString('utf8') });
+      if (writes.length === 1) {
+        firstInjectionStarted();
+        await firstPending;
+      }
+      activeInjectors -= 1;
+    },
+  });
+
+  const first = delivery.deliver(discordMessage('m1', 'first'));
+  await firstStarted;
+  const second = delivery.deliver(discordMessage('m2', 'second'));
+  const secondPersistedBeforeFirstFinished = await new Promise((resolve) => {
+    let attempts = 0;
+    const inspect = () => {
+      const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+      if (persisted.items.some((item) => item.normalized.messageId === 'm2')) {
+        resolve(true);
+        return;
+      }
+      attempts += 1;
+      if (attempts >= 50) {
+        resolve(false);
+        return;
+      }
+      setTimeout(inspect, 1);
+    };
+    inspect();
+  });
+  finishFirstInjection();
+  const results = await Promise.all([first, second]);
+
+  assert.equal(secondPersistedBeforeFirstFinished, true);
+  assert.deepEqual(results.map((result) => result.status), ['delivered', 'delivered']);
+  assert.equal(maxActiveInjectors, 1);
+  assert.deepEqual(writes.map((write) => write.text), [
+    framedPaste('first', '\r'),
+    framedPaste('second', '\r'),
+  ]);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items, []);
+  assert.deepEqual(persisted.completed.map((item) => item.messageId), ['m1', 'm2']);
+});
+
+test('auto-submit compatibility requires an effective submit sequence', async (t) => {
+  for (const [name, override] of [
+    ['tty submit disabled', { ttySubmit: false, ttySubmitSequence: 'cr' }],
+    ['submit sequence none', { ttySubmit: true, ttySubmitSequence: 'none' }],
+  ]) {
+    await t.test(name, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+      const queuePath = path.join(dir, 'pending-delivery.json');
+      let injectorCalls = 0;
+      const delivery = createDelivery({
+        deliveryMode: 'tty',
+        ttyAutoSubmitCompat: true,
+        tty: '/dev/pts/9',
+        ttyPromptFormat: 'plain',
+        ...override,
+        paths: {
+          stateDir: dir,
+          lastInboundPath: path.join(dir, 'last-inbound.json'),
+          deliveryQueuePath: queuePath,
+        },
+      }, () => {}, {
+        ttyExists: () => true,
+        runTtyInjector: async () => {
+          injectorCalls += 1;
+        },
+      });
+
+      const result = await delivery.deliver(discordMessage(`m-${name}`, 'must remain queued'));
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.reason, 'auto_submit_requires_submit_sequence');
+      assert.equal(injectorCalls, 0);
+      const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+      assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), [`m-${name}`]);
+      assert.deepEqual(persisted.completed, []);
+    });
+  }
+});
+
+test('auto-submit compatibility blocks replay after an uncertain injection', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  let injectorCalls = 0;
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    ttyAutoSubmitCompat: true,
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'cr',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: queuePath,
+    },
+  }, () => {}, {
+    ttyExists: () => true,
+    runTtyInjector: async () => {
+      injectorCalls += 1;
+      throw new Error('injector acknowledgement lost');
+    },
+  });
+
+  const first = await delivery.deliver(discordMessage('m1', 'first'));
+  const second = await delivery.deliver(discordMessage('m2', 'second'));
+
+  assert.equal(first.status, 'failed');
+  assert.equal(first.reason, 'delivery_outcome_uncertain');
+  assert.equal(second.status, 'failed');
+  assert.equal(second.reason, 'delivery_outcome_uncertain');
+  assert.equal(injectorCalls, 1);
+  const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+  assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1', 'm2']);
+  assert.equal(persisted.blocked.reason, 'delivery_outcome_uncertain');
+});
+
+test('auto-submit compatibility preserves long Unicode and strips control framing bytes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const writes = [];
+  const unicode = '\u6c49\u5b57\ud83d\ude42e\u0301'.repeat(400);
+  const content = `${unicode}\x1b[201~\rafter`;
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    ttyAutoSubmitCompat: true,
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'cr',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
+  }, () => {}, {
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  const result = await delivery.deliver(discordMessage('m-unicode-control', content));
+
+  assert.equal(result.status, 'delivered');
+  assert.deepEqual(writes, [{
+    tty: '/dev/pts/9',
+    text: framedPaste(`${unicode}[201~\nafter`, '\r'),
+  }]);
 });
 
 test('tty delivery keeps a long Unicode prompt intact in one submitted paste frame', async () => {
