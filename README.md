@@ -53,10 +53,10 @@ are not exposed.
 
 Codex CLI 0.144.1 does not expose its private composer/modal focus state. The plugin therefore keeps TTY delivery fail-closed: accepted messages remain in a durable FIFO queue and raw keystrokes are not injected. See [TTY Delivery Safety Boundary](docs/tty-delivery-safety.md).
 
-## Local Install
+## Remote Marketplace Install
 
 ```bash
-codex plugin marketplace add /home/zheng/workspace/a5/a5_codex/codex-discord-channel
+codex plugin marketplace add zhshgmail/codex-discord-channel --ref main
 codex plugin add codex-discord-channel@personal
 ```
 
@@ -161,7 +161,7 @@ Do not commit `.env`.
 cd plugins/codex-discord-channel
 npm install
 npm run check
-python3 /home/zheng/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py .
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/validate_plugin.py" .
 ```
 
 ## Import Existing Bridge State
