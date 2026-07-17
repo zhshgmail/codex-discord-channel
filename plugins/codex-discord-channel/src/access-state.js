@@ -73,16 +73,7 @@ function mentionsBot(content, botUserId, patterns = []) {
   });
 }
 
-function decideAccess(state, message) {
-  if (message.source === 'dm') {
-    if (state.dmPolicy === 'open') return { allowed: true, reason: 'dm_open' };
-    if (state.allowFrom.includes(message.authorId)) return { allowed: true, reason: 'dm_allowlisted' };
-    if (state.dmPolicy === 'pairing') {
-      return { allowed: false, reason: 'dm_pairing_required', requiresPairingCode: true };
-    }
-    return { allowed: false, reason: 'dm_closed' };
-  }
-
+function decideGuildEnvelopeAccess(state, message) {
   const group = state.groups[message.channelId];
   if (!group) return { allowed: false, reason: 'guild_channel_not_enabled' };
 
@@ -94,15 +85,102 @@ function decideAccess(state, message) {
     return { allowed: false, reason: 'guild_sender_denied' };
   }
 
-  if (group.requireMention && !mentionsBot(message.content, message.botUserId, state.mentionPatterns)) {
+  return { allowed: true, reason: 'guild_envelope_allowed' };
+}
+
+function decideAccess(state, message) {
+  if (message.source === 'dm') {
+    if (state.dmPolicy === 'open') return { allowed: true, reason: 'dm_open' };
+    if (state.allowFrom.includes(message.authorId)) return { allowed: true, reason: 'dm_allowlisted' };
+    if (state.dmPolicy === 'pairing') {
+      return { allowed: false, reason: 'dm_pairing_required', requiresPairingCode: true };
+    }
+    return { allowed: false, reason: 'dm_closed' };
+  }
+
+  const envelopeDecision = decideGuildEnvelopeAccess(state, message);
+  if (!envelopeDecision.allowed) return envelopeDecision;
+
+  const group = state.groups[message.channelId];
+  const currentMessageMentionsBot = mentionsBot(message.content, message.botUserId, state.mentionPatterns);
+  const replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+  const referencedMessageMentionsBot = mentionsBot(
+    message.repliedToContent,
+    message.botUserId,
+    state.mentionPatterns,
+  );
+  if (
+    group.requireMention &&
+    !currentMessageMentionsBot &&
+    !replyAuthorIsBot &&
+    !referencedMessageMentionsBot
+  ) {
     return { allowed: false, reason: 'guild_mention_required' };
   }
 
   return { allowed: true, reason: 'guild_allowed' };
 }
 
+const GUILD_HISTORY_CHANNEL_TYPES = new Set([0, 5, 10, 11, 12]);
+
+function dmCounterpartyId(target, botUserId) {
+  if (target.recipient?.id) return String(target.recipient.id);
+  const recipients = Array.from(target.recipients?.values?.() || []);
+  const counterparty = recipients.find((recipient) => String(recipient?.id || '') !== botUserId);
+  return String(counterparty?.id || '');
+}
+
+function decideHistoryTarget(state, target, botUserId) {
+  if (!target || typeof target !== 'object') {
+    return { allowed: false, reason: 'history_target_not_allowed' };
+  }
+
+  if (target.type === 1 && !target.guildId) {
+    const counterpartyId = dmCounterpartyId(target, botUserId);
+    if (!counterpartyId) return { allowed: false, reason: 'history_target_not_allowed' };
+    if (state.dmPolicy === 'open') {
+      return { allowed: true, reason: 'dm_open', source: 'dm', counterpartyId };
+    }
+    if (state.allowFrom.includes(counterpartyId)) {
+      return { allowed: true, reason: 'dm_allowlisted', source: 'dm', counterpartyId };
+    }
+    return { allowed: false, reason: 'history_target_not_allowed' };
+  }
+
+  const channelId = String(target.id || '');
+  if (
+    target.guildId &&
+    GUILD_HISTORY_CHANNEL_TYPES.has(target.type) &&
+    Object.hasOwn(state.groups, channelId)
+  ) {
+    return { allowed: true, reason: 'guild_channel_enabled', source: 'guild' };
+  }
+  return { allowed: false, reason: 'history_target_not_allowed' };
+}
+
+function allowHistoryMessage(state, target, message, botUserId) {
+  const targetDecision = decideHistoryTarget(state, target, botUserId);
+  if (!targetDecision.allowed) return false;
+
+  const authorId = String(message?.author?.id || '');
+  if (!authorId) return false;
+  if (authorId === botUserId) return true;
+
+  if (targetDecision.source === 'dm') {
+    return authorId === targetDecision.counterpartyId;
+  }
+
+  const group = state.groups[String(target.id)];
+  if (message.author?.bot && group.allowBots !== true) return false;
+  if (group.allowFrom.length > 0 && !group.allowFrom.includes(authorId)) return false;
+  return true;
+}
+
 module.exports = {
+  allowHistoryMessage,
   decideAccess,
+  decideGuildEnvelopeAccess,
+  decideHistoryTarget,
   defaultAccessState,
   ensureAccessFile,
   loadAccessState,

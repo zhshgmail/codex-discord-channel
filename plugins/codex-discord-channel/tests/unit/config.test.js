@@ -22,6 +22,15 @@ test('loadConfig resolves default instance state path', () => {
   const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'Codex 01' }, { cwd: '/workspace' });
   assert.equal(config.paths.instance, 'codex-01');
   assert.equal(config.paths.stateDir, path.join(home, '.codex', 'channels', 'discord', 'codex-01'));
+  assert.equal(config.paths.deliveryQueuePath, path.join(
+    home,
+    '.codex',
+    'channels',
+    'discord',
+    'codex-01',
+    'pending-delivery.json',
+  ));
+  assert.equal(config.ttyAutoSubmitCompat, false);
   assert.equal(config.cwd, '/workspace');
 });
 
@@ -53,12 +62,14 @@ test('loadConfig captures TTY delivery settings', () => {
     CODEX_DISCORD_TTY_USE_SUDO: 'true',
     CODEX_DISCORD_TTY_PROMPT_FORMAT: 'compact',
     CODEX_DISCORD_TTY_SUBMIT_SEQUENCE: 'lf',
+    CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT: 'true',
   });
   assert.equal(config.deliveryMode, 'tty');
   assert.equal(config.tty, '/dev/pts/7');
   assert.equal(config.ttyUseSudo, true);
   assert.equal(config.ttyPromptFormat, 'compact');
   assert.equal(config.ttySubmitSequence, 'lf');
+  assert.equal(config.ttyAutoSubmitCompat, true);
 });
 
 test('loadConfig accepts display prompt format', () => {

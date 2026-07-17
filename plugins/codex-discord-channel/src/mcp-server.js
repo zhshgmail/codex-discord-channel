@@ -2,12 +2,20 @@
 
 const readline = require('node:readline');
 const { loadConfig } = require('./config');
-const { createDelivery, resolveReplyTarget } = require('./delivery');
+const {
+  autoSubmitCompatibilityState,
+  createDelivery,
+  readDeliveryQueueStatus,
+  readLastInboundContext,
+  resolveReplyTarget,
+} = require('./delivery');
 const { sendDiscordMessage, startDiscordClient } = require('./discord-client');
+const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
 
 const SERVER_NAME = 'Codex Discord Channel';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.2.0';
+const MAX_TOOL_RESULT_BYTES = 64 * 1024;
 
 function makeLogger() {
   return (level, message, meta) => {
@@ -35,6 +43,25 @@ function textResult(text, structuredContent = {}) {
   };
 }
 
+function historyToolResult(history) {
+  return textResult(JSON.stringify(history), {
+    channel: {
+      id: history.channelId,
+      name: history.channelName,
+    },
+    source: history.source,
+    page: {
+      hasMore: history.hasMore,
+      nextBefore: history.nextBefore,
+    },
+    messageCount: history.messages.length,
+  });
+}
+
+function historyToolResultFits(history) {
+  return Buffer.byteLength(JSON.stringify(historyToolResult(history)), 'utf8') <= MAX_TOOL_RESULT_BYTES;
+}
+
 function toolList() {
   return [
     {
@@ -59,6 +86,29 @@ function toolList() {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     {
+      name: 'discord_channel_read_history',
+      title: 'Read Discord Channel History',
+      description: 'Read bounded recent history from an authorized Discord channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          channelId: {
+            type: 'string',
+            pattern: '^[1-9]\\d{16,19}$',
+            description: 'Optional Discord channel id. Defaults to the last accepted inbound Discord message.',
+          },
+          before: {
+            type: 'string',
+            pattern: '^[1-9]\\d{16,19}$',
+            description: 'Optional exclusive Discord message id cursor.',
+          },
+          limit: { type: 'integer', minimum: 1, maximum: 25, default: 20 },
+        },
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    {
       name: 'discord_channel_send',
       title: 'Send Discord Message',
       description: 'Send a Discord message through the session-owned bot.',
@@ -76,6 +126,21 @@ function toolList() {
   ];
 }
 
+function historyArgsWithDefaultChannel(args, config) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return args;
+  if (Object.hasOwn(args, 'channelId')) return args;
+
+  let inbound;
+  try {
+    inbound = readLastInboundContext(config);
+  } catch {
+    throw new Error('history_target_not_allowed');
+  }
+  const channelId = typeof inbound?.channelId === 'string' ? inbound.channelId.trim() : '';
+  if (!channelId) throw new Error('history_target_not_allowed');
+  return { ...args, channelId };
+}
+
 function makeContext(config, discordState) {
   return {
     config,
@@ -89,6 +154,13 @@ function makeContext(config, discordState) {
 async function callTool(context, name, args = {}) {
   if (name === 'discord_channel_status') {
     const owner = readOwner(context.config.paths.ownerPath);
+    const deliveryQueue = readDeliveryQueueStatus(context.config);
+    const deliveryMode = String(context.config.deliveryMode || '').toLowerCase();
+    const persistenceEnabled = deliveryMode === 'tty';
+    const autoSubmit = autoSubmitCompatibilityState(context.config);
+    const autoSubmitCompat = persistenceEnabled && autoSubmit.enabled;
+    const autoSubmitPreconditionFailed = persistenceEnabled &&
+      autoSubmit.configured && !autoSubmit.enabled;
     const payload = {
       instance: context.config.paths.instance,
       stateDir: context.config.paths.stateDir,
@@ -104,6 +176,24 @@ async function callTool(context, name, args = {}) {
       ttyPidConfigured: Boolean(context.config.ttyPid),
       ttyUseSudo: context.config.ttyUseSudo,
       ttyPromptFormat: context.config.ttyPromptFormat,
+      ttyAutoSubmitCompat: Boolean(context.config.ttyAutoSubmitCompat),
+      ttyAutoSubmitEffective: autoSubmitCompat,
+      ttyAutoSubmitBlockedReason: autoSubmitPreconditionFailed ? autoSubmit.reason : null,
+      deliverySafety: persistenceEnabled
+        ? (
+          autoSubmitCompat
+            ? 'auto_submit_compat'
+            : (autoSubmitPreconditionFailed ? 'auto_submit_precondition_failed' : 'queue_only')
+        )
+        : 'persistence_disabled',
+      composerReadinessSignal: persistenceEnabled
+        ? (
+          autoSubmitCompat
+            ? 'operator_opt_in_unverified'
+            : (autoSubmitPreconditionFailed ? 'precondition_failed' : 'unavailable')
+        )
+        : 'not_applicable',
+      ...deliveryQueue,
       discordStarted: context.discordState.started,
       discordReason: context.discordState.reason || null,
       currentOwner: owner,
@@ -128,6 +218,16 @@ async function callTool(context, name, args = {}) {
     return textResult(`Sent Discord message ${sent.messageId}.`, sent);
   }
 
+  if (name === 'discord_channel_read_history') {
+    const history = await readDiscordHistory({
+      args: historyArgsWithDefaultChannel(args, context.config),
+      config: context.config,
+      client: context.discordState.client,
+      fitsOutput: historyToolResultFits,
+    });
+    return historyToolResult(history);
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 }
 
@@ -139,7 +239,7 @@ async function handleRequest(context, message) {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        'Use this plugin to claim a Discord bot instance for the current Codex session and deliver accepted Discord messages into the active session terminal.',
+        'Use this plugin to claim a Discord bot instance, inspect the persistent inbound queue, and send Discord replies. TTY delivery defaults to queue-only; explicit auto-submit compatibility is an unverified operator opt-in.',
     });
     return;
   }
@@ -153,7 +253,8 @@ async function handleRequest(context, message) {
   }
   if (method === 'tools/call') {
     try {
-      const result = await callTool(context, params?.name, params?.arguments || {});
+      const args = params != null && Object.hasOwn(params, 'arguments') ? params.arguments : {};
+      const result = await callTool(context, params?.name, args);
       sendResult(id, result);
     } catch (error) {
       sendError(id, -32602, error instanceof Error ? error.message : String(error));
@@ -190,6 +291,7 @@ async function main() {
 }
 
 module.exports = {
+  SERVER_VERSION,
   callTool,
   handleRequest,
   main,

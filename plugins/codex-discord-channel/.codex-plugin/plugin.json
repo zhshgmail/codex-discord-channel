@@ -1,6 +1,6 @@
 {
   "name": "codex-discord-channel",
-  "version": "0.1.0+codex.20260706100450",
+  "version": "0.2.0+codex.20260717042722",
   "description": "Claude-style Discord channel ownership for Codex sessions.",
   "author": {
     "name": "zhshgmail",
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex Discord Channel",
     "shortDescription": "Bind a Discord bot instance to the active Codex session.",
-    "longDescription": "A session-local Discord channel plugin for Codex. It mirrors the Claude Code Discord plugin ownership model, keeps one active owner per bot instance, and delivers accepted Discord messages into the owning terminal session.",
+    "longDescription": "A session-local Discord channel plugin for Codex. It keeps one active owner per bot instance and persistently queues accepted inbound messages until delivery can be verified without unsafe terminal keystrokes.",
     "developerName": "zhshgmail",
     "category": "Productivity",
     "capabilities": [

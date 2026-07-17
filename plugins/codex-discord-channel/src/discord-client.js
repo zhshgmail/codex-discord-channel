@@ -1,6 +1,6 @@
 'use strict';
 
-const { decideAccess, loadAccessState } = require('./access-state');
+const { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require('./access-state');
 const { normalizeDiscordMessage } = require('./delivery');
 const { isActiveDiscordReceiver } = require('./receiver-state');
 
@@ -39,6 +39,25 @@ function configureNetwork(config, logger) {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+}
+
+async function resolveReferencedMessage(message, accessState) {
+  if (
+    !message.guildId ||
+    !message.reference?.messageId ||
+    typeof message.fetchReference !== 'function'
+  ) {
+    return null;
+  }
+
+  const envelopeDecision = decideGuildEnvelopeAccess(accessState, normalizeDiscordMessage(message));
+  if (!envelopeDecision.allowed) return null;
+
+  try {
+    return await message.fetchReference();
+  } catch {
+    return null;
   }
 }
 
@@ -82,7 +101,8 @@ async function startDiscordClient({ config, delivery, logger }) {
         return;
       }
       const accessState = loadAccessState(config.paths.accessPath);
-      const normalized = normalizeDiscordMessage(message);
+      const referencedMessage = await resolveReferencedMessage(message, accessState);
+      const normalized = normalizeDiscordMessage(message, referencedMessage);
       normalized.botUserId = client.user?.id || config.botUserId || '';
       const decision = decideAccess(accessState, normalized);
       if (!decision.allowed) {
@@ -138,6 +158,7 @@ async function sendDiscordMessage(client, args) {
 
 module.exports = {
   configureNetwork,
+  resolveReferencedMessage,
   sendDiscordMessage,
   startDiscordClient,
 };
