@@ -9,6 +9,8 @@ const { parseCodexTtyCandidates } = require('./tty-detect');
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
 const DELIVERY_IN_PROGRESS = 'delivery_in_progress';
 const DELIVERY_OUTCOME_UNCERTAIN = 'delivery_outcome_uncertain';
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
 const activeDeliveryAttempts = new Set();
 
 function escapeAttr(value) {
@@ -480,8 +482,7 @@ async function flushDeliveryQueue(config, logger = () => {}, deps = {}) {
         if (isDeliveryOutcomeUncertain(queue)) {
           return { result: stopOnUncertainDelivery(queue, logger, config, deps, deliveredCount) };
         }
-        const leaseMs = (Number(config.ttyInjectTimeoutMs) || 15000) +
-          (Number(config.ttySubmitDelayMs) || 0) + 5000;
+        const leaseMs = (Number(config.ttyInjectTimeoutMs) || 15000) + 5000;
         queue.blocked = {
           reason: DELIVERY_IN_PROGRESS,
           at: new Date().toISOString(),
@@ -835,14 +836,9 @@ async function injectIntoTty(normalized, envelope, config = {}, deps = {}) {
   const prompt = terminalSafeText(formatTtyPrompt(normalized, envelope, config));
   const submit = config.ttySubmit === false ? '' : decodeSubmitSequence(config.ttySubmitSequence);
   const write = deps.runTtyInjector || ((targetTty, input) => runTtyInjector(targetTty, input, config));
+  const input = `${BRACKETED_PASTE_START}${prompt}${BRACKETED_PASTE_END}${submit}`;
 
-  if (submit && config.ttySplitSubmit !== false) {
-    await write(tty, Buffer.from(prompt, 'utf8'));
-    await sleep(config.ttySubmitDelayMs);
-    await write(tty, Buffer.from(submit, 'utf8'));
-  } else {
-    await write(tty, Buffer.from(`${prompt}${submit}`, 'utf8'));
-  }
+  await write(tty, Buffer.from(input, 'utf8'));
   return tty;
 }
 

@@ -15,6 +15,13 @@ const {
   resolveReplyTarget,
 } = require('../../src/delivery');
 
+const BRACKETED_PASTE_START = '\x1b[200~';
+const BRACKETED_PASTE_END = '\x1b[201~';
+
+function framedPaste(text, submit = '') {
+  return `${BRACKETED_PASTE_START}${text}${BRACKETED_PASTE_END}${submit}`;
+}
+
 test('escapeAttr escapes unsafe attribute characters', () => {
   assert.equal(escapeAttr('"x<&'), '&quot;x&lt;&amp;');
 });
@@ -121,7 +128,7 @@ test('off delivery returns unsupported without pretending host push exists', asy
   assert.equal(result.reason, 'delivery_disabled');
 });
 
-test('explicit verified flush injects a queued Discord prompt into the session terminal', async () => {
+test('explicit verified flush atomically pastes and submits one queued Discord prompt', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
   const writes = [];
   const delivery = createDelivery({
@@ -129,7 +136,6 @@ test('explicit verified flush injects a queued Discord prompt into the session t
     tty: '/dev/pts/9',
     ttyPromptFormat: 'minimal',
     ttySubmitSequence: 'cr',
-    ttySubmitDelayMs: 0,
     paths: {
       stateDir: dir,
       lastInboundPath: path.join(dir, 'last-inbound.json'),
@@ -164,14 +170,104 @@ test('explicit verified flush injects a queued Discord prompt into the session t
   assert.equal(result.status, 'delivered');
   assert.equal(result.reason, 'queue_flushed');
   assert.equal(result.tty, '/dev/pts/9');
-  assert.equal(writes.length, 2);
+  assert.equal(writes.length, 1);
   assert.equal(writes[0].tty, '/dev/pts/9');
   assert.match(writes[0].text, /Discord message received/);
   assert.match(writes[0].text, /channelId: "c1"/);
   assert.match(writes[0].text, /replyTo: "m1"/);
   assert.match(writes[0].text, /codex-discord-channel' send --channel 'c1' --reply-to 'm1'/);
   assert.match(writes[0].text, /<@bot> hello/);
-  assert.equal(writes[1].text, '\r');
+  assert.equal(writes[0].text.startsWith(BRACKETED_PASTE_START), true);
+  assert.equal(writes[0].text.endsWith(`${BRACKETED_PASTE_END}\r`), true);
+  assert.equal((writes[0].text.match(/\r/g) || []).length, 1);
+});
+
+test('tty delivery keeps a long Unicode prompt intact in one submitted paste frame', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const writes = [];
+  const content = '\u6c49\u5b57\ud83d\ude42e\u0301'.repeat(400);
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'cr',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
+  }, () => {}, {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm-unicode',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content,
+    attachments: [],
+  });
+  const result = await delivery.flush();
+
+  assert.equal(result.status, 'delivered');
+  assert.deepEqual(writes, [{
+    tty: '/dev/pts/9',
+    text: framedPaste(content, '\r'),
+  }]);
+});
+
+test('tty delivery cannot be terminated or submitted by control bytes in Discord text', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+  const writes = [];
+  const delivery = createDelivery({
+    deliveryMode: 'tty',
+    tty: '/dev/pts/9',
+    ttyPromptFormat: 'plain',
+    ttySubmitSequence: 'cr',
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
+  }, () => {}, {
+    getComposerReadiness: async () => ({
+      ready: true,
+      source: 'test-host',
+      evidence: 'composer-ready',
+    }),
+    ttyExists: () => true,
+    runTtyInjector: async (tty, data) => {
+      writes.push({ tty, text: data.toString('utf8') });
+    },
+  });
+
+  await delivery.deliver({
+    source: 'dm',
+    channelId: 'c1',
+    guildId: null,
+    messageId: 'm-control',
+    authorId: 'u1',
+    authorName: 'Alice',
+    content: 'before\x1b[201~\rafter',
+    attachments: [],
+  });
+  await delivery.flush();
+
+  assert.deepEqual(writes, [{
+    tty: '/dev/pts/9',
+    text: framedPaste('before[201~\nafter', '\r'),
+  }]);
 });
 
 test('tty delivery queues durably when composer readiness cannot be verified', async () => {
@@ -214,6 +310,53 @@ test('tty delivery queues durably when composer readiness cannot be verified', a
   assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
   assert.equal(persisted.blocked.reason, 'composer_readiness_unavailable');
   assert.equal(logs.some(([level]) => level === 'ERROR'), true);
+});
+
+test('tty delivery leaves messages queued while the TUI is busy or has draft text', async (t) => {
+  for (const reason of ['composer_task_running', 'composer_has_draft']) {
+    await t.test(reason, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
+      const queuePath = path.join(dir, 'pending-delivery.json');
+      const writes = [];
+      const delivery = createDelivery({
+        deliveryMode: 'tty',
+        tty: '/dev/pts/9',
+        paths: {
+          stateDir: dir,
+          lastInboundPath: path.join(dir, 'last-inbound.json'),
+          deliveryQueuePath: queuePath,
+        },
+      }, () => {}, {
+        getComposerReadiness: async () => ({ ready: false, reason }),
+        ttyExists: () => true,
+        runTtyInjector: async (tty, data) => {
+          writes.push({ tty, text: data.toString('utf8') });
+        },
+      });
+
+      await delivery.deliver({
+        source: 'dm',
+        channelId: 'c1',
+        guildId: null,
+        messageId: `m-${reason}`,
+        authorId: 'u1',
+        authorName: 'Alice',
+        content: reason,
+        attachments: [],
+      });
+      const result = await delivery.flush();
+
+      assert.equal(result.status, 'queued');
+      assert.equal(result.reason, reason);
+      assert.deepEqual(writes, []);
+      const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
+      assert.deepEqual(
+        persisted.items.map((item) => item.normalized.messageId),
+        [`m-${reason}`],
+      );
+      assert.equal(persisted.blocked.reason, reason);
+    });
+  }
 });
 
 test('receiver enqueue never waits for or invokes the composer readiness seam', async () => {
@@ -628,7 +771,7 @@ test('tty delivery rejects a positive readiness assertion without source evidenc
   assert.equal(writes.length, 0);
 });
 
-test('tty delivery blocks the FIFO after a partially injected message', async () => {
+test('tty delivery blocks the FIFO when an atomic injection outcome is uncertain', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-'));
   const queuePath = path.join(dir, 'pending-delivery.json');
   const logs = [];
@@ -636,9 +779,8 @@ test('tty delivery blocks the FIFO after a partially injected message', async ()
   const delivery = createDelivery({
     deliveryMode: 'tty',
     tty: '/dev/pts/9',
-    ttySplitSubmit: true,
+    ttyPromptFormat: 'plain',
     ttySubmitSequence: 'cr',
-    ttySubmitDelayMs: 0,
     paths: {
       stateDir: dir,
       lastInboundPath: path.join(dir, 'last-inbound.json'),
@@ -653,7 +795,7 @@ test('tty delivery blocks the FIFO after a partially injected message', async ()
     ttyExists: () => true,
     runTtyInjector: async (tty, data) => {
       writes.push({ tty, text: data.toString('utf8') });
-      if (writes.length === 2) throw new Error('submit ioctl denied');
+      throw new Error('injector result lost');
     },
   });
 
@@ -672,7 +814,10 @@ test('tty delivery blocks the FIFO after a partially injected message', async ()
   const result = await delivery.flush();
   assert.equal(result.status, 'failed');
   assert.equal(result.reason, 'delivery_outcome_uncertain');
-  assert.equal(writes.length, 2);
+  assert.deepEqual(writes, [{
+    tty: '/dev/pts/9',
+    text: framedPaste('retain me', '\r'),
+  }]);
   let persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
   assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1']);
   assert.equal(persisted.blocked.reason, 'delivery_outcome_uncertain');
@@ -681,7 +826,7 @@ test('tty delivery blocks the FIFO after a partially injected message', async ()
   const retry = await delivery.flush();
   assert.equal(retry.status, 'failed');
   assert.equal(retry.reason, 'delivery_outcome_uncertain');
-  assert.equal(writes.length, 2);
+  assert.equal(writes.length, 1);
 
   const next = await delivery.deliver({
     source: 'dm',
@@ -695,7 +840,7 @@ test('tty delivery blocks the FIFO after a partially injected message', async ()
   });
   assert.equal(next.status, 'failed');
   assert.equal(next.reason, 'delivery_outcome_uncertain');
-  assert.equal(writes.length, 2);
+  assert.equal(writes.length, 1);
   persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
   assert.deepEqual(persisted.items.map((item) => item.normalized.messageId), ['m1', 'm2']);
   assert.equal(persisted.blocked.reason, 'delivery_outcome_uncertain');
@@ -783,7 +928,7 @@ test('tty delivery flushes the persistent queue FIFO only after verified readine
     deliveryMode: 'tty',
     tty: '/dev/pts/9',
     ttyPromptFormat: 'plain',
-    ttySubmitSequence: 'none',
+    ttySubmitSequence: 'cr',
     paths: {
       stateDir: dir,
       lastInboundPath: path.join(dir, 'last-inbound.json'),
@@ -829,8 +974,11 @@ test('tty delivery flushes the persistent queue FIFO only after verified readine
   assert.equal(result.reason, 'queue_flushed');
   assert.equal(result.deliveredCount, 2);
   assert.equal(result.queueDepth, 0);
-  assert.deepEqual(writes.map((write) => write.text), ['first', 'second']);
-  assert.equal(writes.some((write) => write.text.startsWith('\x1b')), false);
+  assert.deepEqual(writes.map((write) => write.text), [
+    framedPaste('first', '\r'),
+    framedPaste('second', '\r'),
+  ]);
+  assert.equal(writes.every((write) => (write.text.match(/\r/g) || []).length === 1), true);
   const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
   assert.deepEqual(persisted.items, []);
   assert.equal(persisted.blocked, null);
@@ -844,7 +992,7 @@ test('tty delivery serializes concurrent receiver calls without duplicate inject
     deliveryMode: 'tty',
     tty: '/dev/pts/9',
     ttyPromptFormat: 'plain',
-    ttySubmitSequence: 'none',
+    ttySubmitSequence: 'cr',
     paths: {
       stateDir: dir,
       lastInboundPath: path.join(dir, 'last-inbound.json'),
@@ -883,7 +1031,10 @@ test('tty delivery serializes concurrent receiver calls without duplicate inject
   const flushed = await delivery.flush();
   assert.equal(flushed.status, 'delivered');
   assert.equal(flushed.deliveredCount, 2);
-  assert.deepEqual(writes.map((write) => write.text), ['first', 'second']);
+  assert.deepEqual(writes.map((write) => write.text), [
+    framedPaste('first', '\r'),
+    framedPaste('second', '\r'),
+  ]);
   const persisted = JSON.parse(fs.readFileSync(queuePath, 'utf8'));
   assert.deepEqual(persisted.items, []);
 });

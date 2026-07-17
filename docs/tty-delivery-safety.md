@@ -20,6 +20,8 @@ The shipping runtime now has no automatic raw-key injection path:
 
 The receiver only persists and reports the queue; it never calls the drain seam or waits on a readiness provider. The code-level drain seam exists for a future host-owned readiness adapter and for deterministic tests. It is not exposed as an environment switch, MCP tool, or CLI command.
 
+When a host-owned adapter does invoke that seam after verified readiness, each sanitized prompt is wrapped as one terminal bracketed-paste frame and its configured submit key is appended in the same injector invocation. The previous two-process sequence (plain prompt bytes, a timing delay, then `CR`) could leave Codex's paste-burst detector treating Enter as pasted text and also exposed an interleaving window between messages. Atomic framing removes those two defects, but it does not prove focus, draft state, or delivery acknowledgement; the fail-closed readiness and uncertain-outcome rules still apply.
+
 Persistent storage is a hard dependency. If the queue file or its parent filesystem cannot be written, the receiver logs `ERROR`, returns `delivery_queue_persist_failed`, and performs no injection; no implementation can promise durable acceptance when its storage has failed. The queue also grows while no structured consumer exists, so operators must monitor queue depth and filesystem capacity rather than treating queue-only mode as a permanent transport.
 
 ## Codex 0.144.1 Boundary
