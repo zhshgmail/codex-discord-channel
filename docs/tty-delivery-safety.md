@@ -53,6 +53,11 @@ release before waiting on the separately serialized drain. A later receive can
 therefore reach disk while the head injector is stalled. The queue lock protects
 cross-process state.
 
+After terminal sanitization, an injected prompt whose first non-whitespace
+character is `/` is prefixed as untrusted Discord input. This prevents remote
+text from becoming a Codex slash command even when the operator selects the
+`plain` prompt format.
+
 This mode cannot determine whether the regular composer, a popup, another
 widget, or an unintended draft has focus. It can therefore alter or submit the
 wrong TUI state. Operators must close popups, account for drafts, keep the TUI

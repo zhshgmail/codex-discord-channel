@@ -713,7 +713,13 @@ function terminalSafeText(text) {
   return String(text)
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\u009f]/g, '');
+}
+
+function commandSafeText(text) {
+  const normalized = String(text);
+  if (!/^\s*\//u.test(normalized)) return normalized;
+  return `Discord message (untrusted input):\n\n${normalized}`;
 }
 
 function decodeSubmitSequence(value) {
@@ -883,7 +889,7 @@ function autoSubmitCompatibilityDeps(deps = {}) {
 
 async function injectIntoTty(normalized, envelope, config = {}, deps = {}) {
   const tty = resolveCodexTty(config, deps);
-  const prompt = terminalSafeText(formatTtyPrompt(normalized, envelope, config));
+  const prompt = commandSafeText(terminalSafeText(formatTtyPrompt(normalized, envelope, config)));
   const submit = config.ttySubmit === false ? '' : decodeSubmitSequence(config.ttySubmitSequence);
   const write = deps.runTtyInjector || ((targetTty, input) => runTtyInjector(targetTty, input, config));
   const input = `${BRACKETED_PASTE_START}${prompt}${BRACKETED_PASTE_END}${submit}`;
