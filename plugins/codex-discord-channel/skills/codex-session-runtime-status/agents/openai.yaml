@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Session Runtime Status"
+  short_description: "Verify the current session model and reasoning effort"
+  default_prompt: "Use $codex-session-runtime-status to report this session's model and reasoning effort."

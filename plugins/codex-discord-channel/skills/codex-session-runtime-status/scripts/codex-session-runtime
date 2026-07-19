@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Report the current model and reasoning effort for one exact Codex thread."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import uuid
+
+
+UNKNOWN = "UNKNOWN"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="codex-session-runtime",
+        description="Read model and reasoning effort from one exact Codex session rollout.",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--thread-id", help="exact Codex thread UUID")
+    parser.add_argument("--codex-home", help="Codex home containing sessions/")
+    return parser.parse_args()
+
+
+def emit_unknown(reason: str, thread_id: str | None, json_output: bool) -> int:
+    result = {
+        "effort": UNKNOWN,
+        "model": UNKNOWN,
+        "reason": reason,
+        "status": "unknown",
+        "thread_id": thread_id,
+    }
+    if json_output:
+        print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+    else:
+        print(f"UNKNOWN ({reason})")
+    return 2
+
+
+def emit_success(thread_id: str, model: str, effort: str, json_output: bool) -> int:
+    result = {
+        "effort": effort,
+        "model": model,
+        "status": "ok",
+        "thread_id": thread_id,
+    }
+    if json_output:
+        print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+    else:
+        print(f"model={model}\neffort={effort}")
+    return 0
+
+
+def canonical_thread_id(value: str) -> str | None:
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError):
+        return None
+    canonical = str(parsed)
+    return canonical if value.lower() == canonical else None
+
+
+def valid_runtime_value(value: object, max_length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= max_length
+        and value == value.strip()
+        and value.isprintable()
+    )
+
+
+def inspect_rollout(path: Path, thread_id: str) -> dict[str, object]:
+    session_id: object = None
+    session_meta_count = 0
+    latest_context: object = None
+    malformed = False
+
+    try:
+        before = path.stat()
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.endswith("\n"):
+                    malformed = True
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, UnicodeError):
+                    malformed = True
+                    continue
+
+                if not isinstance(record, dict):
+                    malformed = True
+                    continue
+
+                record_type = record.get("type")
+                if record_type == "session_meta":
+                    session_meta_count += 1
+                    payload = record.get("payload")
+                    candidate_id = payload.get("id") if isinstance(payload, dict) else None
+                    if not isinstance(candidate_id, str):
+                        malformed = True
+                    elif session_id is None:
+                        session_id = candidate_id
+                        if session_id != thread_id:
+                            return {
+                                "kind": "other",
+                                "malformed": malformed,
+                                "session_id": session_id,
+                            }
+                    elif session_id != candidate_id:
+                        malformed = True
+                elif record_type == "turn_context" and session_id == thread_id:
+                    latest_context = record.get("payload")
+        after = path.stat()
+    except (OSError, UnicodeError):
+        return {"kind": "unreadable"}
+
+    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+        malformed = True
+
+    if session_id != thread_id:
+        return {
+            "kind": "other",
+            "malformed": malformed,
+            "session_id": session_id,
+        }
+
+    if malformed or session_meta_count != 1:
+        return {"kind": "match", "reason": "malformed_session"}
+    return {"kind": "match", "context": latest_context}
+
+
+def find_runtime(codex_home: Path, thread_id: str) -> dict[str, object]:
+    sessions_dir = codex_home / "sessions"
+    if not sessions_dir.is_dir():
+        return {"reason": "sessions_not_found"}
+
+    try:
+        rollout_paths = sorted(sessions_dir.rglob("rollout-*.jsonl"))
+    except OSError:
+        return {"reason": "sessions_unreadable"}
+
+    matches: list[dict[str, object]] = []
+    named_candidate_reason: str | None = None
+    expected_suffix = f"-{thread_id}.jsonl"
+
+    for path in rollout_paths:
+        inspected = inspect_rollout(path, thread_id)
+        if inspected["kind"] == "match":
+            matches.append(inspected)
+        elif path.name.endswith(expected_suffix):
+            named_candidate_reason = (
+                "malformed_session"
+                if inspected["kind"] == "unreadable" or inspected.get("malformed")
+                else "session_meta_mismatch"
+            )
+
+    if len(matches) > 1:
+        return {"reason": "ambiguous_session"}
+    if not matches:
+        return {"reason": named_candidate_reason or "thread_not_found"}
+    if named_candidate_reason is not None:
+        return {"reason": "session_meta_mismatch"}
+
+    match = matches[0]
+    if "reason" in match:
+        return {"reason": match["reason"]}
+
+    context = match.get("context")
+    if context is None:
+        return {"reason": "turn_context_missing"}
+    if not isinstance(context, dict):
+        return {"reason": "malformed_session"}
+
+    model = context.get("model")
+    effort = context.get("effort")
+    if not valid_runtime_value(model, 128) or not valid_runtime_value(effort, 64):
+        return {"reason": "turn_context_partial"}
+    return {"model": model, "effort": effort}
+
+
+def main() -> int:
+    args = parse_args()
+    raw_thread_id = (
+        args.thread_id
+        if args.thread_id is not None
+        else os.environ.get("CODEX_THREAD_ID")
+    )
+    if not raw_thread_id:
+        return emit_unknown("missing_thread_id", None, args.json)
+
+    thread_id = canonical_thread_id(raw_thread_id)
+    if thread_id is None:
+        return emit_unknown("invalid_thread_id", None, args.json)
+
+    raw_codex_home = args.codex_home or os.environ.get("CODEX_HOME")
+    codex_home = Path(raw_codex_home).expanduser() if raw_codex_home else Path.home() / ".codex"
+    runtime = find_runtime(codex_home, thread_id)
+    if "reason" in runtime:
+        return emit_unknown(str(runtime["reason"]), thread_id, args.json)
+    return emit_success(
+        thread_id,
+        str(runtime["model"]),
+        str(runtime["effort"]),
+        args.json,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
