@@ -361,7 +361,7 @@ test('status reports when inbound persistence is disabled', async () => {
   assert.equal(result.structuredContent.composerReadinessSignal, 'not_applicable');
 });
 
-test('status reports legacy auto-submit compatibility as disabled queue-only delivery', async () => {
+test('status identifies explicit unverified auto-submit compatibility mode', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const config = loadConfig({
     HOME: home,
@@ -378,16 +378,13 @@ test('status reports legacy auto-submit compatibility as disabled queue-only del
 
   const result = await callTool(context, 'discord_channel_status');
   assert.equal(result.structuredContent.ttyAutoSubmitCompat, true);
-  assert.equal(result.structuredContent.ttyAutoSubmitEffective, false);
-  assert.equal(
-    result.structuredContent.ttyAutoSubmitBlockedReason,
-    'tty_auto_submit_compat_disabled',
-  );
-  assert.equal(result.structuredContent.deliverySafety, 'queue_only');
-  assert.equal(result.structuredContent.composerReadinessSignal, 'unavailable');
+  assert.equal(result.structuredContent.ttyAutoSubmitEffective, true);
+  assert.equal(result.structuredContent.ttyAutoSubmitBlockedReason, null);
+  assert.equal(result.structuredContent.deliverySafety, 'auto_submit_compat');
+  assert.equal(result.structuredContent.composerReadinessSignal, 'operator_opt_in_unverified');
 });
 
-test('status keeps legacy auto-submit disabled regardless of its submit sequence', async () => {
+test('status reports an invalid auto-submit compatibility precondition', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const config = loadConfig({
     HOME: home,
@@ -408,10 +405,10 @@ test('status keeps legacy auto-submit disabled regardless of its submit sequence
   assert.equal(result.structuredContent.ttyAutoSubmitEffective, false);
   assert.equal(
     result.structuredContent.ttyAutoSubmitBlockedReason,
-    'tty_auto_submit_compat_disabled',
+    'auto_submit_requires_submit_sequence',
   );
-  assert.equal(result.structuredContent.deliverySafety, 'queue_only');
-  assert.equal(result.structuredContent.composerReadinessSignal, 'unavailable');
+  assert.equal(result.structuredContent.deliverySafety, 'auto_submit_precondition_failed');
+  assert.equal(result.structuredContent.composerReadinessSignal, 'precondition_failed');
 });
 
 test('send tool defaults to last inbound Discord message when channelId is omitted', async () => {

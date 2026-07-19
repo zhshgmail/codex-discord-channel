@@ -53,9 +53,9 @@ are not exposed.
 
 Codex CLI 0.144.1 does not expose its private composer/modal focus state. TTY
 delivery therefore defaults to fail-closed: accepted messages remain in a
-durable FIFO queue and raw keystrokes are not injected. The former auto-submit
-compatibility setting is retired because it can type into model or
-reasoning-effort popups. Setting it now keeps delivery queue-only. See
+durable FIFO queue and raw keystrokes are not injected. An explicit
+auto-submit compatibility mode is available for a dedicated, operator-managed
+TUI where restoring immediate delivery is worth the focus-state risk. See
 [TTY Delivery Safety Boundary](docs/tty-delivery-safety.md).
 
 ## Remote Marketplace Install
@@ -84,13 +84,16 @@ session.
    session while its instance and state path remain `codex01`.
 3. Call `discord_channel_status`; confirm `deliveryMode: "tty"`, a configured
    TTY, and `discordStarted: true`. The systemd gateway must still be active.
-   Require `ttyAutoSubmitEffective: false`, `deliverySafety: "queue_only"`,
-   and `composerReadinessSignal: "unavailable"`.
-4. Send a controlled message in a real allowed DM and confirm the persistent
-   queue depth increases without text appearing automatically in the visible
-   console. In an allowed guild channel with `requireMention: true`, verify a
-   direct reply to a `codex01` message is also accepted into the queue without
-   a new mention.
+   For immediate TTY delivery, also require `ttyAutoSubmitCompat: true`,
+   `ttyAutoSubmitEffective: true`,
+   `deliverySafety: "auto_submit_compat"`, and
+   `composerReadinessSignal: "operator_opt_in_unverified"`.
+4. Only after closing popups and clearing or intentionally preserving any
+   composer draft, send a controlled message in a real allowed DM and confirm
+   it reaches the visible new Codex console. In an allowed guild channel with
+   `requireMention: true`, verify a direct reply to a `codex01` message reaches
+   that console without a new mention. Without the explicit compatibility
+   setting, verify queue persistence instead of claiming visible delivery.
 5. With `requireMention: true`, verify an inherited reply: reply to a peer
    message that mentioned `codex01` and confirm delivery. Also confirm a reply
    to a peer message that did not mention `codex01` is rejected unless the
@@ -143,10 +146,21 @@ sanitized read errors without printing queued content. By default, the
 receiver does not invoke the internal drain path because the current TUI has no
 verifiable composer-ready signal.
 
-`CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true` is retained only as a legacy
-configuration input. It never enables injection. Messages remain persisted,
-status reports `tty_auto_submit_compat_disabled`, and delivery safety remains
-`queue_only` regardless of the submit setting or sequence.
+With `CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true`, each receive first persists
+the message, FIFO-claims the queue head, and then sends one bracketed-paste
+frame plus its submit key in a single injector process. A successful queue
+commit advances the FIFO; an ambiguous injector or commit result blocks replay
+and preserves that item and every later item for explicit reconciliation. This
+mode does not detect popups, focused widgets, or existing drafts. It can paste
+or submit into the wrong TUI state, so enable it only for a dedicated console
+whose operator accepts that risk. It never prepends Escape or changes model or
+reasoning settings.
+
+Compatibility mode also requires `CODEX_DISCORD_TTY_SUBMIT=true` and a real
+submit sequence such as `cr`, `lf`, or `crlf`. If submit is disabled or the
+sequence is `none`, the message remains persisted, no injector runs, and status
+reports `auto_submit_precondition_failed` with
+`auto_submit_requires_submit_sequence`.
 
 ## Instance Config
 
@@ -169,7 +183,8 @@ DISCORD_PROXY_URL=http://127.0.0.1:8080
 DISCORD_INSECURE_TLS=true
 CODEX_DISCORD_DELIVERY_MODE=tty
 # CODEX_DISCORD_TTY=/dev/pts/7
-# Retired legacy setting. If true, delivery remains queue-only.
+# Optional legacy exact-console behavior. Unsafe when a popup, another widget,
+# or an unintended composer draft has focus. Default: false (queue-only).
 # CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true
 # CODEX_DISCORD_TTY_SUBMIT=true
 # CODEX_DISCORD_TTY_SUBMIT_SEQUENCE=cr

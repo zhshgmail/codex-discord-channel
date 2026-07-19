@@ -8,7 +8,8 @@ Sending Escape first is not safe. It mutates TUI state, can dismiss unrelated us
 
 ## Default Fail-Closed Behavior
 
-The runtime has no automatic raw-key injection path:
+Without an explicit compatibility opt-in, the runtime has no automatic raw-key
+injection path:
 
 - An access-approved Discord message is atomically persisted to `pending-delivery.json` before any delivery attempt. The file is mode `0600` and survives process restarts.
 - Queue mutations use a cross-process lock, and pending plus completed items are deduplicated by Discord channel and message id. Concurrent fallback receivers cannot overwrite or replay an accepted event.
@@ -27,19 +28,37 @@ When a host-owned adapter does invoke that seam after verified readiness, each s
 
 Persistent storage is a hard dependency. If the queue file or its parent filesystem cannot be written, the receiver logs `ERROR`, returns `delivery_queue_persist_failed`, and performs no injection; no implementation can promise durable acceptance when its storage has failed. The queue also grows while no structured consumer exists, so operators must monitor queue depth and filesystem capacity rather than treating queue-only mode as a permanent transport.
 
-## Retired Auto-Submit Compatibility
+## Explicit Auto-Submit Compatibility
 
-`CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true` remains parseable for compatibility
-with existing instance files, but it cannot enable injection. Both receive and
-explicit queue flush stay queue-only, and status reports
-`tty_auto_submit_compat_disabled`. This is independent of the configured TTY
-submit sequence.
+`CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true` is a bounded compatibility path for
+a dedicated TUI where an operator chooses immediate legacy delivery over the
+default focus-state protection. It is not a readiness signal. Status reports
+`deliverySafety: "auto_submit_compat"` and `composerReadinessSignal:
+"operator_opt_in_unverified"` so automation cannot mistake the opt-in for
+observed composer state. TTY submit must be enabled and its decoded sequence
+must be non-empty. Otherwise status reports
+`auto_submit_precondition_failed`/`auto_submit_requires_submit_sequence`, the
+message stays queued, and no injector runs.
 
-The legacy behavior was removed because it could not determine whether the
-regular composer, a popup, another widget, or an unintended draft had focus.
-Raw Discord bytes followed by Enter could therefore alter model or
-reasoning-effort selections. Operator opt-in cannot make an unverifiable focus
-state safe.
+For each receive, the compatibility path atomically persists the Discord item
+before delivery. It then FIFO-claims the queue head with a durable
+`delivery_in_progress` marker, sanitizes terminal control bytes, and passes one
+bracketed-paste frame plus the configured submit sequence to one injector
+process. Only a successful post-injection queue commit marks the identity
+completed. A timeout, injector error, process interruption, changed checkpoint,
+or failed commit blocks the head as `delivery_outcome_uncertain`; it is never
+automatically replayed and all later items remain behind it. Concurrent receive
+admissions serialize only through durable persistence and context update, then
+release before waiting on the separately serialized drain. A later receive can
+therefore reach disk while the head injector is stalled. The queue lock protects
+cross-process state.
+
+This mode cannot determine whether the regular composer, a popup, another
+widget, or an unintended draft has focus. It can therefore alter or submit the
+wrong TUI state. Operators must close popups, account for drafts, keep the TUI
+dedicated, and confirm behavior with a Discord-origin message visible in that
+console. The injector does not send Escape and does not read or change model,
+reasoning-effort, or service-tier settings.
 
 ## Codex 0.144.1 Boundary
 
@@ -65,5 +84,5 @@ The durable solution is to remove keyboard emulation from inbound delivery:
 
 An embedded TUI app-server has no external endpoint for the plugin to join.
 Until the host exposes one or the session uses a shared persistent endpoint,
-inbound messages must remain queued; the retired compatibility setting does
-not provide an alternate delivery path.
+the default mode must keep inbound messages queued; explicit compatibility mode
+remains a consciously unsafe bridge rather than the structured solution.
