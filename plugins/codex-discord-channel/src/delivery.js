@@ -9,6 +9,7 @@ const { parseCodexTtyCandidates } = require('./tty-detect');
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
 const DELIVERY_IN_PROGRESS = 'delivery_in_progress';
 const DELIVERY_OUTCOME_UNCERTAIN = 'delivery_outcome_uncertain';
+const TTY_AUTO_SUBMIT_COMPAT_DISABLED = 'tty_auto_submit_compat_disabled';
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
 const activeDeliveryAttempts = new Set();
@@ -244,7 +245,12 @@ function writeDeliveryQueue(queue, config = {}, deps = {}) {
   fsImpl.renameSync(temp, file);
 }
 
-function queueDelivery(normalized, config = {}, deps = {}) {
+function queueDelivery(
+  normalized,
+  config = {},
+  deps = {},
+  blockedReason = 'composer_readiness_unavailable',
+) {
   const queue = readDeliveryQueue(config, deps);
   const pendingDuplicate = queue.items.some((item) => (
     item.normalized?.channelId === normalized.channelId &&
@@ -264,7 +270,7 @@ function queueDelivery(normalized, config = {}, deps = {}) {
   }
   if (!completedDuplicate && queue.items.length > 0 && !isDeliveryOutcomeUncertain(queue)) {
     queue.blocked = {
-      reason: 'composer_readiness_unavailable',
+      reason: blockedReason,
       at: new Date().toISOString(),
     };
     changed = true;
@@ -726,13 +732,10 @@ function decodeSubmitSequence(value) {
 
 function autoSubmitCompatibilityState(config = {}) {
   const configured = Boolean(config.ttyAutoSubmitCompat);
-  const submitSequence = config.ttySubmit === false
-    ? ''
-    : decodeSubmitSequence(config.ttySubmitSequence);
   return {
     configured,
-    enabled: configured && submitSequence !== '',
-    reason: configured && submitSequence === '' ? 'auto_submit_requires_submit_sequence' : null,
+    enabled: false,
+    reason: configured ? TTY_AUTO_SUBMIT_COMPAT_DISABLED : null,
   };
 }
 
@@ -869,18 +872,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
-function autoSubmitCompatibilityDeps(deps = {}) {
-  if (typeof deps.getComposerReadiness === 'function') return deps;
-  return {
-    ...deps,
-    getComposerReadiness: async () => ({
-      ready: true,
-      source: 'auto_submit_compat',
-      evidence: 'explicit_operator_opt_in',
-    }),
-  };
-}
-
 async function injectIntoTty(normalized, envelope, config = {}, deps = {}) {
   const tty = resolveCodexTty(config, deps);
   const prompt = terminalSafeText(formatTtyPrompt(normalized, envelope, config));
@@ -896,7 +887,6 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let admissionOperations = Promise.resolve();
   let drainOperations = Promise.resolve();
   const autoSubmit = autoSubmitCompatibilityState(config);
-  const drainDeps = autoSubmit.enabled ? autoSubmitCompatibilityDeps(deps) : deps;
   const serializeAdmission = (operation) => {
     const result = admissionOperations.then(operation, operation);
     admissionOperations = result.catch(() => {});
@@ -909,7 +899,43 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   };
   const delivery = {
     flush() {
-      return serializeDrain(() => flushDeliveryQueue(config, logger, drainDeps));
+      if (autoSubmit.configured) {
+        return serializeDrain(async () => {
+          const queue = await withDeliveryQueueLock(
+            config,
+            deps,
+            () => readDeliveryQueue(config, deps),
+          );
+          if (isDeliveryOutcomeUncertain(queue)) {
+            return {
+              status: queue.blocked.reason === DELIVERY_IN_PROGRESS ? 'queued' : 'failed',
+              reason: queue.blocked.reason,
+              deliveredCount: 0,
+              queueDepth: queue.items.length,
+            };
+          }
+          if (queue.items.length === 0) {
+            return {
+              status: 'idle',
+              reason: 'queue_empty',
+              deliveredCount: 0,
+              queueDepth: 0,
+            };
+          }
+          logger('ERROR', 'Legacy TTY auto-submit is disabled; Discord messages remain queued', {
+            reason: autoSubmit.reason,
+            queueDepth: queue.items.length,
+            queuePath: getDeliveryQueuePath(config),
+          });
+          return {
+            status: 'queued',
+            reason: autoSubmit.reason,
+            deliveredCount: 0,
+            queueDepth: queue.items.length,
+          };
+        });
+      }
+      return serializeDrain(() => flushDeliveryQueue(config, logger, deps));
     },
     async deliver(normalized) {
       const envelope = formatEnvelope(normalized);
@@ -940,7 +966,12 @@ function createDelivery(config, logger = () => {}, deps = {}) {
           queueResult = await withDeliveryQueueLock(
             config,
             deps,
-            () => queueDelivery(normalized, config, deps),
+            () => queueDelivery(
+              normalized,
+              config,
+              deps,
+              autoSubmit.configured ? autoSubmit.reason : 'composer_readiness_unavailable',
+            ),
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -1008,7 +1039,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       }
 
       if (autoSubmit.configured && !autoSubmit.enabled) {
-        logger('ERROR', 'Discord message remains queued because auto-submit has no submit sequence', {
+        logger('ERROR', 'Legacy TTY auto-submit is disabled; Discord message remains queued', {
           channelId: normalized.channelId,
           messageId: normalized.messageId,
           reason: autoSubmit.reason,
@@ -1016,26 +1047,11 @@ function createDelivery(config, logger = () => {}, deps = {}) {
           queuePath: getDeliveryQueuePath(config),
         });
         return {
-          status: 'failed',
+          status: 'queued',
           reason: autoSubmit.reason,
           queueDepth: queueResult.queue.items.length,
           envelope,
         };
-      }
-
-      if (autoSubmit.enabled) {
-        logger('WARN', 'Auto-submitting queued Discord message without verified composer state', {
-          channelId: normalized.channelId,
-          messageId: normalized.messageId,
-          queueDepth: queueResult.queue.items.length,
-          queuePath: getDeliveryQueuePath(config),
-        });
-        return serializeDrain(() => flushDeliveryQueue(
-          config,
-          logger,
-          drainDeps,
-          { stopAfter: normalized },
-        ));
       }
 
       logger('ERROR', 'Discord message is queued because composer readiness is not verifiable', {

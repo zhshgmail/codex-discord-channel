@@ -15,11 +15,9 @@ Use this skill when the user wants a Discord bot instance to be owned by the cur
 - Accepted inbound Discord messages are persisted in a FIFO queue for the owning session.
 - Queue mutations are cross-process serialized, with pending and completed Discord identities deduplicated.
 - The current Codex TUI exposes no verifiable composer/modal focus signal, so TTY delivery defaults to queue-only and does not inject raw keystrokes.
-- `CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true` is an explicit operator opt-in
-  for immediate legacy delivery. It persists and FIFO-claims first, then sends
-  one bracketed-paste-plus-submit frame in one injector process. It cannot
-  detect popups, focused widgets, or existing drafts. It requires TTY submit to
-  be enabled with a non-empty submit sequence.
+- `CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true` is a retired legacy input. It
+  remains queue-only and never injects raw keystrokes because the TUI cannot
+  prove which widget has focus.
 - An uncertain prior TTY outcome blocks automatic replay and keeps later items queued for explicit reconciliation.
 - Structured app-server delivery into the exact owned thread is the required exact-console migration path; it must omit model and effort overrides.
 - In enabled guild channels with `requireMention: true`, reply delivery is the
@@ -61,13 +59,10 @@ Use the plugin MCP tools when available:
 Receiver health should show `discordStarted: true`. Default fail-closed status
 reports `deliverySafety: "queue_only"` and `composerReadinessSignal:
 "unavailable"`; inspect `deliveryQueueDepth` and `deliveryBlockedReason` rather
-than claiming inbound transcript delivery. Explicit compatibility mode reports
-`ttyAutoSubmitCompat: true`, `ttyAutoSubmitEffective: true`,
-`deliverySafety: "auto_submit_compat"`, and
-`composerReadinessSignal: "operator_opt_in_unverified"`. An invalid submit configuration reports
-`deliverySafety: "auto_submit_precondition_failed"` and injects nothing. That
-status records accepted risk, not verified TUI focus; visible-console
-acceptance still requires an observed Discord-origin smoke.
+than claiming inbound transcript delivery. If the retired compatibility
+setting is present, status reports `ttyAutoSubmitCompat: true`,
+`ttyAutoSubmitEffective: false`, `tty_auto_submit_compat_disabled`, and
+`deliverySafety: "queue_only"`.
 
 ## History Reads
 
@@ -103,13 +98,11 @@ instead of expecting a closed MCP transport to hot-reload. In that new session:
 1. Call `discord_channel_claim_owner`, then `discord_channel_read_owner`, and
    confirm ownership moved to the new session without changing the instance.
 2. Call `discord_channel_status` and confirm the exact-console TTY route and
-   Discord startup state are healthy. Immediate delivery additionally requires
-   the explicit compatibility diagnostics described above.
-3. Close popups and account for any composer draft, then smoke an allowed DM.
-   In an allowed group with `requireMention: true`, smoke a guild message, a
-   direct reply to this bot, and an inherited reply to a peer message that
-   mentioned this bot; each accepted event must appear in the exact visible new
-   console. In default mode, verify queue persistence instead.
+   Discord startup state are healthy. Confirm delivery remains queue-only.
+3. Smoke an allowed DM. In an allowed group with `requireMention: true`, smoke
+   a guild message, a direct reply to this bot, and an inherited reply to a
+   peer message that mentioned this bot. Each accepted event must remain in
+   the persistent queue and must not type into the visible console.
 4. With `requireMention: true`, confirm a peer reply that does not mention this
    bot is rejected unless the current reply explicitly mentions it. In an
    allowed group with `requireMention: false`, confirm all otherwise-authorized
