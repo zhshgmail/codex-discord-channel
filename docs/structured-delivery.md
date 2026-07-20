@@ -17,16 +17,23 @@ unavailable while accepted messages remain persisted.
 The stable receiver identity is:
 
 1. the normalized Discord instance and its state directory; and
-2. the PID and generation in the atomic JSON authority record at
+2. the PID and generation in the atomically replaced authority record at
    `session-gateway.pid`.
 
 The record is replaced by one atomic rename. A live incumbent remains the
 effective receiver until a logged-in successor has proved durable queue and
 target readiness, armed its listener, and committed that replacement. The new
 record retains the incumbent as fallback, so an A7 incumbent becomes effective
-again if the committed successor process dies. Legacy integer PID plus
-`.generation` state is accepted only as migration input and is never written by
-new claims.
+again if the committed successor process dies.
+
+Pure A7 handoffs store one-line version-2 JSON. When the fallback is a running
+A6 gateway, the same atomic file contains the A6 PID on its first line and the
+version-2 record on its second line. A6 continues to parse its PID, while A7
+validates that the prefix matches the structured version-1 fallback. Because A6
+cannot observe successor death, both listeners remain eligible during this
+staged interval; the process-safe queue lock and Discord identity deduplication
+remain the exactly-once boundary. Graceful A7 release restores the legacy
+integer representation without changing the A6 `.generation` record.
 
 When no live incumbent exists, target readiness is not a receive-startup gate.
 The first gateway logs in, proves queue persistence, arms its listener, and

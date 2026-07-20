@@ -27,11 +27,11 @@
 - Consumes: exact A6 Git object `plugins/codex-discord-channel/src/receiver-state.js`, current A7 receiver-state exports.
 - Produces: two regression cases for post-commit death and graceful release.
 
-- [ ] Add a CommonJS test loader that runs the receiver-state source extracted from exact A6 commit `c09749a018253e79ac939be1e2a5809756209437` in a temporary module directory.
-- [ ] Create a legacy integer authority plus version-1 `.generation` record, commit a version-2 successor through current `createReceiverOwnership()` and `commitReceiverOwnership()`, then assert historical A6 reports `gateway_pid_match` after the successor is considered dead.
-- [ ] Repeat the setup, call current `releaseReceiverOwnership()`, and assert historical A6 reports `gateway_pid_match` after graceful release.
-- [ ] Run `node --test tests/unit/receiver-state-mixed-binary.test.js` and confirm both assertions fail with `gateway_pid_missing` before production edits.
-- [ ] Commit and push the red regression checkpoint.
+- [x] Add a CommonJS test loader that runs the receiver-state source extracted from exact A6 commit `c09749a018253e79ac939be1e2a5809756209437` in a temporary module directory.
+- [x] Create a legacy integer authority plus version-1 `.generation` record, commit a version-2 successor through current `createReceiverOwnership()` and `commitReceiverOwnership()`, then assert historical A6 reports `gateway_pid_match` after the successor is considered dead.
+- [x] Repeat the setup, call current `releaseReceiverOwnership()`, and assert historical A6 reports `gateway_pid_match` after graceful release.
+- [x] Run `node --test tests/unit/receiver-state-mixed-binary.test.js` and confirm both assertions fail with `gateway_pid_missing` before production edits.
+- [x] Commit and push the red regression checkpoint.
 
 ### Task 2: Compatibility-Framed Atomic Authority
 
@@ -44,12 +44,12 @@
 - Consumes: version-1 fallback identity already produced by `readReceiverAuthoritySnapshot()`.
 - Produces: validated framed-record parsing, conditional atomic serialization, and legacy-format graceful restoration.
 
-- [ ] Extend authority parsing to recognize `<pid>\n<json>` only when the JSON is a valid version-2 record with a matching version-1 fallback PID.
-- [ ] Serialize candidate records with a version-1 fallback using the matching PID prefix; keep all other records as one-line JSON.
-- [ ] Restore a live version-1 fallback as an atomic integer PID on graceful release; retain version-2 JSON promotion for all-A7 fallback.
-- [ ] Update the crash fixture to parse the structured body of either pure or compatibility-framed authority.
-- [ ] Run the mixed-binary and receiver-state tests and confirm the historical A6 cases and malformed-frame fail-closed cases pass.
-- [ ] Commit and push the green implementation checkpoint.
+- [x] Extend authority parsing to recognize `<pid>\n<json>` only when the JSON is a valid version-2 record with a matching version-1 fallback PID.
+- [x] Serialize candidate records with a version-1 fallback using the matching PID prefix; keep all other records as one-line JSON.
+- [x] Restore a live version-1 fallback as an atomic integer PID on graceful release; retain version-2 JSON promotion for all-A7 fallback.
+- [x] Update the crash fixture to parse the structured body of either pure or compatibility-framed authority.
+- [x] Run the mixed-binary and receiver-state tests and confirm the historical A6 cases and malformed-frame fail-closed cases pass.
+- [x] Commit and push the green implementation checkpoint.
 
 ### Task 3: Contract And Verification
 
