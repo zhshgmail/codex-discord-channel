@@ -110,7 +110,7 @@ function readQueue(dir) {
   return JSON.parse(fs.readFileSync(path.join(dir, 'pending-delivery.json'), 'utf8'));
 }
 
-function writePendingQueue(dir, messages) {
+function writePendingQueue(dir, messages, options = {}) {
   fs.writeFileSync(path.join(dir, 'pending-delivery.json'), `${JSON.stringify({
     version: 1,
     items: messages.map((normalized) => ({
@@ -118,8 +118,8 @@ function writePendingQueue(dir, messages) {
       queuedAt: '2026-07-20T00:00:00.000Z',
       normalized,
     })),
-    completed: [],
-    blocked: null,
+    completed: options.completed || [],
+    blocked: options.blocked || null,
   }, null, 2)}\n`);
 }
 
@@ -306,6 +306,164 @@ test('persisted accepted message drains autonomously when delivery starts', asyn
 
   assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-startup']);
   assert.deepEqual(readQueue(dir).items, []);
+  delivery.destroy();
+});
+
+test('startup drain advances a crashed accepted head and submits the next FIFO item', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-crash-drain-'));
+  writePendingQueue(dir, [
+    discordMessage('m-crashed', 'accepted before crash'),
+    discordMessage('m-next', 'next in fifo'),
+  ], {
+    blocked: {
+      reason: 'structured_delivery_in_progress',
+      at: '2026-07-20T00:00:00.000Z',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      messageId: 'm-crashed',
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-crashed',
+      pid: process.pid,
+      attemptId: 'crashed-attempt',
+    },
+  });
+  const reconciliations = [];
+  const requests = [];
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-next' } };
+      },
+      async hasDelivered(threadId, clientUserMessageId) {
+        reconciliations.push({ threadId, clientUserMessageId });
+        return clientUserMessageId === 'discord:c1:m-crashed';
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(reconciliations, [{
+    threadId: 'thread-current',
+    clientUserMessageId: 'discord:c1:m-crashed',
+  }]);
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-next']);
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(
+    readQueue(dir).completed.map((item) => item.messageId),
+    ['m-crashed', 'm-next'],
+  );
+  delivery.destroy();
+});
+
+test('startup drain probes an unreconciled crashed head once and remains blocked', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-crash-blocked-'));
+  writePendingQueue(dir, [discordMessage('m-crashed', 'unknown after crash')], {
+    blocked: {
+      reason: 'structured_delivery_in_progress',
+      at: '2026-07-20T00:00:00.000Z',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      messageId: 'm-crashed',
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-crashed',
+      pid: process.pid,
+      attemptId: 'crashed-attempt',
+    },
+  });
+  let reconciliationCount = 0;
+  let starts = 0;
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn() {
+        starts += 1;
+        return { turn: { id: 'must-not-replay' } };
+      },
+      async hasDelivered() {
+        reconciliationCount += 1;
+        return false;
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(reconciliationCount, 1);
+  assert.equal(starts, 0);
+  assert.equal(readQueue(dir).blocked.reason, 'structured_ack_uncertain');
+  delivery.destroy();
+});
+
+test('reconnect drain reconciles an accepted head before submitting the next FIFO item', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-reconnect-drain-'));
+  writePendingQueue(dir, [
+    discordMessage('m-accepted', 'accepted before disconnect'),
+    discordMessage('m-next', 'next after reconnect'),
+  ], {
+    blocked: {
+      reason: 'structured_ack_uncertain',
+      at: '2026-07-20T00:00:00.000Z',
+      messageId: 'm-accepted',
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-accepted',
+    },
+  });
+  let online = false;
+  let reconnectListener = null;
+  const requests = [];
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return online
+          ? { available: true, threadId: 'thread-current', status: 'idle' }
+          : { available: false, reason: 'shared_app_server_disconnected', status: 'unavailable' };
+      },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-next' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        if (!online) throw new Error('disconnected');
+        return clientUserMessageId === 'discord:c1:m-accepted';
+      },
+      onThreadIdle() { return () => {}; },
+      onReconnect(listener) {
+        reconnectListener = listener;
+        return () => { reconnectListener = null; };
+      },
+      status() {
+        return {
+          configured: true,
+          available: online,
+          reason: online ? null : 'shared_app_server_disconnected',
+        };
+      },
+      destroy() {},
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, []);
+
+  online = true;
+  await reconnectListener();
+
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-next']);
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(
+    readQueue(dir).completed.map((item) => item.messageId),
+    ['m-accepted', 'm-next'],
+  );
   delivery.destroy();
 });
 

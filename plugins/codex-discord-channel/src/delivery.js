@@ -369,9 +369,18 @@ async function blockCurrentHead(config, deps, expected, reason, details = {}) {
 }
 
 async function flushStructuredQueue(config, logger, deps, host) {
+  let reconciledCount = 0;
   while (true) {
     const snapshot = await withDeliveryQueueLock(config, deps, () => readDeliveryQueue(config, deps));
     if (snapshot.items.length === 0) {
+      if (reconciledCount > 0) {
+        return {
+          status: 'delivered',
+          reason: 'turn_already_accepted',
+          deliveredCount: reconciledCount,
+          queueDepth: 0,
+        };
+      }
       return { status: 'idle', reason: 'queue_empty', deliveredCount: 0, queueDepth: 0 };
     }
     const next = snapshot.items[0];
@@ -396,12 +405,8 @@ async function flushStructuredQueue(config, logger, deps, host) {
         return { queueDepth: updated.items.length };
       });
       if (reconciled.retry) continue;
-      return {
-        status: 'delivered',
-        reason: 'turn_already_accepted',
-        deliveredCount: 1,
-        queueDepth: reconciled.queueDepth,
-      };
+      reconciledCount += 1;
+      continue;
     }
     if (snapshot.blocked?.reason === DELIVERY_IN_PROGRESS) {
       if (attemptIsActive(snapshot, deps)) return blockedResult(snapshot, DELIVERY_IN_PROGRESS);
@@ -418,7 +423,7 @@ async function flushStructuredQueue(config, logger, deps, host) {
         },
       );
       if (stale.retry) continue;
-      return stale.result;
+      continue;
     }
 
     let target;
@@ -543,7 +548,7 @@ async function flushStructuredQueue(config, logger, deps, host) {
       return {
         status: 'delivered',
         reason: 'turn_accepted',
-        deliveredCount: 1,
+        deliveredCount: reconciledCount + 1,
         queueDepth: committed.queueDepth,
         turnId: response?.turn?.id || null,
       };
