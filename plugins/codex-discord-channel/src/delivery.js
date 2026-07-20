@@ -700,6 +700,18 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     status() {
       return host.status();
     },
+    async ensurePersistenceReady() {
+      if (config.deliveryMode === 'off') {
+        const error = new Error('Structured Discord delivery is disabled.');
+        error.code = 'delivery_disabled';
+        throw error;
+      }
+      return serializeAdmission(() => withDeliveryQueueLock(
+        config,
+        deps,
+        () => readDeliveryQueue(config, deps),
+      ));
+    },
     async ensureReady() {
       if (config.deliveryMode === 'off') {
         const error = new Error('Structured Discord delivery is disabled.');

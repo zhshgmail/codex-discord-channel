@@ -2,11 +2,10 @@
 'use strict';
 
 const { loadConfig } = require('../src/config');
-const { configureNetwork } = require('../src/discord-client');
+const { configureNetwork, releaseDiscordReceiverOwnership } = require('../src/discord-client');
 const { createDelivery, resolveReplyTarget } = require('../src/delivery');
 const { startDiscordClient } = require('../src/discord-client');
 const { claimOwner, createOwner } = require('../src/owner-state');
-const { clearPid } = require('../src/receiver-state');
 
 function usage() {
   process.stderr.write([
@@ -112,12 +111,10 @@ async function runGateway() {
     discordState = await startDiscordClient({ config, delivery, logger, claimReceiver: true });
   } catch (error) {
     delivery.destroy();
-    clearPid(config.paths.gatewayPidPath, process.pid);
     throw error;
   }
   if (!discordState.started) {
     delivery.destroy();
-    clearPid(config.paths.gatewayPidPath, process.pid);
     throw new Error(`Discord gateway did not start: ${discordState.reason || 'unknown'}`);
   }
   if (enabled(config.env.CODEX_DISCORD_GATEWAY_CLAIM_OWNER)) {
@@ -130,17 +127,25 @@ async function runGateway() {
     }
   }
   const keepAlive = setInterval(() => {}, 2 ** 30);
-  const stop = () => {
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
     clearInterval(keepAlive);
-    if (typeof delivery.destroy === 'function') delivery.destroy();
     try {
-      clearPid(config.paths.gatewayPidPath, process.pid);
+      if (discordState.client?.destroy) await discordState.client.destroy();
     } catch {}
-    if (discordState.client?.destroy) discordState.client.destroy();
+    try {
+      await delivery.coordinateReceiverOwnership(() => releaseDiscordReceiverOwnership(
+        config,
+        discordState.receiverOwnership,
+      ));
+    } catch {}
+    if (typeof delivery.destroy === 'function') delivery.destroy();
     process.exit(0);
   };
-  process.once('SIGTERM', stop);
-  process.once('SIGINT', stop);
+  process.once('SIGTERM', () => { void stop(); });
+  process.once('SIGINT', () => { void stop(); });
 }
 
 async function main() {

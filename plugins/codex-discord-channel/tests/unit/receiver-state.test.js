@@ -5,7 +5,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { clearPid, isActiveDiscordReceiver, readPid, writePid } = require('../../src/receiver-state');
+const {
+  clearPid,
+  isActiveDiscordReceiver,
+  readPid,
+  readReceiverAuthoritySnapshot,
+  releaseReceiverOwnership,
+  writePid,
+} = require('../../src/receiver-state');
 
 test('gateway pid file selects active receiver independently from owner id', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-'));
@@ -61,4 +68,35 @@ test('stale gateway pid fails closed instead of enabling a fallback receiver', (
   assert.equal(decision.active, false);
   assert.equal(decision.reason, 'stale_gateway_pid');
   assert.equal(decision.pid, 12345);
+});
+
+test('graceful successor release promotes a live legacy fallback to a valid atomic record', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-release-'));
+  const gatewayPidPath = path.join(dir, 'session-gateway.pid');
+  const current = {
+    version: 2,
+    pid: 23456,
+    generation: 'successor-generation',
+    claimedAt: '2026-07-20T01:00:00.000Z',
+    fallback: {
+      version: 1,
+      pid: process.pid,
+      generation: 'legacy-generation',
+      claimedAt: '2026-07-20T00:00:00.000Z',
+    },
+  };
+  const config = { paths: { gatewayPidPath } };
+  fs.writeFileSync(gatewayPidPath, `${JSON.stringify(current)}\n`);
+
+  assert.equal(releaseReceiverOwnership(config, current, {
+    isProcessAlive: (pid) => pid === process.pid,
+  }), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(gatewayPidPath, 'utf8')), {
+    version: 2,
+    pid: process.pid,
+    generation: 'legacy-generation',
+    claimedAt: '2026-07-20T00:00:00.000Z',
+    fallback: null,
+  });
+  assert.equal(readReceiverAuthoritySnapshot(config).valid, true);
 });

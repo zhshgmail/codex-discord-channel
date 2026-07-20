@@ -1,11 +1,16 @@
 'use strict';
 
-const { randomUUID } = require('node:crypto');
-const fs = require('node:fs');
-const path = require('node:path');
 const { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require('./access-state');
 const { normalizeDiscordMessage } = require('./delivery');
-const { isActiveDiscordReceiver } = require('./receiver-state');
+const {
+  commitReceiverOwnership,
+  createReceiverOwnership,
+  effectiveReceiverOwnership,
+  isActiveDiscordReceiver,
+  isCurrentReceiverOwnership,
+  readReceiverAuthoritySnapshot,
+  releaseReceiverOwnership,
+} = require('./receiver-state');
 
 function log(logger, level, message, meta) {
   if (typeof logger === 'function') logger(level, message, meta);
@@ -45,148 +50,28 @@ function configureNetwork(config, logger) {
   }
 }
 
-function getDiscordReceiverOwnershipPath(config = {}) {
-  if (config.paths?.receiverOwnershipPath) return config.paths.receiverOwnershipPath;
-  const gatewayPidPath = config.paths?.gatewayPidPath || '';
-  return gatewayPidPath ? `${gatewayPidPath}.generation` : '';
-}
-
-function snapshotFile(file, fsImpl) {
-  try {
-    return { exists: true, contents: fsImpl.readFileSync(file) };
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { exists: false, contents: null };
-    throw error;
-  }
-}
-
-function writeFileAtomically(file, contents, fsImpl) {
-  fsImpl.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  try {
-    fsImpl.writeFileSync(temp, contents, { mode: 0o600 });
-    fsImpl.renameSync(temp, file);
-  } finally {
-    try {
-      fsImpl.rmSync(temp, { force: true });
-    } catch {}
-  }
-}
-
-function restoreFile(file, snapshot, fsImpl) {
-  if (snapshot.exists) {
-    writeFileAtomically(file, snapshot.contents, fsImpl);
-    return;
-  }
-  fsImpl.rmSync(file, { force: true });
-}
-
 function readDiscordReceiverOwnership(config = {}, deps = {}) {
-  const ownershipPath = getDiscordReceiverOwnershipPath(config);
-  if (!ownershipPath) return null;
-  const fsImpl = deps.fs || fs;
-  try {
-    const record = JSON.parse(fsImpl.readFileSync(ownershipPath, 'utf8'));
-    if (
-      record?.version !== 1 ||
-      !Number.isInteger(record.pid) ||
-      record.pid <= 0 ||
-      typeof record.generation !== 'string' ||
-      record.generation === '' ||
-      typeof record.claimedAt !== 'string'
-    ) {
-      return null;
-    }
-    return record;
-  } catch {
-    return null;
-  }
+  return readReceiverAuthoritySnapshot(config, deps).record;
 }
 
 function claimDiscordReceiverOwnership(config = {}, deps = {}) {
   const checkReceiver = deps.isActiveDiscordReceiver || isActiveDiscordReceiver;
-  const receiver = checkReceiver(config);
+  const receiver = checkReceiver(config, deps);
   if (!receiver.active) {
     throw new Error(`Cannot claim Discord receiver ownership: ${receiver.reason || 'inactive_receiver'}.`);
   }
-  const ownershipPath = getDiscordReceiverOwnershipPath(config);
-  if (!ownershipPath) throw new Error('Discord receiver ownership path is not configured.');
-  const fsImpl = deps.fs || fs;
-  const generation = (deps.randomUUID || randomUUID)();
-  const record = {
-    version: 1,
-    pid: Number(receiver.pid) || process.pid,
-    generation,
-    claimedAt: new Date().toISOString(),
-  };
-  fsImpl.mkdirSync(path.dirname(ownershipPath), { recursive: true, mode: 0o700 });
-  const temp = `${ownershipPath}.${record.pid}.${generation}.tmp`;
-  try {
-    fsImpl.writeFileSync(temp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-    fsImpl.renameSync(temp, ownershipPath);
-  } finally {
-    try {
-      fsImpl.rmSync(temp, { force: true });
-    } catch {}
-  }
-
-  const rechecked = checkReceiver(config);
-  if (!rechecked.active || (Number(rechecked.pid) || process.pid) !== record.pid) {
-    throw new Error('Discord receiver ownership changed while claiming its generation.');
-  }
-  return record;
-}
-
-function replaceDiscordReceiverOwnership(config = {}, deps = {}, onClaimed = () => {}) {
-  const gatewayPidPath = config.paths?.gatewayPidPath || '';
-  const ownershipPath = getDiscordReceiverOwnershipPath(config);
-  if (!gatewayPidPath) throw new Error('Discord gateway PID path is not configured.');
-  if (!ownershipPath) throw new Error('Discord receiver ownership path is not configured.');
-  const fsImpl = deps.fs || fs;
-  const previousPid = snapshotFile(gatewayPidPath, fsImpl);
-  const previousOwnership = snapshotFile(ownershipPath, fsImpl);
-
-  try {
-    writeFileAtomically(gatewayPidPath, `${process.pid}\n`, fsImpl);
-    const ownership = claimDiscordReceiverOwnership(config, deps);
-    onClaimed(ownership);
-    return ownership;
-  } catch (error) {
-    try {
-      restoreFile(ownershipPath, previousOwnership, fsImpl);
-      restoreFile(gatewayPidPath, previousPid, fsImpl);
-    } catch (restoreError) {
-      error.message = `${error.message} Failed to restore prior Discord receiver ownership: ${
-        restoreError instanceof Error ? restoreError.message : String(restoreError)
-      }`;
-    }
-    throw error;
-  }
+  const snapshot = readReceiverAuthoritySnapshot(config, deps);
+  const effective = effectiveReceiverOwnership(snapshot, deps)?.record || null;
+  const candidate = createReceiverOwnership(effective, deps);
+  return commitReceiverOwnership(config, snapshot, candidate, deps);
 }
 
 function isCurrentDiscordReceiverOwnership(config = {}, expected, deps = {}) {
-  const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config);
-  if (!receiver.active) return receiver;
-  const persisted = readDiscordReceiverOwnership(config, deps);
-  if (
-    !expected ||
-    !persisted ||
-    persisted.pid !== expected.pid ||
-    persisted.generation !== expected.generation ||
-    (Number(receiver.pid) || process.pid) !== expected.pid
-  ) {
-    return {
-      active: false,
-      reason: 'gateway_generation_changed',
-      pid: Number(receiver.pid) || 0,
-    };
-  }
-  return {
-    active: true,
-    reason: 'gateway_generation_match',
-    pid: expected.pid,
-    generation: expected.generation,
-  };
+  return isCurrentReceiverOwnership(config, expected, deps);
+}
+
+function releaseDiscordReceiverOwnership(config = {}, expected, deps = {}) {
+  return releaseReceiverOwnership(config, expected, deps);
 }
 
 async function resolveReferencedMessage(message, accessState) {
@@ -311,7 +196,12 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
   }
   configureNetwork(config, logger);
 
-  const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config);
+  const authoritySnapshot = readReceiverAuthoritySnapshot(config, deps);
+  if (claimReceiver && !authoritySnapshot.valid) {
+    throw new Error('Discord receiver authority record is invalid.');
+  }
+  const effectiveOwnership = effectiveReceiverOwnership(authoritySnapshot, deps)?.record || null;
+  const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps);
   const shouldReceive = claimReceiver || receiver.active;
 
   const {
@@ -333,39 +223,50 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
 
   try {
     await client.login(config.token);
+    let receiverOwnership = null;
     if (shouldReceive) {
-      if (typeof delivery.ensureReady !== 'function') {
-        throw new Error('Discord delivery does not provide app-server readiness checks.');
+      if (typeof delivery.ensurePersistenceReady !== 'function') {
+        throw new Error('Discord delivery does not provide durable queue readiness checks.');
       }
       if (typeof delivery.coordinateReceiverOwnership !== 'function') {
         throw new Error('Discord delivery does not provide durable receiver ownership coordination.');
       }
-      await delivery.ensureReady();
-      await delivery.coordinateReceiverOwnership(() => replaceDiscordReceiverOwnership(
-        config,
-        deps,
-        (receiverOwnership) => {
-          client.on(Events.MessageCreate, createDiscordMessageHandler({
-            config,
-            delivery,
-            logger,
-            client,
-            receiverOwnership,
-            deps,
-          }));
-        },
-      ));
+      await delivery.ensurePersistenceReady();
+      if (effectiveOwnership) {
+        if (typeof delivery.ensureReady !== 'function') {
+          throw new Error('Discord delivery does not provide app-server readiness checks.');
+        }
+        await delivery.ensureReady();
+      }
+      const candidate = createReceiverOwnership(effectiveOwnership, deps);
+      receiverOwnership = await delivery.coordinateReceiverOwnership(() => {
+        const handler = createDiscordMessageHandler({
+          config,
+          delivery,
+          logger,
+          client,
+          receiverOwnership: candidate,
+          deps,
+        });
+        client.on(Events.MessageCreate, handler);
+        try {
+          return commitReceiverOwnership(config, authoritySnapshot, candidate, deps);
+        } catch (error) {
+          if (typeof client.off === 'function') client.off(Events.MessageCreate, handler);
+          throw error;
+        }
+      });
     }
+    log(logger, 'INFO', 'Discord gateway connected', {
+      user: client.user?.tag || client.user?.id || 'unknown',
+    });
+    return { started: true, client, receiverOwnership };
   } catch (error) {
     try {
       if (typeof client.destroy === 'function') await client.destroy();
     } catch {}
     throw error;
   }
-  log(logger, 'INFO', 'Discord gateway connected', {
-    user: client.user?.tag || client.user?.id || 'unknown',
-  });
-  return { started: true, client };
 }
 
 async function sendDiscordMessage(client, args) {
@@ -396,6 +297,7 @@ module.exports = {
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
   readDiscordReceiverOwnership,
+  releaseDiscordReceiverOwnership,
   resolveReferencedMessage,
   sendDiscordMessage,
   startDiscordClient,
