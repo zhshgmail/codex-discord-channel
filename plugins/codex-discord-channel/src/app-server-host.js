@@ -290,11 +290,13 @@ class AppServerHost extends EventEmitter {
     this.client = deps.client || new AppServerRpcClient(config, logger, deps);
     this.lastStatus = this.client.status();
     this.currentThreadId = '';
+    this.threadSelectionRevision = 0;
     this.threadStatuses = new Map();
     this.onNotification = (notification) => {
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
         if (thread?.id && !thread.parentThreadId) {
+          this.threadSelectionRevision += 1;
           this.currentThreadId = thread.id;
           this.threadStatuses.set(thread.id, thread.status?.type || 'unavailable');
           if (thread.status?.type === 'idle') this.emit('idle', { threadId: thread.id });
@@ -315,10 +317,14 @@ class AppServerHost extends EventEmitter {
       if (notification?.method === 'thread/closed') {
         const threadId = notification.params?.threadId;
         this.threadStatuses.delete(threadId);
-        if (this.currentThreadId === threadId) this.currentThreadId = '';
+        if (this.currentThreadId === threadId) {
+          this.threadSelectionRevision += 1;
+          this.currentThreadId = '';
+        }
       }
     };
     this.onConnectionChanged = () => {
+      this.threadSelectionRevision += 1;
       this.currentThreadId = '';
       this.threadStatuses.clear();
       this.lastStatus = this.client.status();
@@ -391,16 +397,19 @@ class AppServerHost extends EventEmitter {
     }
 
     let response;
+    const threadSelectionRevision = this.threadSelectionRevision;
     try {
       response = await requestForTarget('thread/read', {
         threadId,
         includeTurns: false,
       });
     } catch (error) {
+      if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
       const reason = error?.code || 'shared_app_server_thread_unreadable';
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
     }
+    if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
     const thread = response?.thread;
     if (!thread || thread.id !== threadId || thread.parentThreadId) {
       const reason = 'shared_app_server_thread_unprovable';

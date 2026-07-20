@@ -385,6 +385,71 @@ test('latest top-level thread/started notification selects the rotated TUI threa
   );
 });
 
+test('in-flight thread read cannot overwrite a newer top-level thread notification', async () => {
+  let loadedThreadIds = ['thread-before-clear'];
+  let releaseFirstRead;
+  let markFirstReadStarted;
+  const firstReadStarted = new Promise((resolve) => { markFirstReadStarted = resolve; });
+  const firstReadReleased = new Promise((resolve) => { releaseFirstRead = resolve; });
+  let firstRead = true;
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: loadedThreadIds, nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (firstRead) {
+        firstRead = false;
+        markFirstReadStarted();
+        await firstReadReleased;
+      }
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-before-clear',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+
+  const resolving = host.resolveTarget();
+  await firstReadStarted;
+  loadedThreadIds = ['thread-before-clear', 'thread-after-clear'];
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-after-clear',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  releaseFirstRead();
+
+  assert.deepEqual(await resolving, {
+    available: true,
+    threadId: 'thread-after-clear',
+    status: 'idle',
+  });
+  assert.deepEqual(
+    client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params.threadId),
+    ['thread-before-clear', 'thread-after-clear'],
+  );
+});
+
 test('rotated current thread remains selectable beyond the first loaded-thread page', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
