@@ -125,8 +125,10 @@ class AppServerRpcClient extends EventEmitter {
 
     this.ws = ws;
     this.connectionGeneration += 1;
+    const generation = this.connectionGeneration;
     this.emit('connectionChanged', { generation: this.connectionGeneration });
     ws.on('message', (data) => {
+      if (this.ws !== ws || this.connectionGeneration !== generation) return;
       this.handleMessage(Buffer.isBuffer(data) ? data.toString('utf8') : String(data));
     });
     ws.on('error', (error) => {

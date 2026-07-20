@@ -268,6 +268,59 @@ test('late close from a replaced websocket does not invalidate the active connec
   assert.equal(sockets.length, 2);
 });
 
+test('messages from a replaced websocket cannot mutate the active connection thread', async (t) => {
+  let loadedThreadIds = ['thread-before-clear'];
+  const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: loadedThreadIds, nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return {
+        thread: {
+          id: request.params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+
+  assert.equal((await host.resolveTarget()).threadId, 'thread-before-clear');
+  sockets[0].beginClose();
+  loadedThreadIds = ['thread-after-clear'];
+  assert.equal((await host.resolveTarget()).threadId, 'thread-after-clear');
+
+  loadedThreadIds = ['thread-before-clear', 'thread-after-clear'];
+  sockets[0].emit('message', JSON.stringify({
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-before-clear',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  }));
+  assert.equal((await host.resolveTarget()).threadId, 'thread-after-clear');
+
+  loadedThreadIds.push('thread-current');
+  sockets[1].emit('message', JSON.stringify({
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-current',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  }));
+  assert.equal((await host.resolveTarget()).threadId, 'thread-current');
+});
+
 test('latest top-level thread/started notification selects the rotated TUI thread among loaded history', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
