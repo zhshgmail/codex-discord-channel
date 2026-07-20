@@ -470,6 +470,73 @@ test('in-flight thread read cannot overwrite a newer top-level thread notificati
   );
 });
 
+test('in-flight loaded-thread list cannot restore an older thread after rotation', async () => {
+  let loadedThreadIds = ['thread-before-clear'];
+  let releaseFirstList;
+  let markFirstListStarted;
+  const firstListStarted = new Promise((resolve) => { markFirstListStarted = resolve; });
+  const firstListReleased = new Promise((resolve) => { releaseFirstList = resolve; });
+  let firstList = true;
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      if (firstList) {
+        firstList = false;
+        const staleThreadIds = [...loadedThreadIds];
+        markFirstListStarted();
+        await firstListReleased;
+        return { data: staleThreadIds, nextCursor: null };
+      }
+      return { data: loadedThreadIds, nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-before-clear',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+
+  const resolving = host.resolveTarget();
+  await firstListStarted;
+  loadedThreadIds = ['thread-before-clear', 'thread-after-clear'];
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-after-clear',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  releaseFirstList();
+
+  assert.deepEqual(await resolving, {
+    available: true,
+    threadId: 'thread-after-clear',
+    status: 'idle',
+  });
+  assert.deepEqual(
+    client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params.threadId),
+    ['thread-after-clear'],
+  );
+});
+
 test('rotated current thread remains selectable beyond the first loaded-thread page', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
@@ -666,6 +733,18 @@ test('host emits idle only when the current app-server thread becomes idle', asy
 
 test('startTurn forwards only the structured caller payload', async () => {
   const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
     assert.equal(method, 'turn/start');
     assert.equal(Object.hasOwn(params, 'model'), false);
     assert.equal(Object.hasOwn(params, 'effort'), false);
@@ -677,8 +756,52 @@ test('startTurn forwards only the structured caller payload', async () => {
     clientUserMessageId: 'discord:c1:m1',
     input: [{ type: 'text', text: 'hello' }],
   };
-  assert.deepEqual(await host.startTurn(params), { turn: { id: 'turn-1' } });
+  const target = await host.resolveTarget();
+  client.requests.length = 0;
+  assert.deepEqual(await host.startTurn(params, target), { turn: { id: 'turn-1' } });
   assert.deepEqual(client.requests, [{ method: 'turn/start', params }]);
+});
+
+test('startTurn rejects a resolved target after a newer thread generation is selected', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') return { turn: { id: 'must-not-start' } };
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  const target = await host.resolveTarget();
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-b',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+
+  await assert.rejects(
+    host.startTurn({
+      threadId: target.threadId,
+      clientUserMessageId: 'discord:c1:m-stale',
+      input: [{ type: 'text', text: 'stale' }],
+    }, target),
+    (error) => error.code === 'shared_app_server_thread_changed' &&
+      error.deliveryOutcome === 'not_sent',
+  );
+  assert.equal(client.requests.some((request) => request.method === 'turn/start'), false);
 });
 
 test('hasDelivered finds the echoed client user message id without starting another turn', async () => {

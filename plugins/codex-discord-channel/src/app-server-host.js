@@ -3,6 +3,8 @@
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 
+const TARGET_GENERATION = Symbol('appServerTargetGeneration');
+
 function endpointToWebSocket(endpoint) {
   const value = String(endpoint || '').trim();
   if (value.startsWith('unix://')) {
@@ -253,7 +255,7 @@ class AppServerRpcClient extends EventEmitter {
     return this.requestConnected(method, params);
   }
 
-  async requestOnConnection(method, params, expectedGeneration = null) {
+  async requestOnConnection(method, params, expectedGeneration = null, beforeSend = null) {
     if (expectedGeneration != null && this.connectionGeneration !== expectedGeneration) {
       throw deliveryError(
         'Shared app-server connection changed during target resolution.',
@@ -268,6 +270,7 @@ class AppServerRpcClient extends EventEmitter {
         'shared_app_server_disconnected',
       );
     }
+    if (typeof beforeSend === 'function') beforeSend();
     const result = await this.requestConnected(method, params);
     if (this.connectionGeneration !== generation) {
       throw deliveryError(
@@ -348,6 +351,7 @@ class AppServerHost extends EventEmitter {
   }
 
   async resolveTarget() {
+    const threadSelectionRevision = this.threadSelectionRevision;
     const threadIds = [];
     let cursor = '';
     let connectionGeneration = null;
@@ -369,6 +373,7 @@ class AppServerHost extends EventEmitter {
         const params = { limit: 2 };
         if (cursor) params.cursor = cursor;
         const loaded = await requestForTarget('thread/loaded/list', params);
+        if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
         if (loaded?.nextCursor != null && typeof loaded.nextCursor !== 'string') {
           const reason = 'shared_app_server_thread_ambiguous';
           this.lastStatus = { configured: true, available: false, reason };
@@ -407,7 +412,6 @@ class AppServerHost extends EventEmitter {
     }
 
     let response;
-    const threadSelectionRevision = this.threadSelectionRevision;
     try {
       response = await requestForTarget('thread/read', {
         threadId,
@@ -435,18 +439,56 @@ class AppServerHost extends EventEmitter {
     this.currentThreadId = thread.id;
     this.threadStatuses.set(thread.id, status);
     this.lastStatus = { configured: true, available: true, reason: null };
-    return { available: true, threadId: thread.id, status };
+    const target = { available: true, threadId: thread.id, status };
+    Object.defineProperty(target, TARGET_GENERATION, {
+      value: Object.freeze({ connectionGeneration, threadSelectionRevision }),
+    });
+    return target;
   }
 
-  startTurn(params) {
+  async startTurn(params, target) {
+    const generation = target?.[TARGET_GENERATION];
+    const validateTarget = () => {
+      if (
+        !generation ||
+        generation.threadSelectionRevision !== this.threadSelectionRevision ||
+        target.threadId !== params.threadId ||
+        this.currentThreadId !== params.threadId
+      ) {
+        throw deliveryError(
+          'The current app-server thread changed before turn/start.',
+          'shared_app_server_thread_changed',
+        );
+      }
+    };
+    validateTarget();
+    if (typeof this.client.requestOnConnection === 'function') {
+      const response = await this.client.requestOnConnection(
+        'turn/start',
+        params,
+        generation.connectionGeneration,
+        validateTarget,
+      );
+      return response.result;
+    }
     return this.client.request('turn/start', params);
   }
 
   async hasDelivered(threadId, clientUserMessageId) {
-    const response = await this.client.request('thread/read', {
-      threadId,
-      includeTurns: true,
-    });
+    const threadSelectionRevision = this.threadSelectionRevision;
+    const params = { threadId, includeTurns: true };
+    let response;
+    if (typeof this.client.requestOnConnection === 'function') {
+      response = (await this.client.requestOnConnection('thread/read', params)).result;
+    } else {
+      response = await this.client.request('thread/read', params);
+    }
+    if (this.threadSelectionRevision !== threadSelectionRevision) {
+      throw deliveryError(
+        'The current app-server thread changed during delivery reconciliation.',
+        'shared_app_server_thread_changed',
+      );
+    }
     return (response?.thread?.turns || []).some((turn) => (
       (turn.items || []).some((item) => (
         item?.type === 'userMessage' && item.clientId === clientUserMessageId

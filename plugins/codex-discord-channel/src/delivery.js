@@ -477,7 +477,7 @@ async function flushStructuredQueue(config, logger, deps, host) {
 
     let response;
     try {
-      response = await host.startTurn(params);
+      response = await host.startTurn(params, target);
     } catch (error) {
       activeDeliveryAttempts.delete(attemptId);
       const uncertain = error?.deliveryOutcome === 'uncertain';
