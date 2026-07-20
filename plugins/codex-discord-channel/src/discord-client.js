@@ -232,26 +232,30 @@ function createDiscordMessageHandler({
   };
 }
 
-async function startDiscordClient({ config, delivery, logger }) {
+async function startDiscordClient({ config, delivery, logger, deps = {} }) {
   if (!config.tokenConfigured || config.loginDisabled) {
     log(logger, 'INFO', 'Discord login disabled or token missing');
     return { started: false, client: null, reason: config.tokenConfigured ? 'login_disabled' : 'token_missing' };
   }
   configureNetwork(config, logger);
 
-  if (typeof delivery.coordinateReceiverOwnership !== 'function') {
-    throw new Error('Discord delivery does not provide durable receiver ownership coordination.');
+  const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config);
+  let receiverOwnership = null;
+  if (receiver.active) {
+    if (typeof delivery.coordinateReceiverOwnership !== 'function') {
+      throw new Error('Discord delivery does not provide durable receiver ownership coordination.');
+    }
+    receiverOwnership = await delivery.coordinateReceiverOwnership(
+      () => claimDiscordReceiverOwnership(config, deps),
+    );
   }
-  const receiverOwnership = await delivery.coordinateReceiverOwnership(
-    () => claimDiscordReceiverOwnership(config),
-  );
 
   const {
     Client,
     Events,
     GatewayIntentBits,
     Partials,
-  } = require('discord.js');
+  } = deps.discord || require('discord.js');
 
   const client = new Client({
     intents: [
@@ -263,13 +267,16 @@ async function startDiscordClient({ config, delivery, logger }) {
     partials: [Partials.Channel],
   });
 
-  client.on(Events.MessageCreate, createDiscordMessageHandler({
-    config,
-    delivery,
-    logger,
-    client,
-    receiverOwnership,
-  }));
+  if (receiverOwnership) {
+    client.on(Events.MessageCreate, createDiscordMessageHandler({
+      config,
+      delivery,
+      logger,
+      client,
+      receiverOwnership,
+      deps,
+    }));
+  }
 
   await client.login(config.token);
   log(logger, 'INFO', 'Discord gateway connected', {

@@ -25,6 +25,15 @@ function deliveryError(message, code, outcome = 'not_sent') {
   return error;
 }
 
+function reconnectableError(error) {
+  return [
+    'shared_app_server_connect_failed',
+    'shared_app_server_connect_timeout',
+    'shared_app_server_disconnected',
+    'shared_app_server_socket_missing',
+  ].includes(error?.code);
+}
+
 class AppServerRpcClient extends EventEmitter {
   constructor(config = {}, logger = () => {}, deps = {}) {
     super();
@@ -77,6 +86,9 @@ class AppServerRpcClient extends EventEmitter {
     this.connecting = this.connect(WebSocket);
     try {
       await this.connecting;
+    } catch (error) {
+      if (reconnectableError(error)) this.scheduleReconnect();
+      throw error;
     } finally {
       this.connecting = null;
     }
@@ -222,9 +234,10 @@ class AppServerRpcClient extends EventEmitter {
       });
       this.sendRaw({ method: 'initialized' });
       this.state = { configured: true, available: true, reason: null };
+      const recovered = this.reconnectAttempt > 0;
       this.reconnectAttempt = 0;
       this.cancelReconnect();
-      this.emit('connectionChanged', { generation });
+      this.emit('connectionChanged', { generation, recovered });
     } catch (error) {
       ws.close();
       throw error;
@@ -303,7 +316,13 @@ class AppServerRpcClient extends EventEmitter {
     return this.requestConnected(method, params);
   }
 
-  async requestOnConnection(method, params, expectedGeneration = null, beforeSend = null) {
+  async requestOnConnection(
+    method,
+    params,
+    expectedGeneration = null,
+    beforeSend = null,
+    acceptCompletedResponse = false,
+  ) {
     if (expectedGeneration != null && this.connectionGeneration !== expectedGeneration) {
       throw deliveryError(
         'Shared app-server connection changed during target resolution.',
@@ -320,7 +339,7 @@ class AppServerRpcClient extends EventEmitter {
     }
     if (typeof beforeSend === 'function') beforeSend();
     const result = await this.requestConnected(method, params);
-    if (this.connectionGeneration !== generation) {
+    if (this.connectionGeneration !== generation && !acceptCompletedResponse) {
       throw deliveryError(
         'Shared app-server connection changed during target resolution.',
         'shared_app_server_disconnected',
@@ -383,7 +402,7 @@ class AppServerHost extends EventEmitter {
       this.currentThreadId = '';
       this.threadStatuses.clear();
       this.lastStatus = this.client.status();
-      const reconnected = this.lastStatus.available && this.connectionWasLost;
+      const reconnected = this.lastStatus.available && (this.connectionWasLost || event?.recovered);
       if (this.lastStatus.available) {
         this.hasConnected = true;
         this.connectionWasLost = false;
@@ -518,6 +537,7 @@ class AppServerHost extends EventEmitter {
         params,
         generation.connectionGeneration,
         validateTarget,
+        true,
       );
       return response.result;
     }
@@ -525,12 +545,19 @@ class AppServerHost extends EventEmitter {
   }
 
   async hasDelivered(threadId, clientUserMessageId) {
-    const threadSelectionRevision = this.threadSelectionRevision;
     const params = { threadId, includeTurns: true };
+    let threadSelectionRevision;
     let response;
     if (typeof this.client.requestOnConnection === 'function') {
-      response = (await this.client.requestOnConnection('thread/read', params)).result;
+      await this.client.ensureConnected();
+      threadSelectionRevision = this.threadSelectionRevision;
+      response = (await this.client.requestOnConnection(
+        'thread/read',
+        params,
+        this.client.connectionGeneration,
+      )).result;
     } else {
+      threadSelectionRevision = this.threadSelectionRevision;
       response = await this.client.request('thread/read', params);
     }
     if (this.threadSelectionRevision !== threadSelectionRevision) {

@@ -444,6 +444,38 @@ test('failed autonomous reconnect backs off and destroy cancels the next retry',
   assert.equal(sockets.length, 2);
 });
 
+test('initial websocket failure retries autonomously and emits recovery without later traffic', async (t) => {
+  const timers = createManualTimers();
+  const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
+    assert.equal(request.method, 'initialize');
+    return {};
+  }, { failConnections: [0] });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
+    WebSocket,
+    clearTimeout: timers.clearTimeout,
+    reconnectInitialDelayMs: 10,
+    reconnectMaxDelayMs: 40,
+    setTimeout: timers.setTimeout,
+  });
+  t.after(() => host.destroy());
+  const reconnects = [];
+  host.onReconnect((event) => reconnects.push(event));
+
+  await assert.rejects(host.client.ensureConnected(), { code: 'shared_app_server_connect_failed' });
+  assert.equal(timers.pendingCount(), 1);
+  assert.deepEqual(timers.delays, [10]);
+
+  await timers.runNext();
+
+  assert.equal(sockets.length, 2);
+  assert.equal(reconnects.length, 1);
+  assert.deepEqual(host.status(), {
+    configured: true,
+    available: true,
+    reason: null,
+  });
+});
+
 test('host emits reconnect only when availability returns after a live connection was lost', () => {
   let status = { configured: true, available: false, reason: 'shared_app_server_not_connected' };
   const client = new FakeRpcClient(async () => { throw new Error('not used'); });
@@ -902,6 +934,40 @@ test('startTurn rejects a resolved target after a newer thread generation is sel
   assert.equal(client.requests.some((request) => request.method === 'turn/start'), false);
 });
 
+test('accepted turn response remains definitive when the websocket closes immediately after it', async (t) => {
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return {
+        thread: {
+          id: request.params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (request.method === 'turn/start') {
+      return {
+        result: { turn: { id: 'turn-accepted' } },
+        afterResponse: (socket) => socket.close(),
+      };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+  const target = await host.resolveTarget();
+
+  assert.deepEqual(await host.startTurn({
+    threadId: target.threadId,
+    clientUserMessageId: 'discord:c1:m-accepted',
+    input: [{ type: 'text', text: 'accepted' }],
+  }, target), { turn: { id: 'turn-accepted' } });
+});
+
 test('hasDelivered finds the echoed client user message id without starting another turn', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     assert.equal(method, 'thread/read');
@@ -917,4 +983,24 @@ test('hasDelivered finds the echoed client user message id without starting anot
   const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
   assert.equal(await host.hasDelivered('thread-a', 'discord:c1:m1'), true);
   assert.equal(await host.hasDelivered('thread-a', 'discord:c1:missing'), false);
+});
+
+test('hasDelivered reconciles on the first connection without invalidating its own read', async (t) => {
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/read') {
+      return {
+        thread: {
+          turns: [{
+            items: [{ type: 'userMessage', clientId: 'discord:c1:m-first-connect' }],
+          }],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+
+  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:m-first-connect'), true);
 });

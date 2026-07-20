@@ -12,6 +12,7 @@ const {
   createDiscordMessageHandler,
   readDiscordReceiverOwnership,
   resolveReferencedMessage,
+  startDiscordClient,
 } = require('../../src/discord-client');
 
 test('reference resolver fetches references for enabled guild channels', async () => {
@@ -271,4 +272,57 @@ test('old gateway cannot accept an earlier message after new ownership accepts a
   await oldHandling;
 
   assert.deepEqual(delivered, ['m2']);
+});
+
+test('non-receiver MCP client logs in without claiming ownership or registering inbound delivery', async () => {
+  const { EventEmitter } = require('node:events');
+  let claims = 0;
+  class FakeDiscordClient extends EventEmitter {
+    constructor() {
+      super();
+      this.user = { id: 'bot', tag: 'bot#0001' };
+      this.loginTokens = [];
+    }
+
+    async login(token) {
+      this.loginTokens.push(token);
+    }
+  }
+  const delivery = {
+    coordinateReceiverOwnership() {
+      claims += 1;
+      throw new Error('must not claim');
+    },
+  };
+
+  const result = await startDiscordClient({
+    config: {
+      tokenConfigured: true,
+      loginDisabled: false,
+      token: 'test-token',
+      botUserId: 'bot',
+      paths: { gatewayPidPath: '/missing/session-gateway.pid' },
+    },
+    delivery,
+    logger: () => {},
+    deps: {
+      discord: {
+        Client: FakeDiscordClient,
+        Events: { MessageCreate: 'messageCreate' },
+        GatewayIntentBits: {
+          DirectMessages: 1,
+          Guilds: 2,
+          GuildMessages: 4,
+          MessageContent: 8,
+        },
+        Partials: { Channel: 'channel' },
+      },
+      isActiveDiscordReceiver: () => ({ active: false, reason: 'another_gateway_active', pid: 1234 }),
+    },
+  });
+
+  assert.equal(result.started, true);
+  assert.equal(claims, 0);
+  assert.deepEqual(result.client.loginTokens, ['test-token']);
+  assert.equal(result.client.listenerCount('messageCreate'), 0);
 });
