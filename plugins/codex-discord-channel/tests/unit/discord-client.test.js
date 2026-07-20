@@ -9,10 +9,13 @@ const test = require('node:test');
 const { decideAccess, normalizeAccessState } = require('../../src/access-state');
 const { createDelivery, normalizeDiscordMessage } = require('../../src/delivery');
 const {
-  claimDiscordReceiverOwnership,
+  commitReceiverOwnership,
+  createReceiverOwnership,
+  readReceiverAuthoritySnapshot,
+} = require('../../src/receiver-state');
+const {
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
-  readDiscordReceiverOwnership,
   releaseDiscordReceiverOwnership,
   resolveReferencedMessage,
   startDiscordClient,
@@ -256,30 +259,26 @@ test('accepted Discord events persist in FIFO order while an earlier delivery bl
   delivery.destroy();
 });
 
-test('receiver ownership claim stores PID and generation in one atomic authority record', () => {
+test('receiver authority commit stores PID and generation in one atomic record', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-generation-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
   fs.writeFileSync(gatewayPidPath, `${process.pid}\n`);
   const config = { paths: { gatewayPidPath } };
   const generations = ['generation-a', 'generation-b'];
-  const deps = {
-    fs,
-    isActiveDiscordReceiver: () => ({
-      active: true,
-      reason: 'gateway_pid_match',
-      pid: process.pid,
-    }),
-    randomUUID: () => generations.shift(),
-  };
+  const deps = { fs, randomUUID: () => generations.shift() };
 
-  const first = claimDiscordReceiverOwnership(config, deps);
+  const firstSnapshot = readReceiverAuthoritySnapshot(config, deps);
+  const first = createReceiverOwnership(firstSnapshot.record, deps);
+  commitReceiverOwnership(config, firstSnapshot, first, deps);
   const firstAuthority = JSON.parse(fs.readFileSync(gatewayPidPath, 'utf8'));
-  const second = claimDiscordReceiverOwnership(config, deps);
+  const secondSnapshot = readReceiverAuthoritySnapshot(config, deps);
+  const second = createReceiverOwnership(secondSnapshot.record, deps);
+  commitReceiverOwnership(config, secondSnapshot, second, deps);
 
   assert.equal(first.generation, 'generation-a');
   assert.deepEqual(firstAuthority, first);
   assert.equal(second.generation, 'generation-b');
-  assert.deepEqual(readDiscordReceiverOwnership(config, deps), second);
+  assert.deepEqual(readReceiverAuthoritySnapshot(config, deps).record, second);
   assert.equal(fs.existsSync(`${gatewayPidPath}.generation`), false);
   assert.deepEqual(
     fs.readdirSync(dir).filter((name) => name.includes('.tmp')),
@@ -557,7 +556,7 @@ test('successor replaces durable receiver ownership only after login and app-ser
     version: 2,
     pid: successorPid,
     generation: 'successor-generation',
-    claimedAt: readDiscordReceiverOwnership(config).claimedAt,
+    claimedAt: readReceiverAuthoritySnapshot(config).record.claimedAt,
     fallback: ownership,
   });
 });
@@ -626,7 +625,50 @@ test('concurrent sole gateways atomically select one listener and one generation
   assert.match(results.find((result) => result.status === 'rejected').reason.message, /ownership changed/);
   assert.equal(clients.filter((client) => client.listenerCount('messageCreate') === 1).length, 1);
   assert.equal(clients.filter((client) => client.destroyed).length, 1);
-  assert.equal(readDiscordReceiverOwnership(config).generation, 'generation-a');
+  assert.equal(readReceiverAuthoritySnapshot(config).record.generation, 'generation-a');
+});
+
+test('logger failure cannot tear down a listener after atomic authority commit', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-gateway-logger-'));
+  const config = {
+    tokenConfigured: true,
+    loginDisabled: false,
+    token: 'test-token',
+    botUserId: 'bot',
+    paths: { gatewayPidPath: path.join(dir, 'session-gateway.pid') },
+  };
+  const { EventEmitter } = require('node:events');
+  let destroyed = false;
+  class ReadyDiscordClient extends EventEmitter {
+    constructor() {
+      super();
+      this.user = { id: 'bot', tag: 'bot#0001' };
+    }
+    async login() {}
+    destroy() {
+      destroyed = true;
+      this.removeAllListeners();
+    }
+  }
+
+  const result = await startDiscordClient({
+    config,
+    claimReceiver: true,
+    delivery: {
+      async ensurePersistenceReady() {},
+      async coordinateReceiverOwnership(operation) { return operation(); },
+    },
+    logger() { throw new Error('injected logger failure'); },
+    deps: {
+      discord: gatewayDiscordDeps(ReadyDiscordClient),
+      randomUUID: () => 'logger-generation',
+    },
+  });
+
+  assert.equal(result.started, true);
+  assert.equal(result.client.listenerCount('messageCreate'), 1);
+  assert.equal(destroyed, false);
+  assert.equal(readReceiverAuthoritySnapshot(config).record.generation, 'logger-generation');
 });
 
 test('hard crash at every takeover phase leaves incumbent effective or successor armed', () => {
@@ -663,6 +705,95 @@ test('hard crash at every takeover phase leaves incumbent effective or successor
     });
     assert.equal(fs.existsSync(`${gatewayPidPath}.generation`), false);
   }
+});
+
+test('same Discord event crossing authority commit is persisted exactly once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-handoff-event-race-'));
+  const config = {
+    botUserId: 'bot',
+    deliveryMode: 'app-server',
+    paths: {
+      stateDir: dir,
+      gatewayPidPath: path.join(dir, 'session-gateway.pid'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+    },
+  };
+  const incumbent = {
+    version: 2,
+    pid: 30001,
+    generation: 'incumbent-generation',
+    claimedAt: '2026-07-20T00:00:00.000Z',
+    fallback: null,
+  };
+  fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(incumbent)}\n`);
+  const alive = new Set([incumbent.pid, 30002]);
+  const host = {
+    async resolveTarget() {
+      return { available: true, threadId: 'thread-root', status: 'active' };
+    },
+    onThreadIdle() { return () => {}; },
+    onReconnect() { return () => {}; },
+    onThreadClosed() { return () => {}; },
+    status() { return { configured: true, available: true, reason: null }; },
+    destroy() {},
+  };
+  const delivery = createDelivery(config, () => {}, {
+    structuredHost: host,
+    isProcessAlive: (pid) => alive.has(pid),
+  });
+  const accessState = normalizeAccessState({ groups: { c1: { requireMention: false } } });
+  const makeHandler = (receiverOwnership, pid) => createDiscordMessageHandler({
+    config,
+    client: { user: { id: 'bot' } },
+    delivery,
+    logger: () => {},
+    receiverOwnership,
+    deps: {
+      isProcessAlive: (candidatePid) => alive.has(candidatePid),
+      loadAccessState: () => accessState,
+      pid,
+    },
+  });
+  let releaseReference;
+  let markReferenceStarted;
+  const referenceStarted = new Promise((resolve) => { markReferenceStarted = resolve; });
+  const referenceReleased = new Promise((resolve) => { releaseReference = resolve; });
+  const message = {
+    guildId: 'g1',
+    channelId: 'c1',
+    id: 'same-message',
+    author: { id: 'user-1', username: 'Alice', bot: false },
+    content: 'one event',
+    attachments: [],
+    reference: { messageId: 'parent' },
+    async fetchReference() {
+      markReferenceStarted();
+      await referenceReleased;
+      return { author: { id: 'user-0' }, content: 'parent' };
+    },
+  };
+  const incumbentHandling = makeHandler(incumbent, incumbent.pid)(message);
+  await referenceStarted;
+
+  const snapshot = readReceiverAuthoritySnapshot(config, {
+    isProcessAlive: (pid) => alive.has(pid),
+    pid: 30002,
+  });
+  const successor = createReceiverOwnership(incumbent, {
+    pid: 30002,
+    randomUUID: () => 'successor-generation',
+  });
+  commitReceiverOwnership(config, snapshot, successor, { pid: 30002 });
+  await makeHandler(successor, successor.pid)({ ...message, reference: null, fetchReference: undefined });
+  releaseReference();
+  await incumbentHandling;
+
+  const queue = JSON.parse(fs.readFileSync(config.paths.deliveryQueuePath, 'utf8'));
+  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), ['same-message']);
+  assert.deepEqual(queue.completed, []);
+  assert.equal(queue.blocked.reason, 'thread_busy');
+  delivery.destroy();
 });
 
 test('sole gateway queues while target is down and restart delivers the event exactly once', async () => {
@@ -773,4 +904,14 @@ test('sole gateway queues while target is down and restart delivers the event ex
   }), true);
   second.client.destroy();
   secondDelivery.destroy();
+});
+
+test('gateway shutdown transfers authority before destroying its armed listener', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', '..', 'bin', 'codex-discord-channel'), 'utf8');
+  const releaseIndex = source.indexOf('await delivery.coordinateReceiverOwnership');
+  const destroyIndex = source.indexOf('if (discordState.client?.destroy) await discordState.client.destroy()');
+
+  assert.notEqual(releaseIndex, -1);
+  assert.notEqual(destroyIndex, -1);
+  assert.ok(releaseIndex < destroyIndex);
 });

@@ -17,7 +17,21 @@ unavailable while accepted messages remain persisted.
 The stable receiver identity is:
 
 1. the normalized Discord instance and its state directory; and
-2. the live PID in `session-gateway.pid`.
+2. the PID and generation in the atomic JSON authority record at
+   `session-gateway.pid`.
+
+The record is replaced by one atomic rename. A live incumbent remains the
+effective receiver until a logged-in successor has proved durable queue and
+target readiness, armed its listener, and committed that replacement. The new
+record retains the incumbent as fallback, so an A7 incumbent becomes effective
+again if the committed successor process dies. Legacy integer PID plus
+`.generation` state is accepted only as migration input and is never written by
+new claims.
+
+When no live incumbent exists, target readiness is not a receive-startup gate.
+The first gateway logs in, proves queue persistence, arms its listener, and
+claims authority so accepted events can remain durable until app-server
+reconnection or restart delivery.
 
 `owner.json` remains useful for session status and handoff, but it never decides
 whether an individual gateway event is accepted. Thread and session ids may

@@ -13,7 +13,10 @@ const {
 } = require('./receiver-state');
 
 function log(logger, level, message, meta) {
-  if (typeof logger === 'function') logger(level, message, meta);
+  if (typeof logger !== 'function') return;
+  try {
+    logger(level, message, meta);
+  } catch {}
 }
 
 function configureNetwork(config, logger) {
@@ -48,22 +51,6 @@ function configureNetwork(config, logger) {
       });
     }
   }
-}
-
-function readDiscordReceiverOwnership(config = {}, deps = {}) {
-  return readReceiverAuthoritySnapshot(config, deps).record;
-}
-
-function claimDiscordReceiverOwnership(config = {}, deps = {}) {
-  const checkReceiver = deps.isActiveDiscordReceiver || isActiveDiscordReceiver;
-  const receiver = checkReceiver(config, deps);
-  if (!receiver.active) {
-    throw new Error(`Cannot claim Discord receiver ownership: ${receiver.reason || 'inactive_receiver'}.`);
-  }
-  const snapshot = readReceiverAuthoritySnapshot(config, deps);
-  const effective = effectiveReceiverOwnership(snapshot, deps)?.record || null;
-  const candidate = createReceiverOwnership(effective, deps);
-  return commitReceiverOwnership(config, snapshot, candidate, deps);
 }
 
 function isCurrentDiscordReceiverOwnership(config = {}, expected, deps = {}) {
@@ -292,11 +279,9 @@ async function sendDiscordMessage(client, args) {
 }
 
 module.exports = {
-  claimDiscordReceiverOwnership,
   configureNetwork,
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
-  readDiscordReceiverOwnership,
   releaseDiscordReceiverOwnership,
   resolveReferencedMessage,
   sendDiscordMessage,

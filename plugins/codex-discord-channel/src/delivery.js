@@ -200,8 +200,10 @@ async function acquireDeliveryQueueLock(config = {}, deps = {}) {
         throw error;
       }
       return () => {
-        const owner = readLockOwner(lockPath, fsImpl);
-        if (owner?.token === token) removeLockDirectory(lockPath, fsImpl);
+        try {
+          const owner = readLockOwner(lockPath, fsImpl);
+          if (owner?.token === token) removeLockDirectory(lockPath, fsImpl);
+        } catch {}
       };
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;

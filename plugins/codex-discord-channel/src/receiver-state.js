@@ -41,28 +41,6 @@ function parseOwnershipRecord(contents) {
   }
 }
 
-function readPid(pidPath) {
-  try {
-    const contents = fs.readFileSync(pidPath, 'utf8');
-    return parseOwnershipRecord(contents)?.pid || parseLegacyPid(contents);
-  } catch (error) {
-    if (error && error.code === 'ENOENT') return 0;
-    throw error;
-  }
-}
-
-function writePid(pidPath, pid = process.pid) {
-  fs.mkdirSync(path.dirname(pidPath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 });
-  return pid;
-}
-
-function clearPid(pidPath, pid = process.pid) {
-  if (readPid(pidPath) !== pid) return false;
-  fs.unlinkSync(pidPath);
-  return true;
-}
-
 function isProcessAlive(pid) {
   try {
     process.kill(pid, 0);
@@ -298,7 +276,6 @@ function releaseReceiverOwnership(config, expected, deps = {}) {
 }
 
 module.exports = {
-  clearPid,
   commitReceiverOwnership,
   createReceiverOwnership,
   effectiveReceiverOwnership,
@@ -306,9 +283,7 @@ module.exports = {
   isActiveDiscordReceiver,
   isCurrentReceiverOwnership,
   isProcessAlive,
-  readPid,
   readReceiverAuthoritySnapshot,
   releaseReceiverOwnership,
   sameReceiverOwnership,
-  writePid,
 };

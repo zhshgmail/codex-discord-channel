@@ -6,12 +6,9 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
-  clearPid,
   isActiveDiscordReceiver,
-  readPid,
   readReceiverAuthoritySnapshot,
   releaseReceiverOwnership,
-  writePid,
 } = require('../../src/receiver-state');
 
 test('gateway pid file selects active receiver independently from owner id', () => {
@@ -22,8 +19,7 @@ test('gateway pid file selects active receiver independently from owner id', () 
 
   assert.deepEqual(isActiveDiscordReceiver(config), { active: false, reason: 'gateway_pid_missing' });
 
-  writePid(gatewayPidPath, process.pid);
-  assert.equal(readPid(gatewayPidPath), process.pid);
+  fs.writeFileSync(gatewayPidPath, `${process.pid}\n`);
   assert.deepEqual(isActiveDiscordReceiver(config), {
     active: true,
     reason: 'gateway_pid_match',
@@ -42,15 +38,15 @@ test('gateway pid file selects active receiver independently from owner id', () 
     reason: 'gateway_pid_match',
     pid: process.pid,
   });
-  assert.equal(clearPid(gatewayPidPath, process.pid), true);
-  assert.equal(readPid(gatewayPidPath), 0);
+  fs.unlinkSync(gatewayPidPath);
+  assert.deepEqual(isActiveDiscordReceiver(config), { active: false, reason: 'gateway_pid_missing' });
 });
 
 test('non-gateway receiver stands down when live gateway pid differs', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
   const config = { paths: { gatewayPidPath } };
-  writePid(gatewayPidPath, 12345);
+  fs.writeFileSync(gatewayPidPath, '12345\n');
 
   const decision = isActiveDiscordReceiver(config, { isProcessAlive: () => true });
   assert.equal(decision.active, false);
@@ -62,7 +58,7 @@ test('stale gateway pid fails closed instead of enabling a fallback receiver', (
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
   const config = { paths: { gatewayPidPath } };
-  writePid(gatewayPidPath, 12345);
+  fs.writeFileSync(gatewayPidPath, '12345\n');
 
   const decision = isActiveDiscordReceiver(config, { isProcessAlive: () => false });
   assert.equal(decision.active, false);

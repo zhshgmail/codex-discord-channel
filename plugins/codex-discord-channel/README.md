@@ -5,9 +5,10 @@ This directory is the plugin payload for `codex-discord-channel`.
 ## Runtime Contract
 
 The Discord gateway is identified by the configured instance state directory
-and `session-gateway.pid`. `owner.json` is status and handoff metadata; it is
-not a per-message receive gate and may change after `/clear` without replacing
-the gateway.
+and one atomic PID-plus-generation authority record in `session-gateway.pid`.
+The record may retain a live incumbent as takeover fallback. `owner.json` is
+status and handoff metadata; it is not a per-message receive gate and may
+change after `/clear` without replacing the gateway.
 
 Access-approved Discord messages are atomically persisted to
 `pending-delivery.json`, cross-process locked, and deduplicated by Discord
@@ -27,6 +28,11 @@ If the shared endpoint or exact current thread is unavailable, the queue stays
 persisted and status reports a stable reason such as
 `shared_app_server_socket_missing`, `shared_app_server_no_loaded_thread`, or
 `shared_app_server_thread_ambiguous`. There is no terminal fallback.
+
+When no live receiver exists, Discord login, durable queue readiness, and an
+armed listener are sufficient to claim reception; target delivery reconnects
+later. A live-receiver takeover also requires target readiness before its one
+atomic authority commit.
 
 The visible TUI must be relaunched with `codex --remote <same-endpoint> ...`
 after a shared app-server is started. A direct `codex ... resume` process cannot

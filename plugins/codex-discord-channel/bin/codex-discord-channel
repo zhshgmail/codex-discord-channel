@@ -133,13 +133,13 @@ async function runGateway() {
     stopping = true;
     clearInterval(keepAlive);
     try {
-      if (discordState.client?.destroy) await discordState.client.destroy();
-    } catch {}
-    try {
       await delivery.coordinateReceiverOwnership(() => releaseDiscordReceiverOwnership(
         config,
         discordState.receiverOwnership,
       ));
+    } catch {}
+    try {
+      if (discordState.client?.destroy) await discordState.client.destroy();
     } catch {}
     if (typeof delivery.destroy === 'function') delivery.destroy();
     process.exit(0);

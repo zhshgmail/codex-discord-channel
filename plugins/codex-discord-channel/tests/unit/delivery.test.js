@@ -148,6 +148,43 @@ function createManualTimers() {
   };
 }
 
+test('queue lock cleanup failure cannot negate an already committed ownership operation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-cleanup-'));
+  const config = deliveryConfig(dir);
+  let failCleanup = false;
+  const fsProxy = {
+    ...fs,
+    rmSync(target, options) {
+      if (failCleanup && target === `${config.paths.deliveryQueuePath}.lock`) {
+        failCleanup = false;
+        const error = new Error('injected lock cleanup failure');
+        error.code = 'EACCES';
+        throw error;
+      }
+      return fs.rmSync(target, options);
+    },
+  };
+  const delivery = createDelivery(config, () => {}, {
+    fs: fsProxy,
+    structuredHost: {
+      async resolveTarget() { return { available: true, threadId: 'thread-current', status: 'idle' }; },
+      onThreadIdle() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await delivery.flush();
+  failCleanup = true;
+
+  const result = await delivery.coordinateReceiverOwnership(() => 'authority-committed');
+
+  assert.equal(result, 'authority-committed');
+  assert.equal(fs.existsSync(`${config.paths.deliveryQueuePath}.lock`), true);
+  delivery.destroy();
+});
+
 test('escapeAttr escapes unsafe attribute characters', () => {
   assert.equal(escapeAttr('"x<&'), '&quot;x&lt;&amp;');
 });

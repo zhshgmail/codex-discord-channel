@@ -7,7 +7,9 @@ marketplace at `.agents/plugins/marketplace.json`.
 ## What It Does
 
 - Reuses one Discord bot instance and state directory per configured instance.
-- Uses `session-gateway.pid` in that state directory as the active receive gate.
+- Uses one atomically replaced JSON authority record in `session-gateway.pid`
+  as the active receive gate. The record binds PID and generation together and
+  retains a live incumbent fallback across takeover.
 - Keeps `owner.json` for status and handoff metadata only; thread or session ids
   never gate individual Discord messages.
 - Persists accepted messages in a cross-process locked, deduplicated FIFO.
@@ -19,6 +21,11 @@ There is no terminal-input delivery path. If the visible TUI is not attached to
 the same shared app-server, the endpoint is unavailable, or the current thread
 cannot be proved, accepted messages remain queued. The gateway never falls back
 to keyboard emulation.
+
+A first or sole gateway logs in and starts durable Discord admission even when
+the app-server target is unavailable. A takeover of a live receiver additionally
+requires target readiness, arms the successor listener, and then transfers
+authority with one atomic record replacement.
 
 ## Structured Delivery
 
