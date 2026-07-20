@@ -321,6 +321,31 @@ test('messages from a replaced websocket cannot mutate the active connection thr
   assert.equal((await host.resolveTarget()).threadId, 'thread-current');
 });
 
+test('host reports available status after reconnect initialization completes', async (t) => {
+  const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
+    assert.equal(request.method, 'initialize');
+    return {};
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+
+  await host.client.ensureConnected();
+  sockets[0].close();
+  assert.deepEqual(host.status(), {
+    configured: true,
+    available: false,
+    reason: 'shared_app_server_disconnected',
+  });
+
+  await host.client.ensureConnected();
+  assert.equal(sockets.length, 2);
+  assert.deepEqual(host.status(), {
+    configured: true,
+    available: true,
+    reason: null,
+  });
+});
+
 test('latest top-level thread/started notification selects the rotated TUI thread among loaded history', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
