@@ -658,12 +658,11 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     coordinateReceiverOwnership(operation) {
       return serializeAdmission(() => withDeliveryQueueLock(config, deps, operation));
     },
-    async deliver(normalized, options = {}) {
+    async enqueue(normalized, options = {}) {
       const envelope = formatEnvelope(normalized);
       if (config.deliveryMode === 'off') {
         return { status: 'unsupported', reason: 'delivery_disabled', envelope };
       }
-      await startupDrain;
 
       const admission = await serializeAdmission(async () => {
         let queueResult;
@@ -724,8 +723,21 @@ function createDelivery(config, logger = () => {}, deps = {}) {
           envelope,
         };
       }
+      return {
+        status: 'accepted',
+        reason: admission.queueResult.enqueued
+          ? 'discord_message_persisted'
+          : 'discord_message_already_pending',
+        queueDepth: admission.queueResult.queue.items.length,
+        envelope,
+      };
+    },
+    async deliver(normalized, options = {}) {
+      const admission = await delivery.enqueue(normalized, options);
+      if (admission.status !== 'accepted') return admission;
+      await startupDrain;
       const result = await delivery.flush();
-      return { ...result, envelope };
+      return { ...result, envelope: admission.envelope };
     },
     destroy() {
       destroyed = true;

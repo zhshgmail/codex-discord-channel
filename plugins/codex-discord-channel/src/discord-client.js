@@ -170,10 +170,10 @@ function createDiscordMessageHandler({
       deps,
     );
   };
-  const processMessage = async (message) => {
+  const admitMessage = async (message) => {
     try {
       if (message.author?.id && client.user?.id && message.author.id === client.user.id) {
-        return;
+        return null;
       }
       const receiver = verifyReceiverOwnership();
       if (!receiver.active) {
@@ -183,7 +183,7 @@ function createDiscordMessageHandler({
           channelId: message.channelId,
           messageId: message.id,
         });
-        return;
+        return null;
       }
       const accessState = (deps.loadAccessState || loadAccessState)(config.paths?.accessPath);
       const referencedMessage = await resolveReferencedMessage(message, accessState);
@@ -195,7 +195,7 @@ function createDiscordMessageHandler({
           channelId: message.channelId,
           messageId: message.id,
         });
-        return;
+        return null;
       }
       const normalized = normalizeDiscordMessage(message, referencedMessage);
       normalized.botUserId = client.user?.id || config.botUserId || '';
@@ -206,9 +206,24 @@ function createDiscordMessageHandler({
           channelId: normalized.channelId,
           messageId: normalized.messageId,
         });
-        return;
+        return null;
       }
-      const result = await delivery.deliver(normalized, { verifyReceiverOwnership });
+      const result = await delivery.enqueue(normalized, { verifyReceiverOwnership });
+      return { normalized, result };
+    } catch (error) {
+      log(logger, 'ERROR', 'Discord message handler failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  };
+  const drainAdmittedMessage = async (admission) => {
+    if (!admission) return;
+    const { normalized } = admission;
+    try {
+      const result = admission.result.status === 'accepted'
+        ? await delivery.flush()
+        : admission.result;
       log(logger, 'INFO', 'Discord message delivery result', {
         status: result.status,
         reason: result.reason,
@@ -224,11 +239,11 @@ function createDiscordMessageHandler({
 
   return (message) => {
     const result = messageOperations.then(
-      () => processMessage(message),
-      () => processMessage(message),
+      () => admitMessage(message),
+      () => admitMessage(message),
     );
     messageOperations = result.catch(() => {});
-    return result;
+    return result.then(drainAdmittedMessage);
   };
 }
 

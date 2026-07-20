@@ -551,13 +551,16 @@ test('concurrent receivers persist and submit a Discord identity only once', asy
   const config = deliveryConfig(dir);
   const requests = [];
   let release;
+  let markStarted;
   const pending = new Promise((resolve) => { release = resolve; });
+  const started = new Promise((resolve) => { markStarted = resolve; });
   const host = {
     async resolveTarget() {
       return { available: true, threadId: 'thread-current', status: 'idle' };
     },
     async startTurn(params) {
       requests.push(params);
+      markStarted();
       await pending;
       return { turn: { id: 'turn-1' } };
     },
@@ -571,11 +574,14 @@ test('concurrent receivers persist and submit a Discord identity only once', asy
     first.deliver(discordMessage('m-once', 'once')),
     second.deliver(discordMessage('m-once', 'once')),
   ];
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(requests.length, 1);
+  const startedBeforeTimeout = await Promise.race([
+    started.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 250)),
+  ]);
   release();
   const results = await Promise.all(deliveries);
 
+  assert.equal(startedBeforeTimeout, true);
   assert.equal(results.some((result) => result.status === 'delivered'), true);
   assert.equal(requests.length, 1);
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-once']);

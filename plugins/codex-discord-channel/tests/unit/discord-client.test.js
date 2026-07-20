@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { decideAccess, normalizeAccessState } = require('../../src/access-state');
-const { normalizeDiscordMessage } = require('../../src/delivery');
+const { createDelivery, normalizeDiscordMessage } = require('../../src/delivery');
 const {
   claimDiscordReceiverOwnership,
   createDiscordMessageHandler,
@@ -134,10 +134,11 @@ test('concurrent reference fetch preserves Discord event delivery order', async 
     config: { botUserId: 'bot' },
     client: { user: { id: 'bot' } },
     delivery: {
-      async deliver(normalized) {
+      async enqueue(normalized) {
         delivered.push(normalized.messageId);
-        return { status: 'delivered', reason: 'turn_accepted' };
+        return { status: 'accepted', reason: 'discord_message_persisted' };
       },
+      async flush() { return { status: 'delivered', reason: 'turn_accepted' }; },
     },
     logger: () => {},
     deps: {
@@ -180,6 +181,78 @@ test('concurrent reference fetch preserves Discord event delivery order', async 
   assert.deepEqual(delivered, ['m1', 'm2']);
 });
 
+test('accepted Discord events persist in FIFO order while an earlier delivery blocks', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-discord-admission-'));
+  const config = {
+    botUserId: 'bot',
+    deliveryMode: 'app-server',
+    appServerRequestTimeoutMs: 30000,
+    paths: {
+      stateDir: dir,
+      lastInboundPath: path.join(dir, 'last-inbound.json'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
+  };
+  let target = { available: true, threadId: 'thread-root', status: 'idle' };
+  let releaseFirst;
+  let markFirstStarted;
+  const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+  const firstReleased = new Promise((resolve) => { releaseFirst = resolve; });
+  const requests = [];
+  const delivery = createDelivery(config, () => {}, {
+    structuredHost: {
+      async resolveTarget() { return { ...target }; },
+      async startTurn(params) {
+        requests.push(params);
+        target = { ...target, status: 'active' };
+        markFirstStarted();
+        await firstReleased;
+        return { turn: { id: 'turn-m1' } };
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  const handler = createDiscordMessageHandler({
+    config,
+    client: { user: { id: 'bot' } },
+    delivery,
+    logger: () => {},
+    deps: {
+      isActiveDiscordReceiver: () => ({ active: true, reason: 'gateway_pid_match' }),
+      loadAccessState: () => normalizeAccessState({
+        groups: { c1: { requireMention: false } },
+      }),
+    },
+  });
+  const makeMessage = (id, content) => ({
+    guildId: 'g1',
+    channelId: 'c1',
+    id,
+    author: { id: `user-${id}`, username: id, bot: false },
+    content,
+    attachments: [],
+  });
+
+  const firstHandling = handler(makeMessage('m1', 'first'));
+  await firstStarted;
+  const secondHandling = handler(makeMessage('m2', 'second'));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const persistedBeforeFirstCompleted = JSON.parse(
+    fs.readFileSync(config.paths.deliveryQueuePath, 'utf8'),
+  );
+  releaseFirst();
+  await Promise.all([firstHandling, secondHandling]);
+
+  assert.deepEqual(
+    persistedBeforeFirstCompleted.items.map((item) => item.normalized.messageId),
+    ['m1', 'm2'],
+  );
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m1']);
+  delivery.destroy();
+});
+
 test('receiver ownership claim atomically replaces the durable generation', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-generation-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
@@ -216,12 +289,13 @@ test('old gateway cannot accept an earlier message after new ownership accepts a
   const referenceReleased = new Promise((resolve) => { releaseReference = resolve; });
   const delivered = [];
   const delivery = {
-    async deliver(normalized, options = {}) {
+    async enqueue(normalized, options = {}) {
       const receiver = options.verifyReceiverOwnership?.() || { active: true };
       if (!receiver.active) return { status: 'ignored', reason: receiver.reason };
       delivered.push(normalized.messageId);
-      return { status: 'delivered', reason: 'turn_accepted' };
+      return { status: 'accepted', reason: 'discord_message_persisted' };
     },
+    async flush() { return { status: 'delivered', reason: 'turn_accepted' }; },
   };
   const createHandler = (generation) => createDiscordMessageHandler({
     config: { botUserId: 'bot' },
