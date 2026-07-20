@@ -28,7 +28,7 @@ function validOwnershipIdentity(record) {
   );
 }
 
-function parseOwnershipRecord(contents) {
+function parseJsonOwnershipRecord(contents) {
   try {
     const record = JSON.parse(String(contents));
     if (!validOwnershipIdentity(record)) return null;
@@ -39,6 +39,26 @@ function parseOwnershipRecord(contents) {
   } catch {
     return null;
   }
+}
+
+function parseOwnershipRecord(contents) {
+  const text = String(contents);
+  const record = parseJsonOwnershipRecord(text);
+  if (record) return record;
+
+  const lineBreak = text.indexOf('\n');
+  if (lineBreak < 1) return null;
+  const legacyPid = parseLegacyPid(text.slice(0, lineBreak));
+  const framed = parseJsonOwnershipRecord(text.slice(lineBreak + 1));
+  if (
+    !legacyPid ||
+    framed?.version !== 2 ||
+    framed.fallback?.version !== 1 ||
+    framed.fallback.pid !== legacyPid
+  ) {
+    return null;
+  }
+  return framed;
 }
 
 function isProcessAlive(pid) {
@@ -219,19 +239,33 @@ function createReceiverOwnership(previous, deps = {}) {
   };
 }
 
-function writeAuthorityAtomically(file, record, deps = {}) {
+function replaceAuthorityAtomically(file, contents, generation, deps = {}) {
   const fsImpl = deps.fs || fs;
   const pid = localPid(deps);
   fsImpl.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${pid}.${record.generation}.tmp`;
+  const temp = `${file}.${pid}.${generation}.tmp`;
   try {
-    fsImpl.writeFileSync(temp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    fsImpl.writeFileSync(temp, contents, { mode: 0o600 });
     fsImpl.renameSync(temp, file);
   } finally {
     try {
       fsImpl.rmSync(temp, { force: true });
     } catch {}
   }
+}
+
+function serializeAuthorityRecord(record) {
+  const structured = `${JSON.stringify(record)}\n`;
+  if (record.version !== 2 || record.fallback?.version !== 1) return structured;
+  return `${record.fallback.pid}\n${structured}`;
+}
+
+function writeAuthorityAtomically(file, record, deps = {}) {
+  replaceAuthorityAtomically(file, serializeAuthorityRecord(record), record.generation, deps);
+}
+
+function writeLegacyAuthorityAtomically(file, record, deps = {}) {
+  replaceAuthorityAtomically(file, `${record.pid}\n`, record.generation, deps);
 }
 
 function snapshotsMatch(left, right) {
@@ -256,10 +290,14 @@ function releaseReceiverOwnership(config, expected, deps = {}) {
   const current = snapshot.record;
   if (sameReceiverOwnership(current, expected)) {
     const fallback = current.version === 2 && current.fallback && processIsAlive(current.fallback.pid, deps)
-      ? { ...fallbackRecord(current.fallback), version: 2, fallback: null }
+      ? fallbackRecord(current.fallback)
       : null;
     if (fallback) {
-      writeAuthorityAtomically(snapshot.path, fallback, deps);
+      if (fallback.version === 1) {
+        writeLegacyAuthorityAtomically(snapshot.path, fallback, deps);
+      } else {
+        writeAuthorityAtomically(snapshot.path, fallback, deps);
+      }
     } else {
       fsImpl.unlinkSync(snapshot.path);
     }
