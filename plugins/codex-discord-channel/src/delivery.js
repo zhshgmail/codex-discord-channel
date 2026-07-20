@@ -620,6 +620,10 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   const host = deps.structuredHost || createAppServerHost(config, logger, deps.appServer || {});
   let admissionOperations = Promise.resolve();
   let drainOperations = Promise.resolve();
+  let destroyed = false;
+  let unsubscribeIdle = null;
+  let unsubscribeReconnect = null;
+  let startupDrain = Promise.resolve();
   const serializeAdmission = (operation) => {
     const result = admissionOperations.then(operation, operation);
     admissionOperations = result.catch(() => {});
@@ -646,6 +650,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (config.deliveryMode === 'off') {
         return { status: 'unsupported', reason: 'delivery_disabled', envelope };
       }
+      await startupDrain;
 
       const admission = await serializeAdmission(async () => {
         let queueResult;
@@ -696,22 +701,33 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       return { ...result, envelope };
     },
     destroy() {
+      destroyed = true;
       if (typeof unsubscribeIdle === 'function') unsubscribeIdle();
+      if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
       if (typeof host.destroy === 'function') host.destroy();
     },
   };
 
-  const unsubscribeIdle = typeof host.onThreadIdle === 'function'
-    ? host.onThreadIdle(() => delivery.flush().catch((error) => {
-      logger('ERROR', 'Failed to drain Discord delivery queue after thread became idle', {
+  const drainAutonomously = (trigger) => {
+    if (destroyed) return Promise.resolve({ status: 'idle', reason: 'delivery_destroyed' });
+    return delivery.flush().catch((error) => {
+      logger('ERROR', 'Failed to drain Discord delivery queue automatically', {
+        trigger,
         error: error instanceof Error ? error.message : String(error),
       });
       return {
         status: 'failed',
         reason: 'shared_app_server_unavailable',
       };
-    }))
+    });
+  };
+  unsubscribeIdle = typeof host.onThreadIdle === 'function'
+    ? host.onThreadIdle(() => drainAutonomously('thread_idle'))
     : null;
+  unsubscribeReconnect = typeof host.onReconnect === 'function'
+    ? host.onReconnect(() => drainAutonomously('reconnect'))
+    : null;
+  startupDrain = drainAutonomously('startup');
   return delivery;
 }
 

@@ -289,6 +289,8 @@ class AppServerHost extends EventEmitter {
     super();
     this.client = deps.client || new AppServerRpcClient(config, logger, deps);
     this.lastStatus = this.client.status();
+    this.hasConnected = Boolean(this.lastStatus.available);
+    this.connectionWasLost = false;
     this.currentThreadId = '';
     this.threadSelectionRevision = 0;
     this.threadStatuses = new Map();
@@ -323,11 +325,19 @@ class AppServerHost extends EventEmitter {
         }
       }
     };
-    this.onConnectionChanged = () => {
+    this.onConnectionChanged = (event) => {
       this.threadSelectionRevision += 1;
       this.currentThreadId = '';
       this.threadStatuses.clear();
       this.lastStatus = this.client.status();
+      const reconnected = this.lastStatus.available && this.connectionWasLost;
+      if (this.lastStatus.available) {
+        this.hasConnected = true;
+        this.connectionWasLost = false;
+      } else if (this.hasConnected) {
+        this.connectionWasLost = true;
+      }
+      if (reconnected) this.emit('reconnect', event);
     };
     this.client.on('notification', this.onNotification);
     this.client.on('connectionChanged', this.onConnectionChanged);
@@ -447,6 +457,11 @@ class AppServerHost extends EventEmitter {
   onThreadIdle(listener) {
     this.on('idle', listener);
     return () => this.off('idle', listener);
+  }
+
+  onReconnect(listener) {
+    this.on('reconnect', listener);
+    return () => this.off('reconnect', listener);
   }
 
   destroy() {

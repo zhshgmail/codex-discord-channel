@@ -346,6 +346,26 @@ test('host reports available status after reconnect initialization completes', a
   });
 });
 
+test('host emits reconnect only when availability returns after a live connection was lost', () => {
+  let status = { configured: true, available: false, reason: 'shared_app_server_not_connected' };
+  const client = new FakeRpcClient(async () => { throw new Error('not used'); });
+  client.status = () => ({ ...status });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  const seen = [];
+  const unsubscribe = host.onReconnect((event) => seen.push(event));
+
+  status = { configured: true, available: true, reason: null };
+  client.emit('connectionChanged', { generation: 1 });
+  status = { configured: true, available: false, reason: 'shared_app_server_disconnected' };
+  client.emit('connectionChanged', { generation: 2 });
+  status = { configured: true, available: true, reason: null };
+  client.emit('connectionChanged', { generation: 3 });
+
+  assert.deepEqual(seen, [{ generation: 3 }]);
+  unsubscribe();
+  host.destroy();
+});
+
 test('latest top-level thread/started notification selects the rotated TUI thread among loaded history', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {

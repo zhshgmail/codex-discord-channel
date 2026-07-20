@@ -110,6 +110,19 @@ function readQueue(dir) {
   return JSON.parse(fs.readFileSync(path.join(dir, 'pending-delivery.json'), 'utf8'));
 }
 
+function writePendingQueue(dir, messages) {
+  fs.writeFileSync(path.join(dir, 'pending-delivery.json'), `${JSON.stringify({
+    version: 1,
+    items: messages.map((normalized) => ({
+      version: 1,
+      queuedAt: '2026-07-20T00:00:00.000Z',
+      normalized,
+    })),
+    completed: [],
+    blocked: null,
+  }, null, 2)}\n`);
+}
+
 test('escapeAttr escapes unsafe attribute characters', () => {
   assert.equal(escapeAttr('"x<&'), '&quot;x&lt;&amp;');
 });
@@ -268,6 +281,70 @@ test('missing shared app-server fails closed, persists FIFO, and never calls a T
     available: false,
     reason: 'shared_app_server_socket_missing',
   });
+});
+
+test('persisted accepted message drains autonomously when delivery starts', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-startup-'));
+  writePendingQueue(dir, [discordMessage('m-startup', 'persisted')]);
+  const requests = [];
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-startup' } };
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-startup']);
+  assert.deepEqual(readQueue(dir).items, []);
+  delivery.destroy();
+});
+
+test('persisted accepted message drains autonomously when the host reconnects', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-reconnect-'));
+  writePendingQueue(dir, [discordMessage('m-reconnect', 'persisted')]);
+  const requests = [];
+  let availableListener = null;
+  let target = {
+    available: false,
+    reason: 'shared_app_server_disconnected',
+    status: 'unavailable',
+  };
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() { return { ...target }; },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-reconnect' } };
+      },
+      onThreadIdle() { return () => {}; },
+      onReconnect(listener) {
+        availableListener = listener;
+        return () => { availableListener = null; };
+      },
+      status() { return { configured: true, available: target.available, reason: target.reason || null }; },
+      destroy() {},
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, []);
+  assert.equal(typeof availableListener, 'function');
+
+  target = { available: true, threadId: 'thread-current', status: 'idle' };
+  await availableListener();
+
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-reconnect']);
+  assert.deepEqual(readQueue(dir).items, []);
+  delivery.destroy();
 });
 
 test('concurrent receivers persist and submit a Discord identity only once', async () => {
