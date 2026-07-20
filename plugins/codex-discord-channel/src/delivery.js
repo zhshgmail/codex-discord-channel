@@ -649,6 +649,27 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     status() {
       return host.status();
     },
+    async ensureReady() {
+      if (config.deliveryMode === 'off') {
+        const error = new Error('Structured Discord delivery is disabled.');
+        error.code = 'delivery_disabled';
+        throw error;
+      }
+      let target;
+      try {
+        target = await host.resolveTarget();
+      } catch (error) {
+        const unavailable = new Error(error instanceof Error ? error.message : String(error));
+        unavailable.code = error?.code || 'shared_app_server_unavailable';
+        throw unavailable;
+      }
+      if (target?.available !== true) {
+        const error = new Error(target?.error || target?.reason || 'Shared app-server is unavailable.');
+        error.code = target?.reason || 'shared_app_server_unavailable';
+        throw error;
+      }
+      return target;
+    },
     flush() {
       if (config.deliveryMode === 'off') {
         return Promise.resolve({ status: 'unsupported', reason: 'delivery_disabled' });

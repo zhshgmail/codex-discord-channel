@@ -6,7 +6,7 @@ const { configureNetwork } = require('../src/discord-client');
 const { createDelivery, resolveReplyTarget } = require('../src/delivery');
 const { startDiscordClient } = require('../src/discord-client');
 const { claimOwner, createOwner } = require('../src/owner-state');
-const { clearPid, writePid } = require('../src/receiver-state');
+const { clearPid } = require('../src/receiver-state');
 
 function usage() {
   process.stderr.write([
@@ -106,14 +106,10 @@ function enabled(value) {
 async function runGateway() {
   const logger = makeLogger();
   const config = loadConfig();
-  writePid(config.paths.gatewayPidPath, process.pid);
-  if (enabled(config.env.CODEX_DISCORD_GATEWAY_CLAIM_OWNER)) {
-    claimOwner(config.paths.ownerPath, createOwner(config));
-  }
   const delivery = createDelivery(config, logger);
   let discordState;
   try {
-    discordState = await startDiscordClient({ config, delivery, logger });
+    discordState = await startDiscordClient({ config, delivery, logger, claimReceiver: true });
   } catch (error) {
     delivery.destroy();
     clearPid(config.paths.gatewayPidPath, process.pid);
@@ -123,6 +119,15 @@ async function runGateway() {
     delivery.destroy();
     clearPid(config.paths.gatewayPidPath, process.pid);
     throw new Error(`Discord gateway did not start: ${discordState.reason || 'unknown'}`);
+  }
+  if (enabled(config.env.CODEX_DISCORD_GATEWAY_CLAIM_OWNER)) {
+    try {
+      claimOwner(config.paths.ownerPath, createOwner(config));
+    } catch (error) {
+      logger('ERROR', 'Failed to update optional Discord owner metadata', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   const keepAlive = setInterval(() => {}, 2 ** 30);
   const stop = () => {

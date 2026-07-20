@@ -400,3 +400,208 @@ test('non-receiver MCP client logs in without claiming ownership or registering 
   assert.deepEqual(result.client.loginTokens, ['test-token']);
   assert.equal(result.client.listenerCount('messageCreate'), 0);
 });
+
+function gatewayDiscordDeps(Client) {
+  return {
+    Client,
+    Events: { MessageCreate: 'messageCreate' },
+    GatewayIntentBits: {
+      DirectMessages: 1,
+      Guilds: 2,
+      GuildMessages: 4,
+      MessageContent: 8,
+    },
+    Partials: { Channel: 'channel' },
+  };
+}
+
+function incumbentGatewayFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-gateway-takeover-'));
+  const gatewayPidPath = path.join(dir, 'session-gateway.pid');
+  const receiverOwnershipPath = `${gatewayPidPath}.generation`;
+  const ownership = {
+    version: 1,
+    pid: 424242,
+    generation: 'incumbent-generation',
+    claimedAt: '2026-07-20T00:00:00.000Z',
+  };
+  fs.writeFileSync(gatewayPidPath, `${ownership.pid}\n`);
+  fs.writeFileSync(receiverOwnershipPath, `${JSON.stringify(ownership)}\n`);
+  return {
+    config: {
+      tokenConfigured: true,
+      loginDisabled: false,
+      token: 'test-token',
+      botUserId: 'bot',
+      paths: { gatewayPidPath, receiverOwnershipPath },
+    },
+    gatewayPidPath,
+    ownership,
+    receiverOwnershipPath,
+  };
+}
+
+test('successor Discord login failure preserves incumbent durable receiver ownership', async () => {
+  const { config, gatewayPidPath, ownership, receiverOwnershipPath } = incumbentGatewayFixture();
+  let destroys = 0;
+  let readinessChecks = 0;
+  const { EventEmitter } = require('node:events');
+  class FailingDiscordClient extends EventEmitter {
+    async login() { throw new Error('login failed'); }
+    destroy() { destroys += 1; }
+  }
+
+  await assert.rejects(
+    startDiscordClient({
+      config,
+      claimReceiver: true,
+      delivery: {
+        async ensureReady() { readinessChecks += 1; },
+        async coordinateReceiverOwnership(operation) { return operation(); },
+      },
+      logger: () => {},
+      deps: { discord: gatewayDiscordDeps(FailingDiscordClient) },
+    }),
+    /login failed/,
+  );
+
+  assert.equal(destroys, 1);
+  assert.equal(readinessChecks, 0);
+  assert.equal(fs.readFileSync(gatewayPidPath, 'utf8'), `${ownership.pid}\n`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(receiverOwnershipPath, 'utf8')), ownership);
+});
+
+test('successor app-server readiness failure preserves incumbent durable receiver ownership', async () => {
+  const { config, gatewayPidPath, ownership, receiverOwnershipPath } = incumbentGatewayFixture();
+  let destroys = 0;
+  let ownershipClaims = 0;
+  const { EventEmitter } = require('node:events');
+  class ReadyDiscordClient extends EventEmitter {
+    constructor() {
+      super();
+      this.user = { id: 'bot', tag: 'bot#0001' };
+    }
+    async login() {}
+    destroy() { destroys += 1; }
+  }
+
+  await assert.rejects(
+    startDiscordClient({
+      config,
+      claimReceiver: true,
+      delivery: {
+        async ensureReady() { throw new Error('app-server unavailable'); },
+        async coordinateReceiverOwnership(operation) {
+          ownershipClaims += 1;
+          return operation();
+        },
+      },
+      logger: () => {},
+      deps: { discord: gatewayDiscordDeps(ReadyDiscordClient) },
+    }),
+    /app-server unavailable/,
+  );
+
+  assert.equal(destroys, 1);
+  assert.equal(ownershipClaims, 0);
+  assert.equal(fs.readFileSync(gatewayPidPath, 'utf8'), `${ownership.pid}\n`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(receiverOwnershipPath, 'utf8')), ownership);
+});
+
+test('successor replaces durable receiver ownership only after login and app-server readiness', async () => {
+  const { config, gatewayPidPath, receiverOwnershipPath } = incumbentGatewayFixture();
+  const events = [];
+  const { EventEmitter } = require('node:events');
+  class ReadyDiscordClient extends EventEmitter {
+    constructor() {
+      super();
+      this.user = { id: 'bot', tag: 'bot#0001' };
+    }
+    async login() { events.push('login'); }
+  }
+  const isActiveReceiver = () => {
+    const pid = Number.parseInt(fs.readFileSync(gatewayPidPath, 'utf8').trim(), 10);
+    return pid === process.pid
+      ? { active: true, reason: 'gateway_pid_match', pid }
+      : { active: false, reason: 'another_gateway_active', pid };
+  };
+
+  const result = await startDiscordClient({
+    config,
+    claimReceiver: true,
+    delivery: {
+      async ensureReady() {
+        events.push('readiness');
+        return { available: true, threadId: 'thread-root', status: 'idle' };
+      },
+      async coordinateReceiverOwnership(operation) {
+        events.push('coordination');
+        return operation();
+      },
+    },
+    logger: () => {},
+    deps: {
+      discord: gatewayDiscordDeps(ReadyDiscordClient),
+      isActiveDiscordReceiver: isActiveReceiver,
+      randomUUID: () => 'successor-generation',
+    },
+  });
+
+  assert.deepEqual(events, ['login', 'readiness', 'coordination']);
+  assert.equal(result.started, true);
+  assert.equal(result.client.listenerCount('messageCreate'), 1);
+  assert.equal(fs.readFileSync(gatewayPidPath, 'utf8'), `${process.pid}\n`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(receiverOwnershipPath, 'utf8')), {
+    version: 1,
+    pid: process.pid,
+    generation: 'successor-generation',
+    claimedAt: readDiscordReceiverOwnership(config).claimedAt,
+  });
+});
+
+test('failed successor generation claim restores incumbent PID and generation', async () => {
+  const { config, gatewayPidPath, ownership, receiverOwnershipPath } = incumbentGatewayFixture();
+  let currentPidChecks = 0;
+  let destroys = 0;
+  const { EventEmitter } = require('node:events');
+  class ReadyDiscordClient extends EventEmitter {
+    constructor() {
+      super();
+      this.user = { id: 'bot', tag: 'bot#0001' };
+    }
+    async login() {}
+    destroy() { destroys += 1; }
+  }
+  const isActiveReceiver = () => {
+    const pid = Number.parseInt(fs.readFileSync(gatewayPidPath, 'utf8').trim(), 10);
+    if (pid !== process.pid) return { active: false, reason: 'another_gateway_active', pid };
+    currentPidChecks += 1;
+    return currentPidChecks === 1
+      ? { active: true, reason: 'gateway_pid_match', pid }
+      : { active: false, reason: 'gateway_pid_changed', pid };
+  };
+
+  await assert.rejects(
+    startDiscordClient({
+      config,
+      claimReceiver: true,
+      delivery: {
+        async ensureReady() {
+          return { available: true, threadId: 'thread-root', status: 'idle' };
+        },
+        async coordinateReceiverOwnership(operation) { return operation(); },
+      },
+      logger: () => {},
+      deps: {
+        discord: gatewayDiscordDeps(ReadyDiscordClient),
+        isActiveDiscordReceiver: isActiveReceiver,
+        randomUUID: () => 'failed-generation',
+      },
+    }),
+    /ownership changed/,
+  );
+
+  assert.equal(destroys, 1);
+  assert.equal(fs.readFileSync(gatewayPidPath, 'utf8'), `${ownership.pid}\n`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(receiverOwnershipPath, 'utf8')), ownership);
+});
