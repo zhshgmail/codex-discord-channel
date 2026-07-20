@@ -63,7 +63,7 @@
 - Produces: explicit staged-upgrade and mixed-version dedupe contract documentation.
 
 - [x] Document the mixed A6/A7 authority views, overlap semantics, and graceful release without changing state-directory or owner metadata authority.
-- [ ] Run focused mixed-binary tests and all receiver/delivery regression tests.
-- [ ] Run `npm run check`, `npm pack --dry-run`, the forbidden-path scan, and `git diff --check`.
-- [ ] Inspect the branch diff from exact A7, request an independent code review, address all critical/important findings, and rerun affected gates.
-- [ ] Commit and push the verified documentation checkpoint.
+- [x] Run focused mixed-binary tests and all receiver/delivery regression tests.
+- [x] Run `npm run check`, `npm pack --dry-run`, the forbidden-path scan, and `git diff --check`.
+- [x] Inspect the branch diff from exact A7, request an independent code review, address all critical/important findings, and rerun affected gates.
+- [x] Commit and push the verified documentation checkpoint.
