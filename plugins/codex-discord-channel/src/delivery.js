@@ -515,6 +515,8 @@ async function flushStructuredQueue(config, logger, deps, host) {
           if (queueHeadMatches(queue, next)) {
             setQueueBlock(queue, DELIVERY_ACK_UNCERTAIN, {
               messageId: next.normalized.messageId,
+              threadId: target.threadId,
+              clientUserMessageId: params.clientUserMessageId,
               error: 'Structured delivery checkpoint changed before commit.',
             }, config, deps);
           }
@@ -550,6 +552,8 @@ async function flushStructuredQueue(config, logger, deps, host) {
       try {
         await blockCurrentHead(config, deps, next, DELIVERY_ACK_UNCERTAIN, {
           messageId: next.normalized.messageId,
+          threadId: target.threadId,
+          clientUserMessageId: params.clientUserMessageId,
           error: error instanceof Error ? error.message : String(error),
         });
       } catch {}

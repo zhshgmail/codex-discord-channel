@@ -431,6 +431,62 @@ test('uncertain acknowledgement reconciles by client id without replaying turn/s
   assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-reconcile']);
 });
 
+test('post-accept uncertainty persists replay identity and reconciles after restart', async () => {
+  let fixture;
+  fixture = structuredFixture({
+    onStartTurn() {
+      const queue = readQueue(fixture.dir);
+      queue.blocked.attemptId = 'superseded-checkpoint';
+      fs.writeFileSync(
+        path.join(fixture.dir, 'pending-delivery.json'),
+        `${JSON.stringify(queue, null, 2)}\n`,
+      );
+      return { turn: { id: 'turn-accepted-before-checkpoint-change' } };
+    },
+  });
+
+  const uncertain = await fixture.delivery.deliver(discordMessage('m-post-accept', 'once'));
+  const persisted = readQueue(fixture.dir);
+
+  assert.equal(uncertain.status, 'failed');
+  assert.equal(uncertain.reason, 'structured_ack_uncertain');
+  assert.equal(persisted.blocked.threadId, 'thread-current');
+  assert.equal(persisted.blocked.clientUserMessageId, 'discord:c1:m-post-accept');
+  fixture.delivery.destroy();
+
+  const reconciliations = [];
+  let replayStarts = 0;
+  const recovered = createDelivery(deliveryConfig(fixture.dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn() {
+        replayStarts += 1;
+        return { turn: { id: 'must-not-replay' } };
+      },
+      async hasDelivered(threadId, clientUserMessageId) {
+        reconciliations.push({ threadId, clientUserMessageId });
+        return threadId === 'thread-current' &&
+          clientUserMessageId === 'discord:c1:m-post-accept';
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(reconciliations, [{
+    threadId: 'thread-current',
+    clientUserMessageId: 'discord:c1:m-post-accept',
+  }]);
+  assert.equal(replayStarts, 0);
+  assert.deepEqual(readQueue(fixture.dir).items, []);
+  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-post-accept']);
+  recovered.destroy();
+});
+
 test('delivery fails loudly without a network call when durable persistence fails', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-fail-'));
   let starts = 0;
