@@ -14,6 +14,11 @@ const {
   resolveReplyTarget,
   structuredSafeText,
 } = require('../../src/delivery');
+const {
+  commitReceiverOwnership,
+  isCurrentReceiverOwnership,
+  readReceiverAuthoritySnapshot,
+} = require('../../src/receiver-state');
 
 function discordMessage(messageId, content = 'hello') {
   return {
@@ -41,6 +46,15 @@ function deliveryConfig(dir, overrides = {}) {
       deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
     },
     ...overrides,
+  };
+}
+
+function activeReceiver() {
+  return {
+    active: true,
+    reason: 'gateway_generation_match',
+    pid: process.pid,
+    generation: 'receiver-generation',
   };
 }
 
@@ -93,6 +107,7 @@ function structuredFixture(overrides = {}) {
     runTtyInjector: async () => { ttyCalls += 1; },
     injectIntoTty: async () => { ttyCalls += 1; },
   });
+  void delivery.activateReceiver(activeReceiver);
   return {
     delivery,
     dir,
@@ -345,7 +360,7 @@ test('missing shared app-server fails closed, persists FIFO, and never calls a T
   });
 });
 
-test('persisted accepted message drains autonomously when delivery starts', async () => {
+test('constructor defers startup drain until receiver authority is activated', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-startup-'));
   writePendingQueue(dir, [discordMessage('m-startup', 'persisted')]);
   const requests = [];
@@ -365,6 +380,9 @@ test('persisted accepted message drains autonomously when delivery starts', asyn
   });
 
   await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(requests, []);
+  await delivery.activateReceiver(activeReceiver);
 
   assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-startup']);
   assert.deepEqual(readQueue(dir).items, []);
@@ -408,8 +426,7 @@ test('startup drain advances a crashed accepted head and submits the next FIFO i
       destroy() {},
     },
   });
-
-  await new Promise((resolve) => setImmediate(resolve));
+  await delivery.activateReceiver(activeReceiver);
 
   assert.deepEqual(reconciliations, [{
     threadId: 'thread-current',
@@ -458,12 +475,53 @@ test('startup drain probes an unreconciled crashed head once and remains blocked
       destroy() {},
     },
   });
-
-  await new Promise((resolve) => setImmediate(resolve));
+  await delivery.activateReceiver(activeReceiver);
 
   assert.equal(reconciliationCount, 1);
   assert.equal(starts, 0);
   assert.equal(readQueue(dir).blocked.reason, 'structured_ack_uncertain');
+  delivery.destroy();
+});
+
+test('restart retries a lease abandoned before target resolution without replay ambiguity', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-pre-target-crash-'));
+  writePendingQueue(dir, [discordMessage('m-pre-target', 'not submitted')], {
+    blocked: {
+      reason: 'structured_delivery_in_progress',
+      phase: 'resolving_target',
+      at: '2026-07-20T00:00:00.000Z',
+      expiresAt: '2026-07-20T00:00:01.000Z',
+      messageId: 'm-pre-target',
+      threadId: '',
+      clientUserMessageId: '',
+      pid: 424242,
+      attemptId: 'abandoned-pre-target-attempt',
+    },
+  });
+  const requests = [];
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    isProcessAlive: () => false,
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-after-restart' } };
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await delivery.activateReceiver(activeReceiver);
+
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), [
+    'discord:c1:m-pre-target',
+  ]);
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-pre-target']);
   delivery.destroy();
 });
 
@@ -508,7 +566,7 @@ test('foreign delivery lease schedules one expiry wake and drains without replay
       destroy() {},
     },
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await delivery.activateReceiver(activeReceiver);
 
   assert.equal(timers.pendingCount(), 1);
   assert.deepEqual(timers.delays, [100]);
@@ -578,7 +636,7 @@ test('reconnect drain reconciles an accepted head before submitting the next FIF
       destroy() {},
     },
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await delivery.activateReceiver(activeReceiver);
   assert.deepEqual(requests, []);
 
   online = true;
@@ -619,7 +677,7 @@ test('persisted accepted message drains autonomously when the host reconnects', 
       destroy() {},
     },
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await delivery.activateReceiver(activeReceiver);
   assert.deepEqual(requests, []);
   assert.equal(typeof availableListener, 'function');
 
@@ -657,7 +715,7 @@ test('persisted message retries autonomously after a loaded child thread closes'
       destroy() {},
     },
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await delivery.activateReceiver(activeReceiver);
   assert.deepEqual(requests, []);
   assert.equal(typeof childClosedListener, 'function');
 
@@ -711,6 +769,81 @@ test('concurrent receivers persist and submit a Discord identity only once', asy
   assert.equal(results.some((result) => result.status === 'delivered'), true);
   assert.equal(requests.length, 1);
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-once']);
+});
+
+test('receiver handoff waits for the incumbent delivery lease before committing authority', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-authority-handoff-'));
+  const config = deliveryConfig(dir, {
+    appServerRequestTimeoutMs: 100,
+    paths: {
+      ...deliveryConfig(dir).paths,
+      gatewayPidPath: path.join(dir, 'session-gateway.pid'),
+    },
+  });
+  const incumbent = {
+    version: 2,
+    pid: process.pid,
+    generation: 'incumbent-generation',
+    claimedAt: '2026-07-20T00:00:00.000Z',
+    fallback: null,
+  };
+  fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(incumbent)}\n`);
+  let releaseTurn;
+  let markTurnStarted;
+  const turnStarted = new Promise((resolve) => { markTurnStarted = resolve; });
+  const turnReleased = new Promise((resolve) => { releaseTurn = resolve; });
+  const requests = [];
+  const host = {
+    async resolveTarget() {
+      return { available: true, threadId: 'thread-current', status: 'idle' };
+    },
+    async startTurn(params) {
+      requests.push(params);
+      markTurnStarted();
+      await turnReleased;
+      return { turn: { id: 'turn-incumbent' } };
+    },
+    onThreadIdle() { return () => {}; },
+    onReconnect() { return () => {}; },
+    onThreadClosed() { return () => {}; },
+    status() { return { configured: true, available: true, reason: null }; },
+    destroy() {},
+  };
+  const incumbentDelivery = createDelivery(config, () => {}, { structuredHost: host });
+  const successorDelivery = createDelivery(config, () => {}, { structuredHost: host });
+  await incumbentDelivery.enqueue(discordMessage('m-handoff', 'once'));
+  const incumbentDrain = incumbentDelivery.flush({
+    verifyReceiverOwnership: () => isCurrentReceiverOwnership(config, incumbent),
+  });
+  await turnStarted;
+
+  const snapshot = readReceiverAuthoritySnapshot(config);
+  const successor = {
+    ...incumbent,
+    generation: 'successor-generation',
+    claimedAt: '2026-07-20T00:01:00.000Z',
+  };
+  let handoffCommitted = false;
+  const handoff = successorDelivery.coordinateReceiverOwnership(() => {
+    const result = commitReceiverOwnership(config, snapshot, successor);
+    handoffCommitted = true;
+    return result;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(handoffCommitted, false);
+  assert.equal(readReceiverAuthoritySnapshot(config).record.generation, incumbent.generation);
+
+  releaseTurn();
+  await incumbentDrain;
+  await handoff;
+
+  assert.equal(readReceiverAuthoritySnapshot(config).record.generation, successor.generation);
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-handoff']);
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-handoff']);
+  incumbentDelivery.destroy();
+  successorDelivery.destroy();
 });
 
 test('uncertain structured acknowledgement blocks replay and later FIFO items', async () => {
@@ -806,7 +939,7 @@ test('post-accept uncertainty persists replay identity and reconciles after rest
       destroy() {},
     },
   });
-  await new Promise((resolve) => setImmediate(resolve));
+  await recovered.activateReceiver(activeReceiver);
 
   assert.deepEqual(reconciliations, [{
     threadId: 'thread-current',

@@ -539,6 +539,15 @@ test('successor replaces durable receiver ownership only after login and app-ser
         events.push('coordination');
         return operation();
       },
+      async activateReceiver(verifyReceiverOwnership) {
+        events.push('activate');
+        assert.deepEqual(verifyReceiverOwnership(), {
+          active: true,
+          reason: 'gateway_generation_match',
+          pid: successorPid,
+          generation: 'successor-generation',
+        });
+      },
     },
     logger: () => {},
     deps: {
@@ -549,7 +558,7 @@ test('successor replaces durable receiver ownership only after login and app-ser
     },
   });
 
-  assert.deepEqual(events, ['login', 'persistence', 'readiness', 'coordination']);
+  assert.deepEqual(events, ['login', 'persistence', 'readiness', 'coordination', 'activate']);
   assert.equal(result.started, true);
   assert.equal(result.client.listenerCount('messageCreate'), 1);
   assert.deepEqual(JSON.parse(fs.readFileSync(gatewayPidPath, 'utf8')), {
@@ -906,18 +915,21 @@ test('sole gateway queues while target is down and restart delivers the event ex
   secondDelivery.destroy();
 });
 
-test('gateway shutdown transfers authority before destroying its armed listener', () => {
+test('gateway shutdown stops reception and drains before releasing receiver authority', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', '..', 'bin', 'codex-discord-channel'), 'utf8');
   const startLoopIndex = source.indexOf('startGatewayDrainLoop({');
+  const deactivateIndex = source.indexOf('delivery.deactivateReceiver()');
   const stopLoopIndex = source.indexOf('await drainLoop.stop()');
   const releaseIndex = source.indexOf('await delivery.coordinateReceiverOwnership');
   const destroyIndex = source.indexOf('if (discordState.client?.destroy) await discordState.client.destroy()');
 
   assert.notEqual(startLoopIndex, -1);
+  assert.notEqual(deactivateIndex, -1);
   assert.notEqual(stopLoopIndex, -1);
   assert.notEqual(releaseIndex, -1);
   assert.notEqual(destroyIndex, -1);
-  assert.ok(startLoopIndex < stopLoopIndex);
+  assert.ok(startLoopIndex < deactivateIndex);
+  assert.ok(deactivateIndex < destroyIndex);
+  assert.ok(destroyIndex < stopLoopIndex);
   assert.ok(stopLoopIndex < releaseIndex);
-  assert.ok(releaseIndex < destroyIndex);
 });

@@ -74,7 +74,9 @@ function startGatewayDrainLoop({
       return increaseBackoff();
     }
 
-    const result = await delivery.flush();
+    const result = await delivery.flush({
+      verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps),
+    });
     if (result?.status === 'queued' || result?.status === 'failed') {
       return increaseBackoff();
     }

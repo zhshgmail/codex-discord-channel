@@ -332,6 +332,19 @@ function blockedResult(queue, reason, status = 'queued') {
   };
 }
 
+function receiverRejectedResult(queue, receiver = {}) {
+  return blockedResult(
+    queue,
+    receiver.reason || 'gateway_generation_changed',
+  );
+}
+
+function rejectedReceiver(verifyReceiverOwnership) {
+  if (typeof verifyReceiverOwnership !== 'function') return null;
+  const receiver = verifyReceiverOwnership();
+  return receiver?.active ? null : (receiver || {});
+}
+
 function activeAttemptBlockedResult(queue, deps = {}) {
   const attempt = activeDeliveryAttempt(queue, deps);
   if (!attempt.active) return null;
@@ -385,19 +398,38 @@ function unavailableTarget(error) {
   };
 }
 
-async function blockCurrentHead(config, deps, expected, reason, details = {}) {
+async function blockCurrentHead(
+  config,
+  deps,
+  expected,
+  reason,
+  details = {},
+  verifyReceiverOwnership = null,
+) {
   return withDeliveryQueueLock(config, deps, () => {
     const queue = readDeliveryQueue(config, deps);
     if (!queueHeadMatches(queue, expected)) return { retry: true };
+    const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+    if (receiverRejected) return { receiverRejected, queue };
     setQueueBlock(queue, reason, details, config, deps);
     return { result: blockedResult(queue, reason, reason === DELIVERY_ACK_UNCERTAIN ? 'failed' : 'queued') };
   });
 }
 
-async function flushStructuredQueue(config, logger, deps, host) {
+async function flushStructuredQueue(config, logger, deps, host, options = {}) {
+  const verifyReceiverOwnership = options.verifyReceiverOwnership;
   let reconciledCount = 0;
   while (true) {
-    const snapshot = await withDeliveryQueueLock(config, deps, () => readDeliveryQueue(config, deps));
+    const inspection = await withDeliveryQueueLock(config, deps, () => {
+      const queue = readDeliveryQueue(config, deps);
+      if (queue.items.length === 0) return { queue };
+      const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+      return receiverRejected ? { queue, receiverRejected } : { queue };
+    });
+    const snapshot = inspection.queue;
+    if (inspection.receiverRejected) {
+      return receiverRejectedResult(snapshot, inspection.receiverRejected);
+    }
     if (snapshot.items.length === 0) {
       if (reconciledCount > 0) {
         return {
@@ -426,17 +458,48 @@ async function flushStructuredQueue(config, logger, deps, host) {
         if (!queueHeadMatches(queue, next) || queue.blocked?.reason !== DELIVERY_ACK_UNCERTAIN) {
           return { retry: true };
         }
+        const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+        if (receiverRejected) return { receiverRejected, queue };
         const updated = completedQueue(queue, next);
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length };
       });
       if (reconciled.retry) continue;
+      if (reconciled.receiverRejected) {
+        return receiverRejectedResult(reconciled.queue, reconciled.receiverRejected);
+      }
       reconciledCount += 1;
       continue;
     }
     if (snapshot.blocked?.reason === DELIVERY_IN_PROGRESS) {
       const activeResult = activeAttemptBlockedResult(snapshot, deps);
       if (activeResult) return activeResult;
+      if (
+        snapshot.blocked.phase === 'resolving_target' &&
+        !snapshot.blocked.threadId &&
+        !snapshot.blocked.clientUserMessageId
+      ) {
+        const abandoned = await withDeliveryQueueLock(config, deps, () => {
+          const queue = readDeliveryQueue(config, deps);
+          if (
+            !queueHeadMatches(queue, next) ||
+            queue.blocked?.attemptId !== snapshot.blocked.attemptId ||
+            queue.blocked?.phase !== 'resolving_target'
+          ) {
+            return { retry: true };
+          }
+          const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+          if (receiverRejected) return { receiverRejected, queue };
+          queue.blocked = null;
+          writeDeliveryQueue(queue, config, deps);
+          return { released: true };
+        });
+        if (abandoned.retry) continue;
+        if (abandoned.receiverRejected) {
+          return receiverRejectedResult(abandoned.queue, abandoned.receiverRejected);
+        }
+        continue;
+      }
       const stale = await blockCurrentHead(
         config,
         deps,
@@ -448,10 +511,52 @@ async function flushStructuredQueue(config, logger, deps, host) {
           clientUserMessageId: snapshot.blocked.clientUserMessageId || '',
           error: 'Previous structured delivery did not complete.',
         },
+        verifyReceiverOwnership,
       );
       if (stale.retry) continue;
+      if (stale.receiverRejected) {
+        return receiverRejectedResult(stale.queue, stale.receiverRejected);
+      }
       continue;
     }
+
+    const attemptId = `${process.pid}-${currentTimeMs(deps)}-${Math.random().toString(16).slice(2)}`;
+    const claim = await withDeliveryQueueLock(config, deps, () => {
+      const queue = readDeliveryQueue(config, deps);
+      if (!queueHeadMatches(queue, next)) return { retry: true };
+      const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+      if (receiverRejected) return { receiverRejected, queue };
+      if (queue.blocked?.reason === DELIVERY_ACK_UNCERTAIN) {
+        return { result: blockedResult(queue, DELIVERY_ACK_UNCERTAIN, 'failed') };
+      }
+      if (queue.blocked?.reason === DELIVERY_IN_PROGRESS) {
+        const activeResult = activeAttemptBlockedResult(queue, deps);
+        if (activeResult) return { result: activeResult };
+        return { retry: true };
+      }
+      const leaseMs = Number(config.appServerRequestTimeoutMs) || 30000;
+      activeDeliveryAttempts.add(attemptId);
+      try {
+        setQueueBlock(queue, DELIVERY_IN_PROGRESS, {
+          phase: 'resolving_target',
+          expiresAt: new Date(currentTimeMs(deps) + leaseMs + 5000).toISOString(),
+          messageId: next.normalized.messageId,
+          threadId: '',
+          clientUserMessageId: '',
+          pid: process.pid,
+          attemptId,
+        }, config, deps);
+      } catch (error) {
+        activeDeliveryAttempts.delete(attemptId);
+        throw error;
+      }
+      return { next: queue.items[0], queueDepth: queue.items.length };
+    });
+    if (claim.retry) continue;
+    if (claim.receiverRejected) {
+      return receiverRejectedResult(claim.queue, claim.receiverRejected);
+    }
+    if (claim.result) return claim.result;
 
     let target;
     try {
@@ -463,56 +568,61 @@ async function flushStructuredQueue(config, logger, deps, host) {
       ? (target.reason || 'shared_app_server_unavailable')
       : (target?.status === 'idle' ? '' : 'thread_busy');
     if (targetReason) {
-      const blocked = await blockCurrentHead(config, deps, next, targetReason, {
-        ...(target.error ? { error: target.error } : {}),
+      const blocked = await withDeliveryQueueLock(config, deps, () => {
+        const queue = readDeliveryQueue(config, deps);
+        if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
+          return { retry: true };
+        }
+        const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+        if (receiverRejected) return { receiverRejected, queue };
+        setQueueBlock(queue, targetReason, {
+          ...(target.error ? { error: target.error } : {}),
+        }, config, deps);
+        return { result: blockedResult(queue, targetReason) };
       });
+      activeDeliveryAttempts.delete(attemptId);
       if (blocked.retry) continue;
+      if (blocked.receiverRejected) {
+        return receiverRejectedResult(blocked.queue, blocked.receiverRejected);
+      }
       logger('ERROR', 'Structured Discord delivery is unavailable', {
         reason: targetReason,
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId,
-        queueDepth: snapshot.items.length,
+        queueDepth: claim.queueDepth,
       });
       return blocked.result;
     }
 
-    const attemptId = `${process.pid}-${currentTimeMs(deps)}-${Math.random().toString(16).slice(2)}`;
     const params = turnStartParams(next, target.threadId);
-    const claim = await withDeliveryQueueLock(config, deps, () => {
+    const prepared = await withDeliveryQueueLock(config, deps, () => {
       const queue = readDeliveryQueue(config, deps);
-      if (!queueHeadMatches(queue, next)) return { retry: true };
-      if (queue.blocked?.reason === DELIVERY_ACK_UNCERTAIN) {
-        return { result: blockedResult(queue, DELIVERY_ACK_UNCERTAIN, 'failed') };
+      if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
+        return { retry: true };
       }
-      if (queue.blocked?.reason === DELIVERY_IN_PROGRESS) {
-        const activeResult = activeAttemptBlockedResult(queue, deps);
-        if (activeResult) return { result: activeResult };
-      }
-      const leaseMs = Number(config.appServerRequestTimeoutMs) || 30000;
-      activeDeliveryAttempts.add(attemptId);
-      try {
-        setQueueBlock(queue, DELIVERY_IN_PROGRESS, {
-          expiresAt: new Date(currentTimeMs(deps) + leaseMs + 5000).toISOString(),
-          messageId: next.normalized.messageId,
-          threadId: target.threadId,
-          clientUserMessageId: params.clientUserMessageId,
-          pid: process.pid,
-          attemptId,
-        }, config, deps);
-      } catch (error) {
-        activeDeliveryAttempts.delete(attemptId);
-        throw error;
-      }
-      return { next: queue.items[0], queueDepth: queue.items.length };
+      const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+      if (receiverRejected) return { receiverRejected, queue };
+      queue.blocked = {
+        ...queue.blocked,
+        phase: 'starting_turn',
+        threadId: target.threadId,
+        clientUserMessageId: params.clientUserMessageId,
+      };
+      writeDeliveryQueue(queue, config, deps);
+      return { prepared: true };
     });
-    if (claim.retry) continue;
-    if (claim.result) return claim.result;
+    if (!prepared.prepared) {
+      activeDeliveryAttempts.delete(attemptId);
+      if (prepared.receiverRejected) {
+        return receiverRejectedResult(prepared.queue, prepared.receiverRejected);
+      }
+      if (prepared.retry) continue;
+    }
 
     let response;
     try {
       response = await host.startTurn(params, target);
     } catch (error) {
-      activeDeliveryAttempts.delete(attemptId);
       const uncertain = error?.deliveryOutcome === 'uncertain';
       const reason = uncertain
         ? DELIVERY_ACK_UNCERTAIN
@@ -522,6 +632,8 @@ async function flushStructuredQueue(config, logger, deps, host) {
         if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
           return blockedResult(queue, DELIVERY_ACK_UNCERTAIN, 'failed');
         }
+        const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+        if (receiverRejected) return receiverRejectedResult(queue, receiverRejected);
         setQueueBlock(queue, reason, {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
@@ -530,6 +642,7 @@ async function flushStructuredQueue(config, logger, deps, host) {
         }, config, deps);
         return blockedResult(queue, reason, uncertain ? 'failed' : 'queued');
       });
+      activeDeliveryAttempts.delete(attemptId);
       logger('ERROR', uncertain
         ? 'Structured Discord delivery acknowledgement is uncertain'
         : 'Structured Discord delivery was not accepted', {
@@ -555,11 +668,16 @@ async function flushStructuredQueue(config, logger, deps, host) {
           }
           return { uncertain: true, queueDepth: queue.items.length };
         }
+        const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+        if (receiverRejected) return { receiverRejected, queue };
         const updated = completedQueue(queue, next);
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length };
       });
       activeDeliveryAttempts.delete(attemptId);
+      if (committed.receiverRejected) {
+        return receiverRejectedResult(committed.queue, committed.receiverRejected);
+      }
       if (committed.uncertain) {
         return {
           status: 'failed',
@@ -581,15 +699,15 @@ async function flushStructuredQueue(config, logger, deps, host) {
         turnId: response?.turn?.id || null,
       };
     } catch (error) {
-      activeDeliveryAttempts.delete(attemptId);
       try {
         await blockCurrentHead(config, deps, next, DELIVERY_ACK_UNCERTAIN, {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
           error: error instanceof Error ? error.message : String(error),
-        });
+        }, verifyReceiverOwnership);
       } catch {}
+      activeDeliveryAttempts.delete(attemptId);
       return {
         status: 'failed',
         reason: DELIVERY_ACK_UNCERTAIN,
@@ -662,6 +780,8 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let unsubscribeReconnect = null;
   let unsubscribeThreadClosed = null;
   let startupDrain = Promise.resolve();
+  let receiverVerification = null;
+  let receiverActivated = false;
   let leaseWakeTimer = null;
   let leaseWakeAt = 0;
   const serializeAdmission = (operation) => {
@@ -735,18 +855,51 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       }
       return target;
     },
-    flush() {
+    flush(options = {}) {
       if (config.deliveryMode === 'off') {
         return Promise.resolve({ status: 'unsupported', reason: 'delivery_disabled' });
       }
       return serializeDrain(async () => {
-        const result = await flushStructuredQueue(config, logger, deps, host);
+        const result = await flushStructuredQueue(config, logger, deps, host, options);
         updateLeaseWake(result[DELIVERY_LEASE_RETRY_AT]);
         return result;
       });
     },
     coordinateReceiverOwnership(operation) {
-      return serializeAdmission(() => withDeliveryQueueLock(config, deps, operation));
+      const coordinate = async () => {
+        const timeoutMs = Number(config.deliveryQueueLockTimeoutMs) || 60000;
+        const retryMs = Number(config.deliveryQueueLockRetryMs) || 20;
+        const startedAt = Date.now();
+        while (true) {
+          const outcome = await withDeliveryQueueLock(config, deps, async () => {
+            const queue = readDeliveryQueue(config, deps);
+            if (activeAttemptBlockedResult(queue, deps)) return { waitForLease: true };
+            return { result: await operation() };
+          });
+          if (!outcome.waitForLease) return outcome.result;
+          if (Date.now() - startedAt >= timeoutMs) {
+            throw new Error('Timed out waiting for the active Discord delivery lease.');
+          }
+          await sleep(retryMs);
+        }
+      };
+      return serializeDrain(() => serializeAdmission(coordinate));
+    },
+    activateReceiver(verifyReceiverOwnership) {
+      if (typeof verifyReceiverOwnership !== 'function') {
+        throw new Error('Discord receiver activation requires an authority verifier.');
+      }
+      receiverVerification = verifyReceiverOwnership;
+      if (!receiverActivated) {
+        receiverActivated = true;
+        startupDrain = drainAutonomously('startup');
+      }
+      return startupDrain;
+    },
+    deactivateReceiver() {
+      receiverActivated = false;
+      receiverVerification = null;
+      clearLeaseWake();
     },
     async enqueue(normalized, options = {}) {
       const envelope = formatEnvelope(normalized);
@@ -826,11 +979,15 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       const admission = await delivery.enqueue(normalized, options);
       if (admission.status !== 'accepted') return admission;
       await startupDrain;
-      const result = await delivery.flush();
+      const result = await delivery.flush(receiverVerification
+        ? { verifyReceiverOwnership: receiverVerification }
+        : {});
       return { ...result, envelope: admission.envelope };
     },
     destroy() {
       destroyed = true;
+      receiverActivated = false;
+      receiverVerification = null;
       if (typeof unsubscribeIdle === 'function') unsubscribeIdle();
       if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
       if (typeof unsubscribeThreadClosed === 'function') unsubscribeThreadClosed();
@@ -841,7 +998,11 @@ function createDelivery(config, logger = () => {}, deps = {}) {
 
   const drainAutonomously = (trigger) => {
     if (destroyed) return Promise.resolve({ status: 'idle', reason: 'delivery_destroyed' });
-    return delivery.flush().catch((error) => {
+    const verifyReceiverOwnership = receiverVerification;
+    if (!receiverActivated || typeof verifyReceiverOwnership !== 'function') {
+      return Promise.resolve({ status: 'idle', reason: 'receiver_inactive' });
+    }
+    return delivery.flush({ verifyReceiverOwnership }).catch((error) => {
       logger('ERROR', 'Failed to drain Discord delivery queue automatically', {
         trigger,
         error: error instanceof Error ? error.message : String(error),
@@ -861,7 +1022,6 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   unsubscribeThreadClosed = typeof host.onThreadClosed === 'function'
     ? host.onThreadClosed(() => drainAutonomously('thread_closed'))
     : null;
-  startupDrain = drainAutonomously('startup');
   return delivery;
 }
 

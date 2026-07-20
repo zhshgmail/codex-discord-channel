@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { createDelivery } = require('../../src/delivery');
+const { isCurrentReceiverOwnership } = require('../../src/receiver-state');
 
 let startGatewayDrainLoop;
 try {
@@ -291,6 +292,54 @@ test('periodic drain follows durable receiver authority instead of owner or thre
     ['discord:dm-1:message-authority'],
   );
   assert.deepEqual(queueAt(fixture.dir).items, []);
+
+  await loop.stop();
+  fixture.delivery.destroy();
+});
+
+test('authority transfer between the periodic check and delivery lease fences the stale drain', async () => {
+  const fixture = await deliveryFixture({ available: true });
+  await fixture.delivery.enqueue(discordMessage('message-raced-authority'));
+  const successor = {
+    ...fixture.receiverOwnership,
+    generation: 'successor-generation',
+  };
+  const timers = createManualTimers();
+  let ownershipChecks = 0;
+  const loop = startGatewayDrainLoop({
+    config: fixture.config,
+    delivery: fixture.delivery,
+    receiverOwnership: fixture.receiverOwnership,
+    logger: () => {},
+    deps: {
+      clearTimeout: timers.clearTimeout,
+      setTimeout: timers.setTimeout,
+      isCurrentReceiverOwnership(config, expected, deps) {
+        ownershipChecks += 1;
+        if (ownershipChecks === 1) {
+          fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(successor)}\n`);
+          return {
+            active: true,
+            reason: 'gateway_generation_match',
+            pid: expected.pid,
+            generation: expected.generation,
+          };
+        }
+        return isCurrentReceiverOwnership(config, expected, deps);
+      },
+    },
+  });
+
+  await timers.runNext();
+
+  assert.equal(ownershipChecks, 2);
+  assert.equal(fixture.targetAttempts.length, 0);
+  assert.equal(fixture.requests.length, 0);
+  const queue = queueAt(fixture.dir);
+  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), [
+    'message-raced-authority',
+  ]);
+  assert.deepEqual(queue.completed, []);
 
   await loop.stop();
   fixture.delivery.destroy();

@@ -151,7 +151,7 @@ function createDiscordMessageHandler({
     const { normalized } = admission;
     try {
       const result = admission.result.status === 'accepted'
-        ? await delivery.flush()
+        ? await delivery.flush({ verifyReceiverOwnership })
         : admission.result;
       log(logger, 'INFO', 'Discord message delivery result', {
         status: result.status,
@@ -243,6 +243,11 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
           throw error;
         }
       });
+      if (typeof delivery.activateReceiver === 'function') {
+        await delivery.activateReceiver(() => (
+          deps.isCurrentDiscordReceiverOwnership || isCurrentDiscordReceiverOwnership
+        )(config, receiverOwnership, deps));
+      }
     }
     log(logger, 'INFO', 'Discord gateway connected', {
       user: client.user?.tag || client.user?.id || 'unknown',
