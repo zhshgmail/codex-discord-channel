@@ -123,6 +123,31 @@ function writePendingQueue(dir, messages, options = {}) {
   }, null, 2)}\n`);
 }
 
+function createManualTimers() {
+  let nextId = 1;
+  const pending = new Map();
+  const delays = [];
+  return {
+    clearTimeout(id) { pending.delete(id); },
+    delays,
+    pendingCount() { return pending.size; },
+    async runNext() {
+      const entry = pending.entries().next().value;
+      if (!entry) return false;
+      const [id, callback] = entry;
+      pending.delete(id);
+      await callback();
+      return true;
+    },
+    setTimeout(callback, delay) {
+      const id = nextId++;
+      delays.push(delay);
+      pending.set(id, callback);
+      return id;
+    },
+  };
+}
+
 test('escapeAttr escapes unsafe attribute characters', () => {
   assert.equal(escapeAttr('"x<&'), '&quot;x&lt;&amp;');
 });
@@ -402,6 +427,70 @@ test('startup drain probes an unreconciled crashed head once and remains blocked
   assert.equal(reconciliationCount, 1);
   assert.equal(starts, 0);
   assert.equal(readQueue(dir).blocked.reason, 'structured_ack_uncertain');
+  delivery.destroy();
+});
+
+test('foreign delivery lease schedules one expiry wake and drains without replay', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-foreign-lease-'));
+  const timers = createManualTimers();
+  let now = Date.parse('2026-07-20T00:00:00.000Z');
+  const expiresAt = now + 100;
+  writePendingQueue(dir, [discordMessage('m-foreign', 'accepted by another gateway')], {
+    blocked: {
+      reason: 'structured_delivery_in_progress',
+      at: new Date(now - 100).toISOString(),
+      expiresAt: new Date(expiresAt).toISOString(),
+      messageId: 'm-foreign',
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-foreign',
+      pid: 424242,
+      attemptId: 'foreign-attempt',
+    },
+  });
+  const reconciliations = [];
+  let starts = 0;
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    clearTimeout: timers.clearTimeout,
+    isProcessAlive: () => true,
+    now: () => now,
+    setTimeout: timers.setTimeout,
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn() {
+        starts += 1;
+        return { turn: { id: 'must-not-replay' } };
+      },
+      async hasDelivered(threadId, clientUserMessageId) {
+        reconciliations.push({ threadId, clientUserMessageId });
+        return true;
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(timers.pendingCount(), 1);
+  assert.deepEqual(timers.delays, [100]);
+  await delivery.flush();
+  await delivery.flush();
+  assert.equal(timers.pendingCount(), 1);
+  assert.deepEqual(timers.delays, [100]);
+
+  now = expiresAt;
+  await timers.runNext();
+
+  assert.deepEqual(reconciliations, [{
+    threadId: 'thread-current',
+    clientUserMessageId: 'discord:c1:m-foreign',
+  }]);
+  assert.equal(starts, 0);
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-foreign']);
+  assert.equal(timers.pendingCount(), 0);
   delivery.destroy();
 });
 

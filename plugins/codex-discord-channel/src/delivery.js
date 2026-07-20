@@ -8,7 +8,14 @@ const { isProcessAlive } = require('./receiver-state');
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
 const DELIVERY_IN_PROGRESS = 'structured_delivery_in_progress';
 const DELIVERY_ACK_UNCERTAIN = 'structured_ack_uncertain';
+const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
+const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
 const activeDeliveryAttempts = new Set();
+
+function currentTimeMs(deps = {}) {
+  const value = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+  return Number.isFinite(value) ? value : Date.now();
+}
 
 function escapeAttr(value) {
   return String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -298,13 +305,20 @@ function queueHeadMatches(queue, expected) {
   return sameDiscordIdentity(queue.items[0]?.normalized, expected?.normalized);
 }
 
-function attemptIsActive(queue, deps = {}) {
-  if (queue.blocked?.reason !== DELIVERY_IN_PROGRESS) return false;
+function activeDeliveryAttempt(queue, deps = {}) {
+  if (queue.blocked?.reason !== DELIVERY_IN_PROGRESS) return { active: false };
   const ownerPid = Number(queue.blocked.pid) || 0;
   const expiresAt = Date.parse(queue.blocked.expiresAt || '');
-  if (ownerPid === process.pid) return activeDeliveryAttempts.has(queue.blocked.attemptId);
-  return ownerPid > 0 && Number.isFinite(expiresAt) && expiresAt > Date.now() &&
-    (deps.isProcessAlive || isProcessAlive)(ownerPid);
+  if (ownerPid === process.pid) {
+    return {
+      active: activeDeliveryAttempts.has(queue.blocked.attemptId),
+      foreign: false,
+      expiresAt,
+    };
+  }
+  const active = ownerPid > 0 && Number.isFinite(expiresAt) &&
+    expiresAt > currentTimeMs(deps) && (deps.isProcessAlive || isProcessAlive)(ownerPid);
+  return { active, foreign: active, expiresAt };
 }
 
 function blockedResult(queue, reason, status = 'queued') {
@@ -314,6 +328,16 @@ function blockedResult(queue, reason, status = 'queued') {
     deliveredCount: 0,
     queueDepth: queue.items.length,
   };
+}
+
+function activeAttemptBlockedResult(queue, deps = {}) {
+  const attempt = activeDeliveryAttempt(queue, deps);
+  if (!attempt.active) return null;
+  const result = blockedResult(queue, DELIVERY_IN_PROGRESS);
+  if (attempt.foreign) {
+    Object.defineProperty(result, DELIVERY_LEASE_RETRY_AT, { value: attempt.expiresAt });
+  }
+  return result;
 }
 
 function setQueueBlock(queue, reason, details, config, deps) {
@@ -409,7 +433,8 @@ async function flushStructuredQueue(config, logger, deps, host) {
       continue;
     }
     if (snapshot.blocked?.reason === DELIVERY_IN_PROGRESS) {
-      if (attemptIsActive(snapshot, deps)) return blockedResult(snapshot, DELIVERY_IN_PROGRESS);
+      const activeResult = activeAttemptBlockedResult(snapshot, deps);
+      if (activeResult) return activeResult;
       const stale = await blockCurrentHead(
         config,
         deps,
@@ -449,7 +474,7 @@ async function flushStructuredQueue(config, logger, deps, host) {
       return blocked.result;
     }
 
-    const attemptId = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const attemptId = `${process.pid}-${currentTimeMs(deps)}-${Math.random().toString(16).slice(2)}`;
     const params = turnStartParams(next, target.threadId);
     const claim = await withDeliveryQueueLock(config, deps, () => {
       const queue = readDeliveryQueue(config, deps);
@@ -457,14 +482,15 @@ async function flushStructuredQueue(config, logger, deps, host) {
       if (queue.blocked?.reason === DELIVERY_ACK_UNCERTAIN) {
         return { result: blockedResult(queue, DELIVERY_ACK_UNCERTAIN, 'failed') };
       }
-      if (queue.blocked?.reason === DELIVERY_IN_PROGRESS && attemptIsActive(queue, deps)) {
-        return { result: blockedResult(queue, DELIVERY_IN_PROGRESS) };
+      if (queue.blocked?.reason === DELIVERY_IN_PROGRESS) {
+        const activeResult = activeAttemptBlockedResult(queue, deps);
+        if (activeResult) return { result: activeResult };
       }
       const leaseMs = Number(config.appServerRequestTimeoutMs) || 30000;
       activeDeliveryAttempts.add(attemptId);
       try {
         setQueueBlock(queue, DELIVERY_IN_PROGRESS, {
-          expiresAt: new Date(Date.now() + leaseMs + 5000).toISOString(),
+          expiresAt: new Date(currentTimeMs(deps) + leaseMs + 5000).toISOString(),
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
@@ -634,6 +660,8 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let unsubscribeReconnect = null;
   let unsubscribeThreadClosed = null;
   let startupDrain = Promise.resolve();
+  let leaseWakeTimer = null;
+  let leaseWakeAt = 0;
   const serializeAdmission = (operation) => {
     const result = admissionOperations.then(operation, operation);
     admissionOperations = result.catch(() => {});
@@ -643,6 +671,29 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     const result = drainOperations.then(operation, operation);
     drainOperations = result.catch(() => {});
     return result;
+  };
+  const clearLeaseWake = () => {
+    if (leaseWakeTimer == null) return;
+    (deps.clearTimeout || clearTimeout)(leaseWakeTimer);
+    leaseWakeTimer = null;
+    leaseWakeAt = 0;
+  };
+  const updateLeaseWake = (retryAt) => {
+    if (!Number.isFinite(retryAt)) {
+      clearLeaseWake();
+      return;
+    }
+    if (leaseWakeTimer != null && leaseWakeAt === retryAt) return;
+    clearLeaseWake();
+    const delay = Math.max(1, Math.min(retryAt - currentTimeMs(deps), MAX_TIMER_DELAY_MS));
+    const schedule = deps.setTimeout || setTimeout;
+    leaseWakeAt = retryAt;
+    leaseWakeTimer = schedule(() => {
+      leaseWakeTimer = null;
+      leaseWakeAt = 0;
+      return drainAutonomously('delivery_lease_expired');
+    }, delay);
+    if (typeof leaseWakeTimer?.unref === 'function') leaseWakeTimer.unref();
   };
 
   const delivery = {
@@ -674,7 +725,11 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (config.deliveryMode === 'off') {
         return Promise.resolve({ status: 'unsupported', reason: 'delivery_disabled' });
       }
-      return serializeDrain(() => flushStructuredQueue(config, logger, deps, host));
+      return serializeDrain(async () => {
+        const result = await flushStructuredQueue(config, logger, deps, host);
+        updateLeaseWake(result[DELIVERY_LEASE_RETRY_AT]);
+        return result;
+      });
     },
     coordinateReceiverOwnership(operation) {
       return serializeAdmission(() => withDeliveryQueueLock(config, deps, operation));
@@ -765,6 +820,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (typeof unsubscribeIdle === 'function') unsubscribeIdle();
       if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
       if (typeof unsubscribeThreadClosed === 'function') unsubscribeThreadClosed();
+      clearLeaseWake();
       if (typeof host.destroy === 'function') host.destroy();
     },
   };
