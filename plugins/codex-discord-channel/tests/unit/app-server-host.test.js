@@ -29,7 +29,7 @@ class FakeRpcClient extends EventEmitter {
   }
 }
 
-function createFakeWebSocket(server) {
+function createFakeWebSocket(server, options = {}) {
   const sockets = [];
 
   class FakeWebSocket extends EventEmitter {
@@ -41,6 +41,11 @@ function createFakeWebSocket(server) {
       this.connectionIndex = sockets.length;
       sockets.push(this);
       queueMicrotask(() => {
+        if (options.failConnections?.includes(this.connectionIndex)) {
+          this.readyState = 3;
+          this.emit('error', new Error(`connection ${this.connectionIndex} failed`));
+          return;
+        }
         this.readyState = FakeWebSocket.OPEN;
         this.emit('open');
       });
@@ -77,6 +82,36 @@ function createFakeWebSocket(server) {
   }
 
   return { WebSocket: FakeWebSocket, sockets };
+}
+
+function createManualTimers() {
+  let nextId = 1;
+  const pending = new Map();
+  const delays = [];
+  return {
+    clearTimeout(id) {
+      pending.delete(id);
+    },
+    delays,
+    pendingCount() {
+      return pending.size;
+    },
+    async runNext() {
+      const entry = pending.entries().next().value;
+      if (!entry) return false;
+      const [id, timer] = entry;
+      pending.delete(id);
+      await timer.callback();
+      await new Promise((resolve) => setImmediate(resolve));
+      return true;
+    },
+    setTimeout(callback, delay) {
+      const id = nextId++;
+      delays.push(delay);
+      pending.set(id, { callback, delay });
+      return id;
+    },
+  };
 }
 
 test('endpointToWebSocket maps the shared Unix endpoint to the app-server RPC route', () => {
@@ -344,6 +379,69 @@ test('host reports available status after reconnect initialization completes', a
     available: true,
     reason: null,
   });
+});
+
+test('websocket close autonomously reconnects and emits reconnect without later traffic', async (t) => {
+  const timers = createManualTimers();
+  const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
+    assert.equal(request.method, 'initialize');
+    return {};
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
+    WebSocket,
+    clearTimeout: timers.clearTimeout,
+    reconnectInitialDelayMs: 10,
+    reconnectMaxDelayMs: 40,
+    setTimeout: timers.setTimeout,
+  });
+  t.after(() => host.destroy());
+  const reconnects = [];
+  host.onReconnect((event) => reconnects.push(event));
+
+  await host.client.ensureConnected();
+  sockets[0].close();
+
+  assert.equal(timers.pendingCount(), 1);
+  assert.deepEqual(timers.delays, [10]);
+  assert.equal(sockets.length, 1);
+
+  await timers.runNext();
+
+  assert.equal(sockets.length, 2);
+  assert.equal(reconnects.length, 1);
+  assert.deepEqual(host.status(), {
+    configured: true,
+    available: true,
+    reason: null,
+  });
+});
+
+test('failed autonomous reconnect backs off and destroy cancels the next retry', async () => {
+  const timers = createManualTimers();
+  const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
+    assert.equal(request.method, 'initialize');
+    return {};
+  }, { failConnections: [1] });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
+    WebSocket,
+    clearTimeout: timers.clearTimeout,
+    reconnectInitialDelayMs: 10,
+    reconnectMaxDelayMs: 40,
+    setTimeout: timers.setTimeout,
+  });
+
+  await host.client.ensureConnected();
+  sockets[0].close();
+  await timers.runNext();
+
+  assert.equal(sockets.length, 2);
+  assert.deepEqual(timers.delays, [10, 20]);
+  assert.equal(timers.pendingCount(), 1);
+
+  host.destroy();
+  assert.equal(timers.pendingCount(), 0);
+  assert.equal(await timers.runNext(), false);
+  assert.equal(sockets.length, 2);
 });
 
 test('host emits reconnect only when availability returns after a live connection was lost', () => {

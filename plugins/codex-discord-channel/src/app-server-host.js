@@ -38,6 +38,14 @@ class AppServerRpcClient extends EventEmitter {
     this.pending = new Map();
     this.nextId = 1;
     this.connectionGeneration = 0;
+    this.destroyed = false;
+    this.reconnectAttempt = 0;
+    this.reconnectTimer = null;
+    this.reconnectInitialDelayMs = Math.max(1, Number(deps.reconnectInitialDelayMs) || 250);
+    this.reconnectMaxDelayMs = Math.max(
+      this.reconnectInitialDelayMs,
+      Number(deps.reconnectMaxDelayMs) || 5000,
+    );
     this.state = {
       configured: this.endpoint !== '',
       available: false,
@@ -60,6 +68,9 @@ class AppServerRpcClient extends EventEmitter {
   }
 
   async ensureConnected() {
+    if (this.destroyed) {
+      throw deliveryError('Shared app-server client is shut down.', 'shared_app_server_disconnected');
+    }
     const WebSocket = this.deps.WebSocket || require('ws');
     if (this.ws?.readyState === WebSocket.OPEN && this.state.available) return;
     if (this.connecting) return this.connecting;
@@ -69,6 +80,35 @@ class AppServerRpcClient extends EventEmitter {
     } finally {
       this.connecting = null;
     }
+  }
+
+  cancelReconnect() {
+    if (this.reconnectTimer == null) return;
+    (this.deps.clearTimeout || clearTimeout)(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  scheduleReconnect() {
+    if (this.destroyed || !this.endpoint || this.reconnectTimer != null) return;
+    const delay = Math.min(
+      this.reconnectInitialDelayMs * (2 ** this.reconnectAttempt),
+      this.reconnectMaxDelayMs,
+    );
+    this.reconnectAttempt += 1;
+    const schedule = this.deps.setTimeout || setTimeout;
+    this.reconnectTimer = schedule(async () => {
+      this.reconnectTimer = null;
+      if (this.destroyed) return;
+      try {
+        await this.ensureConnected();
+      } catch (error) {
+        this.logger('WARN', 'Shared app-server reconnect failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        this.scheduleReconnect();
+      }
+    }, delay);
+    if (typeof this.reconnectTimer?.unref === 'function') this.reconnectTimer.unref();
   }
 
   async connect(WebSocket) {
@@ -125,6 +165,11 @@ class AppServerRpcClient extends EventEmitter {
       });
     });
 
+    if (this.destroyed) {
+      ws.close();
+      throw deliveryError('Shared app-server client is shut down.', 'shared_app_server_disconnected');
+    }
+
     this.ws = ws;
     this.connectionGeneration += 1;
     const generation = this.connectionGeneration;
@@ -151,6 +196,7 @@ class AppServerRpcClient extends EventEmitter {
         pending.reject(error);
       }
       this.pending.clear();
+      this.scheduleReconnect();
     });
 
     try {
@@ -176,6 +222,8 @@ class AppServerRpcClient extends EventEmitter {
       });
       this.sendRaw({ method: 'initialized' });
       this.state = { configured: true, available: true, reason: null };
+      this.reconnectAttempt = 0;
+      this.cancelReconnect();
       this.emit('connectionChanged', { generation });
     } catch (error) {
       ws.close();
@@ -282,6 +330,8 @@ class AppServerRpcClient extends EventEmitter {
   }
 
   destroy() {
+    this.destroyed = true;
+    this.cancelReconnect();
     if (this.ws) this.ws.close();
     this.ws = null;
   }
