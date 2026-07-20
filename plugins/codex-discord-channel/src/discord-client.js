@@ -61,36 +61,14 @@ async function resolveReferencedMessage(message, accessState) {
   }
 }
 
-async function startDiscordClient({ config, delivery, logger }) {
-  if (!config.tokenConfigured || config.loginDisabled) {
-    log(logger, 'INFO', 'Discord login disabled or token missing');
-    return { started: false, client: null, reason: config.tokenConfigured ? 'login_disabled' : 'token_missing' };
-  }
-  configureNetwork(config, logger);
-
-  const {
-    Client,
-    Events,
-    GatewayIntentBits,
-    Partials,
-  } = require('discord.js');
-
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.DirectMessages,
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-    ],
-    partials: [Partials.Channel],
-  });
-
-  client.on(Events.MessageCreate, async (message) => {
+function createDiscordMessageHandler({ config, delivery, logger, client, deps = {} }) {
+  let messageOperations = Promise.resolve();
+  const processMessage = async (message) => {
     try {
       if (message.author?.id && client.user?.id && message.author.id === client.user.id) {
         return;
       }
-      const receiver = isActiveDiscordReceiver(config);
+      const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config);
       if (!receiver.active) {
         log(logger, 'INFO', 'Ignoring Discord message because another gateway process is active', {
           reason: receiver.reason,
@@ -100,7 +78,7 @@ async function startDiscordClient({ config, delivery, logger }) {
         });
         return;
       }
-      const accessState = loadAccessState(config.paths.accessPath);
+      const accessState = (deps.loadAccessState || loadAccessState)(config.paths?.accessPath);
       const referencedMessage = await resolveReferencedMessage(message, accessState);
       const normalized = normalizeDiscordMessage(message, referencedMessage);
       normalized.botUserId = client.user?.id || config.botUserId || '';
@@ -125,7 +103,48 @@ async function startDiscordClient({ config, delivery, logger }) {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  };
+
+  return (message) => {
+    const result = messageOperations.then(
+      () => processMessage(message),
+      () => processMessage(message),
+    );
+    messageOperations = result.catch(() => {});
+    return result;
+  };
+}
+
+async function startDiscordClient({ config, delivery, logger }) {
+  if (!config.tokenConfigured || config.loginDisabled) {
+    log(logger, 'INFO', 'Discord login disabled or token missing');
+    return { started: false, client: null, reason: config.tokenConfigured ? 'login_disabled' : 'token_missing' };
+  }
+  configureNetwork(config, logger);
+
+  const {
+    Client,
+    Events,
+    GatewayIntentBits,
+    Partials,
+  } = require('discord.js');
+
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+    ],
+    partials: [Partials.Channel],
   });
+
+  client.on(Events.MessageCreate, createDiscordMessageHandler({
+    config,
+    delivery,
+    logger,
+    client,
+  }));
 
   await client.login(config.token);
   log(logger, 'INFO', 'Discord gateway connected', {
@@ -158,6 +177,7 @@ async function sendDiscordMessage(client, args) {
 
 module.exports = {
   configureNetwork,
+  createDiscordMessageHandler,
   resolveReferencedMessage,
   sendDiscordMessage,
   startDiscordClient,

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { decideAccess, normalizeAccessState } = require('../../src/access-state');
 const { normalizeDiscordMessage } = require('../../src/delivery');
-const { resolveReferencedMessage } = require('../../src/discord-client');
+const { createDiscordMessageHandler, resolveReferencedMessage } = require('../../src/discord-client');
 
 test('reference resolver fetches references for enabled guild channels', async () => {
   const referenced = { author: { id: 'peer' }, content: 'hello <@bot>' };
@@ -113,4 +113,60 @@ test('reference resolver does not fetch outside enabled guild channels', async (
 
   assert.equal(await resolveReferencedMessage(message, normalizeAccessState({ groups: { c1: {} } })), null);
   assert.equal(fetchCount, 0);
+});
+
+test('concurrent reference fetch preserves Discord event delivery order', async () => {
+  let releaseReference;
+  let markReferenceStarted;
+  const referenceStarted = new Promise((resolve) => { markReferenceStarted = resolve; });
+  const referenceReleased = new Promise((resolve) => { releaseReference = resolve; });
+  const delivered = [];
+  const handler = createDiscordMessageHandler({
+    config: { botUserId: 'bot' },
+    client: { user: { id: 'bot' } },
+    delivery: {
+      async deliver(normalized) {
+        delivered.push(normalized.messageId);
+        return { status: 'delivered', reason: 'turn_accepted' };
+      },
+    },
+    logger: () => {},
+    deps: {
+      isActiveDiscordReceiver: () => ({ active: true, reason: 'gateway_pid_match' }),
+      loadAccessState: () => normalizeAccessState({
+        groups: { c1: { requireMention: false } },
+      }),
+    },
+  });
+  const first = {
+    guildId: 'g1',
+    channelId: 'c1',
+    id: 'm1',
+    author: { id: 'u1', username: 'Alice', bot: false },
+    content: 'first',
+    attachments: [],
+    reference: { messageId: 'parent' },
+    async fetchReference() {
+      markReferenceStarted();
+      await referenceReleased;
+      return { author: { id: 'u0' }, content: 'parent' };
+    },
+  };
+  const second = {
+    guildId: 'g1',
+    channelId: 'c1',
+    id: 'm2',
+    author: { id: 'u2', username: 'Bob', bot: false },
+    content: 'second',
+    attachments: [],
+  };
+
+  const firstHandling = handler(first);
+  const secondHandling = handler(second);
+  await referenceStarted;
+  assert.deepEqual(delivered, []);
+  releaseReference();
+  await Promise.all([firstHandling, secondHandling]);
+
+  assert.deepEqual(delivered, ['m1', 'm2']);
 });
