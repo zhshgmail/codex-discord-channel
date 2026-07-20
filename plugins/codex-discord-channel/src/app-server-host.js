@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 
 const TARGET_GENERATION = Symbol('appServerTargetGeneration');
+const MAX_FRESH_THREAD_READS = 32;
 
 function endpointToWebSocket(endpoint) {
   const value = String(endpoint || '').trim();
@@ -390,11 +391,13 @@ class AppServerHost extends EventEmitter {
       }
       if (notification?.method === 'thread/closed') {
         const threadId = notification.params?.threadId;
+        if (!threadId) return;
+        this.threadSelectionRevision += 1;
         this.threadStatuses.delete(threadId);
         if (this.currentThreadId === threadId) {
-          this.threadSelectionRevision += 1;
           this.currentThreadId = '';
         }
+        this.emit('threadClosed', { threadId });
       }
     };
     this.onConnectionChanged = (event) => {
@@ -422,6 +425,7 @@ class AppServerHost extends EventEmitter {
   async resolveTarget() {
     const threadSelectionRevision = this.threadSelectionRevision;
     const threadIds = [];
+    const seenThreadIds = new Set();
     let cursor = '';
     let connectionGeneration = null;
     const seenCursors = new Set();
@@ -454,8 +458,20 @@ class AppServerHost extends EventEmitter {
           this.lastStatus = { configured: true, available: false, reason };
           return { available: false, reason, status: 'unavailable' };
         }
-        if (Array.isArray(loaded?.data)) threadIds.push(...loaded.data);
+        if (Array.isArray(loaded?.data)) {
+          for (const threadId of loaded.data) {
+            if (!seenThreadIds.has(threadId)) {
+              seenThreadIds.add(threadId);
+              threadIds.push(threadId);
+            }
+          }
+        }
         if (this.currentThreadId && threadIds.includes(this.currentThreadId)) break;
+        if (!this.currentThreadId && threadIds.length > MAX_FRESH_THREAD_READS) {
+          const reason = 'shared_app_server_thread_ambiguous';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
         cursor = nextCursor;
         if (cursor) seenCursors.add(cursor);
       } while (cursor);
@@ -470,27 +486,59 @@ class AppServerHost extends EventEmitter {
       return { available: false, reason, status: 'unavailable' };
     }
     let threadId = '';
+    let response;
     if (this.currentThreadId && threadIds.includes(this.currentThreadId)) {
       threadId = this.currentThreadId;
-    } else if (threadIds.length === 1) {
-      threadId = threadIds[0];
     } else {
-      const reason = 'shared_app_server_thread_ambiguous';
-      this.lastStatus = { configured: true, available: false, reason };
-      return { available: false, reason, status: 'unavailable' };
+      const topLevelThreads = [];
+      try {
+        for (const candidateThreadId of threadIds) {
+          const candidateResponse = await requestForTarget('thread/read', {
+            threadId: candidateThreadId,
+            includeTurns: false,
+          });
+          if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
+          const candidate = candidateResponse?.thread;
+          if (!candidate || candidate.id !== candidateThreadId) {
+            const reason = 'shared_app_server_thread_unprovable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          }
+          if (!candidate.parentThreadId) {
+            topLevelThreads.push({ threadId: candidateThreadId, response: candidateResponse });
+            if (topLevelThreads.length > 1) {
+              const reason = 'shared_app_server_thread_ambiguous';
+              this.lastStatus = { configured: true, available: false, reason };
+              return { available: false, reason, status: 'unavailable' };
+            }
+          }
+        }
+      } catch (error) {
+        if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
+        const reason = error?.code || 'shared_app_server_thread_unreadable';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
+      if (topLevelThreads.length !== 1) {
+        const reason = 'shared_app_server_thread_unprovable';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
+      [{ threadId, response }] = topLevelThreads;
     }
 
-    let response;
-    try {
-      response = await requestForTarget('thread/read', {
-        threadId,
-        includeTurns: false,
-      });
-    } catch (error) {
-      if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
-      const reason = error?.code || 'shared_app_server_thread_unreadable';
-      this.lastStatus = { configured: true, available: false, reason };
-      return { available: false, reason, status: 'unavailable' };
+    if (!response) {
+      try {
+        response = await requestForTarget('thread/read', {
+          threadId,
+          includeTurns: false,
+        });
+      } catch (error) {
+        if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
+        const reason = error?.code || 'shared_app_server_thread_unreadable';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
     }
     if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
     const thread = response?.thread;
@@ -581,6 +629,11 @@ class AppServerHost extends EventEmitter {
   onReconnect(listener) {
     this.on('reconnect', listener);
     return () => this.off('reconnect', listener);
+  }
+
+  onThreadClosed(listener) {
+    this.on('threadClosed', listener);
+    return () => this.off('threadClosed', listener);
   }
 
   destroy() {

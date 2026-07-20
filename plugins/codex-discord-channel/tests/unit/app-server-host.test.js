@@ -179,6 +179,125 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
   );
 });
 
+test('fresh recovery selects the unique top-level root among loaded subagent threads', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-child', 'thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: params.threadId === 'thread-child' ? 'thread-root' : null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-root',
+    status: 'idle',
+  });
+  assert.deepEqual(
+    client.requests.filter((request) => request.method === 'thread/read')
+      .map((request) => request.params.threadId),
+    ['thread-child', 'thread-root'],
+  );
+});
+
+test('fresh recovery still fails closed after proving multiple loaded roots', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root-a', 'thread-root-b'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: false,
+    reason: 'shared_app_server_thread_ambiguous',
+    status: 'unavailable',
+  });
+  assert.deepEqual(
+    client.requests.filter((request) => request.method === 'thread/read')
+      .map((request) => request.params.threadId),
+    ['thread-root-a', 'thread-root-b'],
+  );
+});
+
+test('fresh recovery bounds loaded-thread parent inspection at 32 candidates', async (t) => {
+  const createCandidateHost = (candidateCount) => {
+    const ids = [
+      'thread-root',
+      ...Array.from({ length: candidateCount - 1 }, (_, index) => `thread-child-${index + 1}`),
+    ];
+    const client = new FakeRpcClient(async (method, params) => {
+      if (method === 'thread/loaded/list') {
+        const offset = Number(params.cursor || 0);
+        const end = Math.min(offset + 2, ids.length);
+        return {
+          data: ids.slice(offset, end),
+          nextCursor: end < ids.length ? String(end) : null,
+        };
+      }
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: params.threadId,
+            parentThreadId: params.threadId === 'thread-root' ? null : 'thread-root',
+            status: { type: 'idle' },
+          },
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    });
+    return {
+      client,
+      host: createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client }),
+    };
+  };
+
+  await t.test('accepts the inclusive bound', async () => {
+    const { client, host } = createCandidateHost(32);
+    assert.deepEqual(await host.resolveTarget(), {
+      available: true,
+      threadId: 'thread-root',
+      status: 'idle',
+    });
+    assert.equal(
+      client.requests.filter((request) => request.method === 'thread/read').length,
+      32,
+    );
+  });
+
+  await t.test('fails closed above the bound', async () => {
+    const { client, host } = createCandidateHost(33);
+    assert.deepEqual(await host.resolveTarget(), {
+      available: false,
+      reason: 'shared_app_server_thread_ambiguous',
+      status: 'unavailable',
+    });
+    assert.equal(
+      client.requests.filter((request) => request.method === 'thread/read').length,
+      0,
+    );
+  });
+});
+
 test('websocket reconnect after hidden thread rotation does not reuse the stale current thread', async (t) => {
   let loadedThreadIds = ['thread-before-clear'];
   const readThreadIds = [];
@@ -217,7 +336,11 @@ test('websocket reconnect after hidden thread rotation does not reuse the stale 
     status: 'unavailable',
   });
   assert.equal(sockets.length, 2);
-  assert.deepEqual(readThreadIds, ['thread-before-clear']);
+  assert.deepEqual(readThreadIds, [
+    'thread-before-clear',
+    'thread-before-clear',
+    'thread-after-clear',
+  ]);
 });
 
 test('disconnect after a list response fails closed before reading that result on a new connection', async (t) => {
@@ -794,9 +917,18 @@ test('host fails closed when the shared app-server has no exact loaded thread', 
     ['malformed cursor', ['thread-a'], {}, 'shared_app_server_thread_ambiguous'],
   ]) {
     await t.test(name, async () => {
-      const client = new FakeRpcClient(async (method) => {
-        assert.equal(method, 'thread/loaded/list');
-        return { data, nextCursor };
+      const client = new FakeRpcClient(async (method, params) => {
+        if (method === 'thread/loaded/list') return { data, nextCursor };
+        if (method === 'thread/read' && name === 'multiple loaded') {
+          return {
+            thread: {
+              id: params.threadId,
+              parentThreadId: null,
+              status: { type: 'idle' },
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
       });
       const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
       assert.deepEqual(await host.resolveTarget(), {
@@ -859,6 +991,21 @@ test('host emits idle only when the current app-server thread becomes idle', asy
     params: { threadId: 'thread-c', status: { type: 'idle' } },
   });
   assert.equal(seen.length, 1);
+});
+
+test('host exposes loaded-thread closure as a persisted recovery transition', () => {
+  const client = new FakeRpcClient(async () => { throw new Error('not used'); });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  const seen = [];
+  const unsubscribe = host.onThreadClosed((event) => seen.push(event));
+
+  client.emit('notification', {
+    method: 'thread/closed',
+    params: { threadId: 'thread-child' },
+  });
+
+  assert.deepEqual(seen, [{ threadId: 'thread-child' }]);
+  unsubscribe();
 });
 
 test('startTurn forwards only the structured caller payload', async () => {

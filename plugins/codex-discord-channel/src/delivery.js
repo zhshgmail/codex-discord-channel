@@ -632,6 +632,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let destroyed = false;
   let unsubscribeIdle = null;
   let unsubscribeReconnect = null;
+  let unsubscribeThreadClosed = null;
   let startupDrain = Promise.resolve();
   const serializeAdmission = (operation) => {
     const result = admissionOperations.then(operation, operation);
@@ -730,6 +731,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       destroyed = true;
       if (typeof unsubscribeIdle === 'function') unsubscribeIdle();
       if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
+      if (typeof unsubscribeThreadClosed === 'function') unsubscribeThreadClosed();
       if (typeof host.destroy === 'function') host.destroy();
     },
   };
@@ -752,6 +754,9 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     : null;
   unsubscribeReconnect = typeof host.onReconnect === 'function'
     ? host.onReconnect(() => drainAutonomously('reconnect'))
+    : null;
+  unsubscribeThreadClosed = typeof host.onThreadClosed === 'function'
+    ? host.onThreadClosed(() => drainAutonomously('thread_closed'))
     : null;
   startupDrain = drainAutonomously('startup');
   return delivery;

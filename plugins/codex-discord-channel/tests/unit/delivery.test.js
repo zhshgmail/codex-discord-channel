@@ -505,6 +505,47 @@ test('persisted accepted message drains autonomously when the host reconnects', 
   delivery.destroy();
 });
 
+test('persisted message retries autonomously after a loaded child thread closes', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-child-close-'));
+  writePendingQueue(dir, [discordMessage('m-child-close', 'persisted')]);
+  const requests = [];
+  let childClosedListener = null;
+  let target = {
+    available: false,
+    reason: 'shared_app_server_thread_ambiguous',
+    status: 'unavailable',
+  };
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() { return { ...target }; },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-after-child-close' } };
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadClosed(listener) {
+        childClosedListener = listener;
+        return () => { childClosedListener = null; };
+      },
+      status() { return { configured: true, available: target.available, reason: target.reason || null }; },
+      destroy() {},
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests, []);
+  assert.equal(typeof childClosedListener, 'function');
+
+  target = { available: true, threadId: 'thread-root', status: 'idle' };
+  await childClosedListener({ threadId: 'thread-child' });
+
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), [
+    'discord:c1:m-child-close',
+  ]);
+  assert.deepEqual(readQueue(dir).items, []);
+  delivery.destroy();
+  assert.equal(childClosedListener, null);
+});
+
 test('concurrent receivers persist and submit a Discord identity only once', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-concurrent-'));
   const config = deliveryConfig(dir);
