@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
+  getStagedReceiverAuthorityPath,
   isActiveDiscordReceiver,
   readReceiverAuthoritySnapshot,
   releaseReceiverOwnership,
@@ -83,13 +84,16 @@ test('graceful successor release restores a live A6 fallback in legacy format', 
     },
   };
   const config = { paths: { gatewayPidPath, receiverOwnershipPath } };
-  fs.writeFileSync(gatewayPidPath, `${JSON.stringify(current)}\n`);
+  const stagedAuthorityPath = getStagedReceiverAuthorityPath(config);
+  fs.writeFileSync(gatewayPidPath, `${process.pid}\n`);
   fs.writeFileSync(receiverOwnershipPath, `${JSON.stringify(current.fallback)}\n`);
+  fs.writeFileSync(stagedAuthorityPath, `${JSON.stringify(current)}\n`);
 
   assert.equal(releaseReceiverOwnership(config, current, {
     isProcessAlive: (pid) => pid === process.pid,
   }), true);
   assert.equal(fs.readFileSync(gatewayPidPath, 'utf8'), `${process.pid}\n`);
+  assert.equal(fs.existsSync(stagedAuthorityPath), false);
   assert.deepEqual(readReceiverAuthoritySnapshot(config).record, current.fallback);
 });
 
@@ -120,23 +124,12 @@ test('graceful successor release keeps an A7 fallback as atomic JSON', () => {
   assert.deepEqual(readReceiverAuthoritySnapshot(config).record, fallback);
 });
 
-test('mismatched legacy prefix and structured fallback fail closed', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-frame-'));
+test('malformed staged authority fails closed over a valid legacy receiver', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-staged-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
-  const current = {
-    version: 2,
-    pid: 23456,
-    generation: 'successor-generation',
-    claimedAt: '2026-07-20T01:00:00.000Z',
-    fallback: {
-      version: 1,
-      pid: process.pid,
-      generation: 'legacy-generation',
-      claimedAt: '2026-07-20T00:00:00.000Z',
-    },
-  };
   const config = { paths: { gatewayPidPath } };
-  fs.writeFileSync(gatewayPidPath, `${process.pid + 1}\n${JSON.stringify(current)}\n`);
+  fs.writeFileSync(gatewayPidPath, `${process.pid}\n`);
+  fs.writeFileSync(getStagedReceiverAuthorityPath(config), '{not-json}\n');
 
   const snapshot = readReceiverAuthoritySnapshot(config);
   assert.equal(snapshot.valid, false);

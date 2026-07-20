@@ -4,7 +4,7 @@
 
 **Goal:** Keep an actual running A6 receiver eligible after an A7 successor commits and then crashes or releases gracefully.
 
-**Architecture:** Encode only A7 records with a version-1 fallback as an atomically written legacy-PID-prefixed structured record. A7 validates and uses the JSON body for generation-fenced authority while unchanged A6 reads the prefix; graceful release restores the legacy integer form.
+**Architecture:** Leave A6's integer PID and version-1 generation files unchanged while atomically storing the A7 generation-fenced CAS record at `session-gateway.pid.v2`. A7 prefers the staged record; graceful A7 release removes it, while A6 shutdown can remove only its own legacy view.
 
 **Tech Stack:** Node.js 22, CommonJS, `node:test`, Git object extraction, synchronous atomic filesystem rename.
 
@@ -27,13 +27,13 @@
 - Consumes: exact A6 Git object `plugins/codex-discord-channel/src/receiver-state.js`, current A7 receiver-state exports.
 - Produces: two regression cases for post-commit death and graceful release.
 
-- [x] Add a CommonJS test loader that runs the receiver-state source extracted from exact A6 commit `c09749a018253e79ac939be1e2a5809756209437` in a temporary module directory.
+- [x] Add a CommonJS test loader for the SHA-256-guarded, byte-identical receiver-state fixture from exact A6 commit `c09749a018253e79ac939be1e2a5809756209437`.
 - [x] Create a legacy integer authority plus version-1 `.generation` record, commit a version-2 successor through current `createReceiverOwnership()` and `commitReceiverOwnership()`, then assert historical A6 reports `gateway_pid_match` after the successor is considered dead.
 - [x] Repeat the setup, call current `releaseReceiverOwnership()`, and assert historical A6 reports `gateway_pid_match` after graceful release.
 - [x] Run `node --test tests/unit/receiver-state-mixed-binary.test.js` and confirm both assertions fail with `gateway_pid_missing` before production edits.
 - [x] Commit and push the red regression checkpoint.
 
-### Task 2: Compatibility-Framed Atomic Authority
+### Task 2: Staged Atomic Authority
 
 **Files:**
 - Modify: `plugins/codex-discord-channel/src/receiver-state.js`
@@ -42,13 +42,13 @@
 
 **Interfaces:**
 - Consumes: version-1 fallback identity already produced by `readReceiverAuthoritySnapshot()`.
-- Produces: validated framed-record parsing, conditional atomic serialization, and legacy-format graceful restoration.
+- Produces: staged authority selection, conditional CAS path selection, and version-aware graceful release.
 
-- [x] Extend authority parsing to recognize `<pid>\n<json>` only when the JSON is a valid version-2 record with a matching version-1 fallback PID.
-- [x] Serialize candidate records with a version-1 fallback using the matching PID prefix; keep all other records as one-line JSON.
-- [x] Restore a live version-1 fallback as an atomic integer PID on graceful release; retain version-2 JSON promotion for all-A7 fallback.
-- [x] Update the crash fixture to parse the structured body of either pure or compatibility-framed authority.
-- [x] Run the mixed-binary and receiver-state tests and confirm the historical A6 cases and malformed-frame fail-closed cases pass.
+- [x] Prefer a valid `session-gateway.pid.v2` staged record and fail closed if it is malformed.
+- [x] Commit a candidate with a version-1 fallback to the staged path without replacing A6's PID or generation files.
+- [x] Remove staged authority on graceful release to A6; retain version-2 JSON promotion for all-A7 fallback.
+- [x] Update the crash fixture to recognize commits to either the canonical or staged authority path.
+- [x] Run the mixed-binary and receiver-state tests and confirm the historical A6 cases and malformed staged-state fail-closed cases pass.
 - [x] Commit and push the green implementation checkpoint.
 
 ### Task 3: Contract And Verification
@@ -59,10 +59,10 @@
 - Modify: `plugins/codex-discord-channel/README.md`
 
 **Interfaces:**
-- Consumes: the compatibility-framed authority behavior.
+- Consumes: the staged compatibility authority behavior.
 - Produces: explicit staged-upgrade and mixed-version dedupe contract documentation.
 
-- [ ] Document the mixed A6/A7 frame, overlap semantics, and graceful legacy restoration without changing state-path or owner metadata authority.
+- [x] Document the mixed A6/A7 authority views, overlap semantics, and graceful release without changing state-directory or owner metadata authority.
 - [ ] Run focused mixed-binary tests and all receiver/delivery regression tests.
 - [ ] Run `npm run check`, `npm pack --dry-run`, the forbidden-path scan, and `git diff --check`.
 - [ ] Inspect the branch diff from exact A7, request an independent code review, address all critical/important findings, and rerun affected gates.

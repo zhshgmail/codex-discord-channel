@@ -8,9 +8,9 @@ marketplace at `.agents/plugins/marketplace.json`.
 
 - Reuses one Discord bot instance and state directory per configured instance.
 - Uses one atomically replaced structured authority record in
-  `session-gateway.pid` as the active receive gate. Pure current-version
-  handoffs use JSON; a staged takeover from a legacy gateway prefixes that
-  gateway's PID so the unchanged incumbent can fail back after successor exit.
+  `session-gateway.pid` as the active receive gate. During a staged takeover
+  from a legacy gateway, its unchanged PID/generation files remain intact and
+  the current receiver CAS lives in `session-gateway.pid.v2`.
 - Keeps `owner.json` for status and handoff metadata only; thread or session ids
   never gate individual Discord messages.
 - Persists accepted messages in a cross-process locked, deduplicated FIFO.
@@ -31,7 +31,9 @@ authority with one atomic record replacement.
 During a staged legacy-to-current takeover, both gateway listeners can remain
 eligible because the legacy binary cannot react to successor process death.
 The cross-process queue lock and Discord identity deduplication keep that
-compatibility overlap to one persisted event and one structured turn.
+compatibility overlap to one persisted event and one structured turn. Current
+receivers prefer the staged authority, so legacy shutdown cannot clear their
+generation.
 
 ## Structured Delivery
 

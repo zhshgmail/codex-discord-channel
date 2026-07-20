@@ -4,11 +4,15 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const { startDiscordClient } = require('../../src/discord-client');
-const { readReceiverAuthoritySnapshot } = require('../../src/receiver-state');
+const {
+  getStagedReceiverAuthorityPath,
+  readReceiverAuthoritySnapshot,
+} = require('../../src/receiver-state');
 
 const stateDir = process.argv[2];
 const crashPhase = process.argv[3];
 const gatewayPidPath = path.join(stateDir, 'session-gateway.pid');
+const stagedAuthorityPath = getStagedReceiverAuthorityPath({ paths: { gatewayPidPath } });
 
 function checkpoint(phase) {
   if (phase === crashPhase) process.exit(86);
@@ -37,7 +41,7 @@ const fsProxy = {
   ...fs,
   renameSync(source, target) {
     fs.renameSync(source, target);
-    if (target !== gatewayPidPath) return;
+    if (target !== gatewayPidPath && target !== stagedAuthorityPath) return;
     try {
       const record = readReceiverAuthoritySnapshot({ paths: { gatewayPidPath } }, { fs }).record;
       if (record?.version === 2 && record.generation) checkpoint('authority_committed');
