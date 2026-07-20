@@ -293,15 +293,34 @@ class AppServerHost extends EventEmitter {
   }
 
   async resolveTarget() {
-    let loaded;
+    const threadIds = [];
+    let cursor = '';
+    const seenCursors = new Set();
     try {
-      loaded = await this.client.request('thread/loaded/list', { limit: 2 });
+      do {
+        const params = { limit: 2 };
+        if (cursor) params.cursor = cursor;
+        const loaded = await this.client.request('thread/loaded/list', params);
+        if (Array.isArray(loaded?.data)) threadIds.push(...loaded.data);
+        if (this.currentThreadId && threadIds.includes(this.currentThreadId)) break;
+        if (loaded?.nextCursor != null && typeof loaded.nextCursor !== 'string') {
+          const reason = 'shared_app_server_thread_ambiguous';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
+        cursor = loaded?.nextCursor || '';
+        if (cursor && seenCursors.has(cursor)) {
+          const reason = 'shared_app_server_thread_ambiguous';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
+        if (cursor) seenCursors.add(cursor);
+      } while (cursor);
     } catch (error) {
       const reason = error?.code || 'shared_app_server_unavailable';
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
     }
-    const threadIds = Array.isArray(loaded?.data) ? loaded.data : [];
     if (threadIds.length === 0) {
       const reason = 'shared_app_server_no_loaded_thread';
       this.lastStatus = { configured: true, available: false, reason };
@@ -310,7 +329,7 @@ class AppServerHost extends EventEmitter {
     let threadId = '';
     if (this.currentThreadId && threadIds.includes(this.currentThreadId)) {
       threadId = this.currentThreadId;
-    } else if (threadIds.length === 1 && !loaded?.nextCursor) {
+    } else if (threadIds.length === 1) {
       threadId = threadIds[0];
     } else {
       const reason = 'shared_app_server_thread_ambiguous';

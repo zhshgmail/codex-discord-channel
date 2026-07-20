@@ -10,12 +10,26 @@ const { clearPid, isActiveDiscordReceiver, readPid, writePid } = require('../../
 test('gateway pid file selects active receiver independently from owner id', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
-  const config = { paths: { gatewayPidPath } };
+  const ownerPath = path.join(dir, 'owner.json');
+  const config = { paths: { gatewayPidPath, ownerPath } };
 
   assert.deepEqual(isActiveDiscordReceiver(config), { active: false, reason: 'gateway_pid_missing' });
 
   writePid(gatewayPidPath, process.pid);
   assert.equal(readPid(gatewayPidPath), process.pid);
+  assert.deepEqual(isActiveDiscordReceiver(config), {
+    active: true,
+    reason: 'gateway_pid_match',
+    pid: process.pid,
+  });
+  fs.writeFileSync(ownerPath, JSON.stringify({
+    ownerId: 'thread-before-clear',
+    pid: 111111,
+  }));
+  fs.writeFileSync(ownerPath, JSON.stringify({
+    ownerId: 'thread-after-clear',
+    pid: 222222,
+  }));
   assert.deepEqual(isActiveDiscordReceiver(config), {
     active: true,
     reason: 'gateway_pid_match',

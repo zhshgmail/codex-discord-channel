@@ -26,8 +26,9 @@ rotate while the same state directory, bot, and gateway continue operating.
 ## Target Resolution
 
 The app-server connection is initialized once and never supplies thread
-settings. Before a turn, the gateway calls `thread/loaded/list` and
-`thread/read` to prove a top-level loaded thread and inspect its status.
+settings. Before a turn, the gateway paginates `thread/loaded/list` until the
+notification-selected current thread is found, then calls `thread/read` to
+prove that it is top-level and inspect its status.
 
 On a fresh endpoint, exactly one top-level loaded thread is required. The
 gateway then records that thread as current. A later top-level

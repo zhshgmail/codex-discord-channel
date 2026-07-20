@@ -423,18 +423,23 @@ test('resolveReplyTarget defaults to the durable last inbound context', async ()
 
 test('production source contains no raw TTY or terminal-control injection path', () => {
   const root = path.resolve(__dirname, '..', '..');
-  const sourceFiles = fs.readdirSync(path.join(root, 'src'))
+  const productionFiles = fs.readdirSync(path.join(root, 'src'))
     .filter((name) => name.endsWith('.js'))
-    .map((name) => fs.readFileSync(path.join(root, 'src', name), 'utf8'))
+    .map((name) => path.join(root, 'src', name));
+  productionFiles.push(path.join(root, 'bin', 'codex-discord-channel'));
+  const source = productionFiles
+    .map((file) => fs.readFileSync(file, 'utf8'))
     .join('\n');
   for (const forbidden of [
     'TIOCSTI',
+    'node:child_process',
+    'tty-detect',
     'runTtyInjector',
     'injectIntoTty',
     'BRACKETED_PASTE',
     '\\x1b[200~',
     '\\x1b[201~',
   ]) {
-    assert.equal(sourceFiles.includes(forbidden), false, `forbidden delivery primitive remains: ${forbidden}`);
+    assert.equal(source.includes(forbidden), false, `forbidden delivery primitive remains: ${forbidden}`);
   }
 });

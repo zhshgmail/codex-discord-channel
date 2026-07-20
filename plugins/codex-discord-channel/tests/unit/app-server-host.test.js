@@ -133,11 +133,55 @@ test('latest top-level thread/started notification selects the rotated TUI threa
   );
 });
 
+test('rotated current thread remains selectable beyond the first loaded-thread page', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      if (!params.cursor) {
+        return { data: ['thread-old-a', 'thread-old-b'], nextCursor: 'page-2' };
+      }
+      assert.equal(params.cursor, 'page-2');
+      return { data: ['thread-current'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-current',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-current',
+    status: 'idle',
+  });
+  assert.deepEqual(
+    client.requests.filter((request) => request.method === 'thread/loaded/list').map((request) => request.params),
+    [{ limit: 2 }, { limit: 2, cursor: 'page-2' }],
+  );
+});
+
 test('host fails closed when the shared app-server has no exact loaded thread', async (t) => {
   for (const [name, data, nextCursor, reason] of [
     ['none loaded', [], null, 'shared_app_server_no_loaded_thread'],
     ['multiple loaded', ['thread-a', 'thread-b'], null, 'shared_app_server_thread_ambiguous'],
     ['more pages', ['thread-a'], 'next', 'shared_app_server_thread_ambiguous'],
+    ['malformed cursor', ['thread-a'], {}, 'shared_app_server_thread_ambiguous'],
   ]) {
     await t.test(name, async () => {
       const client = new FakeRpcClient(async (method) => {
