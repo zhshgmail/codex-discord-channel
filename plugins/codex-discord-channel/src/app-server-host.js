@@ -124,6 +124,26 @@ class AppServerRpcClient extends EventEmitter {
     if (typeof this.reconnectTimer?.unref === 'function') this.reconnectTimer.unref();
   }
 
+  fenceConnection(ws, reason, pendingError, closeSocket = true) {
+    if (this.ws !== ws) return false;
+    this.ws = null;
+    this.connectionGeneration += 1;
+    this.state = { configured: true, available: false, reason };
+    this.emit('connectionChanged', { generation: this.connectionGeneration });
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(pendingError);
+    }
+    this.pending.clear();
+    if (closeSocket) {
+      try {
+        ws.close();
+      } catch {}
+    }
+    this.scheduleReconnect();
+    return true;
+  }
+
   async connect(WebSocket) {
     if (!this.endpoint) {
       throw deliveryError(
@@ -194,22 +214,12 @@ class AppServerRpcClient extends EventEmitter {
       this.logger('WARN', 'Shared app-server websocket error', { error: error.message });
     });
     ws.once('close', () => {
-      if (this.ws !== ws) return;
-      this.ws = null;
-      this.connectionGeneration += 1;
-      this.state = { configured: true, available: false, reason: 'shared_app_server_disconnected' };
-      this.emit('connectionChanged', { generation: this.connectionGeneration });
       const error = deliveryError(
         'Shared app-server disconnected before acknowledging the request.',
         'shared_app_server_disconnected',
         'uncertain',
       );
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(error);
-      }
-      this.pending.clear();
-      this.scheduleReconnect();
+      this.fenceConnection(ws, 'shared_app_server_disconnected', error, false);
     });
 
     try {
@@ -292,14 +302,25 @@ class AppServerRpcClient extends EventEmitter {
 
   requestConnected(method, params) {
     const id = String(this.nextId++);
+    const ws = this.ws;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(deliveryError(
+        const timeoutError = deliveryError(
           `Shared app-server request timed out: ${method}`,
           'shared_app_server_request_timeout',
           'uncertain',
-        ));
+        );
+        reject(timeoutError);
+        this.fenceConnection(
+          ws,
+          'shared_app_server_request_timeout',
+          deliveryError(
+            'Shared app-server connection was fenced after a request timeout.',
+            'shared_app_server_disconnected',
+            'uncertain',
+          ),
+        );
       }, this.requestTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try {

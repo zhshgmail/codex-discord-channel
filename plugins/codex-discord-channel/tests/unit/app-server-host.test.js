@@ -539,6 +539,50 @@ test('websocket close autonomously reconnects and emits reconnect without later 
   });
 });
 
+test('request timeout fences the stale socket and schedules bounded reconnect', async (t) => {
+  const timers = createManualTimers();
+  const { WebSocket, sockets } = createFakeWebSocket(async (request, connectionIndex) => {
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list' && connectionIndex === 0) {
+      return new Promise(() => {});
+    }
+    if (request.method === 'thread/loaded/list') return { data: [], nextCursor: null };
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const client = new AppServerRpcClient({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    appServerRequestTimeoutMs: 10,
+  }, () => {}, {
+    WebSocket,
+    clearTimeout: timers.clearTimeout,
+    reconnectInitialDelayMs: 15,
+    reconnectMaxDelayMs: 30,
+    setTimeout: timers.setTimeout,
+  });
+  t.after(() => client.destroy());
+
+  await client.ensureConnected();
+  await assert.rejects(
+    client.request('thread/loaded/list', { limit: 100 }),
+    (error) => error.code === 'shared_app_server_request_timeout' &&
+      error.deliveryOutcome === 'uncertain',
+  );
+
+  assert.equal(sockets[0].readyState, 3);
+  assert.deepEqual(client.status(), {
+    configured: true,
+    available: false,
+    reason: 'shared_app_server_request_timeout',
+  });
+  assert.equal(timers.pendingCount(), 1);
+  assert.deepEqual(timers.delays, [15]);
+
+  await timers.runNext();
+
+  assert.equal(sockets.length, 2);
+  assert.deepEqual(client.status(), { configured: true, available: true, reason: null });
+});
+
 test('failed autonomous reconnect backs off and destroy cancels the next retry', async () => {
   const timers = createManualTimers();
   const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
