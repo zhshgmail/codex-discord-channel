@@ -1,62 +1,88 @@
 # Codex Discord Channel
 
-Standalone Codex plugin project for Claude-style Discord session ownership.
-
-The plugin lives at `plugins/codex-discord-channel` and is exposed through the repo-local marketplace at `.agents/plugins/marketplace.json`.
+Standalone Codex plugin project for Discord session delivery. The plugin lives
+at `plugins/codex-discord-channel` and is exposed through the repository
+marketplace at `.agents/plugins/marketplace.json`.
 
 ## What It Does
 
-- Claims one active owner for a Discord bot instance when the MCP server starts.
-- Stores local state under `$HOME/.codex/channels/discord/<instance>` by default.
-- Uses a Claude-compatible access model for DMs and guild channels.
-- Persists accepted Discord messages in a durable FIFO queue for the owning Codex session.
-- Exposes MCP tools for status, owner claim/read, bounded history reads, and Discord send.
+- Reuses one Discord bot instance and state directory per configured instance.
+- Uses `session-gateway.pid` in that state directory as the active receive gate.
+- Keeps `owner.json` for status and handoff metadata only; thread or session ids
+  never gate individual Discord messages.
+- Persists accepted messages in a cross-process locked, deduplicated FIFO.
+- Sends one queued message at a time through `turn/start` on the shared Codex
+  app-server used by the visible TUI.
+- Exposes MCP tools for status, owner metadata, bounded history, and replies.
 
-### Guild Reply Audience
+There is no terminal-input delivery path. If the visible TUI is not attached to
+the same shared app-server, the endpoint is unavailable, or the current thread
+cannot be proved, accepted messages remain queued. The gateway never falls back
+to keyboard emulation.
 
-For an enabled guild channel with `requireMention: true`, a reply is an
-implicit mention only for the union of: the referenced message author, bot
-agents explicitly mentioned in the referenced message, and bot agents
-explicitly mentioned in the new reply. Each agent evaluates that union
-independently. Therefore a reply to a peer's message reaches `codex01` only
-when the peer's message mentioned `codex01` or the new reply explicitly
-mentions it. Missing, deleted, or inaccessible references add no implicit
-audience. Existing channel, sender, and bot checks still apply. When
-`requireMention: false`, reply-audience and mention checks do not gate delivery;
-all otherwise-authorized group messages are accepted.
+## Structured Delivery
 
-### Bounded History
+The default endpoint for instance `codex01` is:
 
-`discord_channel_read_history` is a read-only, idempotent MCP tool that reads
-recent messages from the authenticated Discord client without creating a local
-archive. Its strict input is:
-
-```json
-{
-  "channelId": "optional Discord channel snowflake; defaults to last accepted inbound channel",
-  "before": "optional exclusive message snowflake cursor",
-  "limit": "optional integer from 1 to 25; defaults to 20"
-}
+```text
+$CODEX_HOME/channels/discord/codex01/app-server.sock
 ```
 
-Messages are newest first. Use `nextBefore` with `before` when `hasMore` is
-true. Guild history requires the exact channel or thread ID in `groups`; parent
-authorization is never inherited. DM history requires `dmPolicy: "open"` or
-an allowlisted counterparty. Guild `allowFrom` and `allowBots` filter returned
-messages, while the active bot's own messages remain visible. `requireMention`
-does not filter history. Group DMs, categories, voice channels, and forum
-containers are rejected. Results omit embeds, components, reactions, and
-attachment bodies; output is bounded to 64 KiB. Stable sanitized errors include
-`invalid_history_args`, `history_target_not_allowed`,
-`history_channel_inaccessible`, and `history_fetch_failed`; raw Discord errors
-are not exposed.
+When `CODEX_HOME` is unset, `$HOME/.codex` is used. Set
+`CODEX_DISCORD_APP_SERVER_URL` only when the shared endpoint uses another
+`unix://`, `ws://`, or `wss://` address.
 
-Codex CLI 0.144.1 does not expose its private composer/modal focus state. TTY
-delivery therefore defaults to fail-closed: accepted messages remain in a
-durable FIFO queue and raw keystrokes are not injected. An explicit
-auto-submit compatibility mode is available for a dedicated, operator-managed
-TUI where restoring immediate delivery is worth the focus-state risk. See
-[TTY Delivery Safety Boundary](docs/tty-delivery-safety.md).
+For every delivery attempt, the gateway asks the shared server for loaded
+threads and reads the current top-level thread status. A fresh endpoint must
+have one provable top-level TUI thread. After `/clear` or another thread
+rotation, the latest top-level `thread/started` notification becomes the
+current target even while an older subscribed thread is still loaded.
+
+While the current thread is active, messages stay FIFO queued. Each idle
+transition admits at most one `turn/start`; the next item waits for the next
+idle transition. The request includes a stable Discord client message id and
+untrusted Discord context, but omits model, reasoning effort, service tier,
+personality, sandbox, cwd, and approval overrides.
+
+Queue completion is committed only after structured acceptance. If an
+acknowledgement is lost, replay is blocked. The gateway reconciles the stable
+client message id against the thread before it can mark that item complete.
+See [Structured Delivery Contract](docs/structured-delivery.md).
+
+## Required Live Migration
+
+A TUI started as a direct `codex ... resume` process uses a private embedded
+app-server. This repository change cannot attach to that private server. Live
+exact-console verification therefore requires a release/install plus process
+migration:
+
+1. End the direct TUI process at an operator-approved time.
+2. Start a persistent app-server on the instance socket:
+
+   ```bash
+   STATE_DIR="${CODEX_HOME:-$HOME/.codex}/channels/discord/codex01"
+   SOCKET="$STATE_DIR/app-server.sock"
+   mkdir -p "$STATE_DIR"
+   codex app-server --listen "unix://$SOCKET"
+   ```
+
+3. Relaunch the visible TUI against that same endpoint:
+
+   ```bash
+   codex --remote "unix://$SOCKET" resume <THREAD_ID>
+   ```
+
+4. Install the released plugin and restart the `codex01` gateway under normal
+   operator change control so it runs the released code.
+5. Verify `discord_channel_status` reports `deliverySafety:
+   "structured_only"`, `sharedAppServerAvailable: true`, and
+   `discordStarted: true`.
+6. Send a controlled allowed Discord message and confirm that its structured
+   turn appears in that exact visible TUI. Repeat after `/clear` to verify
+   thread rotation.
+
+Until every step is complete, report only repository/test readiness or queued
+unavailability. Do not claim passive or exact-console success.
 
 ## Remote Marketplace Install
 
@@ -65,132 +91,55 @@ codex plugin marketplace add zhshgmail/codex-discord-channel --ref main
 codex plugin add codex-discord-channel@personal
 ```
 
-Use a new Codex thread after installing so the plugin MCP server is loaded.
+Use a new Codex thread after installation so the MCP server is loaded.
 
-## Fresh-Session Handoff And Smoke
+## Status
 
-This is a release-time procedure, not a request to deploy or restart anything
-from this checkout. Keep the same `codex01` bot and state path
-`$HOME/.codex/channels/discord/codex01`. Leave
-`codex-discord-channel@codex01.service` active; do not create a second gateway,
-change `DISCORD_INSTANCE`, or restart the gateway merely to open the new
-session.
-
-1. Install the released plugin, then close the current Codex thread and start a
-   **new** Codex session. A closed MCP transport cannot discover the new tool in
-   place.
-2. In that new session, call `discord_channel_claim_owner`, then
-   `discord_channel_read_owner`, and confirm the reported owner is the new
-   session while its instance and state path remain `codex01`.
-3. Call `discord_channel_status`; confirm `deliveryMode: "tty"`, a configured
-   TTY, and `discordStarted: true`. The systemd gateway must still be active.
-   For immediate TTY delivery, also require `ttyAutoSubmitCompat: true`,
-   `ttyAutoSubmitEffective: true`,
-   `deliverySafety: "auto_submit_compat"`, and
-   `composerReadinessSignal: "operator_opt_in_unverified"`.
-4. Only after closing popups and clearing or intentionally preserving any
-   composer draft, send a controlled message in a real allowed DM and confirm
-   it reaches the visible new Codex console. In an allowed guild channel with
-   `requireMention: true`, verify a direct reply to a `codex01` message reaches
-   that console without a new mention. Without the explicit compatibility
-   setting, verify queue persistence instead of claiming visible delivery.
-5. With `requireMention: true`, verify an inherited reply: reply to a peer
-   message that mentioned `codex01` and confirm delivery. Also confirm a reply
-   to a peer message that did not mention `codex01` is rejected unless the
-   reply explicitly mentions it. In an allowed group with `requireMention:
-   false`, verify that all otherwise-authorized group messages are accepted,
-   including one with no mention or reply audience.
-6. Call `discord_channel_read_history` for an authorized guild channel and a
-   real DM channel. Verify cursor pagination using `nextBefore`, and verify an
-   inaccessible channel returns only its stable sanitized error.
-
-Record non-secret evidence only, such as tool names, message IDs, the owner
-instance, and status booleans. Never record `.env` values, tokens, proxy URLs,
-or raw Discord errors.
-
-## Usage
-
-After starting a new Codex session, ask for the channel status:
-
-```text
-Use $codex-discord-channel to show status.
-```
-
-Expected healthy status:
+Expected fail-closed status before the shared endpoint exists:
 
 ```json
 {
   "instance": "codex01",
-  "tokenConfigured": true,
-  "proxyConfigured": true,
-  "deliveryMode": "tty",
-  "deliverySafety": "queue_only",
-  "composerReadinessSignal": "unavailable",
-  "discordStarted": true
+  "deliveryMode": "app-server",
+  "deliverySafety": "structured_only",
+  "structuredDeliveryState": "unavailable",
+  "sharedAppServerAvailable": false,
+  "sharedAppServerReason": "shared_app_server_socket_missing"
 }
 ```
 
-Send a message through the owned bot:
+Status also reports queue depth and the current blocked reason without exposing
+queued message content, tokens, or proxy values.
+
+## Guild Reply Audience
+
+For an enabled guild channel with `requireMention: true`, a reply is an
+implicit mention for the union of the referenced author, agents mentioned by
+the referenced message, and agents explicitly mentioned by the new reply.
+Every bot applies that union independently after normal channel, sender, and
+bot checks. When `requireMention: false`, otherwise-authorized group messages
+do not require a mention or reply audience.
+
+## Bounded History
+
+`discord_channel_read_history` reads sanitized recent history without creating
+a local archive. It supports `channelId`, an exclusive `before` cursor, and a
+`limit` from 1 to 25. Guild reads require the exact enabled channel or thread;
+DM reads require the configured DM policy. Results are newest first, bounded to
+64 KiB, and omit attachment bodies, embeds, components, and reactions.
+
+## Instance State
 
 ```text
-Use $codex-discord-channel to send "..." to channel <discord-channel-id>.
+$HOME/.codex/channels/discord/codex01/.env
+$HOME/.codex/channels/discord/codex01/access.json
+$HOME/.codex/channels/discord/codex01/owner.json
+$HOME/.codex/channels/discord/codex01/session-gateway.pid
+$HOME/.codex/channels/discord/codex01/pending-delivery.json
+$HOME/.codex/channels/discord/codex01/app-server.sock
 ```
 
-If `discordStarted` is false, check `discordReason`, `envLoaded`, `proxyConfigured`, and `insecureTls` in the status output. The status intentionally reports only booleans and paths, never token or proxy values.
-
-The Discord receiver continues accepting access-approved messages while
-delivery is blocked. Each message is persisted in `pending-delivery.json`;
-queue mutations are cross-process serialized and deduplicated by Discord
-identity. Status reports queue depth, blocked reason, timestamp, path, and
-sanitized read errors without printing queued content. By default, the
-receiver does not invoke the internal drain path because the current TUI has no
-verifiable composer-ready signal.
-
-With `CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true`, each receive first persists
-the message, FIFO-claims the queue head, and then sends one bracketed-paste
-frame plus its submit key in a single injector process. A successful queue
-commit advances the FIFO; an ambiguous injector or commit result blocks replay
-and preserves that item and every later item for explicit reconciliation. This
-mode does not detect popups, focused widgets, or existing drafts. It can paste
-or submit into the wrong TUI state, so enable it only for a dedicated console
-whose operator accepts that risk. It never prepends Escape or changes model or
-reasoning settings.
-
-Compatibility mode also requires `CODEX_DISCORD_TTY_SUBMIT=true` and a real
-submit sequence such as `cr`, `lf`, or `crlf`. If submit is disabled or the
-sequence is `none`, the message remains persisted, no injector runs, and status
-reports `auto_submit_precondition_failed` with
-`auto_submit_requires_submit_sequence`.
-
-## Instance Config
-
-Default instance state:
-
-```text
-$HOME/.codex/channels/discord/default/.env
-$HOME/.codex/channels/discord/default/access.json
-$HOME/.codex/channels/discord/default/owner.json
-$HOME/.codex/channels/discord/default/pending-delivery.json
-```
-
-Example `.env`:
-
-```env
-DISCORD_INSTANCE=codex01
-DISCORD_BOT_TOKEN=replace-with-local-token
-DISCORD_BOT_USER_ID=replace-with-bot-user-id
-DISCORD_PROXY_URL=http://127.0.0.1:8080
-DISCORD_INSECURE_TLS=true
-CODEX_DISCORD_DELIVERY_MODE=tty
-# CODEX_DISCORD_TTY=/dev/pts/7
-# Optional legacy exact-console behavior. Unsafe when a popup, another widget,
-# or an unintended composer draft has focus. Default: false (queue-only).
-# CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT=true
-# CODEX_DISCORD_TTY_SUBMIT=true
-# CODEX_DISCORD_TTY_SUBMIT_SEQUENCE=cr
-```
-
-Do not commit `.env`.
+Do not commit `.env` or print Discord tokens.
 
 ## Validation
 
@@ -203,11 +152,10 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/valid
 
 ## Import Existing Bridge State
 
-After the package checks pass, import an existing `discord-codex-bridge` instance:
-
 ```bash
 cd plugins/codex-discord-channel
 npm run import:bridge -- --instance codex01 --fetch-bot-id
 ```
 
-This reuses the existing `.env`, converts `state.json` into `access.json`, and writes `DISCORD_BOT_USER_ID` when Discord confirms the bot identity. The script never prints the token.
+The import reuses the existing `.env`, converts access state, and never prints
+the bot token.

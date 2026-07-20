@@ -31,9 +31,10 @@ function normalizeInstance(raw) {
 
 function resolvePaths(env = process.env) {
   const home = env.HOME || os.homedir();
+  const codexHome = firstNonEmpty(env.CODEX_HOME, path.join(home, '.codex'));
   const instance = normalizeInstance(firstNonEmpty(env.DISCORD_INSTANCE, env.DISCORD_BRIDGE_INSTANCE));
   const baseDir = expandPath(
-    firstNonEmpty(env.DISCORD_CONFIG_BASE_DIR, path.join(home, '.codex', 'channels', 'discord')),
+    firstNonEmpty(env.DISCORD_CONFIG_BASE_DIR, path.join(codexHome, 'channels', 'discord')),
     env,
   );
   const stateDir = expandPath(

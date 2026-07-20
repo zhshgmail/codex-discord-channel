@@ -12,7 +12,7 @@ test('gateway pid file selects active receiver independently from owner id', () 
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
   const config = { paths: { gatewayPidPath } };
 
-  assert.deepEqual(isActiveDiscordReceiver(config), { active: true, reason: 'gateway_pid_missing' });
+  assert.deepEqual(isActiveDiscordReceiver(config), { active: false, reason: 'gateway_pid_missing' });
 
   writePid(gatewayPidPath, process.pid);
   assert.equal(readPid(gatewayPidPath), process.pid);
@@ -37,14 +37,14 @@ test('non-gateway receiver stands down when live gateway pid differs', () => {
   assert.equal(decision.pid, 12345);
 });
 
-test('stale gateway pid does not block fallback receiver', () => {
+test('stale gateway pid fails closed instead of enabling a fallback receiver', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
   const config = { paths: { gatewayPidPath } };
   writePid(gatewayPidPath, 12345);
 
   const decision = isActiveDiscordReceiver(config, { isProcessAlive: () => false });
-  assert.equal(decision.active, true);
+  assert.equal(decision.active, false);
   assert.equal(decision.reason, 'stale_gateway_pid');
   assert.equal(decision.pid, 12345);
 });

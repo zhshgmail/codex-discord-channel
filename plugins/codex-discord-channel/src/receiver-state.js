@@ -36,17 +36,17 @@ function isProcessAlive(pid) {
 
 function isActiveDiscordReceiver(config = {}, deps = {}) {
   const pidPath = config.paths?.gatewayPidPath || '';
-  if (!pidPath) return { active: true, reason: 'gateway_pid_unconfigured' };
+  if (!pidPath) return { active: false, reason: 'gateway_pid_unconfigured' };
 
   const activePid = readPid(pidPath);
-  if (!activePid) return { active: true, reason: 'gateway_pid_missing' };
+  if (!activePid) return { active: false, reason: 'gateway_pid_missing' };
   if (activePid === process.pid) return { active: true, reason: 'gateway_pid_match', pid: activePid };
 
   const alive = (deps.isProcessAlive || isProcessAlive)(activePid);
   if (alive) {
     return { active: false, reason: 'another_gateway_active', pid: activePid };
   }
-  return { active: true, reason: 'stale_gateway_pid', pid: activePid };
+  return { active: false, reason: 'stale_gateway_pid', pid: activePid };
 }
 
 module.exports = {

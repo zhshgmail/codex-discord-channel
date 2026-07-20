@@ -30,8 +30,27 @@ test('loadConfig resolves default instance state path', () => {
     'codex-01',
     'pending-delivery.json',
   ));
-  assert.equal(config.ttyAutoSubmitCompat, false);
+  assert.equal(config.deliveryMode, 'app-server');
+  assert.equal(
+    config.appServerUrl,
+    `unix://${path.join(home, '.codex', 'channels', 'discord', 'codex-01', 'app-server.sock')}`,
+  );
+  assert.equal(config.ignoredDeliveryMode, null);
   assert.equal(config.cwd, '/workspace');
+});
+
+test('loadConfig uses CODEX_HOME for instance state when configured', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-codex-home-'));
+  const config = loadConfig({ HOME: home, CODEX_HOME: codexHome, DISCORD_INSTANCE: 'codex01' });
+  assert.equal(
+    config.paths.stateDir,
+    path.join(codexHome, 'channels', 'discord', 'codex01'),
+  );
+  assert.equal(
+    config.appServerUrl,
+    `unix://${path.join(codexHome, 'channels', 'discord', 'codex01', 'app-server.sock')}`,
+  );
 });
 
 test('loadConfig reads token from instance env file', () => {
@@ -54,30 +73,29 @@ test('loadConfig captures proxy and insecure TLS settings', () => {
   assert.equal(config.insecureTls, true);
 });
 
-test('loadConfig captures TTY delivery settings', () => {
+test('loadConfig ignores legacy TTY delivery settings and keeps structured delivery', () => {
   const config = loadConfig({
     HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
     CODEX_DISCORD_DELIVERY_MODE: 'tty',
     CODEX_DISCORD_TTY: '/dev/pts/7',
-    CODEX_DISCORD_TTY_USE_SUDO: 'true',
-    CODEX_DISCORD_TTY_PROMPT_FORMAT: 'compact',
-    CODEX_DISCORD_TTY_SUBMIT_SEQUENCE: 'lf',
     CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT: 'true',
   });
-  assert.equal(config.deliveryMode, 'tty');
-  assert.equal(config.tty, '/dev/pts/7');
-  assert.equal(config.ttyUseSudo, true);
-  assert.equal(config.ttyPromptFormat, 'compact');
-  assert.equal(config.ttySubmitSequence, 'lf');
-  assert.equal(config.ttyAutoSubmitCompat, true);
+  assert.equal(config.deliveryMode, 'app-server');
+  assert.equal(config.ignoredDeliveryMode, 'tty');
+  assert.equal(Object.hasOwn(config, 'tty'), false);
+  assert.equal(Object.hasOwn(config, 'ttyAutoSubmitCompat'), false);
 });
 
-test('loadConfig accepts display prompt format', () => {
+test('loadConfig accepts an explicit shared app-server endpoint and timeouts', () => {
   const config = loadConfig({
     HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
-    CODEX_DISCORD_TTY_PROMPT_FORMAT: 'display',
+    CODEX_DISCORD_APP_SERVER_URL: 'ws://127.0.0.1:4500',
+    CODEX_DISCORD_APP_SERVER_CONNECT_TIMEOUT_MS: '3456',
+    CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS: '7890',
   });
-  assert.equal(config.ttyPromptFormat, 'display');
+  assert.equal(config.appServerUrl, 'ws://127.0.0.1:4500');
+  assert.equal(config.appServerConnectTimeoutMs, 3456);
+  assert.equal(config.appServerRequestTimeoutMs, 7890);
 });
 
 test('loadConfig uses Codex thread id as stable owner id', () => {

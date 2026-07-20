@@ -67,8 +67,15 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.CODEX_SESSION_ID ||
     env.CODEX_TARGET_THREAD_ID ||
     `${os.hostname()}:${process.pid}:${Date.now()}`;
-  const deliveryMode = String(env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'tty').toLowerCase();
-  const ttyPromptFormat = String(env.CODEX_DISCORD_TTY_PROMPT_FORMAT || env.CODEX_TTY_PROMPT_FORMAT || 'minimal').toLowerCase();
+  const requestedDeliveryMode = String(
+    env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'app-server',
+  ).toLowerCase();
+  const deliveryMode = requestedDeliveryMode === 'off' ? 'off' : 'app-server';
+  const appServerUrl = String(
+    env.CODEX_DISCORD_APP_SERVER_URL ||
+    env.CODEX_APP_SERVER_URL ||
+    `unix://${paths.stateDir}/app-server.sock`,
+  ).trim();
 
   return {
     env,
@@ -81,17 +88,12 @@ function loadConfig(inputEnv = process.env, options = {}) {
     insecureTls: parseBool(env.DISCORD_INSECURE_TLS, env.NODE_TLS_REJECT_UNAUTHORIZED === '0'),
     loginDisabled: parseBool(env.DISCORD_CHANNEL_DISABLE_LOGIN, false),
     deliveryMode,
-    tty: env.CODEX_DISCORD_TTY || env.CODEX_TTY || '',
-    ttyPid: env.CODEX_DISCORD_TTY_PID || env.CODEX_TTY_PID || '',
-    ttyUseSudo: parseBool(env.CODEX_DISCORD_TTY_USE_SUDO || env.CODEX_TTY_USE_SUDO, true),
-    ttyPromptFormat: ['full', 'compact', 'minimal', 'plain', 'display'].includes(ttyPromptFormat) ? ttyPromptFormat : 'minimal',
-    ttySubmit: parseBool(env.CODEX_DISCORD_TTY_SUBMIT || env.CODEX_TTY_SUBMIT, true),
-    ttySubmitSequence: env.CODEX_DISCORD_TTY_SUBMIT_SEQUENCE || env.CODEX_TTY_SUBMIT_SEQUENCE || 'cr',
-    ttyAutoSubmitCompat: parseBool(
-      env.CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT || env.CODEX_TTY_AUTO_SUBMIT_COMPAT,
-      false,
-    ),
-    ttyInjectTimeoutMs: parseInteger(env.CODEX_DISCORD_TTY_INJECT_TIMEOUT_MS || env.CODEX_TTY_INJECT_TIMEOUT_MS, 15000),
+    ignoredDeliveryMode: ['app-server', 'app_server', 'structured', 'turn', 'off'].includes(requestedDeliveryMode)
+      ? null
+      : requestedDeliveryMode,
+    appServerUrl,
+    appServerConnectTimeoutMs: parseInteger(env.CODEX_DISCORD_APP_SERVER_CONNECT_TIMEOUT_MS, 10000),
+    appServerRequestTimeoutMs: parseInteger(env.CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS, 30000),
     parentPid: process.ppid,
     ownerId,
     cwd,

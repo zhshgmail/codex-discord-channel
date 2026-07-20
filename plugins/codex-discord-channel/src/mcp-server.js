@@ -3,7 +3,6 @@
 const readline = require('node:readline');
 const { loadConfig } = require('./config');
 const {
-  autoSubmitCompatibilityState,
   createDelivery,
   readDeliveryQueueStatus,
   readLastInboundContext,
@@ -141,10 +140,11 @@ function historyArgsWithDefaultChannel(args, config) {
   return { ...args, channelId };
 }
 
-function makeContext(config, discordState) {
+function makeContext(config, discordState, delivery = null) {
   return {
     config,
     discordState,
+    delivery,
     claim() {
       return claimOwner(config.paths.ownerPath, createOwner(config));
     },
@@ -155,12 +155,14 @@ async function callTool(context, name, args = {}) {
   if (name === 'discord_channel_status') {
     const owner = readOwner(context.config.paths.ownerPath);
     const deliveryQueue = readDeliveryQueueStatus(context.config);
-    const deliveryMode = String(context.config.deliveryMode || '').toLowerCase();
-    const persistenceEnabled = deliveryMode === 'tty';
-    const autoSubmit = autoSubmitCompatibilityState(context.config);
-    const autoSubmitCompat = persistenceEnabled && autoSubmit.enabled;
-    const autoSubmitPreconditionFailed = persistenceEnabled &&
-      autoSubmit.configured && !autoSubmit.enabled;
+    const deliveryDisabled = context.config.deliveryMode === 'off';
+    const structured = context.delivery?.status?.() || {
+      configured: Boolean(context.config.appServerUrl),
+      available: false,
+      reason: context.config.appServerUrl
+        ? 'shared_app_server_not_connected'
+        : 'shared_app_server_unconfigured',
+    };
     const payload = {
       instance: context.config.paths.instance,
       stateDir: context.config.paths.stateDir,
@@ -172,27 +174,16 @@ async function callTool(context, name, args = {}) {
       insecureTls: context.config.insecureTls,
       loginDisabled: context.config.loginDisabled,
       deliveryMode: context.config.deliveryMode,
-      ttyConfigured: Boolean(context.config.tty),
-      ttyPidConfigured: Boolean(context.config.ttyPid),
-      ttyUseSudo: context.config.ttyUseSudo,
-      ttyPromptFormat: context.config.ttyPromptFormat,
-      ttyAutoSubmitCompat: Boolean(context.config.ttyAutoSubmitCompat),
-      ttyAutoSubmitEffective: autoSubmitCompat,
-      ttyAutoSubmitBlockedReason: autoSubmitPreconditionFailed ? autoSubmit.reason : null,
-      deliverySafety: persistenceEnabled
-        ? (
-          autoSubmitCompat
-            ? 'auto_submit_compat'
-            : (autoSubmitPreconditionFailed ? 'auto_submit_precondition_failed' : 'queue_only')
-        )
-        : 'persistence_disabled',
-      composerReadinessSignal: persistenceEnabled
-        ? (
-          autoSubmitCompat
-            ? 'operator_opt_in_unverified'
-            : (autoSubmitPreconditionFailed ? 'precondition_failed' : 'unavailable')
-        )
-        : 'not_applicable',
+      ignoredDeliveryMode: context.config.ignoredDeliveryMode,
+      deliverySafety: deliveryDisabled ? 'persistence_disabled' : 'structured_only',
+      structuredDeliveryState: deliveryDisabled
+        ? 'disabled'
+        : (structured.available ? 'available' : 'unavailable'),
+      sharedAppServerConfigured: Boolean(structured.configured),
+      sharedAppServerAvailable: Boolean(structured.available),
+      sharedAppServerReason: structured.reason || null,
+      gatewayPidPath: context.config.paths.gatewayPidPath,
+      ownerIsReceiveGate: false,
       ...deliveryQueue,
       discordStarted: context.discordState.started,
       discordReason: context.discordState.reason || null,
@@ -239,7 +230,7 @@ async function handleRequest(context, message) {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        'Use this plugin to claim a Discord bot instance, inspect the persistent inbound queue, and send Discord replies. TTY delivery defaults to queue-only; explicit auto-submit compatibility is an unverified operator opt-in.',
+        'Use this plugin to inspect the persistent Discord inbound queue and send replies. Inbound delivery uses only a shared app-server; unavailable structured delivery remains queued and never falls back to terminal input.',
     });
     return;
   }
@@ -275,7 +266,7 @@ async function main() {
     logger('ERROR', 'Discord startup failed', { error: error instanceof Error ? error.message : String(error) });
     return { started: false, client: null, reason: 'startup_failed' };
   });
-  const context = makeContext(config, discordState);
+  const context = makeContext(config, discordState, delivery);
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   lines.on('line', (line) => {

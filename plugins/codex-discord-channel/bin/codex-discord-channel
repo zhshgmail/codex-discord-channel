@@ -111,13 +111,23 @@ async function runGateway() {
     claimOwner(config.paths.ownerPath, createOwner(config));
   }
   const delivery = createDelivery(config, logger);
-  const discordState = await startDiscordClient({ config, delivery, logger });
+  let discordState;
+  try {
+    discordState = await startDiscordClient({ config, delivery, logger });
+  } catch (error) {
+    delivery.destroy();
+    clearPid(config.paths.gatewayPidPath, process.pid);
+    throw error;
+  }
   if (!discordState.started) {
+    delivery.destroy();
+    clearPid(config.paths.gatewayPidPath, process.pid);
     throw new Error(`Discord gateway did not start: ${discordState.reason || 'unknown'}`);
   }
   const keepAlive = setInterval(() => {}, 2 ** 30);
   const stop = () => {
     clearInterval(keepAlive);
+    if (typeof delivery.destroy === 'function') delivery.destroy();
     try {
       clearPid(config.paths.gatewayPidPath, process.pid);
     } catch {}

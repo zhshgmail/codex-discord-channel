@@ -279,7 +279,7 @@ test('status reports non-secret Discord startup diagnostics', async () => {
     version: 1,
     items: [{ normalized: { messageId: 'm1', content: 'queued-secret-content' } }],
     blocked: {
-      reason: 'composer_readiness_unavailable',
+      reason: 'shared_app_server_socket_missing',
       at: '2026-07-13T00:00:00.000Z',
     },
   }));
@@ -288,6 +288,11 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   const context = {
     config,
     discordState: { started: false, client: null, reason: 'startup_failed' },
+    delivery: {
+      status() {
+        return { configured: true, available: false, reason: 'shared_app_server_socket_missing' };
+      },
+    },
     claim() {
       throw new Error('not used');
     },
@@ -300,13 +305,14 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   assert.equal(result.structuredContent.insecureTls, true);
   assert.equal(result.structuredContent.discordStarted, false);
   assert.equal(result.structuredContent.discordReason, 'startup_failed');
-  assert.equal(result.structuredContent.deliverySafety, 'queue_only');
-  assert.equal(result.structuredContent.composerReadinessSignal, 'unavailable');
-  assert.equal(result.structuredContent.ttyAutoSubmitCompat, false);
-  assert.equal(result.structuredContent.ttyAutoSubmitEffective, false);
-  assert.equal(result.structuredContent.ttyAutoSubmitBlockedReason, null);
+  assert.equal(result.structuredContent.deliverySafety, 'structured_only');
+  assert.equal(result.structuredContent.structuredDeliveryState, 'unavailable');
+  assert.equal(result.structuredContent.sharedAppServerConfigured, true);
+  assert.equal(result.structuredContent.sharedAppServerAvailable, false);
+  assert.equal(result.structuredContent.sharedAppServerReason, 'shared_app_server_socket_missing');
+  assert.equal(Object.hasOwn(result.structuredContent, 'ttyAutoSubmitCompat'), false);
   assert.equal(result.structuredContent.deliveryQueueDepth, 1);
-  assert.equal(result.structuredContent.deliveryBlockedReason, 'composer_readiness_unavailable');
+  assert.equal(result.structuredContent.deliveryBlockedReason, 'shared_app_server_socket_missing');
   assert.equal(result.structuredContent.deliveryBlockedAt, '2026-07-13T00:00:00.000Z');
   assert.equal(result.structuredContent.deliveryQueuePath, path.join(stateDir, 'pending-delivery.json'));
   assert.equal(result.content[0].text.includes('secret-token'), false);
@@ -358,57 +364,37 @@ test('status reports when inbound persistence is disabled', async () => {
 
   const result = await callTool(context, 'discord_channel_status');
   assert.equal(result.structuredContent.deliverySafety, 'persistence_disabled');
-  assert.equal(result.structuredContent.composerReadinessSignal, 'not_applicable');
+  assert.equal(result.structuredContent.structuredDeliveryState, 'disabled');
 });
 
-test('status identifies explicit unverified auto-submit compatibility mode', async () => {
+test('status ignores legacy TTY settings and reports structured-only delivery', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const config = loadConfig({
     HOME: home,
     DISCORD_INSTANCE: 'codex01',
+    CODEX_DISCORD_DELIVERY_MODE: 'tty',
     CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT: 'true',
   }, { cwd: '/workspace' });
   const context = {
     config,
     discordState: { started: true, client: null, reason: null },
+    delivery: {
+      status() {
+        return { configured: true, available: false, reason: 'shared_app_server_socket_missing' };
+      },
+    },
     claim() {
       throw new Error('not used');
     },
   };
 
   const result = await callTool(context, 'discord_channel_status');
-  assert.equal(result.structuredContent.ttyAutoSubmitCompat, true);
-  assert.equal(result.structuredContent.ttyAutoSubmitEffective, true);
-  assert.equal(result.structuredContent.ttyAutoSubmitBlockedReason, null);
-  assert.equal(result.structuredContent.deliverySafety, 'auto_submit_compat');
-  assert.equal(result.structuredContent.composerReadinessSignal, 'operator_opt_in_unverified');
-});
-
-test('status reports an invalid auto-submit compatibility precondition', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
-  const config = loadConfig({
-    HOME: home,
-    DISCORD_INSTANCE: 'codex01',
-    CODEX_DISCORD_TTY_AUTO_SUBMIT_COMPAT: 'true',
-    CODEX_DISCORD_TTY_SUBMIT_SEQUENCE: 'none',
-  }, { cwd: '/workspace' });
-  const context = {
-    config,
-    discordState: { started: true, client: null, reason: null },
-    claim() {
-      throw new Error('not used');
-    },
-  };
-
-  const result = await callTool(context, 'discord_channel_status');
-  assert.equal(result.structuredContent.ttyAutoSubmitCompat, true);
-  assert.equal(result.structuredContent.ttyAutoSubmitEffective, false);
-  assert.equal(
-    result.structuredContent.ttyAutoSubmitBlockedReason,
-    'auto_submit_requires_submit_sequence',
-  );
-  assert.equal(result.structuredContent.deliverySafety, 'auto_submit_precondition_failed');
-  assert.equal(result.structuredContent.composerReadinessSignal, 'precondition_failed');
+  assert.equal(result.structuredContent.deliveryMode, 'app-server');
+  assert.equal(result.structuredContent.ignoredDeliveryMode, 'tty');
+  assert.equal(result.structuredContent.deliverySafety, 'structured_only');
+  assert.equal(result.structuredContent.structuredDeliveryState, 'unavailable');
+  assert.equal(Object.hasOwn(result.structuredContent, 'ttyConfigured'), false);
+  assert.equal(Object.hasOwn(result.structuredContent, 'ttyAutoSubmitCompat'), false);
 });
 
 test('send tool defaults to last inbound Discord message when channelId is omitted', async () => {
