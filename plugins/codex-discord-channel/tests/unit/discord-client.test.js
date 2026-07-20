@@ -448,7 +448,10 @@ test('successor Discord login failure preserves incumbent durable receiver owner
   const { EventEmitter } = require('node:events');
   class FailingDiscordClient extends EventEmitter {
     async login() { throw new Error('login failed'); }
-    destroy() { destroys += 1; }
+    async destroy() {
+      await new Promise((resolve) => setImmediate(resolve));
+      destroys += 1;
+    }
   }
 
   await assert.rejects(

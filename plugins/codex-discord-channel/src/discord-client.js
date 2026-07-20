@@ -358,7 +358,7 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
     }
   } catch (error) {
     try {
-      if (typeof client.destroy === 'function') client.destroy();
+      if (typeof client.destroy === 'function') await client.destroy();
     } catch {}
     throw error;
   }
