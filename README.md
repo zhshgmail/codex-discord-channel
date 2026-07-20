@@ -53,16 +53,26 @@ have one provable top-level TUI thread. After `/clear` or another thread
 rotation, the latest top-level `thread/started` notification becomes the
 current target even while an older subscribed thread is still loaded.
 
-While the current thread is active, messages stay FIFO queued. Each idle
-transition admits at most one `turn/start`; the next item waits for the next
-idle transition. The request includes a stable Discord client message id and
-untrusted Discord context, but omits model, reasoning effort, service tier,
-personality, sandbox, cwd, and approval overrides.
+While the current thread is active, messages stay FIFO queued. Each drain that
+proves the current thread idle admits at most one `turn/start`; a later item
+waits for a subsequent drain to prove the thread idle again. The request
+includes a stable Discord client message id and untrusted Discord context, but
+omits model, reasoning effort, service tier, personality, sandbox, cwd, and
+approval overrides.
 
 Queue completion is committed only after structured acceptance. If an
 acknowledgement is lost, replay is blocked. The gateway reconciles the stable
 client message id against the thread before it can mark that item complete.
 See [Structured Delivery Contract](docs/structured-delivery.md).
+
+The standalone gateway also owns a periodic durable-queue check. A nonempty
+queue is retried without new Discord traffic or TUI activity, while unavailable
+targets back off from 1 second to a 30-second maximum. Every tick verifies the
+gateway's durable PID/generation authority under the configured Discord state
+directory; `owner.json` and thread/session ids are not receive gates. The
+interval bounds may be changed with
+`CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS` and
+`CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS`.
 
 ## Required Live Migration
 

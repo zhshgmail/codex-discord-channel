@@ -20,11 +20,20 @@ The default is `unix://<state-dir>/app-server.sock`; an explicit
 
 The gateway dynamically resolves the current top-level loaded TUI thread,
 tracks `thread/started` rotation, queues while the thread is active, and sends
-one FIFO item per idle transition with `turn/start`. Turn payloads omit model,
-reasoning effort, service tier, personality, cwd, sandbox, and approval
-overrides; Discord metadata is carried only in the sanitized text envelope.
-Lost acknowledgements are reconciled by the echoed client user message id
-before completion, so the gateway does not replay speculatively.
+at most one FIFO item per drain that proves the thread idle with `turn/start`.
+Turn payloads omit model, reasoning effort, service tier, personality, cwd,
+sandbox, and approval overrides; Discord metadata is carried only in the
+sanitized text envelope. Lost acknowledgements are reconciled by the echoed
+client user message id before completion, so the gateway does not replay
+speculatively.
+
+The standalone gateway checks the durable queue periodically as well as on
+app-server recovery events. A nonempty blocked queue retries with exponential
+backoff from 1 second to a 30-second maximum, and each tick re-verifies the
+durable PID/generation receiver authority before resolving the structured
+target. `owner.json` and volatile thread/session ids never gate these retries.
+The bounds are configurable with `CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS` and
+`CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS`.
 
 If the shared endpoint or exact current thread is unavailable, the queue stays
 persisted and status reports a stable reason such as

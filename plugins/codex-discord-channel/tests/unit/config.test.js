@@ -36,6 +36,8 @@ test('loadConfig resolves default instance state path', () => {
     `unix://${path.join(home, '.codex', 'channels', 'discord', 'codex-01', 'app-server.sock')}`,
   );
   assert.equal(config.ignoredDeliveryMode, null);
+  assert.equal(config.deliveryDrainIntervalMs, 1000);
+  assert.equal(config.deliveryDrainMaxBackoffMs, 30000);
   assert.equal(config.cwd, '/workspace');
 });
 
@@ -92,10 +94,14 @@ test('loadConfig accepts an explicit shared app-server endpoint and timeouts', (
     CODEX_DISCORD_APP_SERVER_URL: 'ws://127.0.0.1:4500',
     CODEX_DISCORD_APP_SERVER_CONNECT_TIMEOUT_MS: '3456',
     CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS: '7890',
+    CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS: '25',
+    CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS: '400',
   });
   assert.equal(config.appServerUrl, 'ws://127.0.0.1:4500');
   assert.equal(config.appServerConnectTimeoutMs, 3456);
   assert.equal(config.appServerRequestTimeoutMs, 7890);
+  assert.equal(config.deliveryDrainIntervalMs, 25);
+  assert.equal(config.deliveryDrainMaxBackoffMs, 400);
 });
 
 test('loadConfig uses Codex thread id as stable owner id', () => {

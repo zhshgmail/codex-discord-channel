@@ -908,10 +908,16 @@ test('sole gateway queues while target is down and restart delivers the event ex
 
 test('gateway shutdown transfers authority before destroying its armed listener', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', '..', 'bin', 'codex-discord-channel'), 'utf8');
+  const startLoopIndex = source.indexOf('startGatewayDrainLoop({');
+  const stopLoopIndex = source.indexOf('await drainLoop.stop()');
   const releaseIndex = source.indexOf('await delivery.coordinateReceiverOwnership');
   const destroyIndex = source.indexOf('if (discordState.client?.destroy) await discordState.client.destroy()');
 
+  assert.notEqual(startLoopIndex, -1);
+  assert.notEqual(stopLoopIndex, -1);
   assert.notEqual(releaseIndex, -1);
   assert.notEqual(destroyIndex, -1);
+  assert.ok(startLoopIndex < stopLoopIndex);
+  assert.ok(stopLoopIndex < releaseIndex);
   assert.ok(releaseIndex < destroyIndex);
 });

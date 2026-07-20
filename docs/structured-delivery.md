@@ -44,6 +44,12 @@ reconnection or restart delivery.
 whether an individual gateway event is accepted. Thread and session ids may
 rotate while the same state directory, bot, and gateway continue operating.
 
+The standalone gateway's periodic drain loop verifies this durable receiver
+authority on every nonempty-queue tick. A superseded receiver keeps checking
+with bounded backoff so it can recover if it becomes the effective fallback,
+but it cannot resolve a target or submit a turn while another generation is
+effective.
+
 ## Target Resolution
 
 The app-server connection is initialized once and never supplies thread
@@ -64,10 +70,18 @@ Every accepted Discord event is persisted before target resolution. Queue
 mutations use a process-safe lock and deduplicate pending and completed Discord
 identities.
 
-An active target records `thread_busy`. An idle transition may accept only the
-queue head. Once `turn/start` is acknowledged, that item is committed complete
-and the drain stops. A later item waits for the next idle transition, preventing
-two turns from racing on one thread.
+An active target records `thread_busy`. A drain that proves the target idle may
+accept only the queue head. Once `turn/start` is acknowledged, that item is
+committed complete and the drain stops. A later item waits for a subsequent
+drain to prove the thread idle again, preventing two turns from racing on one
+thread.
+
+The gateway also inspects the durable queue periodically. Missing endpoints,
+missing loaded threads, busy threads, and stale receiver authority retain the
+head and retry with exponential backoff from the configured base interval to a
+configured maximum. The defaults are 1 second and 30 seconds. Timer, app-server
+event, and restart drains all use the same serialized queue lock, in-progress
+lease, and acknowledgement boundary.
 
 ## Turn Payload
 
