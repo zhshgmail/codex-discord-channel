@@ -681,6 +681,40 @@ test('delivery fails loudly without a network call when durable persistence fail
   assert.equal(starts, 0);
 });
 
+test('stale receiver generation is rejected inside durable queue admission', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-stale-receiver-'));
+  let starts = 0;
+  let ownershipChecks = 0;
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn() {
+        starts += 1;
+        return { turn: { id: 'must-not-start' } };
+      },
+      onThreadIdle() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  const result = await delivery.deliver(discordMessage('m-stale'), {
+    verifyReceiverOwnership() {
+      ownershipChecks += 1;
+      return { active: false, reason: 'gateway_generation_changed' };
+    },
+  });
+
+  assert.equal(result.status, 'ignored');
+  assert.equal(result.reason, 'gateway_generation_changed');
+  assert.equal(ownershipChecks, 1);
+  assert.equal(starts, 0);
+  assert.equal(fs.existsSync(path.join(dir, 'pending-delivery.json')), false);
+  delivery.destroy();
+});
+
 test('off delivery returns unsupported without writing the queue', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-off-'));
   const delivery = createDelivery(deliveryConfig(dir, { deliveryMode: 'off' }), () => {});

@@ -654,7 +654,10 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       }
       return serializeDrain(() => flushStructuredQueue(config, logger, deps, host));
     },
-    async deliver(normalized) {
+    coordinateReceiverOwnership(operation) {
+      return serializeAdmission(() => withDeliveryQueueLock(config, deps, operation));
+    },
+    async deliver(normalized, options = {}) {
       const envelope = formatEnvelope(normalized);
       if (config.deliveryMode === 'off') {
         return { status: 'unsupported', reason: 'delivery_disabled', envelope };
@@ -667,7 +670,13 @@ function createDelivery(config, logger = () => {}, deps = {}) {
           queueResult = await withDeliveryQueueLock(
             config,
             deps,
-            () => queueDelivery(normalized, config, deps),
+            () => {
+              if (typeof options.verifyReceiverOwnership === 'function') {
+                const receiver = options.verifyReceiverOwnership();
+                if (!receiver?.active) return { receiverRejected: receiver || {} };
+              }
+              return queueDelivery(normalized, config, deps);
+            },
           );
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -687,6 +696,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         }
 
         try {
+          if (queueResult.receiverRejected) return { receiverRejected: queueResult.receiverRejected };
           writeLastInboundContext(normalized, config, deps);
         } catch (error) {
           logger('ERROR', 'Failed to update last inbound Discord context after queueing', {
@@ -698,6 +708,13 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         return { queueResult };
       });
       if (admission.result) return admission.result;
+      if (admission.receiverRejected) {
+        return {
+          status: 'ignored',
+          reason: admission.receiverRejected.reason || 'gateway_generation_changed',
+          envelope,
+        };
+      }
       if (admission.queueResult.duplicate === 'completed') {
         return {
           status: 'duplicate',
