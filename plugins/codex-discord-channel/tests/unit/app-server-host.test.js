@@ -29,6 +29,56 @@ class FakeRpcClient extends EventEmitter {
   }
 }
 
+function createFakeWebSocket(server) {
+  const sockets = [];
+
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+
+    constructor() {
+      super();
+      this.readyState = 0;
+      this.connectionIndex = sockets.length;
+      sockets.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeWebSocket.OPEN;
+        this.emit('open');
+      });
+    }
+
+    send(text) {
+      const request = JSON.parse(text);
+      if (!Object.hasOwn(request, 'id')) return;
+      Promise.resolve(server(request, this.connectionIndex)).then((reply) => {
+        const result = Object.hasOwn(reply, 'afterResponse') ? reply.result : reply;
+        this.emit('message', JSON.stringify({ id: request.id, result }));
+        if (Object.hasOwn(reply, 'afterResponse')) reply.afterResponse(this);
+      });
+    }
+
+    beginClose() {
+      this.readyState = 2;
+    }
+
+    finishClose() {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      this.emit('close');
+    }
+
+    close() {
+      this.beginClose();
+      this.finishClose();
+    }
+
+    terminate() {
+      this.close();
+    }
+  }
+
+  return { WebSocket: FakeWebSocket, sockets };
+}
+
 test('endpointToWebSocket maps the shared Unix endpoint to the app-server RPC route', () => {
   assert.deepEqual(endpointToWebSocket('unix:///tmp/codex01/app-server.sock'), {
     url: 'ws+unix:///tmp/codex01/app-server.sock:/rpc',
@@ -92,6 +142,130 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
     client.requests.filter((request) => request.method === 'thread/loaded/list').length,
     2,
   );
+});
+
+test('websocket reconnect after hidden thread rotation does not reuse the stale current thread', async (t) => {
+  let loadedThreadIds = ['thread-before-clear'];
+  const readThreadIds = [];
+  const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: loadedThreadIds, nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      readThreadIds.push(request.params.threadId);
+      return {
+        thread: {
+          id: request.params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-before-clear',
+    status: 'idle',
+  });
+
+  sockets[0].close();
+  loadedThreadIds = ['thread-before-clear', 'thread-after-clear'];
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: false,
+    reason: 'shared_app_server_thread_ambiguous',
+    status: 'unavailable',
+  });
+  assert.equal(sockets.length, 2);
+  assert.deepEqual(readThreadIds, ['thread-before-clear']);
+});
+
+test('disconnect after a list response fails closed before reading that result on a new connection', async (t) => {
+  let rotateWhileDisconnected = false;
+  const readThreadIds = [];
+  const { WebSocket, sockets } = createFakeWebSocket(async (request, connectionIndex) => {
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      if (rotateWhileDisconnected && connectionIndex === 0) {
+        return {
+          result: { data: ['thread-before-clear'], nextCursor: null },
+          afterResponse: (socket) => socket.close(),
+        };
+      }
+      return {
+        data: rotateWhileDisconnected
+          ? ['thread-before-clear', 'thread-after-clear']
+          : ['thread-before-clear'],
+        nextCursor: null,
+      };
+    }
+    if (request.method === 'thread/read') {
+      readThreadIds.push(request.params.threadId);
+      return {
+        thread: {
+          id: request.params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+
+  assert.equal((await host.resolveTarget()).threadId, 'thread-before-clear');
+  rotateWhileDisconnected = true;
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: false,
+    reason: 'shared_app_server_disconnected',
+    status: 'unavailable',
+  });
+  assert.equal(sockets.length, 1);
+  assert.deepEqual(readThreadIds, ['thread-before-clear']);
+});
+
+test('late close from a replaced websocket does not invalidate the active connection thread', async (t) => {
+  let loadedThreadIds = ['thread-before-clear'];
+  const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: loadedThreadIds, nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return {
+        thread: {
+          id: request.params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+
+  assert.equal((await host.resolveTarget()).threadId, 'thread-before-clear');
+  sockets[0].beginClose();
+  loadedThreadIds = ['thread-after-clear'];
+  assert.equal((await host.resolveTarget()).threadId, 'thread-after-clear');
+
+  loadedThreadIds = ['thread-before-clear', 'thread-after-clear'];
+  sockets[0].finishClose();
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-after-clear',
+    status: 'idle',
+  });
+  assert.equal(sockets.length, 2);
 });
 
 test('latest top-level thread/started notification selects the rotated TUI thread among loaded history', async () => {
@@ -174,6 +348,82 @@ test('rotated current thread remains selectable beyond the first loaded-thread p
     client.requests.filter((request) => request.method === 'thread/loaded/list').map((request) => request.params),
     [{ limit: 2 }, { limit: 2, cursor: 'page-2' }],
   );
+});
+
+test('host rejects a malformed cursor before accepting the current thread on that page', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-current'], nextCursor: {} };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-current',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: false,
+    reason: 'shared_app_server_thread_ambiguous',
+    status: 'unavailable',
+  });
+  assert.equal(client.requests.some((request) => request.method === 'thread/read'), false);
+});
+
+test('host rejects a repeated cursor before accepting the current thread on that page', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      if (!params.cursor) {
+        return { data: ['thread-old'], nextCursor: 'page-2' };
+      }
+      assert.equal(params.cursor, 'page-2');
+      return { data: ['thread-current'], nextCursor: 'page-2' };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-current',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: false,
+    reason: 'shared_app_server_thread_ambiguous',
+    status: 'unavailable',
+  });
+  assert.equal(client.requests.some((request) => request.method === 'thread/read'), false);
 });
 
 test('host fails closed when the shared app-server has no exact loaded thread', async (t) => {

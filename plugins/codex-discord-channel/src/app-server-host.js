@@ -35,6 +35,7 @@ class AppServerRpcClient extends EventEmitter {
     this.connecting = null;
     this.pending = new Map();
     this.nextId = 1;
+    this.connectionGeneration = 0;
     this.state = {
       configured: this.endpoint !== '',
       available: false,
@@ -123,6 +124,8 @@ class AppServerRpcClient extends EventEmitter {
     });
 
     this.ws = ws;
+    this.connectionGeneration += 1;
+    this.emit('connectionChanged', { generation: this.connectionGeneration });
     ws.on('message', (data) => {
       this.handleMessage(Buffer.isBuffer(data) ? data.toString('utf8') : String(data));
     });
@@ -130,8 +133,11 @@ class AppServerRpcClient extends EventEmitter {
       this.logger('WARN', 'Shared app-server websocket error', { error: error.message });
     });
     ws.once('close', () => {
-      if (this.ws === ws) this.ws = null;
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.connectionGeneration += 1;
       this.state = { configured: true, available: false, reason: 'shared_app_server_disconnected' };
+      this.emit('connectionChanged', { generation: this.connectionGeneration });
       const error = deliveryError(
         'Shared app-server disconnected before acknowledging the request.',
         'shared_app_server_disconnected',
@@ -245,6 +251,31 @@ class AppServerRpcClient extends EventEmitter {
     return this.requestConnected(method, params);
   }
 
+  async requestOnConnection(method, params, expectedGeneration = null) {
+    if (expectedGeneration != null && this.connectionGeneration !== expectedGeneration) {
+      throw deliveryError(
+        'Shared app-server connection changed during target resolution.',
+        'shared_app_server_disconnected',
+      );
+    }
+    await this.ensureConnected();
+    const generation = this.connectionGeneration;
+    if (expectedGeneration != null && generation !== expectedGeneration) {
+      throw deliveryError(
+        'Shared app-server connection changed during target resolution.',
+        'shared_app_server_disconnected',
+      );
+    }
+    const result = await this.requestConnected(method, params);
+    if (this.connectionGeneration !== generation) {
+      throw deliveryError(
+        'Shared app-server connection changed during target resolution.',
+        'shared_app_server_disconnected',
+      );
+    }
+    return { generation, result };
+  }
+
   destroy() {
     if (this.ws) this.ws.close();
     this.ws = null;
@@ -285,7 +316,13 @@ class AppServerHost extends EventEmitter {
         if (this.currentThreadId === threadId) this.currentThreadId = '';
       }
     };
+    this.onConnectionChanged = () => {
+      this.currentThreadId = '';
+      this.threadStatuses.clear();
+      this.lastStatus = this.client.status();
+    };
     this.client.on('notification', this.onNotification);
+    this.client.on('connectionChanged', this.onConnectionChanged);
   }
 
   status() {
@@ -295,25 +332,39 @@ class AppServerHost extends EventEmitter {
   async resolveTarget() {
     const threadIds = [];
     let cursor = '';
+    let connectionGeneration = null;
     const seenCursors = new Set();
+    const requestForTarget = async (method, params) => {
+      if (typeof this.client.requestOnConnection !== 'function') {
+        return this.client.request(method, params);
+      }
+      const response = await this.client.requestOnConnection(
+        method,
+        params,
+        connectionGeneration,
+      );
+      connectionGeneration = response.generation;
+      return response.result;
+    };
     try {
       do {
         const params = { limit: 2 };
         if (cursor) params.cursor = cursor;
-        const loaded = await this.client.request('thread/loaded/list', params);
-        if (Array.isArray(loaded?.data)) threadIds.push(...loaded.data);
-        if (this.currentThreadId && threadIds.includes(this.currentThreadId)) break;
+        const loaded = await requestForTarget('thread/loaded/list', params);
         if (loaded?.nextCursor != null && typeof loaded.nextCursor !== 'string') {
           const reason = 'shared_app_server_thread_ambiguous';
           this.lastStatus = { configured: true, available: false, reason };
           return { available: false, reason, status: 'unavailable' };
         }
-        cursor = loaded?.nextCursor || '';
-        if (cursor && seenCursors.has(cursor)) {
+        const nextCursor = loaded?.nextCursor || '';
+        if (nextCursor && seenCursors.has(nextCursor)) {
           const reason = 'shared_app_server_thread_ambiguous';
           this.lastStatus = { configured: true, available: false, reason };
           return { available: false, reason, status: 'unavailable' };
         }
+        if (Array.isArray(loaded?.data)) threadIds.push(...loaded.data);
+        if (this.currentThreadId && threadIds.includes(this.currentThreadId)) break;
+        cursor = nextCursor;
         if (cursor) seenCursors.add(cursor);
       } while (cursor);
     } catch (error) {
@@ -339,7 +390,7 @@ class AppServerHost extends EventEmitter {
 
     let response;
     try {
-      response = await this.client.request('thread/read', {
+      response = await requestForTarget('thread/read', {
         threadId,
         includeTurns: false,
       });
@@ -389,6 +440,7 @@ class AppServerHost extends EventEmitter {
 
   destroy() {
     this.client.off('notification', this.onNotification);
+    this.client.off('connectionChanged', this.onConnectionChanged);
     if (typeof this.client.destroy === 'function') this.client.destroy();
   }
 }
