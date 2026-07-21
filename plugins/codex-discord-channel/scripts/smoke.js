@@ -22,6 +22,25 @@ const manifest = readJson('.codex-plugin/plugin.json');
 const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
 
+function assertNoAbsolutePaths(value, location = '.mcp.json') {
+  if (typeof value === 'string') {
+    assert(
+      !path.posix.isAbsolute(value) && !path.win32.isAbsolute(value),
+      `${location} must not contain an absolute workstation path`,
+    );
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoAbsolutePaths(item, `${location}[${index}]`));
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      assertNoAbsolutePaths(item, `${location}.${key}`);
+    }
+  }
+}
+
 assert(manifest.name === 'codex-discord-channel', 'manifest name mismatch');
 assert(
   typeof manifest.version === 'string' &&
@@ -30,10 +49,23 @@ assert(
   'manifest version mismatch',
 );
 assert(manifest.mcpServers === './.mcp.json', 'manifest must point at .mcp.json');
-assert(mcp.mcpServers['codex-discord-channel'], 'missing MCP server config');
+assertNoAbsolutePaths(mcp);
+assert(
+  JSON.stringify(mcp.mcpServers['codex-discord-channel']) === JSON.stringify({
+    cwd: '.',
+    command: 'node',
+    args: ['./runtime/mcp-server.cjs'],
+  }),
+  'MCP server must run the committed relative bundle',
+);
 assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
 assert(SERVER_VERSION === PACKAGE_VERSION, 'MCP server version mismatch');
+assert(pkg.main === 'runtime/mcp-server.cjs', 'package main must use the committed MCP bundle');
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');
+assert(pkg.bin['codex-discord-session'] === 'bin/codex-discord-session', 'session bin entry mismatch');
+for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
+  assert(!Object.hasOwn(pkg.scripts, lifecycle), `package must not define ${lifecycle}`);
+}
 
 const historyTool = toolList().find((tool) => tool.name === 'discord_channel_read_history');
 assert(historyTool, 'missing discord_channel_read_history tool');
@@ -51,6 +83,11 @@ assert(mcpServerSource.includes(`const SERVER_VERSION = '${PACKAGE_VERSION}';`),
 const binPath = path.join(root, 'bin', 'codex-discord-channel');
 const mode = fs.statSync(binPath).mode;
 assert((mode & 0o111) !== 0, 'bin/codex-discord-channel must be executable');
+const sessionBinPath = path.join(root, 'bin', 'codex-discord-session');
+const sessionMode = fs.statSync(sessionBinPath).mode;
+assert((sessionMode & 0o111) !== 0, 'bin/codex-discord-session must be executable');
+assert(fs.existsSync(path.join(root, 'runtime', 'mcp-server.cjs')), 'missing MCP runtime bundle');
+assert(fs.existsSync(path.join(root, 'runtime', 'channel-cli.cjs')), 'missing CLI runtime bundle');
 assert(!fs.existsSync(path.join(root, '.env')), 'plugin root must not contain .env');
 
 process.stdout.write('smoke passed\n');

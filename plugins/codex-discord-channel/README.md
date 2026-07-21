@@ -51,19 +51,47 @@ exactly-once boundary until every running gateway uses the current format. The
 current reader prefers `.v2`, so legacy cleanup cannot remove successor
 authority.
 
-The visible TUI must be relaunched with `codex --remote <same-endpoint> ...`
-after a shared app-server is started. A direct `codex ... resume` process cannot
-be verified from this plugin. See the repository
+The installed `codex-discord-session` shim starts or reuses the state-path
+app-server and launches the future visible TUI with `--remote` against that
+same endpoint. It does not hot-adopt a currently running TUI, and a direct
+`codex ... resume` process cannot be verified from this plugin. See the repository
 [Structured Delivery Contract](../../docs/structured-delivery.md) for the full
 migration and acceptance boundary.
+
+## Installed Runtime
+
+`.mcp.json` invokes `node ./runtime/mcp-server.cjs` from the installed plugin
+root. `bin/codex-discord-channel` and `bin/codex-discord-session` are
+dependency-free loaders for `runtime/channel-cli.cjs`. Both committed bundles
+include `ws`, `discord.js`, and `undici`; only `node:*` modules remain external.
+
+Marketplace installation copies those files directly. It runs no `npm install`
+and no lifecycle hooks, and the installed cache contains no `node_modules`.
+`npm` and esbuild are required only to change and regenerate the committed
+runtime during development.
+
+To start or resume a future shared session:
+
+```bash
+DISCORD_INSTANCE=codex01 codex-discord-session resume <THREAD_ID>
+```
+
+For an isolated state path, `codex-discord-channel gateway-probe` performs a
+bounded `thread/loaded/list` and `thread/read` check. The explicit
+`--exercise-turn` option also calls `turn/start`; it is intended for isolated
+acceptance environments, not passive live diagnostics.
 
 ## Checks
 
 ```bash
-npm install
+npm ci
+npm run build:runtime
 npm run check
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/validate_plugin.py" .
 ```
+
+`npm run build:check` fails when either committed bundle is stale or retains a
+non-`node:*` external import.
 
 ## Import Existing Bridge State
 

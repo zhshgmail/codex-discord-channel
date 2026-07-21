@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
-require('../runtime/channel-cli.cjs').main().catch((error) => {
+require('../runtime/channel-cli.cjs').runSession(process.argv.slice(2)).then((code) => {
+  process.exitCode = code;
+}).catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
   process.exit(1);
 });

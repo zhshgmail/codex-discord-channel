@@ -8,9 +8,12 @@ embedded server cannot satisfy this contract. Repository tests cannot cross
 that process boundary, and release-time verification requires relaunching the
 TUI with `--remote` against the shared endpoint.
 
-The runtime contains no terminal-input adapter and does not start a private
-app-server. Missing, disconnected, or ambiguous shared state is reported as
-unavailable while accepted messages remain persisted.
+The MCP and gateway runtimes contain no terminal-input adapter and never start
+a private app-server. The explicit `codex-discord-session` launcher may start
+one state-path shared app-server before it launches the future visible TUI
+against that same endpoint. It cannot adopt an already-running TUI. Missing,
+disconnected, or ambiguous shared state is reported as unavailable while
+accepted messages remain persisted.
 
 ## Receiver Identity
 
@@ -112,7 +115,8 @@ second `turn/start`. If proof is unavailable, the block remains.
 
 After release installation and operator-approved process migration:
 
-1. confirm the gateway and TUI use the same endpoint;
+1. restart the visible session through `codex-discord-session` and confirm the
+   gateway and TUI use the same state-path endpoint;
 2. confirm status reports structured availability and Discord startup;
 3. send one allowed Discord message and observe its structured turn in the
    exact visible TUI;

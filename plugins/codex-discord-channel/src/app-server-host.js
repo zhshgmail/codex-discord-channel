@@ -2,6 +2,7 @@
 
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
+const net = require('node:net');
 
 const TARGET_GENERATION = Symbol('appServerTargetGeneration');
 const MAX_FRESH_THREAD_READS = 32;
@@ -166,10 +167,14 @@ class AppServerRpcClient extends EventEmitter {
       );
     }
 
-    const ws = new WebSocket(transport.url, {
+    const options = {
       handshakeTimeout: this.connectTimeoutMs,
       perMessageDeflate: false,
-    });
+    };
+    if (transport.socketPath) {
+      options.createConnection = () => net.createConnection({ path: transport.socketPath });
+    }
+    const ws = new WebSocket(transport.url, options);
     await new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {

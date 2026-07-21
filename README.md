@@ -74,35 +74,29 @@ interval bounds may be changed with
 `CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS` and
 `CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS`.
 
-## Required Live Migration
+## Shared Session Launch
 
 A TUI started as a direct `codex ... resume` process uses a private embedded
-app-server. This repository change cannot attach to that private server. Live
-exact-console verification therefore requires a release/install plus process
-migration:
+app-server. The plugin does not hot-adopt that process. After marketplace
+installation, an explicit later restart establishes the supported topology:
 
 1. End the direct TUI process at an operator-approved time.
-2. Start a persistent app-server on the instance socket:
+2. Launch or resume the visible session through the installed shim:
 
    ```bash
-   STATE_DIR="${CODEX_HOME:-$HOME/.codex}/channels/discord/codex01"
-   SOCKET="$STATE_DIR/app-server.sock"
-   mkdir -p "$STATE_DIR"
-   codex app-server --listen "unix://$SOCKET"
+   DISCORD_INSTANCE=codex01 codex-discord-session resume <THREAD_ID>
    ```
 
-3. Relaunch the visible TUI against that same endpoint:
-
-   ```bash
-   codex --remote "unix://$SOCKET" resume <THREAD_ID>
-   ```
-
-4. Install the released plugin and restart the `codex01` gateway under normal
+   The shim starts or reuses one app-server at
+   `$CODEX_HOME/channels/discord/codex01/app-server.sock`, then launches the
+   visible TUI with `--remote` against that exact endpoint. Caller-supplied
+   remote endpoints are rejected.
+3. Restart the `codex01` gateway under normal
    operator change control so it runs the released code.
-5. Verify `discord_channel_status` reports `deliverySafety:
+4. Verify `discord_channel_status` reports `deliverySafety:
    "structured_only"`, `sharedAppServerAvailable: true`, and
    `discordStarted: true`.
-6. Send a controlled allowed Discord message and confirm that its structured
+5. Send a controlled allowed Discord message and confirm that its structured
    turn appears in that exact visible TUI. Repeat after `/clear` to verify
    thread rotation.
 
@@ -116,7 +110,10 @@ codex plugin marketplace add zhshgmail/codex-discord-channel --ref main
 codex plugin add codex-discord-channel@personal
 ```
 
-Use a new Codex thread after installation so the MCP server is loaded.
+The marketplace copies committed Node 22 CommonJS bundles. It does not run
+`npm install` or package lifecycle hooks, and the installed cache does not need
+`node_modules`. Use a new Codex thread after installation so the bundled MCP
+server is loaded.
 
 ## Status
 
@@ -170,10 +167,15 @@ Do not commit `.env` or print Discord tokens.
 
 ```bash
 cd plugins/codex-discord-channel
-npm install
+npm ci
+npm run build:runtime
 npm run check
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/validate_plugin.py" .
 ```
+
+`npm` is a development/build dependency only. `npm run build:check` verifies
+that the committed runtime bundles match the source and leave only `node:*`
+imports external.
 
 ## Import Existing Bridge State
 

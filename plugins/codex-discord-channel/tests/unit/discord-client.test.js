@@ -916,7 +916,7 @@ test('sole gateway queues while target is down and restart delivers the event ex
 });
 
 test('gateway shutdown stops reception and drains before releasing receiver authority', () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', '..', 'bin', 'codex-discord-channel'), 'utf8');
+  const source = fs.readFileSync(path.join(__dirname, '..', '..', 'src', 'channel-cli.js'), 'utf8');
   const startLoopIndex = source.indexOf('startGatewayDrainLoop({');
   const deactivateIndex = source.indexOf('delivery.deactivateReceiver()');
   const stopLoopIndex = source.indexOf('await drainLoop.stop()');

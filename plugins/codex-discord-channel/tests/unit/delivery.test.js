@@ -1063,7 +1063,6 @@ test('production source contains no raw TTY or terminal-control injection path',
     .join('\n');
   for (const forbidden of [
     'TIOCSTI',
-    'node:child_process',
     'tty-detect',
     'runTtyInjector',
     'injectIntoTty',
