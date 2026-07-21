@@ -22,6 +22,25 @@ const manifest = readJson('.codex-plugin/plugin.json');
 const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
 
+function assertNoAbsolutePaths(value, location = '.mcp.json') {
+  if (typeof value === 'string') {
+    assert(
+      !path.posix.isAbsolute(value) && !path.win32.isAbsolute(value),
+      `${location} must not contain an absolute workstation path`,
+    );
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoAbsolutePaths(item, `${location}[${index}]`));
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      assertNoAbsolutePaths(item, `${location}.${key}`);
+    }
+  }
+}
+
 assert(manifest.name === 'codex-discord-channel', 'manifest name mismatch');
 assert(
   typeof manifest.version === 'string' &&
@@ -31,6 +50,7 @@ assert(
 );
 assert(manifest.mcpServers === './.mcp.json', 'manifest must point at .mcp.json');
 assert(mcp.mcpServers['codex-discord-channel'], 'missing MCP server config');
+assertNoAbsolutePaths(mcp);
 assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
 assert(SERVER_VERSION === PACKAGE_VERSION, 'MCP server version mismatch');
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');

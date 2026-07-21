@@ -24,9 +24,14 @@ probe_bin=${CODEX_DISCORD_SESSION_PROBE_BIN:-}
 socket_probe_bin=${CODEX_DISCORD_SESSION_SOCKET_PROBE_BIN:-}
 timeout_ms=${CODEX_DISCORD_SESSION_STARTUP_TIMEOUT_MS:-15000}
 poll_ms=${CODEX_DISCORD_SESSION_POLL_INTERVAL_MS:-100}
-case "$timeout_ms:$poll_ms" in
-  *[!0-9:]*|:*|*:|0:*|*:0) fail 'startup timeout and poll interval must be positive integers' ;;
+case "$timeout_ms" in
+  ''|*[!0-9]*) fail 'startup timeout and poll interval must be positive integers' ;;
 esac
+case "$poll_ms" in
+  ''|*[!0-9]*) fail 'startup timeout and poll interval must be positive integers' ;;
+esac
+[ "$timeout_ms" -gt 0 ] && [ "$poll_ms" -gt 0 ] \
+  || fail 'startup timeout and poll interval must be positive integers'
 probe_timeout_ms=$poll_ms
 [ "$probe_timeout_ms" -ge 250 ] || probe_timeout_ms=250
 
@@ -63,6 +68,9 @@ sleep_interval=$(awk -v ms="$poll_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
 lock_timeout=$(awk -v ms="$timeout_ms" 'BEGIN { printf "%.3f", (ms * 2 + 1000) / 1000 }')
 lock_file="$state_dir/app-server.start.lock"
 owns_lock=0
+started_server_pid=
+started_server_start_time=
+started_server_committed=0
 
 now_ms() {
   awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime
@@ -77,6 +85,50 @@ wait_for_ready() {
   return 1
 }
 
+process_stat() {
+  awk '
+    {
+      line = $0
+      sub(/^.*\) /, "", line)
+      count = split(line, fields, " ")
+      if (count < 20) exit 1
+      print fields[1], fields[20]
+    }
+  ' "/proc/$1/stat" 2>/dev/null
+}
+
+started_server_matches() {
+  [ -n "$started_server_pid" ] && [ -n "$started_server_start_time" ] || return 1
+  current_stat=$(process_stat "$started_server_pid") || return 1
+  set -- $current_stat
+  [ "$#" -eq 2 ] && [ "$2" = "$started_server_start_time" ]
+}
+
+stop_uncommitted_server() {
+  [ "$started_server_committed" -eq 0 ] || return 0
+  started_server_matches || return 0
+
+  kill -TERM "$started_server_pid" 2>/dev/null || true
+  stop_deadline_ms=$(($(now_ms) + 1000))
+  while started_server_matches && [ "$(now_ms)" -lt "$stop_deadline_ms" ]; do
+    current_stat=$(process_stat "$started_server_pid") || break
+    set -- $current_stat
+    [ "$1" = Z ] && break
+    sleep "$sleep_interval"
+  done
+  if started_server_matches; then
+    current_stat=$(process_stat "$started_server_pid") || current_stat=
+    set -- $current_stat
+    if [ "${1:-}" != Z ]; then
+      kill -KILL "$started_server_pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$started_server_pid" 2>/dev/null || true
+  if [ -e "$socket_path" ] && ! socket_listens; then
+    rm -f "$socket_path"
+  fi
+}
+
 cleanup_lock() {
   if [ "$owns_lock" -eq 1 ]; then
     flock -u 9 || true
@@ -84,7 +136,12 @@ cleanup_lock() {
     owns_lock=0
   fi
 }
-trap cleanup_lock EXIT
+
+cleanup() {
+  stop_uncommitted_server
+  cleanup_lock
+}
+trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -111,14 +168,28 @@ if ! probe; then
         || fail 'setsid is required to detach the shared app-server'
       nohup "$setsid_bin" "$codex_bin" app-server --listen "$endpoint" \
         9>&- </dev/null >>"$log_file" 2>&1 &
-      app_server_pid=$!
-      pid_temp="$pid_file.$$"
-      printf '%s\n' "$app_server_pid" >"$pid_temp"
-      chmod 600 "$pid_temp"
-      mv -f "$pid_temp" "$pid_file"
+      started_server_pid=$!
+      current_stat=$(process_stat "$started_server_pid") \
+        || fail 'unable to retain the newly-started app-server process identity'
+      current_state=${current_stat%% *}
+      started_server_start_time=${current_stat#* }
+      case "$current_state" in
+        ?) ;;
+        *) fail 'unable to retain the newly-started app-server process identity' ;;
+      esac
+      case "$started_server_start_time" in
+        ''|*[!0-9]*) fail 'unable to retain the newly-started app-server process identity' ;;
+      esac
 
       wait_for_ready \
         || fail "app-server did not become ready at $endpoint; see $log_file"
+      started_server_matches \
+        || fail 'newly-started app-server exited before readiness was committed'
+      pid_temp="$pid_file.$$"
+      printf '%s\n' "$started_server_pid" >"$pid_temp"
+      chmod 600 "$pid_temp"
+      mv -f "$pid_temp" "$pid_file"
+      started_server_committed=1
     fi
   fi
 fi

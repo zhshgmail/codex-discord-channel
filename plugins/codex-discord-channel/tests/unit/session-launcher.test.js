@@ -2,11 +2,13 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const test = require('node:test');
+const { WebSocketServer } = require('ws');
 const {
   parseAppServerProbeArgs,
   probeAppServer,
@@ -43,6 +45,25 @@ function runLauncher(args, env) {
   });
 }
 
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+async function waitFor(predicate, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return predicate();
+}
+
 test('app-server readiness probe requires only an initialized protocol connection', async () => {
   const calls = [];
   const client = {
@@ -68,6 +89,43 @@ test('app-server readiness probe requires only an initialized protocol connectio
 
   assert.deepEqual(result, { available: true });
   assert.deepEqual(calls, ['connected', 'destroyed']);
+});
+
+test('real app-server probe connects through a Unix socket path containing spaces', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc real probe '));
+  const socketPath = path.join(root, 'shared state', 'app-server.sock');
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+
+  const server = http.createServer();
+  const webSocketServer = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (request, socket, head) => {
+    webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+      webSocketServer.emit('connection', webSocket, request);
+    });
+  });
+  webSocketServer.on('connection', (webSocket) => {
+    webSocket.on('message', (data) => {
+      const request = JSON.parse(data.toString('utf8'));
+      if (request.method === 'initialize') {
+        webSocket.send(JSON.stringify({ id: request.id, result: {} }));
+      }
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  t.after(async () => {
+    for (const client of webSocketServer.clients) client.terminate();
+    await new Promise((resolve) => webSocketServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  assert.deepEqual(await probeAppServer({
+    endpoint: `unix://${socketPath}`,
+    timeoutMs: 500,
+  }), { available: true });
 });
 
 test('app-server probe arguments require one absolute Unix endpoint', () => {
@@ -299,6 +357,93 @@ test('slow live listener readiness is bounded by elapsed startup time', async (t
   assert.match(result.stderr, /listener did not become protocol-ready/);
   assert.ok(probeCalls <= 7, `expected at most 7 probes, saw ${probeCalls}`);
   assert.ok(elapsedMs < 1000, `expected bounded startup, took ${elapsedMs}ms`);
+});
+
+test('failed startup stops only its detached child and never trusts a stale pid file', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-session-cleanup-'));
+  const stateDir = path.join(root, 'state');
+  const fakeCodex = path.join(root, 'fake-codex');
+  const fakeProbe = path.join(root, 'fake-probe');
+  const fakeSocketProbe = path.join(root, 'fake-socket-probe');
+  const fakeSetsid = path.join(root, 'fake-setsid');
+  const startedPidFile = path.join(root, 'started.pid');
+  const stoppedFile = path.join(root, 'started-stopped');
+  const sentinelReadyFile = path.join(root, 'sentinel-ready');
+  const sentinelSignaledFile = path.join(root, 'sentinel-signaled');
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  writeExecutable(fakeProbe, '#!/bin/sh\nexit 1\n');
+  writeExecutable(fakeSocketProbe, '#!/bin/sh\nexit 1\n');
+  writeExecutable(fakeSetsid, '#!/bin/sh\nexec "$@"\n');
+  writeExecutable(fakeCodex, `#!/usr/bin/env node
+const fs = require('node:fs');
+if (process.argv[2] !== 'app-server') process.exit(3);
+process.on('SIGTERM', () => {
+  fs.writeFileSync(process.env.FAKE_STOPPED, 'stopped\\n');
+  process.exit(0);
+});
+fs.writeFileSync(process.env.FAKE_STARTED_PID, \`\${process.pid}\\n\`);
+setInterval(() => {}, 1000);
+`);
+
+  const sentinel = spawn(process.execPath, ['-e', `
+const fs = require('node:fs');
+process.on('SIGTERM', () => fs.writeFileSync(process.env.SENTINEL_SIGNALED, 'signaled\\n'));
+fs.writeFileSync(process.env.SENTINEL_READY, 'ready\\n');
+setInterval(() => {}, 1000);
+`], {
+    env: {
+      ...process.env,
+      SENTINEL_READY: sentinelReadyFile,
+      SENTINEL_SIGNALED: sentinelSignaledFile,
+    },
+    stdio: 'ignore',
+  });
+  t.after(() => {
+    stopTrackedServer(startedPidFile);
+    if (processIsAlive(sentinel.pid)) sentinel.kill('SIGKILL');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  assert.equal(await waitFor(() => fs.existsSync(sentinelReadyFile)), true);
+  fs.writeFileSync(path.join(stateDir, 'app-server.pid'), `${sentinel.pid}\n`);
+
+  const result = await runLauncher([], {
+    ...process.env,
+    HOME: root,
+    DISCORD_STATE_DIR: stateDir,
+    CODEX_DISCORD_CODEX_BIN: fakeCodex,
+    CODEX_DISCORD_SESSION_PROBE_BIN: fakeProbe,
+    CODEX_DISCORD_SESSION_SOCKET_PROBE_BIN: fakeSocketProbe,
+    CODEX_DISCORD_SETSID_BIN: fakeSetsid,
+    CODEX_DISCORD_SESSION_STARTUP_TIMEOUT_MS: '120',
+    CODEX_DISCORD_SESSION_POLL_INTERVAL_MS: '20',
+    FAKE_STARTED_PID: startedPidFile,
+    FAKE_STOPPED: stoppedFile,
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /app-server did not become ready/);
+  assert.equal(await waitFor(() => fs.existsSync(startedPidFile)), true);
+  const startedPid = Number.parseInt(fs.readFileSync(startedPidFile, 'utf8'), 10);
+  assert.equal(await waitFor(() => !processIsAlive(startedPid)), true);
+  assert.equal(fs.existsSync(stoppedFile), true);
+  assert.equal(processIsAlive(sentinel.pid), true);
+  assert.equal(fs.existsSync(sentinelSignaledFile), false);
+});
+
+test('launcher rejects embedded colons in numeric startup settings', () => {
+  const result = spawnSync(LAUNCHER, [], {
+    env: {
+      ...process.env,
+      CODEX_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-session-home-')),
+      CODEX_DISCORD_SESSION_STARTUP_TIMEOUT_MS: '1:2',
+      CODEX_DISCORD_SESSION_POLL_INTERVAL_MS: '10',
+    },
+    encoding: 'utf8',
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /startup timeout and poll interval must be positive integers/);
 });
 
 test('launcher rejects a caller-supplied remote endpoint', () => {
