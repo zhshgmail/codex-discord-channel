@@ -51,8 +51,18 @@ exactly-once boundary until every running gateway uses the current format. The
 current reader prefers `.v2`, so legacy cleanup cannot remove successor
 authority.
 
-The visible TUI must be relaunched with `codex --remote <same-endpoint> ...`
-after a shared app-server is started. A direct `codex ... resume` process cannot
+Future visible TUIs must be started through the state-path launcher:
+
+```bash
+DISCORD_INSTANCE=codex01 bin/codex-discord-session resume --last
+```
+
+It probes `unix://<state-dir>/app-server.sock`, starts a detached shared
+app-server only when no Unix listener owns that endpoint, waits for protocol
+initialization, and execs the visible TUI with
+`codex --remote <same-endpoint> ...`. An unready live listener is preserved and
+fails closed. The launcher never discovers or binds a changing thread/session
+id. A direct `codex ... resume` process cannot
 be verified from this plugin. See the repository
 [Structured Delivery Contract](../../docs/structured-delivery.md) for the full
 migration and acceptance boundary.

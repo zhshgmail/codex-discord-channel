@@ -8,6 +8,13 @@ embedded server cannot satisfy this contract. Repository tests cannot cross
 that process boundary, and release-time verification requires relaunching the
 TUI with `--remote` against the shared endpoint.
 
+For future sessions, `bin/codex-discord-session` owns that startup boundary. It
+derives the endpoint from the normalized Discord instance state directory,
+probes app-server initialization without requiring a loaded thread, starts the
+server if necessary, and execs either a fresh TUI or the requested interactive
+command with `--remote`. `resume --last` is the supported state-path handoff;
+the launcher does not persist or select a volatile thread/session id.
+
 The runtime contains no terminal-input adapter and does not start a private
 app-server. Missing, disconnected, or ambiguous shared state is reported as
 unavailable while accepted messages remain persisted.

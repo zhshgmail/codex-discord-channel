@@ -1057,7 +1057,9 @@ test('production source contains no raw TTY or terminal-control injection path',
   const productionFiles = fs.readdirSync(path.join(root, 'src'))
     .filter((name) => name.endsWith('.js'))
     .map((name) => path.join(root, 'src', name));
-  productionFiles.push(path.join(root, 'bin', 'codex-discord-channel'));
+  productionFiles.push(...fs.readdirSync(path.join(root, 'bin'))
+    .map((name) => path.join(root, 'bin', name))
+    .filter((file) => fs.statSync(file).isFile()));
   const source = productionFiles
     .map((file) => fs.readFileSync(file, 'utf8'))
     .join('\n');

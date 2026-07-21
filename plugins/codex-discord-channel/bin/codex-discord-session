@@ -1,0 +1,128 @@
+#!/bin/sh
+set -eu
+
+umask 077
+
+fail() {
+  printf '%s\n' "codex-discord-session: $*" >&2
+  exit 2
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --remote|--remote=*|--remote-auth-token-env|--remote-auth-token-env=*)
+      fail '--remote is managed from the Discord instance state path'
+      ;;
+  esac
+done
+
+codex_bin=${CODEX_DISCORD_CODEX_BIN:-codex}
+node_bin=${CODEX_DISCORD_NODE_BIN:-node}
+setsid_bin=${CODEX_DISCORD_SETSID_BIN:-setsid}
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+probe_bin=${CODEX_DISCORD_SESSION_PROBE_BIN:-}
+socket_probe_bin=${CODEX_DISCORD_SESSION_SOCKET_PROBE_BIN:-}
+timeout_ms=${CODEX_DISCORD_SESSION_STARTUP_TIMEOUT_MS:-15000}
+poll_ms=${CODEX_DISCORD_SESSION_POLL_INTERVAL_MS:-100}
+case "$timeout_ms:$poll_ms" in
+  *[!0-9:]*|:*|*:|0:*|*:0) fail 'startup timeout and poll interval must be positive integers' ;;
+esac
+probe_timeout_ms=$poll_ms
+[ "$probe_timeout_ms" -ge 250 ] || probe_timeout_ms=250
+
+if ! endpoint=$("$node_bin" "$script_dir/codex-discord-channel" app-server-endpoint 2>/dev/null); then
+  fail 'unable to resolve a safe state-path app-server endpoint'
+fi
+case "$endpoint" in
+  unix:///*/app-server.sock) ;;
+  *) fail 'resolved app-server endpoint is not a state-path Unix socket' ;;
+esac
+socket_path=${endpoint#unix://}
+state_dir=${socket_path%/app-server.sock}
+mkdir -p "$state_dir"
+
+probe() {
+  if [ -n "$probe_bin" ]; then
+    "$probe_bin" "$endpoint" "$probe_timeout_ms" >/dev/null 2>&1
+  else
+    "$node_bin" "$script_dir/codex-discord-channel" app-server-probe \
+      --endpoint "$endpoint" --timeout-ms "$probe_timeout_ms" >/dev/null 2>&1
+  fi
+}
+
+socket_listens() {
+  if [ -n "$socket_probe_bin" ]; then
+    "$socket_probe_bin" "$endpoint" "$probe_timeout_ms" >/dev/null 2>&1
+  else
+    "$node_bin" "$script_dir/codex-discord-channel" app-server-socket-probe \
+      --endpoint "$endpoint" --timeout-ms "$probe_timeout_ms" >/dev/null 2>&1
+  fi
+}
+
+sleep_interval=$(awk -v ms="$poll_ms" 'BEGIN { printf "%.3f", ms / 1000 }')
+lock_timeout=$(awk -v ms="$timeout_ms" 'BEGIN { printf "%.3f", (ms * 2 + 1000) / 1000 }')
+lock_file="$state_dir/app-server.start.lock"
+owns_lock=0
+
+now_ms() {
+  awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime
+}
+
+wait_for_ready() {
+  deadline_ms=$(($(now_ms) + timeout_ms))
+  while [ "$(now_ms)" -lt "$deadline_ms" ]; do
+    probe && return 0
+    sleep "$sleep_interval"
+  done
+  return 1
+}
+
+cleanup_lock() {
+  if [ "$owns_lock" -eq 1 ]; then
+    flock -u 9 || true
+    exec 9>&-
+    owns_lock=0
+  fi
+}
+trap cleanup_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if ! probe; then
+  command -v flock >/dev/null 2>&1 || fail 'flock is required to coordinate app-server startup'
+  exec 9>"$lock_file"
+  chmod 600 "$lock_file"
+  flock -w "$lock_timeout" 9 \
+    || fail "timed out waiting for app-server startup lock at $endpoint"
+  owns_lock=1
+
+  if ! probe; then
+    if [ -e "$socket_path" ] && socket_listens; then
+      wait_for_ready \
+        || fail "app-server listener did not become protocol-ready at $endpoint"
+    else
+      pid_file="$state_dir/app-server.pid"
+      log_file="$state_dir/app-server.log"
+      rm -f "$socket_path"
+      : >"$log_file"
+      chmod 600 "$log_file"
+      command -v "$setsid_bin" >/dev/null 2>&1 \
+        || fail 'setsid is required to detach the shared app-server'
+      nohup "$setsid_bin" "$codex_bin" app-server --listen "$endpoint" \
+        9>&- </dev/null >>"$log_file" 2>&1 &
+      app_server_pid=$!
+      pid_temp="$pid_file.$$"
+      printf '%s\n' "$app_server_pid" >"$pid_temp"
+      chmod 600 "$pid_temp"
+      mv -f "$pid_temp" "$pid_file"
+
+      wait_for_ready \
+        || fail "app-server did not become ready at $endpoint; see $log_file"
+    fi
+  fi
+fi
+
+cleanup_lock
+trap - EXIT HUP INT TERM
+exec "$codex_bin" --remote "$endpoint" "$@"

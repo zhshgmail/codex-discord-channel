@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
+const net = require('node:net');
 const { loadConfig } = require('../src/config');
+const { AppServerRpcClient, endpointToWebSocket } = require('../src/app-server-host');
 const { configureNetwork, releaseDiscordReceiverOwnership } = require('../src/discord-client');
 const { createDelivery, resolveReplyTarget } = require('../src/delivery');
 const { startGatewayDrainLoop } = require('../src/gateway-drain-loop');
@@ -37,6 +39,86 @@ function parseSendArgs(argv) {
     }
   }
   return args;
+}
+
+function parseAppServerProbeArgs(argv) {
+  const args = { endpoint: '', timeoutMs: 10000 };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--endpoint') {
+      args.endpoint = argv[index + 1] || '';
+      index += 1;
+    } else if (arg === '--timeout-ms') {
+      args.timeoutMs = Number.parseInt(argv[index + 1] || '', 10);
+      index += 1;
+    } else {
+      throw new Error(`Unknown app-server probe argument: ${arg}`);
+    }
+  }
+  if (!args.endpoint.startsWith('unix:///')) {
+    throw new Error('App-server probe requires an absolute Unix socket endpoint.');
+  }
+  if (!Number.isInteger(args.timeoutMs) || args.timeoutMs <= 0) {
+    throw new Error('App-server probe timeout must be a positive integer.');
+  }
+  return args;
+}
+
+async function probeAppServer(args, deps = {}) {
+  const createClient = deps.createClient || ((config) => new AppServerRpcClient(config));
+  const client = createClient({
+    appServerUrl: args.endpoint,
+    appServerConnectTimeoutMs: args.timeoutMs,
+    appServerRequestTimeoutMs: args.timeoutMs,
+  });
+  try {
+    await client.ensureConnected();
+    return { available: true };
+  } finally {
+    client.destroy();
+  }
+}
+
+async function probeUnixSocketListener(args, deps = {}) {
+  const { socketPath } = endpointToWebSocket(args.endpoint);
+  if (!socketPath) throw new Error('Unix listener probe requires a Unix socket endpoint.');
+  const createConnection = deps.createConnection || net.createConnection;
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    let socket;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (socket && typeof socket.destroy === 'function') socket.destroy();
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error('Timed out connecting to the Unix socket listener.')),
+      args.timeoutMs,
+    );
+    try {
+      socket = createConnection({ path: socketPath });
+      socket.once('connect', () => finish());
+      socket.once('error', finish);
+    } catch (error) {
+      finish(error);
+    }
+  });
+  return { available: true };
+}
+
+function resolveSessionAppServerEndpoint(env = process.env) {
+  const config = loadConfig(env);
+  if (/[\u0000-\u001f\u007f]/.test(config.paths.stateDir)) {
+    throw new Error('Discord state path must not contain ASCII control bytes.');
+  }
+  const endpoint = `unix://${config.paths.stateDir}/app-server.sock`;
+  if (config.appServerUrl !== endpoint) {
+    throw new Error(`Configured app-server endpoint must match the Discord state path: ${endpoint}`);
+  }
+  return endpoint;
 }
 
 function readStdin() {
@@ -176,6 +258,23 @@ async function main() {
     await runGateway();
     return;
   }
+  if (command === 'app-server-probe') {
+    const args = parseAppServerProbeArgs(rest);
+    const result = await probeAppServer(args);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (command === 'app-server-socket-probe') {
+    const args = parseAppServerProbeArgs(rest);
+    const result = await probeUnixSocketListener(args);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (command === 'app-server-endpoint') {
+    if (rest.length > 0) throw new Error('app-server-endpoint does not accept arguments.');
+    process.stdout.write(`${resolveSessionAppServerEndpoint()}\n`);
+    return;
+  }
   if (command === '-h' || command === '--help') {
     usage();
     return;
@@ -185,8 +284,12 @@ async function main() {
 
 module.exports = {
   main,
+  parseAppServerProbeArgs,
   parseSendArgs,
+  probeAppServer,
+  probeUnixSocketListener,
   readStdin,
+  resolveSessionAppServerEndpoint,
   sendViaRest,
 };
 

@@ -74,35 +74,43 @@ interval bounds may be changed with
 `CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS` and
 `CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS`.
 
-## Required Live Migration
+## Future Visible Sessions
 
 A TUI started as a direct `codex ... resume` process uses a private embedded
 app-server. This repository change cannot attach to that private server. Live
-exact-console verification therefore requires a release/install plus process
-migration:
+exact-console verification therefore requires a release/install plus an
+operator-approved process migration. After ending the old direct TUI, start
+future visible sessions through the state-path launcher:
 
-1. End the direct TUI process at an operator-approved time.
-2. Start a persistent app-server on the instance socket:
+```bash
+DISCORD_INSTANCE=codex01 \
+  plugins/codex-discord-channel/bin/codex-discord-session resume --last
+```
 
-   ```bash
-   STATE_DIR="${CODEX_HOME:-$HOME/.codex}/channels/discord/codex01"
-   SOCKET="$STATE_DIR/app-server.sock"
-   mkdir -p "$STATE_DIR"
-   codex app-server --listen "unix://$SOCKET"
-   ```
+The launcher derives exactly one endpoint from the normalized instance state
+directory. It starts a detached `codex app-server` only when the protocol probe
+is unavailable and the Unix socket has no listener; an unready live listener
+is preserved and fails closed after the startup window. It then replaces
+itself with:
 
-3. Relaunch the visible TUI against that same endpoint:
+```bash
+codex --remote "unix://<state-dir>/app-server.sock" resume --last
+```
 
-   ```bash
-   codex --remote "unix://$SOCKET" resume <THREAD_ID>
-   ```
+Arguments after `codex-discord-session` are ordinary interactive Codex
+arguments, so omitting `resume --last` starts a fresh visible thread. The
+wrapper rejects a caller-supplied `--remote`; endpoint ownership stays with the
+Discord instance state path instead of a changing thread or session id. The
+launcher requires the standard Linux `flock` and `setsid` utilities.
 
-4. Install the released plugin and restart the `codex01` gateway under normal
+After the process migration:
+
+1. Install the released plugin and restart the `codex01` gateway under normal
    operator change control so it runs the released code.
-5. Verify `discord_channel_status` reports `deliverySafety:
+2. Verify `discord_channel_status` reports `deliverySafety:
    "structured_only"`, `sharedAppServerAvailable: true`, and
    `discordStarted: true`.
-6. Send a controlled allowed Discord message and confirm that its structured
+3. Send a controlled allowed Discord message and confirm that its structured
    turn appears in that exact visible TUI. Repeat after `/clear` to verify
    thread rotation.
 
@@ -162,6 +170,9 @@ $HOME/.codex/channels/discord/codex01/owner.json
 $HOME/.codex/channels/discord/codex01/session-gateway.pid
 $HOME/.codex/channels/discord/codex01/pending-delivery.json
 $HOME/.codex/channels/discord/codex01/app-server.sock
+$HOME/.codex/channels/discord/codex01/app-server.pid
+$HOME/.codex/channels/discord/codex01/app-server.log
+$HOME/.codex/channels/discord/codex01/app-server.start.lock
 ```
 
 Do not commit `.env` or print Discord tokens.

@@ -34,6 +34,7 @@ assert(mcp.mcpServers['codex-discord-channel'], 'missing MCP server config');
 assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
 assert(SERVER_VERSION === PACKAGE_VERSION, 'MCP server version mismatch');
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');
+assert(pkg.bin['codex-discord-session'] === 'bin/codex-discord-session', 'session bin entry mismatch');
 
 const historyTool = toolList().find((tool) => tool.name === 'discord_channel_read_history');
 assert(historyTool, 'missing discord_channel_read_history tool');
@@ -51,6 +52,9 @@ assert(mcpServerSource.includes(`const SERVER_VERSION = '${PACKAGE_VERSION}';`),
 const binPath = path.join(root, 'bin', 'codex-discord-channel');
 const mode = fs.statSync(binPath).mode;
 assert((mode & 0o111) !== 0, 'bin/codex-discord-channel must be executable');
+const sessionBinPath = path.join(root, 'bin', 'codex-discord-session');
+const sessionMode = fs.statSync(sessionBinPath).mode;
+assert((sessionMode & 0o111) !== 0, 'bin/codex-discord-session must be executable');
 assert(!fs.existsSync(path.join(root, '.env')), 'plugin root must not contain .env');
 
 process.stdout.write('smoke passed\n');
