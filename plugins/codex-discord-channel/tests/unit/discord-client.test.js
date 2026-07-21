@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -915,21 +915,71 @@ test('sole gateway queues while target is down and restart delivers the event ex
   secondDelivery.destroy();
 });
 
-test('gateway shutdown stops reception and drains before releasing receiver authority', () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', '..', 'bin', 'codex-discord-channel'), 'utf8');
-  const startLoopIndex = source.indexOf('startGatewayDrainLoop({');
-  const deactivateIndex = source.indexOf('delivery.deactivateReceiver()');
-  const stopLoopIndex = source.indexOf('await drainLoop.stop()');
-  const releaseIndex = source.indexOf('await delivery.coordinateReceiverOwnership');
-  const destroyIndex = source.indexOf('if (discordState.client?.destroy) await discordState.client.destroy()');
+test('gateway shutdown fences an in-flight admission before releasing receiver authority', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-gateway-shutdown-'));
+  const eventsPath = path.join(dir, 'events.jsonl');
+  const fixture = path.join(
+    __dirname,
+    '..',
+    'fixtures',
+    'gateway-shutdown-inflight-admission.js',
+  );
+  const gateway = path.join(__dirname, '..', '..', 'bin', 'codex-discord-channel');
+  const child = spawn(process.execPath, [gateway, 'gateway'], {
+    env: {
+      ...process.env,
+      CODEX_DISCORD_TEST_SHUTDOWN_EVENTS: eventsPath,
+      NODE_OPTIONS: `--require=${fixture}`,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  });
 
-  assert.notEqual(startLoopIndex, -1);
-  assert.notEqual(deactivateIndex, -1);
-  assert.notEqual(stopLoopIndex, -1);
-  assert.notEqual(releaseIndex, -1);
-  assert.notEqual(destroyIndex, -1);
-  assert.ok(startLoopIndex < deactivateIndex);
-  assert.ok(deactivateIndex < destroyIndex);
-  assert.ok(destroyIndex < stopLoopIndex);
-  assert.ok(stopLoopIndex < releaseIndex);
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`gateway fixture did not become ready: ${stderr}`)), 5000);
+    const inspect = () => {
+      if (!stdout.includes('fixture-ready')) return;
+      clearTimeout(timeout);
+      child.stdout.off('data', inspect);
+      resolve();
+    };
+    child.stdout.on('data', inspect);
+    inspect();
+  });
+
+  assert.equal(child.kill('SIGTERM'), true);
+  const [exitCode, signal] = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`gateway fixture did not stop: ${stderr}`)), 5000);
+    child.once('exit', (code, exitSignal) => {
+      clearTimeout(timeout);
+      resolve([code, exitSignal]);
+    });
+  });
+  const events = fs.readFileSync(eventsPath, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line).event);
+  const index = (event) => events.indexOf(event);
+
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(signal, null);
+  assert.equal(events.includes('enqueue_called'), false, events.join(', '));
+  assert.equal(events.includes('flush_called'), false, events.join(', '));
+  assert.match(stderr, /Ignoring Discord message because receiver ownership changed/);
+  assert.ok(index('gateway_ready_with_inflight_admission') < index('receiver_deactivated'));
+  assert.ok(index('receiver_deactivated') < index('reference_fetch_finished'));
+  assert.ok(index('reference_fetch_finished') < index('client_destroy_finished'));
+  assert.ok(index('client_destroy_finished') < index('drain_stop_started'));
+  assert.ok(index('drain_stop_finished') < index('authority_release_started'));
+  assert.ok(index('authority_release_started') < index('authority_released'));
+  assert.ok(index('authority_released') < index('delivery_destroyed'));
 });
