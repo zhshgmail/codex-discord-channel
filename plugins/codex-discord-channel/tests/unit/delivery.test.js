@@ -543,6 +543,78 @@ test('superseded receiver cannot rotate or archive the active runtime queue', as
   delivery.destroy();
 });
 
+test('activation removes pending identities already recorded as terminal', async (t) => {
+  const terminalCases = [
+    {
+      name: 'completed',
+      options: {
+        completed: [{
+          channelId: 'c1',
+          messageId: 'm-terminal',
+          completedAt: '2026-07-21T20:00:02.000Z',
+        }],
+      },
+    },
+    {
+      name: 'archived',
+      options: {
+        archived: [{
+          channelId: 'c1',
+          messageId: 'm-terminal',
+          queuedAt: '2026-07-21T19:59:59.000Z',
+          archivedAt: '2026-07-21T20:00:00.000Z',
+          reason: 'stale_delivery_activation',
+        }],
+      },
+    },
+  ];
+
+  for (const terminalCase of terminalCases) {
+    await t.test(terminalCase.name, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), `cdc-terminal-${terminalCase.name}-`));
+      writePendingQueue(dir, [{
+        ...discordMessage('m-terminal', 'must never be submitted again'),
+        createdAt: '2026-07-21T20:00:01.000Z',
+      }], {
+        activationId: 'runtime-a',
+        activatedAt: '2026-07-21T20:00:00.000Z',
+        queuedAt: '2026-07-21T20:00:01.000Z',
+        ...terminalCase.options,
+      });
+      let targetResolutions = 0;
+      let turnStarts = 0;
+      const delivery = createDelivery(deliveryConfig(dir, {
+        deliveryActivationId: 'runtime-a',
+      }), () => {}, {
+        structuredHost: {
+          async resolveTarget() {
+            targetResolutions += 1;
+            return { available: true, threadId: 'thread-current', status: 'idle' };
+          },
+          async startTurn() {
+            turnStarts += 1;
+            return { turn: { id: 'duplicate-turn' } };
+          },
+          onThreadIdle() { return () => {}; },
+          onThreadActive() { return () => {}; },
+          onReconnect() { return () => {}; },
+          onThreadClosed() { return () => {}; },
+          status() { return { configured: true, available: true, reason: null }; },
+          destroy() {},
+        },
+      });
+
+      await delivery.activateReceiver(activeReceiver);
+
+      assert.equal(targetResolutions, 0);
+      assert.equal(turnStarts, 0);
+      assert.deepEqual(readQueue(dir).items, []);
+      assert.equal(JSON.stringify(readQueue(dir)).includes('must never be submitted again'), false);
+      delivery.destroy();
+    });
+  }
+});
+
 test('same activation restart preserves the watermark and recovers a fresh pending item', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-restart-'));
   const config = deliveryConfig(dir, { deliveryActivationId: 'runtime-a' });

@@ -352,14 +352,17 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
   const activationId = deliveryActivationId(config, deps);
   const activatedAtMs = timestampMs(queue.activation?.activatedAt);
   const activationMatches = queue.activation?.id === activationId && activatedAtMs != null;
+  const itemIsEligible = (item) => itemMatchesActivation(item, activationId, activatedAtMs) &&
+    !queue.completed.some((entry) => sameDiscordIdentity(entry, item.normalized)) &&
+    !queue.archived.some((entry) => sameDiscordIdentity(entry, item.normalized));
   const staleItems = activationMatches
-    ? queue.items.filter((item) => !itemMatchesActivation(item, activationId, activatedAtMs))
+    ? queue.items.filter((item) => !itemIsEligible(item))
     : queue.items;
   const staleIdentities = new Set(staleItems.map((item) => (
     `${item.normalized?.channelId || ''}\0${item.normalized?.messageId || ''}`
   )));
   const eligibleItems = activationMatches
-    ? queue.items.filter((item) => itemMatchesActivation(item, activationId, activatedAtMs))
+    ? queue.items.filter((item) => itemIsEligible(item))
     : [];
   const archived = [...queue.archived];
   const archivedAt = new Date(currentTimeMs(deps)).toISOString();
