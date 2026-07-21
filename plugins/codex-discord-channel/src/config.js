@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const os = require('node:os');
+const path = require('node:path');
 const { resolvePaths } = require('./paths');
 
 function stripQuotes(value) {
@@ -76,6 +77,9 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.CODEX_APP_SERVER_URL ||
     `unix://${paths.stateDir}/app-server.sock`,
   ).trim();
+  const deliveryActivationId = String(
+    env.CODEX_DISCORD_DELIVERY_ACTIVATION_ID || '',
+  ).trim() || fs.realpathSync(path.resolve(__dirname, '..'));
 
   return {
     env,
@@ -88,6 +92,7 @@ function loadConfig(inputEnv = process.env, options = {}) {
     insecureTls: parseBool(env.DISCORD_INSECURE_TLS, env.NODE_TLS_REJECT_UNAUTHORIZED === '0'),
     loginDisabled: parseBool(env.DISCORD_CHANNEL_DISABLE_LOGIN, false),
     deliveryMode,
+    deliveryActivationId,
     ignoredDeliveryMode: ['app-server', 'app_server', 'structured', 'turn', 'off'].includes(requestedDeliveryMode)
       ? null
       : requestedDeliveryMode,

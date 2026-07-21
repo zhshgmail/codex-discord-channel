@@ -67,8 +67,30 @@ current thread, delivery fails closed.
 ## FIFO And Active Turns
 
 Every accepted Discord event is persisted before target resolution. Queue
-mutations use a process-safe lock and deduplicate pending and completed Discord
-identities.
+mutations use a process-safe lock and deduplicate pending, completed, and
+archived Discord identities.
+
+The queue's durable activation id defaults to the real installed plugin root
+and is paired with a durable activation timestamp. After receiver authority
+transfers, the first locked drain rotates a missing or changed activation and
+archives every legacy, mismatched, or pre-activation pending item before that
+item can resolve a target. Discord source creation time is also compared when
+present, so a historical event received after activation cannot become current
+work. Archive entries contain only channel id, message id, queue time, archive
+time, and disposition; queued message content is discarded. Archival cannot
+call `turn/start` or `turn/steer`.
+
+Newly admitted items are stamped with the active id. A restart of the same
+installed runtime can therefore recover its own pending items, while a new
+versioned runtime cannot replay the old backlog. Readiness checks before an
+authority transfer are read-only, so a successor that fails readiness does not
+modify the incumbent queue. Queue schema v2 makes an older runtime reject an
+activated queue instead of replaying it after rollback. Deployments without
+versioned install paths may set `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`
+explicitly.
+
+If the activation or archive cannot be persisted, receiver activation fails and
+the gateway does not continue as an inbound receiver.
 
 Each drain may accept only the queue head. A proven idle target uses
 `turn/start`. A target with an exact active turn uses `turn/steer` and supplies

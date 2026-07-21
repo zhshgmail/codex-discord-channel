@@ -22,6 +22,8 @@ const {
   readReceiverAuthoritySnapshot,
 } = require('../../src/receiver-state');
 
+const TEST_ACTIVATION_ID = path.resolve(__dirname, '..', '..');
+
 function discordMessage(messageId, content = 'hello') {
   return {
     source: 'dm',
@@ -41,6 +43,7 @@ function discordMessage(messageId, content = 'hello') {
 function deliveryConfig(dir, overrides = {}) {
   return {
     deliveryMode: 'app-server',
+    deliveryActivationId: TEST_ACTIVATION_ID,
     paths: {
       instance: 'codex01',
       stateDir: dir,
@@ -142,14 +145,25 @@ function readQueue(dir) {
 }
 
 function writePendingQueue(dir, messages, options = {}) {
+  const activationId = options.activationId || TEST_ACTIVATION_ID;
+  const activatedAt = options.activatedAt || '2026-07-20T00:00:00.000Z';
+  const queuedAt = options.queuedAt || activatedAt;
   fs.writeFileSync(path.join(dir, 'pending-delivery.json'), `${JSON.stringify({
     version: 1,
+    ...(options.legacy ? {} : {
+      activation: {
+        id: activationId,
+        activatedAt,
+      },
+    }),
     items: messages.map((normalized) => ({
       version: 1,
-      queuedAt: '2026-07-20T00:00:00.000Z',
+      ...(options.legacy ? {} : { activationId }),
+      queuedAt,
       normalized,
     })),
     completed: options.completed || [],
+    archived: options.archived || [],
     blocked: options.blocked || null,
   }, null, 2)}\n`);
 }
@@ -239,6 +253,7 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
     channelId: 'c1',
     guildId: null,
     id: 'm1',
+    createdTimestamp: Date.parse('2026-07-21T20:00:00.000Z'),
     author: { id: 'u1', username: 'alice', bot: false },
     reference: { messageId: 'm0' },
     content: 'reply',
@@ -249,6 +264,7 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
   });
   assert.equal(normalized.repliedToAuthorId, 'u0');
   assert.equal(normalized.repliedToContent, 'parent');
+  assert.equal(normalized.createdAt, '2026-07-21T20:00:00.000Z');
 
   const withoutReference = normalizeDiscordMessage({
     channelId: 'c1',
@@ -274,6 +290,347 @@ test('structuredSafeText preserves Unicode while escaping every terminal control
   assert.match(output, /\\x03/);
   assert.match(output, /\\x7f/);
   assert.match(output, /汉字🙂/);
+});
+
+test('activation archives stale backlog before target resolution and delivers a fresh message', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-watermark-'));
+  writePendingQueue(dir, [discordMessage('m-stale', 'must not replay')], { legacy: true });
+  const requests = [];
+  let targetResolutions = 0;
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: 'runtime-b',
+  }), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        targetResolutions += 1;
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-fresh' } };
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await delivery.activateReceiver(activeReceiver);
+
+  assert.equal(targetResolutions, 0);
+  assert.deepEqual(requests, []);
+  const activated = readQueue(dir);
+  assert.equal(activated.version, 2);
+  assert.deepEqual(activated.items, []);
+  assert.deepEqual(activated.completed, []);
+  assert.deepEqual(activated.activation, {
+    id: 'runtime-b',
+    activatedAt: activated.activation.activatedAt,
+  });
+  assert.deepEqual(activated.archived, [{
+    channelId: 'c1',
+    messageId: 'm-stale',
+    queuedAt: '2026-07-20T00:00:00.000Z',
+    archivedAt: activated.archived[0].archivedAt,
+    reason: 'stale_delivery_activation',
+  }]);
+  assert.equal(Object.hasOwn(activated.archived[0], 'normalized'), false);
+  assert.equal(JSON.stringify(activated.archived).includes('must not replay'), false);
+
+  const fresh = await delivery.deliver(discordMessage('m-fresh', 'deliver now'));
+
+  assert.equal(fresh.status, 'delivered');
+  assert.equal(targetResolutions, 1);
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), [
+    'discord:c1:m-fresh',
+  ]);
+  const drained = readQueue(dir);
+  assert.deepEqual(drained.items, []);
+  assert.deepEqual(drained.completed.map((item) => item.messageId), ['m-fresh']);
+  assert.deepEqual(drained.archived.map((item) => item.messageId), ['m-stale']);
+  delivery.destroy();
+});
+
+test('persistence preflight leaves legacy backlog unchanged until receiver activation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-preflight-'));
+  writePendingQueue(dir, [discordMessage('m-incumbent', 'preserve until takeover')], {
+    legacy: true,
+  });
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const before = fs.readFileSync(queuePath, 'utf8');
+  let targetResolutions = 0;
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: 'runtime-successor',
+  }), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        targetResolutions += 1;
+        return { available: false, reason: 'not-ready' };
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: false, reason: 'not-ready' }; },
+      destroy() {},
+    },
+  });
+
+  await delivery.ensurePersistenceReady();
+
+  assert.equal(fs.readFileSync(queuePath, 'utf8'), before);
+  assert.equal(targetResolutions, 0);
+  delivery.destroy();
+});
+
+test('activation archives matching-id queue entries older than its durable time watermark', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-time-'));
+  writePendingQueue(dir, [discordMessage('m-before-watermark', 'must remain stale')], {
+    activationId: 'runtime-a',
+    activatedAt: '2026-07-21T20:00:00.000Z',
+    queuedAt: '2026-07-21T19:59:59.000Z',
+  });
+  let targetResolutions = 0;
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: 'runtime-a',
+  }), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        targetResolutions += 1;
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn() {
+        throw new Error('pre-activation item must not start a turn');
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await delivery.activateReceiver(activeReceiver);
+
+  assert.equal(targetResolutions, 0);
+  const queue = readQueue(dir);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.archived.map((item) => item.messageId), ['m-before-watermark']);
+  delivery.destroy();
+});
+
+test('post-activation admission archives a Discord event created before the watermark', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-source-time-'));
+  const activatedAtMs = Date.parse('2026-07-21T20:00:00.000Z');
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: 'runtime-a',
+  }), () => {}, {
+    now: () => activatedAtMs,
+    structuredHost: {
+      async resolveTarget() {
+        throw new Error('stale event must not resolve a target');
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: false, reason: 'not-needed' }; },
+      destroy() {},
+    },
+  });
+  await delivery.activateReceiver(activeReceiver);
+
+  const result = await delivery.enqueue({
+    ...discordMessage('m-delayed', 'must not enter the active turn'),
+    createdAt: '2026-07-21T19:59:59.000Z',
+  });
+
+  assert.equal(result.status, 'duplicate');
+  assert.equal(result.reason, 'discord_message_archived_at_activation');
+  const queue = readQueue(dir);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.archived.map((item) => item.messageId), ['m-delayed']);
+  delivery.destroy();
+});
+
+test('receiver activation fails closed when the durable watermark cannot be persisted', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-persist-failure-'));
+  writePendingQueue(dir, [discordMessage('m-stale', 'must remain fenced')], { legacy: true });
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  let targetResolutions = 0;
+  const fsProxy = {
+    ...fs,
+    renameSync(source, target) {
+      if (target === queuePath && source.startsWith(`${queuePath}.`)) {
+        const error = new Error('injected activation persistence failure');
+        error.code = 'EIO';
+        throw error;
+      }
+      return fs.renameSync(source, target);
+    },
+  };
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: 'runtime-a',
+  }), () => {}, {
+    fs: fsProxy,
+    structuredHost: {
+      async resolveTarget() {
+        targetResolutions += 1;
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(
+    delivery.activateReceiver(activeReceiver),
+    /injected activation persistence failure/,
+  );
+  assert.equal(targetResolutions, 0);
+  delivery.destroy();
+});
+
+test('superseded receiver cannot rotate or archive the active runtime queue', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-stale-receiver-'));
+  writePendingQueue(dir, [{
+    ...discordMessage('m-successor', 'belongs to the active runtime'),
+    createdAt: '2026-07-21T20:00:01.000Z',
+  }], {
+    activationId: 'runtime-successor',
+    activatedAt: '2026-07-21T20:00:00.000Z',
+    queuedAt: '2026-07-21T20:00:01.000Z',
+  });
+  const queuePath = path.join(dir, 'pending-delivery.json');
+  const before = fs.readFileSync(queuePath, 'utf8');
+  let targetResolutions = 0;
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: 'runtime-superseded',
+  }), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        targetResolutions += 1;
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  const result = await delivery.flush({
+    verifyReceiverOwnership: () => ({
+      active: false,
+      reason: 'gateway_generation_changed',
+    }),
+  });
+
+  assert.equal(result.status, 'queued');
+  assert.equal(result.reason, 'gateway_generation_changed');
+  assert.equal(targetResolutions, 0);
+  assert.equal(fs.readFileSync(queuePath, 'utf8'), before);
+  delivery.destroy();
+});
+
+test('same activation restart preserves the watermark and recovers a fresh pending item', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-restart-'));
+  const config = deliveryConfig(dir, { deliveryActivationId: 'runtime-a' });
+  let now = Date.parse('2026-07-21T20:00:00.000Z');
+  const unavailableHost = {
+    async resolveTarget() {
+      return { available: false, reason: 'shared_app_server_disconnected' };
+    },
+    onThreadIdle() { return () => {}; },
+    onThreadActive() { return () => {}; },
+    onReconnect() { return () => {}; },
+    onThreadClosed() { return () => {}; },
+    status() { return { configured: true, available: false, reason: 'shared_app_server_disconnected' }; },
+    destroy() {},
+  };
+  const first = createDelivery(config, () => {}, {
+    now: () => now,
+    structuredHost: unavailableHost,
+  });
+  await first.activateReceiver(activeReceiver);
+  const activatedAt = readQueue(dir).activation.activatedAt;
+  now += 1000;
+  const queued = await first.deliver({
+    ...discordMessage('m-after-watermark', 'recover after restart'),
+    createdAt: new Date(now).toISOString(),
+  });
+  assert.equal(queued.status, 'queued');
+  first.destroy();
+
+  now += 1000;
+  const requests = [];
+  const second = createDelivery(config, () => {}, {
+    now: () => now,
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-after-restart' } };
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await second.activateReceiver(activeReceiver);
+
+  assert.equal(readQueue(dir).activation.activatedAt, activatedAt);
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), [
+    'discord:c1:m-after-watermark',
+  ]);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), [
+    'm-after-watermark',
+  ]);
+  second.destroy();
+});
+
+test('archived Discord identity remains deduplicated after activation', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-activation-dedup-'));
+  writePendingQueue(dir, [discordMessage('m-stale', 'must not replay')], { legacy: true });
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: 'runtime-b',
+  }), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        throw new Error('stale backlog must not resolve a target');
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: false, reason: 'not-needed' }; },
+      destroy() {},
+    },
+  });
+
+  await delivery.activateReceiver(activeReceiver);
+  const duplicate = await delivery.enqueue(discordMessage('m-stale', 'must not return'));
+
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(duplicate.reason, 'discord_message_archived_at_activation');
+  assert.deepEqual(readQueue(dir).items, []);
+  delivery.destroy();
 });
 
 test('authorized Discord payload starts one structured turn without TTY or runtime overrides', async () => {
@@ -1128,6 +1485,8 @@ test('delivery status sanitizes malformed queue content', () => {
   assert.deepEqual(readDeliveryQueueStatus(deliveryConfig(dir)), {
     deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
     deliveryQueueDepth: null,
+    deliveryArchivedCount: null,
+    deliveryActivatedAt: null,
     deliveryBlockedReason: 'delivery_queue_unreadable',
     deliveryBlockedAt: null,
     deliveryQueueError: 'Unable to read persistent Discord delivery queue.',

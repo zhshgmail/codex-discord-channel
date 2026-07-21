@@ -68,6 +68,16 @@ acknowledgement is lost, replay is blocked. The gateway reconciles the stable
 client message id against the thread before it can mark that item complete.
 See [Structured Delivery Contract](docs/structured-delivery.md).
 
+The queue also carries a durable delivery activation id and timestamp. The id
+defaults to the real installed plugin root, so a newly installed version
+archives pending items from an older runtime before resolving a target. Items
+queued before the activation timestamp and delayed Discord events created
+before it are stale as well. The archive retains only Discord identity and
+timestamps for deduplication; message content is removed. Restarts of the same
+installed runtime retain and recover only items stamped within that activation.
+Operators may set an explicit stable boundary with
+`CODEX_DISCORD_DELIVERY_ACTIVATION_ID`.
+
 The standalone gateway also owns a periodic durable-queue check. A nonempty
 queue is retried without new Discord traffic or TUI activity, while unavailable
 targets back off from 1 second to a 30-second maximum. Every tick verifies the

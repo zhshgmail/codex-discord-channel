@@ -6,8 +6,10 @@ const { createAppServerHost } = require('./app-server-host');
 const { isProcessAlive } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
+const DELIVERY_QUEUE_VERSION = 2;
 const DELIVERY_IN_PROGRESS = 'structured_delivery_in_progress';
 const DELIVERY_ACK_UNCERTAIN = 'structured_ack_uncertain';
+const STALE_DELIVERY_ACTIVATION = 'stale_delivery_activation';
 const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
 const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
 const activeDeliveryAttempts = new Set();
@@ -26,6 +28,7 @@ function normalizeDiscordMessage(message, referencedMessage = null) {
     ? message.attachments
     : Array.from(message.attachments?.values?.() || []);
   const hasReference = Boolean(message.reference?.messageId);
+  const createdTimestamp = Number(message.createdTimestamp);
   return {
     source: message.guildId ? 'guild' : 'dm',
     channelId: message.channelId,
@@ -38,6 +41,9 @@ function normalizeDiscordMessage(message, referencedMessage = null) {
     repliedToContent: hasReference && typeof referencedMessage?.content === 'string'
       ? referencedMessage.content
       : '',
+    createdAt: Number.isFinite(createdTimestamp)
+      ? new Date(createdTimestamp).toISOString()
+      : null,
     content: message.content || '',
     attachments: attachments.map((attachment) => ({
       id: attachment.id,
@@ -226,7 +232,14 @@ async function withDeliveryQueueLock(config, deps, operation) {
 }
 
 function emptyDeliveryQueue() {
-  return { version: 1, items: [], completed: [], blocked: null };
+  return {
+    version: DELIVERY_QUEUE_VERSION,
+    activation: null,
+    items: [],
+    completed: [],
+    archived: [],
+    blocked: null,
+  };
 }
 
 function readDeliveryQueue(config = {}, deps = {}) {
@@ -240,13 +253,17 @@ function readDeliveryQueue(config = {}, deps = {}) {
   } catch {
     throw new Error(DELIVERY_QUEUE_ERROR_MESSAGE);
   }
-  if (parsed?.version !== 1 || !Array.isArray(parsed.items)) {
+  if (![1, DELIVERY_QUEUE_VERSION].includes(parsed?.version) || !Array.isArray(parsed.items)) {
     throw new Error(`Invalid Discord delivery queue: ${file}`);
   }
   return {
-    version: 1,
+    version: parsed.version,
+    activation: parsed.activation && typeof parsed.activation === 'object'
+      ? parsed.activation
+      : null,
     items: parsed.items,
     completed: Array.isArray(parsed.completed) ? parsed.completed : [],
+    archived: Array.isArray(parsed.archived) ? parsed.archived : [],
     blocked: parsed.blocked && typeof parsed.blocked === 'object' ? parsed.blocked : null,
   };
 }
@@ -258,6 +275,8 @@ function readDeliveryQueueStatus(config = {}, deps = {}) {
     return {
       deliveryQueuePath: queuePath,
       deliveryQueueDepth: queue.items.length,
+      deliveryArchivedCount: queue.archived.length,
+      deliveryActivatedAt: queue.activation?.activatedAt || null,
       deliveryBlockedReason: queue.blocked?.reason || null,
       deliveryBlockedAt: queue.blocked?.at || null,
       deliveryQueueError: null,
@@ -266,6 +285,8 @@ function readDeliveryQueueStatus(config = {}, deps = {}) {
     return {
       deliveryQueuePath: queuePath,
       deliveryQueueDepth: null,
+      deliveryArchivedCount: null,
+      deliveryActivatedAt: null,
       deliveryBlockedReason: 'delivery_queue_unreadable',
       deliveryBlockedAt: null,
       deliveryQueueError: DELIVERY_QUEUE_ERROR_MESSAGE,
@@ -287,19 +308,129 @@ function sameDiscordIdentity(left, right) {
   return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
 }
 
+function deliveryActivationId(config = {}, deps = {}) {
+  const configured = String(
+    deps.deliveryActivationId || config.deliveryActivationId || '',
+  ).trim();
+  return configured || fs.realpathSync(path.resolve(__dirname, '..'));
+}
+
+function timestampMs(value) {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function sourcePredatesActivation(normalized, activatedAtMs) {
+  if (normalized?.createdAt == null || normalized.createdAt === '') return false;
+  const createdAtMs = timestampMs(normalized.createdAt);
+  return createdAtMs == null || createdAtMs < activatedAtMs;
+}
+
+function itemMatchesActivation(item, activationId, activatedAtMs) {
+  if (item?.activationId !== activationId) return false;
+  const queuedAtMs = timestampMs(item.queuedAt);
+  if (queuedAtMs == null || queuedAtMs < activatedAtMs) return false;
+  return !sourcePredatesActivation(item.normalized, activatedAtMs);
+}
+
+function archiveIdentity(archived, completed, identity, queuedAt, archivedAt) {
+  if (!identity?.channelId || !identity?.messageId) return false;
+  if (archived.some((entry) => sameDiscordIdentity(entry, identity))) return false;
+  if (completed.some((entry) => sameDiscordIdentity(entry, identity))) return false;
+  archived.push({
+    channelId: identity.channelId,
+    messageId: identity.messageId,
+    queuedAt: queuedAt || null,
+    archivedAt,
+    reason: STALE_DELIVERY_ACTIVATION,
+  });
+  return true;
+}
+
+function activateDeliveryQueue(queue, config = {}, deps = {}) {
+  const activationId = deliveryActivationId(config, deps);
+  const activatedAtMs = timestampMs(queue.activation?.activatedAt);
+  const activationMatches = queue.activation?.id === activationId && activatedAtMs != null;
+  const staleItems = activationMatches
+    ? queue.items.filter((item) => !itemMatchesActivation(item, activationId, activatedAtMs))
+    : queue.items;
+  const staleIdentities = new Set(staleItems.map((item) => (
+    `${item.normalized?.channelId || ''}\0${item.normalized?.messageId || ''}`
+  )));
+  const eligibleItems = activationMatches
+    ? queue.items.filter((item) => itemMatchesActivation(item, activationId, activatedAtMs))
+    : [];
+  const archived = [...queue.archived];
+  const archivedAt = new Date(currentTimeMs(deps)).toISOString();
+  for (const item of staleItems) {
+    archiveIdentity(
+      archived,
+      queue.completed,
+      item.normalized,
+      item.queuedAt,
+      archivedAt,
+    );
+  }
+  const headIdentity = queue.items[0]?.normalized;
+  const headWasArchived = headIdentity && staleIdentities.has(
+    `${headIdentity.channelId || ''}\0${headIdentity.messageId || ''}`,
+  );
+  const changed = queue.version !== DELIVERY_QUEUE_VERSION || !activationMatches || staleItems.length > 0;
+  if (!changed) return { queue, changed: false, archivedCount: 0 };
+  return {
+    queue: {
+      version: DELIVERY_QUEUE_VERSION,
+      activation: activationMatches
+        ? queue.activation
+        : { id: activationId, activatedAt: archivedAt },
+      items: eligibleItems,
+      completed: queue.completed,
+      archived,
+      blocked: !activationMatches || headWasArchived ? null : queue.blocked,
+    },
+    changed: true,
+    archivedCount: staleItems.length,
+  };
+}
+
 function queueDelivery(normalized, config = {}, deps = {}) {
-  const queue = readDeliveryQueue(config, deps);
+  const activated = activateDeliveryQueue(readDeliveryQueue(config, deps), config, deps);
+  const queue = activated.queue;
+  const activationId = queue.activation.id;
+  const activatedAtMs = timestampMs(queue.activation.activatedAt);
   const identity = { channelId: normalized.channelId, messageId: normalized.messageId };
+  if (sourcePredatesActivation(normalized, activatedAtMs)) {
+    archiveIdentity(
+      queue.archived,
+      queue.completed,
+      identity,
+      null,
+      new Date(currentTimeMs(deps)).toISOString(),
+    );
+    writeDeliveryQueue(queue, config, deps);
+    return { queue, enqueued: false, duplicate: 'archived' };
+  }
   const pendingDuplicate = queue.items.some((item) => sameDiscordIdentity(item.normalized, identity));
   const completedDuplicate = queue.completed.some((item) => sameDiscordIdentity(item, identity));
-  if (!pendingDuplicate && !completedDuplicate) {
-    queue.items.push({ version: 1, queuedAt: new Date().toISOString(), normalized });
+  const archivedDuplicate = queue.archived.some((item) => sameDiscordIdentity(item, identity));
+  if (!pendingDuplicate && !completedDuplicate && !archivedDuplicate) {
+    queue.items.push({
+      version: DELIVERY_QUEUE_VERSION,
+      activationId,
+      queuedAt: new Date(currentTimeMs(deps)).toISOString(),
+      normalized,
+    });
+    writeDeliveryQueue(queue, config, deps);
+  } else if (activated.changed) {
     writeDeliveryQueue(queue, config, deps);
   }
   return {
     queue,
-    enqueued: !pendingDuplicate && !completedDuplicate,
-    duplicate: completedDuplicate ? 'completed' : (pendingDuplicate ? 'pending' : null),
+    enqueued: !pendingDuplicate && !completedDuplicate && !archivedDuplicate,
+    duplicate: completedDuplicate
+      ? 'completed'
+      : (archivedDuplicate ? 'archived' : (pendingDuplicate ? 'pending' : null)),
   };
 }
 
@@ -366,7 +497,8 @@ function setQueueBlock(queue, reason, details, config, deps) {
 
 function completedQueue(queue, next) {
   return {
-    version: 1,
+    version: DELIVERY_QUEUE_VERSION,
+    activation: queue.activation,
     items: queue.items.slice(1),
     completed: [
       ...queue.completed,
@@ -376,6 +508,7 @@ function completedQueue(queue, next) {
         completedAt: new Date().toISOString(),
       },
     ],
+    archived: queue.archived,
     blocked: null,
   };
 }
@@ -421,10 +554,14 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
   let reconciledCount = 0;
   while (true) {
     const inspection = await withDeliveryQueueLock(config, deps, () => {
-      const queue = readDeliveryQueue(config, deps);
-      if (queue.items.length === 0) return { queue };
+      const persisted = readDeliveryQueue(config, deps);
       const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-      return receiverRejected ? { queue, receiverRejected } : { queue };
+      if (receiverRejected) return { queue: persisted, receiverRejected };
+      const activated = activateDeliveryQueue(persisted, config, deps);
+      const queue = activated.queue;
+      if (activated.changed) writeDeliveryQueue(queue, config, deps);
+      if (queue.items.length === 0) return { queue };
+      return { queue };
     });
     const snapshot = inspection.queue;
     if (inspection.receiverRejected) {
@@ -898,7 +1035,11 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       receiverVerification = verifyReceiverOwnership;
       if (!receiverActivated) {
         receiverActivated = true;
-        startupDrain = drainAutonomously('startup');
+        startupDrain = drainAutonomously('startup', { propagateErrors: true }).catch((error) => {
+          receiverActivated = false;
+          receiverVerification = null;
+          throw error;
+        });
       }
       return startupDrain;
     },
@@ -972,6 +1113,14 @@ function createDelivery(config, logger = () => {}, deps = {}) {
           envelope,
         };
       }
+      if (admission.queueResult.duplicate === 'archived') {
+        return {
+          status: 'duplicate',
+          reason: 'discord_message_archived_at_activation',
+          queueDepth: admission.queueResult.queue.items.length,
+          envelope,
+        };
+      }
       return {
         status: 'accepted',
         reason: admission.queueResult.enqueued
@@ -1003,13 +1152,15 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     },
   };
 
-  const drainAutonomously = (trigger) => {
+  const drainAutonomously = (trigger, options = {}) => {
     if (destroyed) return Promise.resolve({ status: 'idle', reason: 'delivery_destroyed' });
     const verifyReceiverOwnership = receiverVerification;
     if (!receiverActivated || typeof verifyReceiverOwnership !== 'function') {
       return Promise.resolve({ status: 'idle', reason: 'receiver_inactive' });
     }
-    return delivery.flush({ verifyReceiverOwnership }).catch((error) => {
+    const operation = delivery.flush({ verifyReceiverOwnership });
+    if (options.propagateErrors) return operation;
+    return operation.catch((error) => {
       logger('ERROR', 'Failed to drain Discord delivery queue automatically', {
         trigger,
         error: error instanceof Error ? error.message : String(error),

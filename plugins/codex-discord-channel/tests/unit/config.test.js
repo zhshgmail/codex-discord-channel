@@ -41,6 +41,23 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.cwd, '/workspace');
 });
 
+test('loadConfig derives delivery activation from the installed plugin root', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+  });
+
+  assert.equal(config.deliveryActivationId, path.resolve(__dirname, '..', '..'));
+});
+
+test('loadConfig accepts an explicit delivery activation id', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    CODEX_DISCORD_DELIVERY_ACTIVATION_ID: 'release-a',
+  });
+
+  assert.equal(config.deliveryActivationId, 'release-a');
+});
+
 test('loadConfig uses CODEX_HOME for instance state when configured', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-codex-home-'));

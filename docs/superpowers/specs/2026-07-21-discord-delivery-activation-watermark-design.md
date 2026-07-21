@@ -9,18 +9,21 @@ but it does not distinguish current-runtime pending input from stale backlog.
 
 ## Design
 
-The queue gains a durable activation record and an identity-only archive. The
-activation id defaults to the real installed plugin root and may be overridden
-with `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`. Versioned runtime installs therefore
-rotate activation automatically, while restarts of the same installed runtime
-retain the same activation.
+The queue gains a durable activation record with an id and timestamp plus an
+identity-only archive. The activation id defaults to the real installed plugin
+root and may be overridden with `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`.
+Versioned runtime installs therefore rotate activation automatically, while
+restarts of the same installed runtime retain the same activation.
 
-Before a receiver can claim authority or resolve a structured target, queue
-activation runs under the existing cross-process lock. A missing or changed
-activation archives every pending item and clears its delivery block. An item
-is eligible only when its stamped activation id exactly matches the current
-queue activation. Legacy, missing, or mismatched stamps are archived before
-target resolution.
+Receiver readiness probing is read-only. After authority is committed, queue
+activation runs under the existing cross-process lock and before a pending item
+can resolve a structured target. A missing or changed activation archives every
+pending item and clears its delivery block. An item is eligible only when its
+stamped activation id exactly matches the current queue activation and its
+queue timestamp is not older than activation. Discord source creation time is
+also checked when present, preventing a delayed historical event from being
+admitted after activation. Legacy, missing, mismatched, or pre-activation items
+are archived before target resolution.
 
 Archived entries retain only channel id, message id, original queue time,
 archive time, and disposition. Their message content is removed. Admission
@@ -30,10 +33,13 @@ cannot re-enter the queue after archival.
 New messages are stamped with the active id when atomically enqueued. A crash or
 restart in the same runtime may recover those items. A new runtime cannot
 deliver them unless an operator explicitly reuses the old activation override.
+Activation writes queue schema v2, which the previous runtime rejects rather
+than replaying after rollback.
 
 ## Failure Behavior
 
-- Queue activation or archival persistence failure prevents receiver startup.
+- Queue activation or archival persistence failure prevents receiver delivery.
+- A successor that fails before authority transfer does not mutate the queue.
 - Missing or malformed legacy activation metadata is stale, not eligible.
 - Archival performs no app-server request and cannot call `turn/start` or
   `turn/steer`.
