@@ -89,6 +89,7 @@ function readJsonLines(file) {
 }
 
 function processExists(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -143,6 +144,70 @@ async function mcpRequests(command, args, options, requests) {
   return requests.map((request) => responses.get(String(request.id)));
 }
 
+async function codexHostedMcpStatus(command, options) {
+  const child = spawn(command, ['app-server', '--stdio'], {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const pending = new Map();
+  let nextId = 1;
+  const exit = new Promise((resolve) => child.once('exit', resolve));
+
+  lines.on('line', (line) => {
+    const message = JSON.parse(line);
+    const request = pending.get(String(message.id));
+    if (!request) return;
+    pending.delete(String(message.id));
+    clearTimeout(request.timer);
+    if (message.error) request.reject(new Error(message.error.message));
+    else request.resolve(message.result);
+  });
+  child.once('error', (error) => {
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+  });
+  child.once('exit', (code, signal) => {
+    const error = new Error(`Codex app-server exited ${code ?? signal}: ${stderr}`);
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
+  });
+
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = nextId;
+    nextId += 1;
+    const timer = setTimeout(() => {
+      pending.delete(String(id));
+      reject(new Error(`Timed out waiting for Codex app-server ${method}: ${stderr}`));
+    }, 10000);
+    pending.set(String(id), { reject, resolve, timer });
+    child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
+  });
+
+  try {
+    await request('initialize', {
+      clientInfo: { name: 'codex_discord_channel_test', version: '0.1.0' },
+    });
+    child.stdin.write(`${JSON.stringify({ method: 'initialized' })}\n`);
+    return await request('mcpServerStatus/list', {});
+  } finally {
+    child.kill('SIGTERM');
+    const stopped = await Promise.race([
+      exit.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+    ]);
+    if (!stopped) {
+      child.kill('SIGKILL');
+      await exit;
+    }
+    lines.close();
+  }
+}
+
 test('real marketplace cache runs bundled MCP, CLI dependencies, and shared-session topology without npm', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex marketplace runtime with spaces '));
   let appServerPid = 0;
@@ -181,21 +246,58 @@ test('real marketplace cache runs bundled MCP, CLI dependencies, and shared-sess
 
   const mcpConfig = JSON.parse(fs.readFileSync(path.join(installedPath, '.mcp.json'), 'utf8'))
     .mcpServers['codex-discord-channel'];
-  assert.deepEqual(mcpConfig, {
-    cwd: '.',
-    command: 'node',
-    args: ['./runtime/mcp-server.cjs'],
-  });
   assert.equal(fs.existsSync(path.join(installedPath, 'runtime', 'mcp-server.cjs')), true);
   assert.equal(fs.existsSync(path.join(installedPath, 'runtime', 'channel-cli.cjs')), true);
   assert.equal(fs.existsSync(path.join(installedPath, 'bin', 'codex-discord-session')), true);
 
   const stateDir = path.join(root, 'isolated plugin state');
-  const runtimeEnv = {
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, '.env'),
+    'DISCORD_CHANNEL_DISABLE_LOGIN=1\n',
+    { mode: 0o600 },
+  );
+  const hostedEnv = {
     ...isolatedEnv,
-    DISCORD_CHANNEL_DISABLE_LOGIN: '1',
-    DISCORD_INSTANCE: 'isolated-runtime',
+    DISCORD_INSTANCE: 'codex01',
     DISCORD_STATE_DIR: stateDir,
+    NODE_PATH: '',
+  };
+  const hostedStatus = await codexHostedMcpStatus(realCodex, {
+    cwd: installedPath,
+    env: hostedEnv,
+  });
+  const hostedPlugin = hostedStatus.data.find((server) => server.name === 'codex-discord-channel');
+  assert.ok(hostedPlugin, 'real Codex host must discover the installed MCP server');
+  assert.ok(hostedPlugin.tools.discord_channel_status);
+  const hostedOwnerPath = path.join(stateDir, 'owner.json');
+  assert.equal(
+    fs.existsSync(hostedOwnerPath),
+    true,
+    'real Codex-hosted MCP must use the gateway/session Discord state binding',
+  );
+  assert.equal(JSON.parse(fs.readFileSync(hostedOwnerPath, 'utf8')).instance, 'codex01');
+  assert.equal(
+    fs.existsSync(path.join(codexHome, 'channels', 'discord', 'default', 'owner.json')),
+    false,
+    'real Codex-hosted MCP must not fall back to the default instance state',
+  );
+
+  assert.deepEqual(mcpConfig, {
+    cwd: '.',
+    command: 'node',
+    args: ['./runtime/mcp-server.cjs'],
+    env_vars: ['CODEX_HOME', 'DISCORD_INSTANCE', 'DISCORD_STATE_DIR'],
+  });
+  const noticesPath = path.join(installedPath, 'THIRD_PARTY_NOTICES.txt');
+  assert.equal(fs.existsSync(noticesPath), true, 'marketplace payload must include third-party notices');
+  assert.equal(
+    fs.readFileSync(noticesPath, 'utf8'),
+    fs.readFileSync(path.join(pluginRoot, 'THIRD_PARTY_NOTICES.txt'), 'utf8'),
+  );
+
+  const runtimeEnv = {
+    ...hostedEnv,
     HTTP_PROXY: 'http://127.0.0.1:1',
     HTTPS_PROXY: 'http://127.0.0.1:1',
     NO_PROXY: '',

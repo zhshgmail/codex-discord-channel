@@ -55,6 +55,7 @@ assert(
     cwd: '.',
     command: 'node',
     args: ['./runtime/mcp-server.cjs'],
+    env_vars: ['CODEX_HOME', 'DISCORD_INSTANCE', 'DISCORD_STATE_DIR'],
   }),
   'MCP server must run the committed relative bundle',
 );

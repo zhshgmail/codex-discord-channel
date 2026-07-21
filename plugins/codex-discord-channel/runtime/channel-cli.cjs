@@ -92446,7 +92446,7 @@ var require_owner_state = __commonJS({
 var require_session_launcher = __commonJS({
   "src/session-launcher.js"(exports2, module2) {
     "use strict";
-    var { spawn } = require("node:child_process"), fs = require("node:fs"), net = require("node:net"), path = require("node:path"), { AppServerRpcClient, endpointToWebSocket } = require_app_server_host(), { loadConfig: loadConfig2 } = require_config(), DEFAULT_POLL_MS = 100, DEFAULT_TIMEOUT_MS = 15e3, MAX_TIMEOUT_MS = 3e5;
+    var { spawn } = require("node:child_process"), { randomUUID } = require("node:crypto"), fs = require("node:fs"), net = require("node:net"), path = require("node:path"), { AppServerRpcClient, endpointToWebSocket } = require_app_server_host(), { loadConfig: loadConfig2 } = require_config(), DEFAULT_POLL_MS = 100, DEFAULT_TIMEOUT_MS = 15e3, MALFORMED_LOCK_STALE_MS = 1e3, MAX_TIMEOUT_MS = 3e5;
     function positiveInteger(value, fallback, label) {
       if (value === void 0 || value === "") return fallback;
       if (!/^\d+$/.test(String(value))) throw new Error(`${label} must be a positive integer.`);
@@ -92497,31 +92497,60 @@ var require_session_launcher = __commonJS({
     }
     function readLockOwner(lockPath) {
       try {
-        let value = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-        return Number(value.pid);
+        let recordPath = fs.statSync(lockPath).isDirectory() ? path.join(lockPath, "owner.json") : lockPath, value = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+        return !value || typeof value != "object" ? null : value;
       } catch {
-        return 0;
+        return null;
       }
+    }
+    function removeLockPath(lockPath) {
+      fs.rmSync(lockPath, { recursive: !0, force: !0 });
+    }
+    function tryReclaimStaleLock(lockPath) {
+      let ageMs;
+      try {
+        ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+      } catch (error) {
+        if (error.code === "ENOENT") return !0;
+        throw error;
+      }
+      let owner = readLockOwner(lockPath), ownerPid = Number(owner?.pid) || 0;
+      if (processExists(ownerPid) || !owner && ageMs < MALFORMED_LOCK_STALE_MS) return !1;
+      let stalePath = `${lockPath}.stale.${process.pid}.${randomUUID()}`;
+      try {
+        fs.renameSync(lockPath, stalePath);
+      } catch (error) {
+        return error.code === "ENOENT";
+      }
+      return removeLockPath(stalePath), !0;
     }
     function tryAcquireLock(lockPath) {
+      let owner = {
+        pid: process.pid,
+        token: randomUUID(),
+        startedAt: Date.now()
+      }, candidatePath = `${lockPath}.candidate.${owner.pid}.${owner.token}`;
+      fs.writeFileSync(candidatePath, `${JSON.stringify(owner)}
+`, { flag: "wx", mode: 384 });
       try {
-        let descriptor = fs.openSync(lockPath, "wx", 384);
-        return fs.writeFileSync(descriptor, `${JSON.stringify({ pid: process.pid, startedAt: Date.now() })}
-`), fs.closeSync(descriptor), !0;
+        fs.linkSync(candidatePath, lockPath);
       } catch (error) {
+        try {
+          fs.unlinkSync(candidatePath);
+        } catch {
+        }
         if (error.code !== "EEXIST") throw error;
-        let ownerPid = readLockOwner(lockPath);
-        if (!processExists(ownerPid))
-          try {
-            fs.unlinkSync(lockPath);
-          } catch (unlinkError) {
-            if (unlinkError.code !== "ENOENT") return !1;
-          }
-        return !1;
+        return tryReclaimStaleLock(lockPath), null;
       }
+      try {
+        fs.unlinkSync(candidatePath);
+      } catch {
+      }
+      return owner;
     }
-    function releaseLock(lockPath) {
-      if (readLockOwner(lockPath) === process.pid)
+    function releaseLock(lockPath, expectedOwner) {
+      let owner = readLockOwner(lockPath);
+      if (!(owner?.pid !== expectedOwner.pid || owner?.token !== expectedOwner.token))
         try {
           fs.unlinkSync(lockPath);
         } catch (error) {
@@ -92592,7 +92621,8 @@ var require_session_launcher = __commonJS({
         timeoutMs
       } = options, { socketPath } = endpointToWebSocket(endpoint), stateDir = path.dirname(socketPath), lockPath = path.join(stateDir, "app-server.start.lock"), pidPath = path.join(stateDir, "app-server.pid"), deadline = Date.now() + timeoutMs;
       if (fs.mkdirSync(stateDir, { recursive: !0, mode: 448 }), await protocolReady(endpoint, Math.min(timeoutMs, 500))) return { endpoint, started: !1 };
-      for (; !tryAcquireLock(lockPath); ) {
+      let lockOwner = null;
+      for (; !(lockOwner = tryAcquireLock(lockPath)); ) {
         if (await protocolReady(endpoint, Math.min(Math.max(1, deadline - Date.now()), 500)))
           return { endpoint, started: !1 };
         if (Date.now() >= deadline) throw new Error(`Timed out waiting for app-server startup at ${endpoint}.`);
@@ -92621,7 +92651,7 @@ var require_session_launcher = __commonJS({
           }
         throw error;
       } finally {
-        releaseLock(lockPath);
+        releaseLock(lockPath, lockOwner);
       }
     }
     async function launchVisibleSession(codexBin, endpoint, args, env) {

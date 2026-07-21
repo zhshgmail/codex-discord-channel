@@ -1,6 +1,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
@@ -9,6 +10,7 @@ const { loadConfig } = require('./config');
 
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_TIMEOUT_MS = 15000;
+const MALFORMED_LOCK_STALE_MS = 1000;
 const MAX_TIMEOUT_MS = 300000;
 
 function positiveInteger(value, fallback, label) {
@@ -78,35 +80,73 @@ function processExists(pid) {
 
 function readLockOwner(lockPath) {
   try {
-    const value = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    return Number(value.pid);
+    const recordPath = fs.statSync(lockPath).isDirectory()
+      ? path.join(lockPath, 'owner.json')
+      : lockPath;
+    const value = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
+    if (!value || typeof value !== 'object') return null;
+    return value;
   } catch {
-    return 0;
+    return null;
   }
+}
+
+function removeLockPath(lockPath) {
+  fs.rmSync(lockPath, { recursive: true, force: true });
+}
+
+function tryReclaimStaleLock(lockPath) {
+  let ageMs;
+  try {
+    ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+  } catch (error) {
+    if (error.code === 'ENOENT') return true;
+    throw error;
+  }
+
+  const owner = readLockOwner(lockPath);
+  const ownerPid = Number(owner?.pid) || 0;
+  if (processExists(ownerPid)) return false;
+  if (!owner && ageMs < MALFORMED_LOCK_STALE_MS) return false;
+
+  const stalePath = `${lockPath}.stale.${process.pid}.${randomUUID()}`;
+  try {
+    fs.renameSync(lockPath, stalePath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return true;
+    return false;
+  }
+  removeLockPath(stalePath);
+  return true;
 }
 
 function tryAcquireLock(lockPath) {
+  const owner = {
+    pid: process.pid,
+    token: randomUUID(),
+    startedAt: Date.now(),
+  };
+  const candidatePath = `${lockPath}.candidate.${owner.pid}.${owner.token}`;
+  fs.writeFileSync(candidatePath, `${JSON.stringify(owner)}\n`, { flag: 'wx', mode: 0o600 });
   try {
-    const descriptor = fs.openSync(lockPath, 'wx', 0o600);
-    fs.writeFileSync(descriptor, `${JSON.stringify({ pid: process.pid, startedAt: Date.now() })}\n`);
-    fs.closeSync(descriptor);
-    return true;
+    fs.linkSync(candidatePath, lockPath);
   } catch (error) {
+    try {
+      fs.unlinkSync(candidatePath);
+    } catch {}
     if (error.code !== 'EEXIST') throw error;
-    const ownerPid = readLockOwner(lockPath);
-    if (!processExists(ownerPid)) {
-      try {
-        fs.unlinkSync(lockPath);
-      } catch (unlinkError) {
-        if (unlinkError.code !== 'ENOENT') return false;
-      }
-    }
-    return false;
+    tryReclaimStaleLock(lockPath);
+    return null;
   }
+  try {
+    fs.unlinkSync(candidatePath);
+  } catch {}
+  return owner;
 }
 
-function releaseLock(lockPath) {
-  if (readLockOwner(lockPath) !== process.pid) return;
+function releaseLock(lockPath, expectedOwner) {
+  const owner = readLockOwner(lockPath);
+  if (owner?.pid !== expectedOwner.pid || owner?.token !== expectedOwner.token) return;
   try {
     fs.unlinkSync(lockPath);
   } catch (error) {
@@ -207,7 +247,8 @@ async function ensureSharedAppServer(options) {
 
   if (await protocolReady(endpoint, Math.min(timeoutMs, 500))) return { endpoint, started: false };
 
-  while (!tryAcquireLock(lockPath)) {
+  let lockOwner = null;
+  while (!(lockOwner = tryAcquireLock(lockPath))) {
     if (await protocolReady(endpoint, Math.min(Math.max(1, deadline - Date.now()), 500))) {
       return { endpoint, started: false };
     }
@@ -243,7 +284,7 @@ async function ensureSharedAppServer(options) {
     }
     throw error;
   } finally {
-    releaseLock(lockPath);
+    releaseLock(lockPath, lockOwner);
   }
 }
 

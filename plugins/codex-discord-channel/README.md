@@ -61,9 +61,11 @@ migration and acceptance boundary.
 ## Installed Runtime
 
 `.mcp.json` invokes `node ./runtime/mcp-server.cjs` from the installed plugin
-root. `bin/codex-discord-channel` and `bin/codex-discord-session` are
-dependency-free loaders for `runtime/channel-cli.cjs`. Both committed bundles
-include `ws`, `discord.js`, and `undici`; only `node:*` modules remain external.
+root and asks Codex to pass through `CODEX_HOME`, `DISCORD_INSTANCE`, and
+`DISCORD_STATE_DIR` from the gateway/session environment. The executable shims
+are dependency-free loaders for `runtime/channel-cli.cjs`. Both committed
+bundles include `ws`, `discord.js`, and `undici`; only `node:*` modules remain
+external. `THIRD_PARTY_NOTICES.txt` retains their required license notices.
 
 Marketplace installation copies those files directly. It runs no `npm install`
 and no lifecycle hooks, and the installed cache contains no `node_modules`.
