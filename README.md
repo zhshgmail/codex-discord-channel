@@ -14,8 +14,9 @@ marketplace at `.agents/plugins/marketplace.json`.
 - Keeps `owner.json` for status and handoff metadata only; thread or session ids
   never gate individual Discord messages.
 - Persists accepted messages in a cross-process locked, deduplicated FIFO.
-- Sends one queued message at a time through `turn/start` on the shared Codex
-  app-server used by the visible TUI.
+- Sends one queued message at a time through `turn/start` when idle or
+  `turn/steer` when an exact active turn is known on the shared Codex app-server
+  used by the visible TUI.
 - Exposes MCP tools for status, owner metadata, bounded history, and replies.
 
 There is no terminal-input delivery path. If the visible TUI is not attached to
@@ -53,12 +54,14 @@ have one provable top-level TUI thread. After `/clear` or another thread
 rotation, the latest top-level `thread/started` notification becomes the
 current target even while an older subscribed thread is still loaded.
 
-While the current thread is active, messages stay FIFO queued. Each drain that
-proves the current thread idle admits at most one `turn/start`; a later item
-waits for a subsequent drain to prove the thread idle again. The request
-includes a stable Discord client message id and untrusted Discord context, but
-omits model, reasoning effort, service tier, personality, sandbox, cwd, and
-approval overrides.
+Each drain admits at most one FIFO item. An idle target uses `turn/start`; an
+active target with a notification-proven current turn uses `turn/steer` with an
+exact turn-id precondition. Active turns whose identity is not known remain
+`thread_busy`. Turn-start and active-turn notifications wake another serialized
+drain, so automatic goal continuations cannot indefinitely win every idle
+boundary. Requests include a stable Discord client message id and untrusted
+Discord context, but omit model, reasoning effort, service tier, personality,
+sandbox, cwd, and approval overrides.
 
 Queue completion is committed only after structured acceptance. If an
 acknowledgement is lost, replay is blocked. The gateway reconciles the stable

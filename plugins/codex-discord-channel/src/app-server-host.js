@@ -388,6 +388,7 @@ class AppServerHost extends EventEmitter {
     this.currentThreadId = '';
     this.threadSelectionRevision = 0;
     this.threadStatuses = new Map();
+    this.activeTurnIds = new Map();
     this.onNotification = (notification) => {
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
@@ -399,12 +400,37 @@ class AppServerHost extends EventEmitter {
         }
         return;
       }
+      if (notification?.method === 'turn/started') {
+        const threadId = notification.params?.threadId;
+        const turnId = notification.params?.turn?.id;
+        if (!threadId || !turnId) return;
+        this.threadStatuses.set(threadId, 'active');
+        this.activeTurnIds.set(threadId, turnId);
+        if (threadId === this.currentThreadId) {
+          this.threadSelectionRevision += 1;
+          this.emit('active', { threadId, turnId });
+        }
+        return;
+      }
+      if (notification?.method === 'turn/completed') {
+        const threadId = notification.params?.threadId;
+        const turnId = notification.params?.turn?.id;
+        if (!threadId) return;
+        if (!turnId || this.activeTurnIds.get(threadId) === turnId) {
+          this.activeTurnIds.delete(threadId);
+        }
+        if (threadId === this.currentThreadId) this.threadSelectionRevision += 1;
+        return;
+      }
       if (
         notification?.method === 'thread/status/changed' &&
         notification.params?.threadId
       ) {
         const { threadId, status } = notification.params;
-        this.threadStatuses.set(threadId, status?.type || 'unavailable');
+        const statusType = status?.type || 'unavailable';
+        this.threadStatuses.set(threadId, statusType);
+        if (statusType === 'idle') this.activeTurnIds.delete(threadId);
+        if (threadId === this.currentThreadId) this.threadSelectionRevision += 1;
         if (threadId === this.currentThreadId && status?.type === 'idle') {
           this.emit('idle', { threadId });
         }
@@ -415,6 +441,7 @@ class AppServerHost extends EventEmitter {
         if (!threadId) return;
         this.threadSelectionRevision += 1;
         this.threadStatuses.delete(threadId);
+        this.activeTurnIds.delete(threadId);
         if (this.currentThreadId === threadId) {
           this.currentThreadId = '';
         }
@@ -425,6 +452,7 @@ class AppServerHost extends EventEmitter {
       this.threadSelectionRevision += 1;
       this.currentThreadId = '';
       this.threadStatuses.clear();
+      this.activeTurnIds.clear();
       this.lastStatus = this.client.status();
       const reconnected = this.lastStatus.available && (this.connectionWasLost || event?.recovered);
       if (this.lastStatus.available) {
@@ -548,11 +576,11 @@ class AppServerHost extends EventEmitter {
       [{ threadId, response }] = topLevelThreads;
     }
 
-    if (!response) {
+    if (!response || response?.thread?.status?.type === 'active') {
       try {
         response = await requestForTarget('thread/read', {
           threadId,
-          includeTurns: false,
+          includeTurns: true,
         });
       } catch (error) {
         if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
@@ -576,8 +604,22 @@ class AppServerHost extends EventEmitter {
     }
     this.currentThreadId = thread.id;
     this.threadStatuses.set(thread.id, status);
+    if (status === 'active') {
+      const inProgressTurnIds = (Array.isArray(thread.turns) ? thread.turns : [])
+        .filter((turn) => turn?.status === 'inProgress' && typeof turn.id === 'string' && turn.id)
+        .map((turn) => turn.id);
+      if (inProgressTurnIds.length === 1) {
+        this.activeTurnIds.set(thread.id, inProgressTurnIds[0]);
+      } else {
+        this.activeTurnIds.delete(thread.id);
+      }
+    } else {
+      this.activeTurnIds.delete(thread.id);
+    }
     this.lastStatus = { configured: true, available: true, reason: null };
     const target = { available: true, threadId: thread.id, status };
+    const activeTurnId = status === 'active' ? this.activeTurnIds.get(thread.id) : '';
+    if (activeTurnId) target.activeTurnId = activeTurnId;
     Object.defineProperty(target, TARGET_GENERATION, {
       value: Object.freeze({ connectionGeneration, threadSelectionRevision }),
     });
@@ -587,30 +629,38 @@ class AppServerHost extends EventEmitter {
   async startTurn(params, target) {
     const generation = target?.[TARGET_GENERATION];
     const validateTarget = () => {
+      const statusChanged = target?.status === 'active'
+        ? !target.activeTurnId || this.activeTurnIds.get(params.threadId) !== target.activeTurnId
+        : this.threadStatuses.get(params.threadId) !== 'idle';
       if (
         !generation ||
         generation.threadSelectionRevision !== this.threadSelectionRevision ||
         target.threadId !== params.threadId ||
-        this.currentThreadId !== params.threadId
+        this.currentThreadId !== params.threadId ||
+        statusChanged
       ) {
         throw deliveryError(
-          'The current app-server thread changed before turn/start.',
+          'The current app-server thread changed before structured turn submission.',
           'shared_app_server_thread_changed',
         );
       }
     };
     validateTarget();
+    const method = target.status === 'active' ? 'turn/steer' : 'turn/start';
+    const requestParams = target.status === 'active'
+      ? { ...params, expectedTurnId: target.activeTurnId }
+      : params;
     if (typeof this.client.requestOnConnection === 'function') {
       const response = await this.client.requestOnConnection(
-        'turn/start',
-        params,
+        method,
+        requestParams,
         generation.connectionGeneration,
         validateTarget,
         true,
       );
       return response.result;
     }
-    return this.client.request('turn/start', params);
+    return this.client.request(method, requestParams);
   }
 
   async hasDelivered(threadId, clientUserMessageId) {
@@ -645,6 +695,11 @@ class AppServerHost extends EventEmitter {
   onThreadIdle(listener) {
     this.on('idle', listener);
     return () => this.off('idle', listener);
+  }
+
+  onThreadActive(listener) {
+    this.on('active', listener);
+    return () => this.off('active', listener);
   }
 
   onReconnect(listener) {

@@ -1,10 +1,12 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { createAppServerHost } = require('../../src/app-server-host');
 const {
   createDelivery,
   escapeAttr,
@@ -61,8 +63,10 @@ function activeReceiver() {
 function structuredFixture(overrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-delivery-'));
   const requests = [];
+  const submittedTargets = [];
   let target = { available: true, threadId: 'thread-current', status: 'idle' };
   let idleListener = null;
+  let activeListener = null;
   let ttyCalls = 0;
   const host = {
     async resolveTarget() {
@@ -71,8 +75,9 @@ function structuredFixture(overrides = {}) {
       }
       return { ...target };
     },
-    async startTurn(params) {
+    async startTurn(params, resolvedTarget) {
       requests.push(params);
+      submittedTargets.push(resolvedTarget);
       if (typeof overrides.onStartTurn === 'function') {
         return overrides.onStartTurn(params, {
           getTarget: () => ({ ...target }),
@@ -91,6 +96,12 @@ function structuredFixture(overrides = {}) {
       idleListener = listener;
       return () => {
         if (idleListener === listener) idleListener = null;
+      };
+    },
+    onThreadActive(listener) {
+      activeListener = listener;
+      return () => {
+        if (activeListener === listener) activeListener = null;
       };
     },
     status() {
@@ -112,11 +123,16 @@ function structuredFixture(overrides = {}) {
     delivery,
     dir,
     requests,
+    submittedTargets,
     get ttyCalls() { return ttyCalls; },
     setTarget(next) { target = { ...next }; },
     async emitIdle() {
       assert.equal(typeof idleListener, 'function');
       return idleListener();
+    },
+    async emitActive() {
+      assert.equal(typeof activeListener, 'function');
+      return activeListener();
     },
   };
 }
@@ -327,6 +343,82 @@ test('busy target drains one FIFO item per idle transition and dynamically follo
   const drained = readQueue(fixture.dir);
   assert.deepEqual(drained.items, []);
   assert.deepEqual(drained.completed.map((item) => item.messageId), ['m1', 'm2']);
+});
+
+test('startup and reconnect recover an active goal turn and steer the persisted queue', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-active-recovery-'));
+  writePendingQueue(dir, [discordMessage('m-startup-goal', 'startup goal input')]);
+  const client = new EventEmitter();
+  const requests = [];
+  let available = true;
+  let activeTurnId = 'goal-continuation-startup';
+  client.status = () => ({
+    configured: true,
+    available,
+    reason: available ? null : 'shared_app_server_disconnected',
+  });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    if (!available) {
+      const error = new Error('disconnected');
+      error.code = 'shared_app_server_disconnected';
+      throw error;
+    }
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-goal'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: [{ id: activeTurnId, status: 'inProgress', items: [] }],
+        },
+      };
+    }
+    if (method === 'turn/steer') return { turnId: params.expectedTurnId };
+    throw new Error(`unexpected method ${method}`);
+  };
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, { structuredHost: host });
+
+  await delivery.activateReceiver(activeReceiver);
+
+  let steerRequests = requests.filter((request) => request.method === 'turn/steer');
+  assert.deepEqual(steerRequests.map((request) => request.params.expectedTurnId), [
+    'goal-continuation-startup',
+  ]);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-startup-goal']);
+
+  available = false;
+  client.emit('connectionChanged', { generation: 2 });
+  const queued = await delivery.deliver(discordMessage('m-reconnect-goal', 'reconnect goal input'));
+  assert.equal(queued.status, 'queued');
+  assert.equal(queued.reason, 'shared_app_server_disconnected');
+
+  activeTurnId = 'goal-continuation-reconnect';
+  available = true;
+  client.emit('connectionChanged', { generation: 3 });
+  for (let attempt = 0; attempt < 20 && readQueue(dir).items.length > 0; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  steerRequests = requests.filter((request) => request.method === 'turn/steer');
+  assert.deepEqual(steerRequests.map((request) => request.params.expectedTurnId), [
+    'goal-continuation-startup',
+    'goal-continuation-reconnect',
+  ]);
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), [
+    'm-startup-goal',
+    'm-reconnect-goal',
+  ]);
+  delivery.destroy();
 });
 
 test('missing shared app-server fails closed, persists FIFO, and never calls a TTY seam', async () => {

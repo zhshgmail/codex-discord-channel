@@ -64,17 +64,25 @@ other thread rotation to move delivery even when an older gateway-subscribed
 thread remains loaded. Subagent threads are never selected. Without a provable
 current thread, delivery fails closed.
 
-## FIFO And Busy State
+## FIFO And Active Turns
 
 Every accepted Discord event is persisted before target resolution. Queue
 mutations use a process-safe lock and deduplicate pending and completed Discord
 identities.
 
-An active target records `thread_busy`. A drain that proves the target idle may
-accept only the queue head. Once `turn/start` is acknowledged, that item is
-committed complete and the drain stops. A later item waits for a subsequent
-drain to prove the thread idle again, preventing two turns from racing on one
-thread.
+Each drain may accept only the queue head. A proven idle target uses
+`turn/start`. A target with an exact active turn uses `turn/steer` and supplies
+that turn id as `expectedTurnId`; the precondition rejects a stale continuation
+without attaching input to another turn. Notifications track live turn changes,
+while startup and reconnect recover exactly one `inProgress` turn id from
+`thread/read` with turns included. Active targets whose turn identity is absent
+or ambiguous record `thread_busy`. `turn/started` wakes the serialized drain, so
+a goal continuation that wins an idle-boundary race becomes the bounded delivery
+target instead of starving the FIFO. The active turn id is a request precondition
+only, not receiver ownership or session binding.
+
+Once either structured request is acknowledged, that item is committed complete
+and the drain stops. Later items retain FIFO order and wait for another drain.
 
 The gateway also inspects the durable queue periodically. Missing endpoints,
 missing loaded threads, busy threads, and stale receiver authority retain the
@@ -90,6 +98,7 @@ The request contains only:
 - `threadId`
 - one sanitized text input containing the Discord envelope
 - a stable `clientUserMessageId`
+- `expectedTurnId` only for `turn/steer`
 
 Network text controls are represented as printable escape text. The request
 does not contain model, reasoning effort, summary, service tier, personality,
@@ -98,15 +107,15 @@ thread settings remain authoritative.
 
 ## Acknowledgement And Deduplication
 
-A successful `turn/start` response is the acceptance boundary. If the request
-is known to be rejected or was not sent, the queue head remains retryable. If
-the connection or timeout makes acceptance uncertain, the FIFO is blocked as
-`structured_ack_uncertain`.
+A successful `turn/start` or `turn/steer` response is the acceptance boundary.
+If the request is known to be rejected or was not sent, the queue head remains
+retryable. If the connection or timeout makes acceptance uncertain, the FIFO is
+blocked as `structured_ack_uncertain`.
 
 The stable client user message id is echoed by the app-server on the persisted
 user item. Before clearing an uncertain block, the gateway reads the target
 thread and proves that id already exists. It then commits completion without a
-second `turn/start`. If proof is unavailable, the block remains.
+second structured submission. If proof is unavailable, the block remains.
 
 ## Live Acceptance
 
@@ -116,7 +125,8 @@ After release installation and operator-approved process migration:
 2. confirm status reports structured availability and Discord startup;
 3. send one allowed Discord message and observe its structured turn in the
    exact visible TUI;
-4. send while busy and confirm FIFO delivery after idle;
+4. start `/goal`, send while its continuation is active, and confirm
+   `turn/steer` attaches the FIFO head to that exact turn before it becomes idle;
 5. rotate the thread with `/clear` and confirm the next message targets the new
    visible thread; and
 6. confirm no model or reasoning setting changes.

@@ -564,9 +564,14 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
     } catch (error) {
       target = unavailableTarget(error);
     }
+    const targetAcceptsInput = target?.status === 'idle' || (
+      target?.status === 'active' &&
+      typeof target.activeTurnId === 'string' &&
+      target.activeTurnId !== ''
+    );
     const targetReason = target?.available === false
       ? (target.reason || 'shared_app_server_unavailable')
-      : (target?.status === 'idle' ? '' : 'thread_busy');
+      : (targetAcceptsInput ? '' : 'thread_busy');
     if (targetReason) {
       const blocked = await withDeliveryQueueLock(config, deps, () => {
         const queue = readDeliveryQueue(config, deps);
@@ -696,7 +701,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         reason: 'turn_accepted',
         deliveredCount: reconciledCount + 1,
         queueDepth: committed.queueDepth,
-        turnId: response?.turn?.id || null,
+        turnId: response?.turn?.id || response?.turnId || null,
       };
     } catch (error) {
       try {
@@ -777,6 +782,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let drainOperations = Promise.resolve();
   let destroyed = false;
   let unsubscribeIdle = null;
+  let unsubscribeActive = null;
   let unsubscribeReconnect = null;
   let unsubscribeThreadClosed = null;
   let startupDrain = Promise.resolve();
@@ -989,6 +995,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       receiverActivated = false;
       receiverVerification = null;
       if (typeof unsubscribeIdle === 'function') unsubscribeIdle();
+      if (typeof unsubscribeActive === 'function') unsubscribeActive();
       if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
       if (typeof unsubscribeThreadClosed === 'function') unsubscribeThreadClosed();
       clearLeaseWake();
@@ -1015,6 +1022,9 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   };
   unsubscribeIdle = typeof host.onThreadIdle === 'function'
     ? host.onThreadIdle(() => drainAutonomously('thread_idle'))
+    : null;
+  unsubscribeActive = typeof host.onThreadActive === 'function'
+    ? host.onThreadActive(() => drainAutonomously('thread_active'))
     : null;
   unsubscribeReconnect = typeof host.onReconnect === 'function'
     ? host.onReconnect(() => drainAutonomously('reconnect'))

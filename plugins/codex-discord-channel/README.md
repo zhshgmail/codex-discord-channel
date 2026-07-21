@@ -18,14 +18,15 @@ channel and message id. Inbound delivery uses only a shared app-server endpoint.
 The default is `unix://<state-dir>/app-server.sock`; an explicit
 `CODEX_DISCORD_APP_SERVER_URL` may use `unix://`, `ws://`, or `wss://`.
 
-The gateway dynamically resolves the current top-level loaded TUI thread,
-tracks `thread/started` rotation, queues while the thread is active, and sends
-at most one FIFO item per drain that proves the thread idle with `turn/start`.
-Turn payloads omit model, reasoning effort, service tier, personality, cwd,
-sandbox, and approval overrides; Discord metadata is carried only in the
-sanitized text envelope. Lost acknowledgements are reconciled by the echoed
-client user message id before completion, so the gateway does not replay
-speculatively.
+The gateway dynamically resolves the current top-level loaded TUI thread and
+tracks thread rotation plus active turn identity. It sends at most one FIFO item
+per drain: `turn/start` for an idle target, or `turn/steer` with an exact active
+turn precondition when a goal continuation or other turn is already running.
+Unknown active-turn identity remains `thread_busy`. Turn payloads omit model,
+reasoning effort, service tier, personality, cwd, sandbox, and approval
+overrides; Discord metadata is carried only in the sanitized text envelope.
+Lost acknowledgements are reconciled by the echoed client user message id
+before completion, so the gateway does not replay speculatively.
 
 The standalone gateway checks the durable queue periodically as well as on
 app-server recovery events. A nonempty blocked queue retries with exponential

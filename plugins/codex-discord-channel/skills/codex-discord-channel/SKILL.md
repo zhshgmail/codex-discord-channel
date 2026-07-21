@@ -15,8 +15,9 @@ description: Use when inspecting or managing the Discord channel plugin, its per
   thread id as a per-message receive gate.
 - Accepted events are persisted in a cross-process locked FIFO and deduplicated
   by Discord channel and message id.
-- Inbound delivery uses only a shared app-server endpoint and `turn/start` on a
-  dynamically resolved current top-level thread.
+- Inbound delivery uses only a shared app-server endpoint and a dynamically
+  resolved current top-level thread: `turn/start` while idle, or `turn/steer`
+  with an exact active turn precondition.
 - There is no terminal-input fallback. Missing or ambiguous structured state is
   unavailable and leaves the FIFO queued.
 
@@ -84,9 +85,12 @@ must expose one provable top-level loaded thread. The latest top-level
 `thread/started` notification replaces it after thread rotation. Subagents are
 never targets.
 
-Busy threads retain the FIFO. One idle transition accepts at most one queue
-head, and the next item waits for the next idle transition. Turn requests omit
-model, reasoning effort, service tier, personality, cwd, sandbox, permissions,
+Each drain accepts at most one FIFO head. Idle targets use `turn/start`; active
+targets use `turn/steer` only with an exact turn id observed from app-server
+notifications or recovered from `thread/read` during startup and reconnect.
+Unknown or ambiguous active-turn identity remains `thread_busy`, while a new
+`turn/started` notification wakes the serialized drain. Requests omit model,
+reasoning effort, service tier, personality, cwd, sandbox, permissions,
 collaboration mode, and approval overrides.
 
 If acknowledgement is uncertain, automatic replay stops. Reconciliation must

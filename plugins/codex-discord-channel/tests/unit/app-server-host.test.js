@@ -1083,6 +1083,53 @@ test('startTurn forwards only the structured caller payload', async () => {
   assert.deepEqual(client.requests, [{ method: 'turn/start', params }]);
 });
 
+test('active goal turn recovered from thread/read accepts input with an exact turn precondition', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-goal'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: [{
+            id: 'goal-continuation-2',
+            status: 'inProgress',
+            items: [],
+          }],
+        },
+      };
+    }
+    assert.equal(method, 'turn/steer');
+    return { turnId: params.expectedTurnId };
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  const target = await host.resolveTarget();
+  assert.equal(
+    client.requests.filter((request) => request.method === 'thread/read').at(-1).params.includeTurns,
+    true,
+  );
+  assert.equal(target.activeTurnId, 'goal-continuation-2');
+  client.requests.length = 0;
+  const params = {
+    threadId: 'thread-goal',
+    clientUserMessageId: 'discord:c1:m-goal',
+    input: [{ type: 'text', text: 'prioritize this input' }],
+  };
+
+  assert.deepEqual(await host.startTurn(params, target), { turnId: 'goal-continuation-2' });
+  assert.deepEqual(client.requests, [{
+    method: 'turn/steer',
+    params: {
+      ...params,
+      expectedTurnId: 'goal-continuation-2',
+    },
+  }]);
+});
+
 test('startTurn rejects a resolved target after a newer thread generation is selected', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
