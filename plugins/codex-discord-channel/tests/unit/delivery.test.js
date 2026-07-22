@@ -850,6 +850,30 @@ test('startup and reconnect recover an active goal turn and steer the persisted 
   delivery.destroy();
 });
 
+test('system-error top-level target starts a recovery turn instead of blocking the queue', async () => {
+  const fixture = structuredFixture();
+  fixture.setTarget({
+    available: true,
+    threadId: 'thread-recoverable',
+    status: 'systemError',
+  });
+
+  const result = await fixture.delivery.deliver(
+    discordMessage('m-system-error', 'continue after the failed turn'),
+  );
+
+  assert.equal(result.status, 'delivered');
+  assert.deepEqual(fixture.requests.map((request) => request.clientUserMessageId), [
+    'discord:c1:m-system-error',
+  ]);
+  assert.equal(fixture.submittedTargets[0].threadId, 'thread-recoverable');
+  assert.equal(fixture.submittedTargets[0].status, 'systemError');
+  assert.deepEqual(readQueue(fixture.dir).items, []);
+  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), [
+    'm-system-error',
+  ]);
+});
+
 test('missing shared app-server fails closed, persists FIFO, and never calls a TTY seam', async () => {
   const fixture = structuredFixture({
     resolveTarget: async () => ({

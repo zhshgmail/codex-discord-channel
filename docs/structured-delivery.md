@@ -93,8 +93,10 @@ If the activation or archive cannot be persisted, receiver activation fails and
 the gateway does not continue as an inbound receiver.
 
 Each drain may accept only the queue head. A proven idle target uses
-`turn/start`. A target with an exact active turn uses `turn/steer` and supplies
-that turn id as `expectedTurnId`; the precondition rejects a stale continuation
+`turn/start`. A proven top-level `systemError` target also uses `turn/start` to
+begin the next turn after the failed one; an active subagent never becomes the
+target. A target with an exact active turn uses `turn/steer` and supplies that
+turn id as `expectedTurnId`; the precondition rejects a stale continuation
 without attaching input to another turn. Notifications track live turn changes,
 while startup and reconnect recover exactly one `inProgress` turn id from
 `thread/read` with turns included. Active targets whose turn identity is absent

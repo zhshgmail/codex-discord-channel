@@ -704,7 +704,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
     } catch (error) {
       target = unavailableTarget(error);
     }
-    const targetAcceptsInput = target?.status === 'idle' || (
+    const targetAcceptsInput = ['idle', 'systemError'].includes(target?.status) || (
       target?.status === 'active' &&
       typeof target.activeTurnId === 'string' &&
       target.activeTurnId !== ''

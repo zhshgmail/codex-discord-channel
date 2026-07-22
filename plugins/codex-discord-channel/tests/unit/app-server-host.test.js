@@ -209,6 +209,87 @@ test('fresh recovery selects the unique top-level root among loaded subagent thr
   );
 });
 
+test('system-error root remains the structured target while a subagent is active', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-child', 'thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      const child = params.threadId === 'thread-child';
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: child ? 'thread-root' : null,
+          status: child
+            ? { type: 'active', activeFlags: [] }
+            : { type: 'systemError' },
+          turns: child
+            ? [{ id: 'child-turn', status: 'inProgress', items: [] }]
+            : [],
+        },
+      };
+    }
+    if (method === 'turn/start') return { turn: { id: 'root-recovery-turn' } };
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  const target = await host.resolveTarget();
+  assert.deepEqual(target, {
+    available: true,
+    threadId: 'thread-root',
+    status: 'systemError',
+  });
+
+  client.requests.length = 0;
+  const params = {
+    threadId: 'thread-root',
+    clientUserMessageId: 'discord:c1:m-recover-root',
+    input: [{ type: 'text', text: 'recover the owner thread' }],
+  };
+  assert.deepEqual(await host.startTurn(params, target), {
+    turn: { id: 'root-recovery-turn' },
+  });
+  assert.deepEqual(client.requests, [{ method: 'turn/start', params }]);
+});
+
+test('system-error recovery fails closed when the root status changes before submission', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'systemError' },
+        },
+      };
+    }
+    if (method === 'turn/start') return { turn: { id: 'must-not-start' } };
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  const target = await host.resolveTarget();
+
+  client.emit('notification', {
+    method: 'thread/status/changed',
+    params: { threadId: 'thread-root', status: { type: 'idle' } },
+  });
+
+  await assert.rejects(
+    host.startTurn({
+      threadId: 'thread-root',
+      clientUserMessageId: 'discord:c1:m-stale-system-error',
+      input: [{ type: 'text', text: 'stale recovery' }],
+    }, target),
+    (error) => error.code === 'shared_app_server_thread_changed' &&
+      error.deliveryOutcome === 'not_sent',
+  );
+  assert.equal(client.requests.some((request) => request.method === 'turn/start'), false);
+});
+
 test('fresh recovery still fails closed after proving multiple loaded roots', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
