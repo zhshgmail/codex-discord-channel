@@ -597,7 +597,7 @@ class AppServerHost extends EventEmitter {
       return { available: false, reason, status: 'unavailable' };
     }
     const status = thread.status?.type || 'unavailable';
-    if (!['idle', 'active'].includes(status)) {
+    if (!['idle', 'active', 'systemError'].includes(status)) {
       const reason = 'shared_app_server_thread_unavailable';
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
@@ -631,7 +631,7 @@ class AppServerHost extends EventEmitter {
     const validateTarget = () => {
       const statusChanged = target?.status === 'active'
         ? !target.activeTurnId || this.activeTurnIds.get(params.threadId) !== target.activeTurnId
-        : this.threadStatuses.get(params.threadId) !== 'idle';
+        : this.threadStatuses.get(params.threadId) !== target?.status;
       if (
         !generation ||
         generation.threadSelectionRevision !== this.threadSelectionRevision ||

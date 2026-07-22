@@ -85,9 +85,10 @@ must expose one provable top-level loaded thread. The latest top-level
 `thread/started` notification replaces it after thread rotation. Subagents are
 never targets.
 
-Each drain accepts at most one FIFO head. Idle targets use `turn/start`; active
-targets use `turn/steer` only with an exact turn id observed from app-server
-notifications or recovered from `thread/read` during startup and reconnect.
+Each drain accepts at most one FIFO head. Idle targets and proven top-level
+`systemError` targets use `turn/start`; active targets use `turn/steer` only with
+an exact turn id observed from app-server notifications or recovered from
+`thread/read` during startup and reconnect.
 Unknown or ambiguous active-turn identity remains `thread_busy`, while a new
 `turn/started` notification wakes the serialized drain. Requests omit model,
 reasoning effort, service tier, personality, cwd, sandbox, permissions,

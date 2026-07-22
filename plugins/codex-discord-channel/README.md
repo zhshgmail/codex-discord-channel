@@ -20,8 +20,9 @@ The default is `unix://<state-dir>/app-server.sock`; an explicit
 
 The gateway dynamically resolves the current top-level loaded TUI thread and
 tracks thread rotation plus active turn identity. It sends at most one FIFO item
-per drain: `turn/start` for an idle target, or `turn/steer` with an exact active
-turn precondition when a goal continuation or other turn is already running.
+per drain: `turn/start` for an idle target or a top-level target whose previous
+turn ended in `systemError`, or `turn/steer` with an exact active turn
+precondition when a goal continuation or other turn is already running.
 Unknown active-turn identity remains `thread_busy`. Turn payloads omit model,
 reasoning effort, service tier, personality, cwd, sandbox, and approval
 overrides; Discord metadata is carried only in the sanitized text envelope.
