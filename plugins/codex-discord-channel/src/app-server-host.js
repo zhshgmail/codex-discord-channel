@@ -563,7 +563,6 @@ class AppServerHost extends EventEmitter {
           }
         }
       } catch (error) {
-        if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
         const reason = error?.code || 'shared_app_server_thread_unreadable';
         this.lastStatus = { configured: true, available: false, reason };
         return { available: false, reason, status: 'unavailable' };
@@ -583,7 +582,6 @@ class AppServerHost extends EventEmitter {
           includeTurns: true,
         });
       } catch (error) {
-        if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
         const reason = error?.code || 'shared_app_server_thread_unreadable';
         this.lastStatus = { configured: true, available: false, reason };
         return { available: false, reason, status: 'unavailable' };

@@ -848,6 +848,35 @@ test('in-flight thread read cannot overwrite a newer top-level thread notificati
   );
 });
 
+test('thread read failure after connection fencing returns unavailable without recursive retry', async () => {
+  let readCount = 0;
+  const client = new FakeRpcClient(async (method) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-current'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      readCount += 1;
+      client.emit('connectionChanged', { generation: readCount });
+      const error = new Error('thread/read timed out');
+      error.code = 'shared_app_server_request_timeout';
+      throw error;
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: false,
+    reason: 'shared_app_server_request_timeout',
+    status: 'unavailable',
+  });
+  assert.equal(readCount, 1);
+});
+
 test('in-flight loaded-thread list cannot restore an older thread after rotation', async () => {
   let loadedThreadIds = ['thread-before-clear'];
   let releaseFirstList;
