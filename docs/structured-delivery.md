@@ -53,9 +53,10 @@ effective.
 ## Target Resolution
 
 The app-server connection is initialized once and never supplies thread
-settings. Before a turn, the gateway paginates `thread/loaded/list` until the
-notification-selected current thread is found, then calls `thread/read` to
-prove that it is top-level and inspect its status.
+settings. Before a turn, the gateway reads the complete bounded
+`thread/loaded/list` inventory, then calls `thread/read` to prove that the
+selected current thread is top-level and inspect its status. Malformed pages,
+more than 32 unique threads, or more than 32 pages fail closed.
 
 On a fresh endpoint, exactly one top-level loaded thread is required. The
 gateway then records that thread as current. A later top-level
@@ -68,14 +69,14 @@ An exact active target is checkpointed across a gateway process restart. The
 checkpoint remains usable only while its target thread is still loaded, and
 submission still uses the recorded turn id as the `turn/steer`
 `expectedTurnId` precondition. Removed non-target threads do not invalidate
-that target. Newly loaded threads are read without turns and must be provable
-subagent children with a non-empty string parent id; malformed lineage fails
-closed. A newly loaded top-level thread invalidates the checkpoint so an
-offline `/clear` cannot steer back into the old root. Candidate loaded-thread
-state is not made durable until every added thread passes this proof. Restored
-and fresh resolution both stop after 32 unique threads or 32 list pages. An
-empty loaded set, a missing target thread, or a rejected exact turn also clears
-the checkpoint and returns to fresh top-level resolution.
+that target. Newly loaded threads are read without turns and must have an
+acyclic parent chain anchored in the previously proven checkpoint inventory;
+self-parent, orphan, and malformed lineage fail closed. A newly loaded
+top-level thread invalidates the checkpoint so an offline `/clear` cannot steer
+back into the old root. Candidate loaded-thread state is not made durable until
+every added thread passes this proof. An empty loaded set, a missing target
+thread, or a rejected exact turn also clears the checkpoint and returns to
+fresh top-level resolution.
 
 ## FIFO And Active Turns
 

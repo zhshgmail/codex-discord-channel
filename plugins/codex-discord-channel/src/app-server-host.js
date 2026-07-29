@@ -720,26 +720,29 @@ class AppServerHost extends EventEmitter {
           this.lastStatus = { configured: true, available: false, reason };
           return { available: false, reason, status: 'unavailable' };
         }
-        if (Array.isArray(loaded?.data)) {
-          for (const threadId of loaded.data) {
-            if (!seenThreadIds.has(threadId)) {
-              seenThreadIds.add(threadId);
-              threadIds.push(threadId);
-              if (threadIds.length > MAX_FRESH_THREAD_READS) {
-                const reason = 'shared_app_server_thread_ambiguous';
-                this.lastStatus = { configured: true, available: false, reason };
-                return { available: false, reason, status: 'unavailable' };
-              }
+        if (
+          !Array.isArray(loaded?.data) ||
+          loaded.data.some((threadId) => (
+            typeof threadId !== 'string' || threadId.trim() === ''
+          ))
+        ) {
+          const reason = 'shared_app_server_thread_ambiguous';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
+        for (const threadId of loaded.data) {
+          if (!seenThreadIds.has(threadId)) {
+            seenThreadIds.add(threadId);
+            threadIds.push(threadId);
+            if (threadIds.length > MAX_FRESH_THREAD_READS) {
+              const reason = 'shared_app_server_thread_ambiguous';
+              this.lastStatus = { configured: true, available: false, reason };
+              return { available: false, reason, status: 'unavailable' };
             }
           }
         }
         cursor = nextCursor;
         if (cursor) seenCursors.add(cursor);
-        if (
-          !restoredTargetCheckpoint &&
-          this.currentThreadId &&
-          threadIds.includes(this.currentThreadId)
-        ) break;
       } while (cursor);
     } catch (error) {
       const reason = error?.code || 'shared_app_server_unavailable';
@@ -764,6 +767,7 @@ class AppServerHost extends EventEmitter {
       let checkpointInvalid = !loadedThreadIds.has(restoredTargetCheckpoint.threadId);
       if (!checkpointInvalid) {
         const addedThreadIds = threadIds.filter((threadId) => !checkpointThreadIds.has(threadId));
+        const addedParents = new Map();
         try {
           for (const addedThreadId of addedThreadIds) {
             const addedResponse = await requestForTarget('thread/read', {
@@ -790,6 +794,31 @@ class AppServerHost extends EventEmitter {
               const reason = 'shared_app_server_thread_unprovable';
               this.lastStatus = { configured: true, available: false, reason };
               return { available: false, reason, status: 'unavailable' };
+            }
+            addedParents.set(addedThreadId, addedThread.parentThreadId);
+          }
+          if (!checkpointInvalid) {
+            for (const addedThreadId of addedThreadIds) {
+              const lineage = new Set();
+              let descendantId = addedThreadId;
+              while (!checkpointThreadIds.has(descendantId)) {
+                if (lineage.has(descendantId)) {
+                  const reason = 'shared_app_server_thread_unprovable';
+                  this.lastStatus = { configured: true, available: false, reason };
+                  return { available: false, reason, status: 'unavailable' };
+                }
+                lineage.add(descendantId);
+                const parentThreadId = addedParents.get(descendantId);
+                if (
+                  typeof parentThreadId !== 'string' ||
+                  !loadedThreadIds.has(parentThreadId)
+                ) {
+                  const reason = 'shared_app_server_thread_unprovable';
+                  this.lastStatus = { configured: true, available: false, reason };
+                  return { available: false, reason, status: 'unavailable' };
+                }
+                descendantId = parentThreadId;
+              }
             }
           }
         } catch (error) {

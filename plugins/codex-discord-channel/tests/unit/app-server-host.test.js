@@ -1023,6 +1023,37 @@ test('host rejects a malformed cursor before accepting the current thread on tha
   assert.equal(client.requests.some((request) => request.method === 'thread/read'), false);
 });
 
+test('host rejects malformed loaded-thread page data after a valid target page', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      if (!params.cursor) {
+        return { data: ['thread-current'], nextCursor: 'page-2' };
+      }
+      assert.equal(params.cursor, 'page-2');
+      return { data: {}, nextCursor: null };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-current',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: false,
+    reason: 'shared_app_server_thread_ambiguous',
+    status: 'unavailable',
+  });
+  assert.equal(client.requests.some((request) => request.method === 'thread/read'), false);
+});
+
 test('host rejects a repeated cursor before accepting the current thread on that page', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
@@ -1490,6 +1521,63 @@ async function createDurableTarget(config, turnId = 'turn-before-restart') {
   host.destroy();
 }
 
+test('durable target checkpoint records every bounded loaded-thread page', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-complete-pagination-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const firstClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      if (!params.cursor) {
+        return { data: ['thread-current'], nextCursor: 'page-2' };
+      }
+      assert.equal(params.cursor, 'page-2');
+      return { data: ['thread-older-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-complete-pagination' } };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  firstClient.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-current',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  const target = await firstHost.resolveTarget();
+  await firstHost.startTurn({
+    threadId: target.threadId,
+    clientUserMessageId: 'discord:c1:m-complete-pagination',
+    input: [{ type: 'text', text: 'persist the complete loaded inventory' }],
+  }, target);
+  firstHost.destroy();
+
+  const checkpoint = JSON.parse(
+    fs.readFileSync(path.join(stateDir, 'app-server-target.json'), 'utf8'),
+  );
+  assert.deepEqual(
+    checkpoint.loadedThreadIds,
+    ['thread-current', 'thread-older-root'],
+  );
+});
+
 test('gateway restart retains a durable active target when an unrelated loaded child closed', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-closed-child-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
@@ -1656,6 +1744,45 @@ test('gateway restart rejects malformed parent lineage for an added thread', asy
   const target = await host.resolveTarget();
   assert.equal(target.available, false);
   assert.equal(target.reason, 'shared_app_server_thread_unprovable');
+});
+
+test('gateway restart rejects self-parent and orphan lineage for an added thread', async (t) => {
+  for (const [name, parentThreadId] of [
+    ['self parent', 'thread-added'],
+    ['orphan parent', 'thread-missing'],
+  ]) {
+    await t.test(name, async (t) => {
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-unanchored-child-target-'));
+      t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+      const config = {
+        appServerUrl: 'ws://127.0.0.1:4500',
+        paths: { stateDir },
+      };
+      await createDurableTarget(config, `turn-before-${name.replace(' ', '-')}`);
+
+      const client = new FakeRpcClient(async (method, params) => {
+        if (method === 'thread/loaded/list') {
+          return { data: ['thread-a', 'thread-added'], nextCursor: null };
+        }
+        if (method === 'thread/read' && params.threadId === 'thread-added') {
+          return {
+            thread: {
+              id: 'thread-added',
+              parentThreadId,
+              status: { type: 'active' },
+            },
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      });
+      const host = createAppServerHost(config, () => {}, { client });
+      t.after(() => host.destroy());
+
+      const target = await host.resolveTarget();
+      assert.equal(target.available, false);
+      assert.equal(target.reason, 'shared_app_server_thread_unprovable');
+    });
+  }
 });
 
 test('failed added-thread proof cannot be persisted by a later active notification', async (t) => {
