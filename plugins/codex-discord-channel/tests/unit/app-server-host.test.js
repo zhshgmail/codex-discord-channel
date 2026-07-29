@@ -779,7 +779,7 @@ test('latest top-level thread/started notification selects the rotated TUI threa
   });
   assert.deepEqual(
     client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params.threadId),
-    ['thread-after-clear'],
+    ['thread-before-clear', 'thread-after-clear'],
   );
 });
 
@@ -844,7 +844,7 @@ test('in-flight thread read cannot overwrite a newer top-level thread notificati
   });
   assert.deepEqual(
     client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params.threadId),
-    ['thread-before-clear', 'thread-after-clear'],
+    ['thread-before-clear', 'thread-before-clear', 'thread-after-clear'],
   );
 });
 
@@ -940,7 +940,7 @@ test('in-flight loaded-thread list cannot restore an older thread after rotation
   });
   assert.deepEqual(
     client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params.threadId),
-    ['thread-after-clear'],
+    ['thread-before-clear', 'thread-after-clear'],
   );
 });
 
@@ -1865,6 +1865,125 @@ test('gateway restart rejects a multi-node cycle in added thread lineage', async
   const target = await host.resolveTarget();
   assert.equal(target.available, false);
   assert.equal(target.reason, 'shared_app_server_thread_unprovable');
+});
+
+test('same-runtime topology refresh rejects a multi-node cycle before replacing its checkpoint', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-live-cyclic-child-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  let loadedThreadIds = ['thread-a'];
+  let addedThreadReads = 0;
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: loadedThreadIds, nextCursor: null };
+    }
+    if (method === 'thread/read' && params.threadId === 'thread-a') {
+      return {
+        thread: {
+          id: 'thread-a',
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{ id: 'turn-live-cycle', status: 'inProgress', items: [] }],
+        },
+      };
+    }
+    if (method === 'thread/read' && params.threadId === 'thread-added-a') {
+      addedThreadReads += 1;
+      return {
+        thread: {
+          id: 'thread-added-a',
+          parentThreadId: 'thread-added-b',
+          status: { type: 'active' },
+        },
+      };
+    }
+    if (method === 'thread/read' && params.threadId === 'thread-added-b') {
+      addedThreadReads += 1;
+      return {
+        thread: {
+          id: 'thread-added-b',
+          parentThreadId: 'thread-added-a',
+          status: { type: 'active' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(config, () => {}, { client });
+  t.after(() => host.destroy());
+
+  assert.equal((await host.resolveTarget()).available, true);
+  loadedThreadIds = ['thread-a', 'thread-added-a', 'thread-added-b'];
+  for (const [id, parentThreadId] of [
+    ['thread-added-a', 'thread-added-b'],
+    ['thread-added-b', 'thread-added-a'],
+  ]) {
+    client.emit('notification', {
+      method: 'thread/started',
+      params: {
+        thread: {
+          id,
+          parentThreadId,
+          status: { type: 'active' },
+        },
+      },
+    });
+  }
+
+  const target = await host.resolveTarget();
+  assert.equal(target.available, false);
+  assert.equal(target.reason, 'shared_app_server_thread_unprovable');
+  assert.equal(addedThreadReads, 2);
+  assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
+});
+
+test('topology revision retries share one bounded resolution budget', async (t) => {
+  let loadedListRequests = 0;
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      loadedListRequests += 1;
+      if (loadedListRequests <= 40) {
+        queueMicrotask(() => {
+          client.emit('notification', {
+            method: 'thread/started',
+            params: {
+              thread: {
+                id: `thread-worker-${loadedListRequests}`,
+                parentThreadId: 'thread-a',
+                status: { type: 'active' },
+              },
+            },
+          });
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.available, false);
+  assert.equal(target.reason, 'shared_app_server_thread_ambiguous');
+  assert.ok(loadedListRequests <= 8, `expected a bounded retry budget, got ${loadedListRequests}`);
 });
 
 test('failed added-thread proof cannot be persisted by a later active notification', async (t) => {

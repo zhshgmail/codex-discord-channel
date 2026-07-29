@@ -54,32 +54,38 @@ effective.
 
 The app-server connection is initialized once and never supplies thread
 settings. Before a turn, the gateway reads the complete bounded
-`thread/loaded/list` inventory, then calls `thread/read` to prove that the
-selected current thread is top-level and inspect its status. Malformed pages,
-more than 32 unique threads, or more than 32 pages fail closed.
+`thread/loaded/list` inventory. Without a previously proven inventory, it reads
+every loaded thread without turns and rejects malformed, cyclic, or orphaned
+lineage before selecting a top-level current thread. Malformed pages, more than
+32 unique threads, or more than 32 pages fail closed.
 
-On a fresh endpoint, exactly one top-level loaded thread is required. The
-gateway then records that thread as current. A later top-level
-`thread/started` notification replaces it, allowing `/clear`, compaction, or
-other thread rotation to move delivery even when an older gateway-subscribed
-thread remains loaded. Subagent threads are never selected. Without a provable
-current thread, delivery fails closed.
+On a fresh endpoint without a same-connection selection notification, exactly
+one top-level loaded thread is required. The gateway then records that thread
+as current. A later top-level `thread/started` notification replaces it,
+allowing `/clear`, compaction, or other thread rotation to move delivery even
+when an older gateway-subscribed thread remains loaded. That selected root is
+still verified against the complete bounded inventory before use. Subagent
+threads are never selected. Without a provable current thread, delivery fails
+closed.
 
 An exact active target is checkpointed across a gateway process restart. The
 checkpoint remains usable only while its target thread is still loaded, and
 submission still uses the recorded turn id as the `turn/steer`
 `expectedTurnId` precondition. Removed non-target threads do not invalidate
-that target. Newly loaded threads are read without turns and must have an
-acyclic parent chain anchored in the previously proven checkpoint inventory;
-self-parent, orphan, and malformed lineage fail closed. A newly loaded
-top-level thread invalidates the checkpoint so an offline `/clear` cannot steer
+that target. After either a restart or a same-runtime topology change, newly
+loaded threads are read without turns and must have an acyclic parent chain
+anchored in the previously proven inventory; self-parent, orphan, malformed,
+and cyclic lineage fail closed. A newly loaded top-level thread observed only
+after restart invalidates the checkpoint so an offline `/clear` cannot steer
 back into the old root. Candidate loaded-thread state is not made durable until
 every added thread passes this proof. Thread start/close notifications
 invalidate the inventory proof; notification state alone can never create or
 refresh a checkpoint. The next checkpoint therefore requires another complete
-bounded inventory read. An empty loaded set, a missing target thread, or a
-rejected exact turn also clears the checkpoint and returns to fresh top-level
-resolution.
+bounded inventory read. Topology revisions during one resolution share a hard
+budget of four restarts; the budget is not reset by retry recursion. An empty
+loaded set, a missing target thread, an exhausted revision budget, or a
+rejected exact turn also clears or rejects the candidate and returns to fresh
+top-level resolution.
 
 ## FIFO And Active Turns
 

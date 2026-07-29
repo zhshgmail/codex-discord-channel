@@ -7,6 +7,7 @@ const path = require('node:path');
 const TARGET_GENERATION = Symbol('appServerTargetGeneration');
 const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
+const MAX_TARGET_RESOLUTION_RESTARTS = 4;
 const TARGET_CHECKPOINT_VERSION = 1;
 
 function parseTargetCheckpoint(raw) {
@@ -457,7 +458,6 @@ class AppServerHost extends EventEmitter {
         }
         if (thread?.id && !thread.parentThreadId) {
           this.currentThreadId = thread.id;
-          this.knownLoadedThreadIds.add(thread.id);
           this.threadStatuses.set(thread.id, thread.status?.type || 'unavailable');
           if (thread.status?.type === 'idle') this.emit('idle', { threadId: thread.id });
         }
@@ -528,7 +528,6 @@ class AppServerHost extends EventEmitter {
         this.clearTargetCheckpoint();
         this.restoredTargetCheckpoint = null;
         this.threadSelectionRevision += 1;
-        this.knownLoadedThreadIds.delete(threadId);
         this.threadStatuses.delete(threadId);
         this.activeTurnIds.delete(threadId);
         if (this.timeoutRecoveryTarget?.threadId === threadId) {
@@ -684,15 +683,29 @@ class AppServerHost extends EventEmitter {
   }
 
   async resolveTarget() {
+    return this.resolveTargetAttempt({ revisionRestarts: 0 });
+  }
+
+  async resolveTargetAttempt(resolutionBudget) {
     this.loadedInventoryProven = false;
     const threadSelectionRevision = this.threadSelectionRevision;
     const restoredTargetCheckpoint = this.restoredTargetCheckpoint;
+    const provenLoadedThreadIds = new Set(this.knownLoadedThreadIds);
     const threadIds = [];
     const seenThreadIds = new Set();
     let cursor = '';
     let connectionGeneration = null;
     const seenCursors = new Set();
     let loadedPageCount = 0;
+    const retryAfterRevision = () => {
+      resolutionBudget.revisionRestarts += 1;
+      if (resolutionBudget.revisionRestarts > MAX_TARGET_RESOLUTION_RESTARTS) {
+        const reason = 'shared_app_server_thread_ambiguous';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
+      return this.resolveTargetAttempt(resolutionBudget);
+    };
     const requestForTarget = async (method, params) => {
       if (typeof this.client.requestOnConnection !== 'function') {
         return this.client.request(method, params);
@@ -716,7 +729,9 @@ class AppServerHost extends EventEmitter {
         const params = { limit: 2 };
         if (cursor) params.cursor = cursor;
         const loaded = await requestForTarget('thread/loaded/list', params);
-        if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
+        if (this.threadSelectionRevision !== threadSelectionRevision) {
+          return retryAfterRevision();
+        }
         if (loaded?.nextCursor != null && typeof loaded.nextCursor !== 'string') {
           const reason = 'shared_app_server_thread_ambiguous';
           this.lastStatus = { configured: true, available: false, reason };
@@ -769,73 +784,92 @@ class AppServerHost extends EventEmitter {
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
     }
-    if (restoredTargetCheckpoint) {
-      const loadedThreadIds = new Set(threadIds);
-      const checkpointThreadIds = new Set(restoredTargetCheckpoint.loadedThreadIds);
-      let checkpointInvalid = !loadedThreadIds.has(restoredTargetCheckpoint.threadId);
-      if (!checkpointInvalid) {
-        const addedThreadIds = threadIds.filter((threadId) => !checkpointThreadIds.has(threadId));
-        const addedParents = new Map();
-        try {
-          for (const addedThreadId of addedThreadIds) {
-            const addedResponse = await requestForTarget('thread/read', {
-              threadId: addedThreadId,
-              includeTurns: false,
-            });
-            if (this.threadSelectionRevision !== threadSelectionRevision) {
-              return this.resolveTarget();
-            }
-            const addedThread = addedResponse?.thread;
-            if (!addedThread || addedThread.id !== addedThreadId) {
+    const loadedThreadIds = new Set(threadIds);
+    const trustedThreadIds = restoredTargetCheckpoint
+      ? new Set(restoredTargetCheckpoint.loadedThreadIds)
+      : provenLoadedThreadIds;
+    const validatedAddedResponses = new Map();
+    let targetInvalid = Boolean(
+      restoredTargetCheckpoint &&
+      !loadedThreadIds.has(restoredTargetCheckpoint.threadId),
+    );
+    if (trustedThreadIds.size > 0) {
+      const addedThreadIds = threadIds.filter((threadId) => !trustedThreadIds.has(threadId));
+      const addedParents = new Map();
+      const addedTopLevelThreadIds = new Set();
+      try {
+        for (const addedThreadId of addedThreadIds) {
+          const addedResponse = await requestForTarget('thread/read', {
+            threadId: addedThreadId,
+            includeTurns: false,
+          });
+          if (this.threadSelectionRevision !== threadSelectionRevision) {
+            return retryAfterRevision();
+          }
+          const addedThread = addedResponse?.thread;
+          if (!addedThread || addedThread.id !== addedThreadId) {
+            const reason = 'shared_app_server_thread_unprovable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          }
+          if (addedThread.parentThreadId == null) {
+            addedTopLevelThreadIds.add(addedThreadId);
+            addedParents.set(addedThreadId, null);
+          } else if (
+            typeof addedThread.parentThreadId !== 'string' ||
+            addedThread.parentThreadId.trim() === ''
+          ) {
+            const reason = 'shared_app_server_thread_unprovable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          } else {
+            addedParents.set(addedThreadId, addedThread.parentThreadId);
+          }
+          validatedAddedResponses.set(addedThreadId, addedResponse);
+        }
+        for (const addedThreadId of addedThreadIds) {
+          const lineage = new Set();
+          let descendantId = addedThreadId;
+          while (!trustedThreadIds.has(descendantId)) {
+            if (lineage.has(descendantId)) {
               const reason = 'shared_app_server_thread_unprovable';
               this.lastStatus = { configured: true, available: false, reason };
               return { available: false, reason, status: 'unavailable' };
             }
-            if (addedThread.parentThreadId == null) {
-              checkpointInvalid = true;
-              break;
-            }
+            lineage.add(descendantId);
+            const parentThreadId = addedParents.get(descendantId);
+            if (parentThreadId == null) break;
             if (
-              typeof addedThread.parentThreadId !== 'string' ||
-              addedThread.parentThreadId.trim() === ''
+              typeof parentThreadId !== 'string' ||
+              !loadedThreadIds.has(parentThreadId)
             ) {
               const reason = 'shared_app_server_thread_unprovable';
               this.lastStatus = { configured: true, available: false, reason };
               return { available: false, reason, status: 'unavailable' };
             }
-            addedParents.set(addedThreadId, addedThread.parentThreadId);
+            descendantId = parentThreadId;
           }
-          if (!checkpointInvalid) {
-            for (const addedThreadId of addedThreadIds) {
-              const lineage = new Set();
-              let descendantId = addedThreadId;
-              while (!checkpointThreadIds.has(descendantId)) {
-                if (lineage.has(descendantId)) {
-                  const reason = 'shared_app_server_thread_unprovable';
-                  this.lastStatus = { configured: true, available: false, reason };
-                  return { available: false, reason, status: 'unavailable' };
-                }
-                lineage.add(descendantId);
-                const parentThreadId = addedParents.get(descendantId);
-                if (
-                  typeof parentThreadId !== 'string' ||
-                  !loadedThreadIds.has(parentThreadId)
-                ) {
-                  const reason = 'shared_app_server_thread_unprovable';
-                  this.lastStatus = { configured: true, available: false, reason };
-                  return { available: false, reason, status: 'unavailable' };
-                }
-                descendantId = parentThreadId;
-              }
-            }
-          }
-        } catch (error) {
-          const reason = error?.code || 'shared_app_server_thread_unreadable';
-          this.lastStatus = { configured: true, available: false, reason };
-          return { available: false, reason, status: 'unavailable' };
         }
+        if (
+          addedTopLevelThreadIds.size > 0 &&
+          (
+            restoredTargetCheckpoint ||
+            (
+              !trustedThreadIds.has(this.currentThreadId) &&
+              !addedTopLevelThreadIds.has(this.currentThreadId)
+            )
+          )
+        ) {
+          targetInvalid = true;
+        }
+      } catch (error) {
+        const reason = error?.code || 'shared_app_server_thread_unreadable';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
       }
-      if (checkpointInvalid) {
+    }
+    if (restoredTargetCheckpoint || targetInvalid) {
+      if (targetInvalid) {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
@@ -845,29 +879,70 @@ class AppServerHost extends EventEmitter {
     }
     let threadId = '';
     let response;
-    if (this.currentThreadId && threadIds.includes(this.currentThreadId)) {
+    if (
+      this.currentThreadId &&
+      threadIds.includes(this.currentThreadId) &&
+      (
+        trustedThreadIds.has(this.currentThreadId) ||
+        validatedAddedResponses.has(this.currentThreadId)
+      )
+    ) {
       threadId = this.currentThreadId;
+      response = validatedAddedResponses.get(threadId);
     } else {
       const topLevelThreads = [];
+      const candidateParents = new Map();
       try {
         for (const candidateThreadId of threadIds) {
           const candidateResponse = await requestForTarget('thread/read', {
             threadId: candidateThreadId,
             includeTurns: false,
           });
-          if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
+          if (this.threadSelectionRevision !== threadSelectionRevision) {
+            return retryAfterRevision();
+          }
           const candidate = candidateResponse?.thread;
           if (!candidate || candidate.id !== candidateThreadId) {
             const reason = 'shared_app_server_thread_unprovable';
             this.lastStatus = { configured: true, available: false, reason };
             return { available: false, reason, status: 'unavailable' };
           }
-          if (!candidate.parentThreadId) {
+          if (candidate.parentThreadId == null) {
+            candidateParents.set(candidateThreadId, null);
             topLevelThreads.push({ threadId: candidateThreadId, response: candidateResponse });
-            if (topLevelThreads.length > 1) {
-              const reason = 'shared_app_server_thread_ambiguous';
-              this.lastStatus = { configured: true, available: false, reason };
-              return { available: false, reason, status: 'unavailable' };
+          } else if (
+            typeof candidate.parentThreadId !== 'string' ||
+            candidate.parentThreadId.trim() === ''
+          ) {
+            const reason = 'shared_app_server_thread_unprovable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          } else {
+            candidateParents.set(candidateThreadId, candidate.parentThreadId);
+          }
+        }
+        if (topLevelThreads.length > 0) {
+          const rootThreadIds = new Set(topLevelThreads.map((candidate) => candidate.threadId));
+          for (const candidateThreadId of threadIds) {
+            const lineage = new Set();
+            let descendantId = candidateThreadId;
+            while (!rootThreadIds.has(descendantId)) {
+              if (lineage.has(descendantId)) {
+                const reason = 'shared_app_server_thread_unprovable';
+                this.lastStatus = { configured: true, available: false, reason };
+                return { available: false, reason, status: 'unavailable' };
+              }
+              lineage.add(descendantId);
+              const parentThreadId = candidateParents.get(descendantId);
+              if (
+                typeof parentThreadId !== 'string' ||
+                !loadedThreadIds.has(parentThreadId)
+              ) {
+                const reason = 'shared_app_server_thread_unprovable';
+                this.lastStatus = { configured: true, available: false, reason };
+                return { available: false, reason, status: 'unavailable' };
+              }
+              descendantId = parentThreadId;
             }
           }
         }
@@ -876,12 +951,20 @@ class AppServerHost extends EventEmitter {
         this.lastStatus = { configured: true, available: false, reason };
         return { available: false, reason, status: 'unavailable' };
       }
-      if (topLevelThreads.length !== 1) {
-        const reason = 'shared_app_server_thread_unprovable';
+      const notifiedTarget = topLevelThreads.find((candidate) => (
+        candidate.threadId === this.currentThreadId
+      ));
+      if (notifiedTarget) {
+        ({ threadId, response } = notifiedTarget);
+      } else if (topLevelThreads.length === 1) {
+        [{ threadId, response }] = topLevelThreads;
+      } else {
+        const reason = topLevelThreads.length > 1
+          ? 'shared_app_server_thread_ambiguous'
+          : 'shared_app_server_thread_unprovable';
         this.lastStatus = { configured: true, available: false, reason };
         return { available: false, reason, status: 'unavailable' };
       }
-      [{ threadId, response }] = topLevelThreads;
     }
 
     const cachedActiveTurnId = !response &&
@@ -913,7 +996,9 @@ class AppServerHost extends EventEmitter {
         return { available: false, reason, status: 'unavailable' };
       }
     }
-    if (this.threadSelectionRevision !== threadSelectionRevision) return this.resolveTarget();
+    if (this.threadSelectionRevision !== threadSelectionRevision) {
+      return retryAfterRevision();
+    }
     const thread = response?.thread;
     if (!thread || thread.id !== threadId || thread.parentThreadId) {
       const reason = 'shared_app_server_thread_unprovable';
