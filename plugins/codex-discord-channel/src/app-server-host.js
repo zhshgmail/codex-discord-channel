@@ -2,9 +2,55 @@
 
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
+const path = require('node:path');
 
 const TARGET_GENERATION = Symbol('appServerTargetGeneration');
 const MAX_FRESH_THREAD_READS = 32;
+const TARGET_CHECKPOINT_VERSION = 1;
+
+function parseTargetCheckpoint(raw) {
+  let record;
+  try {
+    record = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    record?.version !== TARGET_CHECKPOINT_VERSION ||
+    record.status !== 'active' ||
+    typeof record.threadId !== 'string' ||
+    record.threadId === '' ||
+    typeof record.activeTurnId !== 'string' ||
+    record.activeTurnId === '' ||
+    !Array.isArray(record.loadedThreadIds) ||
+    record.loadedThreadIds.length === 0 ||
+    record.loadedThreadIds.some((threadId) => typeof threadId !== 'string' || threadId === '')
+  ) {
+    return null;
+  }
+  const loadedThreadIds = [...new Set(record.loadedThreadIds)].sort();
+  if (
+    loadedThreadIds.length !== record.loadedThreadIds.length ||
+    !loadedThreadIds.includes(record.threadId)
+  ) {
+    return null;
+  }
+  return {
+    version: TARGET_CHECKPOINT_VERSION,
+    threadId: record.threadId,
+    status: 'active',
+    activeTurnId: record.activeTurnId,
+    loadedThreadIds,
+  };
+}
+
+function sameStringSet(left, right) {
+  if (left.size !== right.size) return false;
+  for (const value of left) {
+    if (!right.has(value)) return false;
+  }
+  return true;
+}
 
 function endpointToWebSocket(endpoint) {
   const value = String(endpoint || '').trim();
@@ -381,6 +427,13 @@ class AppServerRpcClient extends EventEmitter {
 class AppServerHost extends EventEmitter {
   constructor(config = {}, logger = () => {}, deps = {}) {
     super();
+    this.logger = logger;
+    this.fs = deps.fs || fs;
+    this.targetCheckpointPath = config.paths?.appServerTargetPath || (
+      config.paths?.stateDir
+        ? path.join(config.paths.stateDir, 'app-server-target.json')
+        : ''
+    );
     this.client = deps.client || new AppServerRpcClient(config, logger, deps);
     this.lastStatus = this.client.status();
     this.hasConnected = Boolean(this.lastStatus.available);
@@ -389,13 +442,27 @@ class AppServerHost extends EventEmitter {
     this.threadSelectionRevision = 0;
     this.threadStatuses = new Map();
     this.activeTurnIds = new Map();
+    this.knownLoadedThreadIds = new Set();
+    this.restoredTargetCheckpoint = this.loadTargetCheckpoint();
+    if (this.restoredTargetCheckpoint) {
+      const checkpoint = this.restoredTargetCheckpoint;
+      this.currentThreadId = checkpoint.threadId;
+      this.threadStatuses.set(checkpoint.threadId, checkpoint.status);
+      this.activeTurnIds.set(checkpoint.threadId, checkpoint.activeTurnId);
+      this.knownLoadedThreadIds = new Set(checkpoint.loadedThreadIds);
+    }
     this.timeoutRecoveryTarget = null;
     this.onNotification = (notification) => {
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
         if (thread?.id && !thread.parentThreadId) {
+          if (this.currentThreadId && this.currentThreadId !== thread.id) {
+            this.clearTargetCheckpoint();
+            this.restoredTargetCheckpoint = null;
+          }
           this.threadSelectionRevision += 1;
           this.currentThreadId = thread.id;
+          this.knownLoadedThreadIds.add(thread.id);
           this.threadStatuses.set(thread.id, thread.status?.type || 'unavailable');
           if (thread.status?.type === 'idle') this.emit('idle', { threadId: thread.id });
         }
@@ -409,6 +476,7 @@ class AppServerHost extends EventEmitter {
         this.activeTurnIds.set(threadId, turnId);
         if (threadId === this.currentThreadId) {
           this.threadSelectionRevision += 1;
+          this.persistTargetCheckpoint();
           this.emit('active', { threadId, turnId });
         }
         return;
@@ -426,7 +494,11 @@ class AppServerHost extends EventEmitter {
         ) {
           this.timeoutRecoveryTarget = null;
         }
-        if (threadId === this.currentThreadId) this.threadSelectionRevision += 1;
+        if (threadId === this.currentThreadId) {
+          this.threadSelectionRevision += 1;
+          this.clearTargetCheckpoint();
+          this.restoredTargetCheckpoint = null;
+        }
         return;
       }
       if (
@@ -441,6 +513,12 @@ class AppServerHost extends EventEmitter {
           if (this.timeoutRecoveryTarget?.threadId === threadId) {
             this.timeoutRecoveryTarget = null;
           }
+          if (threadId === this.currentThreadId) {
+            this.clearTargetCheckpoint();
+            this.restoredTargetCheckpoint = null;
+          }
+        } else if (statusType === 'active' && threadId === this.currentThreadId) {
+          this.persistTargetCheckpoint();
         }
         if (threadId === this.currentThreadId) this.threadSelectionRevision += 1;
         if (threadId === this.currentThreadId && status?.type === 'idle') {
@@ -452,6 +530,7 @@ class AppServerHost extends EventEmitter {
         const threadId = notification.params?.threadId;
         if (!threadId) return;
         this.threadSelectionRevision += 1;
+        this.knownLoadedThreadIds.delete(threadId);
         this.threadStatuses.delete(threadId);
         this.activeTurnIds.delete(threadId);
         if (this.timeoutRecoveryTarget?.threadId === threadId) {
@@ -459,6 +538,8 @@ class AppServerHost extends EventEmitter {
         }
         if (this.currentThreadId === threadId) {
           this.currentThreadId = '';
+          this.clearTargetCheckpoint();
+          this.restoredTargetCheckpoint = null;
         }
         this.emit('threadClosed', { threadId });
       }
@@ -481,7 +562,14 @@ class AppServerHost extends EventEmitter {
         this.lastStatus.available ||
         this.lastStatus.reason === 'shared_app_server_request_timeout'
       );
-      if (retainTimeoutTarget) {
+      if (this.restoredTargetCheckpoint) {
+        const checkpoint = this.restoredTargetCheckpoint;
+        this.currentThreadId = checkpoint.threadId;
+        this.threadStatuses.clear();
+        this.threadStatuses.set(checkpoint.threadId, checkpoint.status);
+        this.activeTurnIds.clear();
+        this.activeTurnIds.set(checkpoint.threadId, checkpoint.activeTurnId);
+      } else if (retainTimeoutTarget) {
         const { threadId, turnId } = this.timeoutRecoveryTarget;
         this.currentThreadId = threadId;
         this.threadStatuses.clear();
@@ -493,6 +581,9 @@ class AppServerHost extends EventEmitter {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
+        this.knownLoadedThreadIds.clear();
+        this.clearTargetCheckpoint();
+        this.restoredTargetCheckpoint = null;
       }
       const reconnected = this.lastStatus.available && (this.connectionWasLost || event?.recovered);
       if (this.lastStatus.available) {
@@ -505,6 +596,70 @@ class AppServerHost extends EventEmitter {
     };
     this.client.on('notification', this.onNotification);
     this.client.on('connectionChanged', this.onConnectionChanged);
+  }
+
+  loadTargetCheckpoint() {
+    if (!this.targetCheckpointPath) return null;
+    try {
+      return parseTargetCheckpoint(this.fs.readFileSync(this.targetCheckpointPath, 'utf8'));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger('WARN', 'Unable to read app-server target checkpoint', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return null;
+    }
+  }
+
+  clearTargetCheckpoint() {
+    if (!this.targetCheckpointPath) return;
+    try {
+      this.fs.unlinkSync(this.targetCheckpointPath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger('WARN', 'Unable to clear app-server target checkpoint', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  persistTargetCheckpoint() {
+    if (!this.targetCheckpointPath) return;
+    const threadId = this.currentThreadId;
+    const activeTurnId = this.activeTurnIds.get(threadId);
+    if (
+      !threadId ||
+      this.threadStatuses.get(threadId) !== 'active' ||
+      !activeTurnId ||
+      !this.knownLoadedThreadIds.has(threadId)
+    ) {
+      this.clearTargetCheckpoint();
+      return;
+    }
+    const record = {
+      version: TARGET_CHECKPOINT_VERSION,
+      threadId,
+      status: 'active',
+      activeTurnId,
+      loadedThreadIds: [...this.knownLoadedThreadIds].sort(),
+    };
+    const directory = path.dirname(this.targetCheckpointPath);
+    const tempPath = `${this.targetCheckpointPath}.tmp-${process.pid}-${Date.now()}`;
+    try {
+      this.fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      this.fs.writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+      this.fs.renameSync(tempPath, this.targetCheckpointPath);
+      this.fs.chmodSync(this.targetCheckpointPath, 0o600);
+    } catch (error) {
+      try {
+        this.fs.unlinkSync(tempPath);
+      } catch {}
+      this.logger('WARN', 'Unable to persist app-server target checkpoint', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   status() {
@@ -524,11 +679,13 @@ class AppServerHost extends EventEmitter {
     this.currentThreadId = threadId;
     this.threadStatuses.set(threadId, 'active');
     this.activeTurnIds.set(threadId, turnId);
+    this.persistTargetCheckpoint();
     this.emit('active', { threadId, turnId });
   }
 
   async resolveTarget() {
     const threadSelectionRevision = this.threadSelectionRevision;
+    const restoredTargetCheckpoint = this.restoredTargetCheckpoint;
     const threadIds = [];
     const seenThreadIds = new Set();
     let cursor = '';
@@ -571,14 +728,18 @@ class AppServerHost extends EventEmitter {
             }
           }
         }
-        if (this.currentThreadId && threadIds.includes(this.currentThreadId)) break;
+        cursor = nextCursor;
+        if (cursor) seenCursors.add(cursor);
+        if (
+          !restoredTargetCheckpoint &&
+          this.currentThreadId &&
+          threadIds.includes(this.currentThreadId)
+        ) break;
         if (!this.currentThreadId && threadIds.length > MAX_FRESH_THREAD_READS) {
           const reason = 'shared_app_server_thread_ambiguous';
           this.lastStatus = { configured: true, available: false, reason };
           return { available: false, reason, status: 'unavailable' };
         }
-        cursor = nextCursor;
-        if (cursor) seenCursors.add(cursor);
       } while (cursor);
     } catch (error) {
       const reason = error?.code || 'shared_app_server_unavailable';
@@ -589,6 +750,23 @@ class AppServerHost extends EventEmitter {
       const reason = 'shared_app_server_no_loaded_thread';
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
+    }
+    if (!cursor) this.knownLoadedThreadIds = new Set(threadIds);
+    if (restoredTargetCheckpoint) {
+      const loadedThreadIds = new Set(threadIds);
+      const checkpointThreadIds = new Set(restoredTargetCheckpoint.loadedThreadIds);
+      if (!sameStringSet(loadedThreadIds, checkpointThreadIds)) {
+        this.currentThreadId = '';
+        this.threadStatuses.clear();
+        this.activeTurnIds.clear();
+        this.clearTargetCheckpoint();
+      }
+      this.restoredTargetCheckpoint = null;
+      if (!this.currentThreadId && threadIds.length > MAX_FRESH_THREAD_READS) {
+        const reason = 'shared_app_server_thread_ambiguous';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
     }
     let threadId = '';
     let response;
@@ -691,6 +869,8 @@ class AppServerHost extends EventEmitter {
     const target = { available: true, threadId: thread.id, status };
     const activeTurnId = status === 'active' ? this.activeTurnIds.get(thread.id) : '';
     if (activeTurnId) target.activeTurnId = activeTurnId;
+    if (activeTurnId) this.persistTargetCheckpoint();
+    else this.clearTargetCheckpoint();
     Object.defineProperty(target, TARGET_GENERATION, {
       value: Object.freeze({ connectionGeneration, threadSelectionRevision }),
     });
@@ -748,6 +928,8 @@ class AppServerHost extends EventEmitter {
         this.currentThreadId = '';
         this.threadStatuses.delete(params.threadId);
         this.activeTurnIds.delete(params.threadId);
+        this.clearTargetCheckpoint();
+        this.restoredTargetCheckpoint = null;
       }
       throw error;
     }
