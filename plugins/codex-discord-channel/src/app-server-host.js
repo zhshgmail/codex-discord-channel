@@ -471,6 +471,22 @@ class AppServerHost extends EventEmitter {
     return { ...this.lastStatus };
   }
 
+  rememberAcceptedTurn(threadId, result, connectionGeneration = null) {
+    const turnId = result?.turn?.id || result?.turnId;
+    if (!threadId || typeof turnId !== 'string' || !turnId) return;
+    if (
+      connectionGeneration != null &&
+      this.client.connectionGeneration !== connectionGeneration
+    ) {
+      return;
+    }
+    this.threadSelectionRevision += 1;
+    this.currentThreadId = threadId;
+    this.threadStatuses.set(threadId, 'active');
+    this.activeTurnIds.set(threadId, turnId);
+    this.emit('active', { threadId, turnId });
+  }
+
   async resolveTarget() {
     const threadSelectionRevision = this.threadSelectionRevision;
     const threadIds = [];
@@ -575,7 +591,24 @@ class AppServerHost extends EventEmitter {
       [{ threadId, response }] = topLevelThreads;
     }
 
-    if (!response || response?.thread?.status?.type === 'active') {
+    const cachedActiveTurnId = !response &&
+      this.threadStatuses.get(threadId) === 'active' &&
+      this.activeTurnIds.get(threadId);
+    if (cachedActiveTurnId) {
+      response = {
+        thread: {
+          id: threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{
+            id: cachedActiveTurnId,
+            status: 'inProgress',
+            items: [],
+          }],
+        },
+      };
+    }
+    if (!response || (response?.thread?.status?.type === 'active' && !cachedActiveTurnId)) {
       try {
         response = await requestForTarget('thread/read', {
           threadId,
@@ -656,9 +689,18 @@ class AppServerHost extends EventEmitter {
         validateTarget,
         true,
       );
+      if (method === 'turn/start') {
+        this.rememberAcceptedTurn(
+          params.threadId,
+          response.result,
+          response.generation,
+        );
+      }
       return response.result;
     }
-    return this.client.request(method, requestParams);
+    const result = await this.client.request(method, requestParams);
+    if (method === 'turn/start') this.rememberAcceptedTurn(params.threadId, result);
+    return result;
   }
 
   async hasDelivered(threadId, clientUserMessageId) {

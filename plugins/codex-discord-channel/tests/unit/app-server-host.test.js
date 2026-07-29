@@ -1193,6 +1193,70 @@ test('startTurn forwards only the structured caller payload', async () => {
   assert.deepEqual(client.requests, [{ method: 'turn/start', params }]);
 });
 
+test('accepted turn response keeps active delivery available when its notification is missed', async () => {
+  let turnStarted = false;
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (turnStarted) throw new Error('active thread/read must not be required');
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      turnStarted = true;
+      return { turn: { id: 'turn-from-response' } };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-from-response');
+      return { turnId: params.expectedTurnId };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+
+  const idleTarget = await host.resolveTarget();
+  await host.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-start',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+
+  client.requests.length = 0;
+  const activeTarget = await host.resolveTarget();
+  assert.equal(activeTarget.available, true);
+  assert.equal(activeTarget.threadId, 'thread-a');
+  assert.equal(activeTarget.status, 'active');
+  assert.equal(activeTarget.activeTurnId, 'turn-from-response');
+  assert.equal(
+    client.requests.some((request) => request.method === 'thread/read'),
+    false,
+  );
+
+  await host.startTurn({
+    threadId: activeTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-steer',
+    input: [{ type: 'text', text: 'steer the active work' }],
+  }, activeTarget);
+  assert.equal(
+    client.requests.some((request) => (
+      request.method === 'turn/steer' &&
+      request.params.expectedTurnId === 'turn-from-response'
+    )),
+    true,
+  );
+});
+
 test('active goal turn recovered from thread/read accepts input with an exact turn precondition', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
