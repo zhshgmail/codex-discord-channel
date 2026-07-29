@@ -64,6 +64,13 @@ other thread rotation to move delivery even when an older gateway-subscribed
 thread remains loaded. Subagent threads are never selected. Without a provable
 current thread, delivery fails closed.
 
+An exact active target is checkpointed across a gateway process restart. The
+checkpoint remains usable only while its target thread is still loaded, and
+submission still uses the recorded turn id as the `turn/steer`
+`expectedTurnId` precondition. Closing or starting an unrelated subagent does
+not invalidate that target. A missing target thread or a rejected exact turn
+clears the checkpoint and returns to fresh top-level resolution.
+
 ## FIFO And Active Turns
 
 Every accepted Discord event is persisted before target resolution. Queue

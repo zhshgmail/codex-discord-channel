@@ -1463,7 +1463,69 @@ test('accepted active target survives a gateway process restart through a durabl
   }, recoveredTarget);
 });
 
-test('gateway restart discards a durable active target when the loaded thread set changed', async (t) => {
+test('gateway restart retains a durable active target when an unrelated loaded child closed', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-closed-child-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const firstClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a', 'thread-worker'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: params.threadId === 'thread-worker' ? 'thread-a' : null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-after-worker-close' } };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  const idleTarget = await firstHost.resolveTarget();
+  await firstHost.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-before-worker-close',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+  firstHost.destroy();
+
+  const secondClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      throw new Error('worker closure must not force a read of the unchanged active thread');
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-after-worker-close');
+      return { turnId: params.expectedTurnId };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const secondHost = createAppServerHost(config, () => {}, { client: secondClient });
+  t.after(() => secondHost.destroy());
+
+  const recoveredTarget = await secondHost.resolveTarget();
+  assert.equal(recoveredTarget.available, true);
+  assert.equal(recoveredTarget.threadId, 'thread-a');
+  assert.equal(recoveredTarget.status, 'active');
+  assert.equal(recoveredTarget.activeTurnId, 'turn-after-worker-close');
+  await secondHost.startTurn({
+    threadId: recoveredTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-after-worker-close',
+    input: [{ type: 'text', text: 'continue after worker close' }],
+  }, recoveredTarget);
+});
+
+test('gateway restart discards a durable active target when the target thread is no longer loaded', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-stale-active-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const config = {

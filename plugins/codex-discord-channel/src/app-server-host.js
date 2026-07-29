@@ -44,14 +44,6 @@ function parseTargetCheckpoint(raw) {
   };
 }
 
-function sameStringSet(left, right) {
-  if (left.size !== right.size) return false;
-  for (const value of left) {
-    if (!right.has(value)) return false;
-  }
-  return true;
-}
-
 function endpointToWebSocket(endpoint) {
   const value = String(endpoint || '').trim();
   if (value.startsWith('unix://')) {
@@ -754,8 +746,7 @@ class AppServerHost extends EventEmitter {
     if (!cursor) this.knownLoadedThreadIds = new Set(threadIds);
     if (restoredTargetCheckpoint) {
       const loadedThreadIds = new Set(threadIds);
-      const checkpointThreadIds = new Set(restoredTargetCheckpoint.loadedThreadIds);
-      if (!sameStringSet(loadedThreadIds, checkpointThreadIds)) {
+      if (!loadedThreadIds.has(restoredTargetCheckpoint.threadId)) {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
