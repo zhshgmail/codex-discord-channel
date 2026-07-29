@@ -389,6 +389,7 @@ class AppServerHost extends EventEmitter {
     this.threadSelectionRevision = 0;
     this.threadStatuses = new Map();
     this.activeTurnIds = new Map();
+    this.timeoutRecoveryTarget = null;
     this.onNotification = (notification) => {
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
@@ -419,6 +420,12 @@ class AppServerHost extends EventEmitter {
         if (!turnId || this.activeTurnIds.get(threadId) === turnId) {
           this.activeTurnIds.delete(threadId);
         }
+        if (
+          this.timeoutRecoveryTarget?.threadId === threadId &&
+          (!turnId || this.timeoutRecoveryTarget.turnId === turnId)
+        ) {
+          this.timeoutRecoveryTarget = null;
+        }
         if (threadId === this.currentThreadId) this.threadSelectionRevision += 1;
         return;
       }
@@ -429,7 +436,12 @@ class AppServerHost extends EventEmitter {
         const { threadId, status } = notification.params;
         const statusType = status?.type || 'unavailable';
         this.threadStatuses.set(threadId, statusType);
-        if (statusType === 'idle') this.activeTurnIds.delete(threadId);
+        if (statusType === 'idle') {
+          this.activeTurnIds.delete(threadId);
+          if (this.timeoutRecoveryTarget?.threadId === threadId) {
+            this.timeoutRecoveryTarget = null;
+          }
+        }
         if (threadId === this.currentThreadId) this.threadSelectionRevision += 1;
         if (threadId === this.currentThreadId && status?.type === 'idle') {
           this.emit('idle', { threadId });
@@ -442,6 +454,9 @@ class AppServerHost extends EventEmitter {
         this.threadSelectionRevision += 1;
         this.threadStatuses.delete(threadId);
         this.activeTurnIds.delete(threadId);
+        if (this.timeoutRecoveryTarget?.threadId === threadId) {
+          this.timeoutRecoveryTarget = null;
+        }
         if (this.currentThreadId === threadId) {
           this.currentThreadId = '';
         }
@@ -450,10 +465,35 @@ class AppServerHost extends EventEmitter {
     };
     this.onConnectionChanged = (event) => {
       this.threadSelectionRevision += 1;
-      this.currentThreadId = '';
-      this.threadStatuses.clear();
-      this.activeTurnIds.clear();
       this.lastStatus = this.client.status();
+      if (
+        !this.lastStatus.available &&
+        this.lastStatus.reason === 'shared_app_server_request_timeout'
+      ) {
+        const turnId = this.activeTurnIds.get(this.currentThreadId);
+        this.timeoutRecoveryTarget = (
+          this.currentThreadId &&
+          this.threadStatuses.get(this.currentThreadId) === 'active' &&
+          turnId
+        ) ? { threadId: this.currentThreadId, turnId } : null;
+      }
+      const retainTimeoutTarget = Boolean(this.timeoutRecoveryTarget) && (
+        this.lastStatus.available ||
+        this.lastStatus.reason === 'shared_app_server_request_timeout'
+      );
+      if (retainTimeoutTarget) {
+        const { threadId, turnId } = this.timeoutRecoveryTarget;
+        this.currentThreadId = threadId;
+        this.threadStatuses.clear();
+        this.threadStatuses.set(threadId, 'active');
+        this.activeTurnIds.clear();
+        this.activeTurnIds.set(threadId, turnId);
+      } else {
+        this.timeoutRecoveryTarget = null;
+        this.currentThreadId = '';
+        this.threadStatuses.clear();
+        this.activeTurnIds.clear();
+      }
       const reconnected = this.lastStatus.available && (this.connectionWasLost || event?.recovered);
       if (this.lastStatus.available) {
         this.hasConnected = true;
@@ -681,25 +721,39 @@ class AppServerHost extends EventEmitter {
     const requestParams = target.status === 'active'
       ? { ...params, expectedTurnId: target.activeTurnId }
       : params;
-    if (typeof this.client.requestOnConnection === 'function') {
-      const response = await this.client.requestOnConnection(
-        method,
-        requestParams,
-        generation.connectionGeneration,
-        validateTarget,
-        true,
-      );
-      if (method === 'turn/start') {
-        this.rememberAcceptedTurn(
-          params.threadId,
-          response.result,
-          response.generation,
+    let result;
+    let acceptedGeneration = null;
+    try {
+      if (typeof this.client.requestOnConnection === 'function') {
+        const response = await this.client.requestOnConnection(
+          method,
+          requestParams,
+          generation.connectionGeneration,
+          validateTarget,
+          true,
         );
+        result = response.result;
+        acceptedGeneration = response.generation;
+      } else {
+        result = await this.client.request(method, requestParams);
       }
-      return response.result;
+    } catch (error) {
+      if (
+        method === 'turn/steer' &&
+        error?.deliveryOutcome === 'rejected' &&
+        this.activeTurnIds.get(params.threadId) === target.activeTurnId
+      ) {
+        this.threadSelectionRevision += 1;
+        this.timeoutRecoveryTarget = null;
+        this.currentThreadId = '';
+        this.threadStatuses.delete(params.threadId);
+        this.activeTurnIds.delete(params.threadId);
+      }
+      throw error;
     }
-    const result = await this.client.request(method, requestParams);
-    if (method === 'turn/start') this.rememberAcceptedTurn(params.threadId, result);
+    if (method === 'turn/start') {
+      this.rememberAcceptedTurn(params.threadId, result, acceptedGeneration);
+    }
     return result;
   }
 

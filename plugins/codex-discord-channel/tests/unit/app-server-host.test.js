@@ -1257,6 +1257,147 @@ test('accepted turn response keeps active delivery available when its notificati
   );
 });
 
+test('request-timeout reconnect retains the exact accepted active turn', async () => {
+  let turnStarted = false;
+  let clientStatus = { configured: true, available: true, reason: null };
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (turnStarted) throw new Error('reconnect must not reread the active thread');
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      turnStarted = true;
+      return { turn: { id: 'turn-before-timeout' } };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-before-timeout');
+      return { turnId: params.expectedTurnId };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  client.status = () => clientStatus;
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+
+  const idleTarget = await host.resolveTarget();
+  await host.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-start',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+
+  clientStatus = {
+    configured: true,
+    available: false,
+    reason: 'shared_app_server_request_timeout',
+  };
+  client.emit('connectionChanged', { generation: 2 });
+  clientStatus = { configured: true, available: true, reason: null };
+  client.emit('connectionChanged', { generation: 3, recovered: true });
+
+  client.requests.length = 0;
+  const activeTarget = await host.resolveTarget();
+  assert.equal(activeTarget.available, true);
+  assert.equal(activeTarget.threadId, 'thread-a');
+  assert.equal(activeTarget.status, 'active');
+  assert.equal(activeTarget.activeTurnId, 'turn-before-timeout');
+  assert.equal(
+    client.requests.some((request) => request.method === 'thread/read'),
+    false,
+  );
+
+  await host.startTurn({
+    threadId: activeTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-after-timeout',
+    input: [{ type: 'text', text: 'continue after reconnect' }],
+  }, activeTarget);
+});
+
+test('rejected timeout-recovery turn is discarded before the next target resolution', async () => {
+  let turnStarted = false;
+  let rejectRecoveredTurn = false;
+  let clientStatus = { configured: true, available: true, reason: null };
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      turnStarted = true;
+      return { turn: { id: 'turn-before-timeout' } };
+    }
+    if (method === 'turn/steer' && rejectRecoveredTurn) {
+      const error = new Error('expected turn is no longer active');
+      error.code = 'shared_app_server_request_rejected';
+      error.deliveryOutcome = 'rejected';
+      throw error;
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  client.status = () => clientStatus;
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+
+  const idleTarget = await host.resolveTarget();
+  await host.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-start',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+  assert.equal(turnStarted, true);
+
+  clientStatus = {
+    configured: true,
+    available: false,
+    reason: 'shared_app_server_request_timeout',
+  };
+  client.emit('connectionChanged', { generation: 2 });
+  clientStatus = { configured: true, available: true, reason: null };
+  client.emit('connectionChanged', { generation: 3, recovered: true });
+
+  const recoveredTarget = await host.resolveTarget();
+  rejectRecoveredTurn = true;
+  await assert.rejects(
+    host.startTurn({
+      threadId: recoveredTarget.threadId,
+      clientUserMessageId: 'discord:c1:m-stale-recovery',
+      input: [{ type: 'text', text: 'stale recovery' }],
+    }, recoveredTarget),
+    (error) => error.deliveryOutcome === 'rejected',
+  );
+
+  client.requests.length = 0;
+  const idleAfterRejection = await host.resolveTarget();
+  assert.equal(idleAfterRejection.status, 'idle');
+  assert.equal(
+    client.requests.some((request) => request.method === 'thread/read'),
+    true,
+  );
+});
+
 test('active goal turn recovered from thread/read accepts input with an exact turn precondition', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
