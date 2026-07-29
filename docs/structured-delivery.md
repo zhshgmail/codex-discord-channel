@@ -69,10 +69,13 @@ checkpoint remains usable only while its target thread is still loaded, and
 submission still uses the recorded turn id as the `turn/steer`
 `expectedTurnId` precondition. Removed non-target threads do not invalidate
 that target. Newly loaded threads are read without turns and must be provable
-subagent children; a newly loaded top-level thread invalidates the checkpoint
-so an offline `/clear` cannot steer back into the old root. An empty loaded
-set, a missing target thread, or a rejected exact turn also clears the
-checkpoint and returns to fresh top-level resolution.
+subagent children with a non-empty string parent id; malformed lineage fails
+closed. A newly loaded top-level thread invalidates the checkpoint so an
+offline `/clear` cannot steer back into the old root. Candidate loaded-thread
+state is not made durable until every added thread passes this proof. Restored
+and fresh resolution both stop after 32 unique threads or 32 list pages. An
+empty loaded set, a missing target thread, or a rejected exact turn also clears
+the checkpoint and returns to fresh top-level resolution.
 
 ## FIFO And Active Turns
 

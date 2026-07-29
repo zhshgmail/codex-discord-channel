@@ -6,6 +6,7 @@ const path = require('node:path');
 
 const TARGET_GENERATION = Symbol('appServerTargetGeneration');
 const MAX_FRESH_THREAD_READS = 32;
+const MAX_LOADED_THREAD_PAGES = 32;
 const TARGET_CHECKPOINT_VERSION = 1;
 
 function parseTargetCheckpoint(raw) {
@@ -683,6 +684,7 @@ class AppServerHost extends EventEmitter {
     let cursor = '';
     let connectionGeneration = null;
     const seenCursors = new Set();
+    let loadedPageCount = 0;
     const requestForTarget = async (method, params) => {
       if (typeof this.client.requestOnConnection !== 'function') {
         return this.client.request(method, params);
@@ -697,6 +699,12 @@ class AppServerHost extends EventEmitter {
     };
     try {
       do {
+        loadedPageCount += 1;
+        if (loadedPageCount > MAX_LOADED_THREAD_PAGES) {
+          const reason = 'shared_app_server_thread_ambiguous';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
         const params = { limit: 2 };
         if (cursor) params.cursor = cursor;
         const loaded = await requestForTarget('thread/loaded/list', params);
@@ -717,6 +725,11 @@ class AppServerHost extends EventEmitter {
             if (!seenThreadIds.has(threadId)) {
               seenThreadIds.add(threadId);
               threadIds.push(threadId);
+              if (threadIds.length > MAX_FRESH_THREAD_READS) {
+                const reason = 'shared_app_server_thread_ambiguous';
+                this.lastStatus = { configured: true, available: false, reason };
+                return { available: false, reason, status: 'unavailable' };
+              }
             }
           }
         }
@@ -727,11 +740,6 @@ class AppServerHost extends EventEmitter {
           this.currentThreadId &&
           threadIds.includes(this.currentThreadId)
         ) break;
-        if (!this.currentThreadId && threadIds.length > MAX_FRESH_THREAD_READS) {
-          const reason = 'shared_app_server_thread_ambiguous';
-          this.lastStatus = { configured: true, available: false, reason };
-          return { available: false, reason, status: 'unavailable' };
-        }
       } while (cursor);
     } catch (error) {
       const reason = error?.code || 'shared_app_server_unavailable';
@@ -750,7 +758,6 @@ class AppServerHost extends EventEmitter {
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
     }
-    if (!cursor) this.knownLoadedThreadIds = new Set(threadIds);
     if (restoredTargetCheckpoint) {
       const loadedThreadIds = new Set(threadIds);
       const checkpointThreadIds = new Set(restoredTargetCheckpoint.loadedThreadIds);
@@ -772,9 +779,17 @@ class AppServerHost extends EventEmitter {
               this.lastStatus = { configured: true, available: false, reason };
               return { available: false, reason, status: 'unavailable' };
             }
-            if (!addedThread.parentThreadId) {
+            if (addedThread.parentThreadId == null) {
               checkpointInvalid = true;
               break;
+            }
+            if (
+              typeof addedThread.parentThreadId !== 'string' ||
+              addedThread.parentThreadId.trim() === ''
+            ) {
+              const reason = 'shared_app_server_thread_unprovable';
+              this.lastStatus = { configured: true, available: false, reason };
+              return { available: false, reason, status: 'unavailable' };
             }
           }
         } catch (error) {
@@ -790,11 +805,6 @@ class AppServerHost extends EventEmitter {
         this.clearTargetCheckpoint();
       }
       this.restoredTargetCheckpoint = null;
-      if (!this.currentThreadId && threadIds.length > MAX_FRESH_THREAD_READS) {
-        const reason = 'shared_app_server_thread_ambiguous';
-        this.lastStatus = { configured: true, available: false, reason };
-        return { available: false, reason, status: 'unavailable' };
-      }
     }
     let threadId = '';
     let response;
@@ -879,6 +889,7 @@ class AppServerHost extends EventEmitter {
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
     }
+    this.knownLoadedThreadIds = new Set(threadIds);
     this.currentThreadId = thread.id;
     this.threadStatuses.set(thread.id, status);
     if (status === 'active') {
