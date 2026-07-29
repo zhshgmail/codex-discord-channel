@@ -74,9 +74,12 @@ acyclic parent chain anchored in the previously proven checkpoint inventory;
 self-parent, orphan, and malformed lineage fail closed. A newly loaded
 top-level thread invalidates the checkpoint so an offline `/clear` cannot steer
 back into the old root. Candidate loaded-thread state is not made durable until
-every added thread passes this proof. An empty loaded set, a missing target
-thread, or a rejected exact turn also clears the checkpoint and returns to
-fresh top-level resolution.
+every added thread passes this proof. Thread start/close notifications
+invalidate the inventory proof; notification state alone can never create or
+refresh a checkpoint. The next checkpoint therefore requires another complete
+bounded inventory read. An empty loaded set, a missing target thread, or a
+rejected exact turn also clears the checkpoint and returns to fresh top-level
+resolution.
 
 ## FIFO And Active Turns
 

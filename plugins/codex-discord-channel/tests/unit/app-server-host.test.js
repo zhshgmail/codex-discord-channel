@@ -1578,6 +1578,47 @@ test('durable target checkpoint records every bounded loaded-thread page', async
   );
 });
 
+test('notifications cannot persist a target before loaded-thread inventory is proven', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-notification-only-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`notification-only path must not request ${method}`);
+  });
+  const host = createAppServerHost(config, () => {}, { client });
+  t.after(() => host.destroy());
+
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-current',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  client.emit('notification', {
+    method: 'turn/started',
+    params: {
+      threadId: 'thread-current',
+      turn: { id: 'turn-notification-only' },
+    },
+  });
+
+  assert.equal(
+    fs.existsSync(path.join(stateDir, 'app-server-target.json')),
+    false,
+  );
+  assert.equal(
+    client.requests.filter((request) => request.method === 'thread/loaded/list').length,
+    0,
+  );
+});
+
 test('gateway restart retains a durable active target when an unrelated loaded child closed', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-closed-child-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
@@ -1785,6 +1826,47 @@ test('gateway restart rejects self-parent and orphan lineage for an added thread
   }
 });
 
+test('gateway restart rejects a multi-node cycle in added thread lineage', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-cyclic-child-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  await createDurableTarget(config, 'turn-before-cyclic-children');
+
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a', 'thread-added-a', 'thread-added-b'], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.threadId === 'thread-added-a') {
+      return {
+        thread: {
+          id: 'thread-added-a',
+          parentThreadId: 'thread-added-b',
+          status: { type: 'active' },
+        },
+      };
+    }
+    if (method === 'thread/read' && params.threadId === 'thread-added-b') {
+      return {
+        thread: {
+          id: 'thread-added-b',
+          parentThreadId: 'thread-added-a',
+          status: { type: 'active' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(config, () => {}, { client });
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.available, false);
+  assert.equal(target.reason, 'shared_app_server_thread_unprovable');
+});
+
 test('failed added-thread proof cannot be persisted by a later active notification', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-unproven-child-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
@@ -1817,6 +1899,7 @@ test('failed added-thread proof cannot be persisted by a later active notificati
   failedHost.destroy();
 
   let addedThreadReads = 0;
+  let rootThreadReads = 0;
   const recoveredClient = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
       return { data: ['thread-a', 'thread-unproven'], nextCursor: null };
@@ -1831,6 +1914,21 @@ test('failed added-thread proof cannot be persisted by a later active notificati
         },
       };
     }
+    if (method === 'thread/read' && params.threadId === 'thread-a') {
+      rootThreadReads += 1;
+      return {
+        thread: {
+          id: 'thread-a',
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{
+            id: 'turn-before-unproven-child',
+            status: 'inProgress',
+            items: [],
+          }],
+        },
+      };
+    }
     throw new Error(`unexpected method ${method}`);
   });
   const recoveredHost = createAppServerHost(config, () => {}, { client: recoveredClient });
@@ -1841,6 +1939,7 @@ test('failed added-thread proof cannot be persisted by a later active notificati
   assert.equal(recoveredTarget.threadId, 'thread-a');
   assert.equal(recoveredTarget.activeTurnId, 'turn-before-unproven-child');
   assert.equal(addedThreadReads, 1);
+  assert.equal(rootThreadReads, 2);
 });
 
 test('gateway restart bounds added-thread lineage reads', async (t) => {

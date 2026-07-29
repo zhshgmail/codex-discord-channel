@@ -436,6 +436,7 @@ class AppServerHost extends EventEmitter {
     this.threadStatuses = new Map();
     this.activeTurnIds = new Map();
     this.knownLoadedThreadIds = new Set();
+    this.loadedInventoryProven = false;
     this.restoredTargetCheckpoint = this.loadTargetCheckpoint();
     if (this.restoredTargetCheckpoint) {
       const checkpoint = this.restoredTargetCheckpoint;
@@ -448,12 +449,13 @@ class AppServerHost extends EventEmitter {
     this.onNotification = (notification) => {
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
-        if (thread?.id && !thread.parentThreadId) {
-          if (this.currentThreadId && this.currentThreadId !== thread.id) {
-            this.clearTargetCheckpoint();
-            this.restoredTargetCheckpoint = null;
-          }
+        if (thread?.id) {
+          this.loadedInventoryProven = false;
+          this.clearTargetCheckpoint();
+          this.restoredTargetCheckpoint = null;
           this.threadSelectionRevision += 1;
+        }
+        if (thread?.id && !thread.parentThreadId) {
           this.currentThreadId = thread.id;
           this.knownLoadedThreadIds.add(thread.id);
           this.threadStatuses.set(thread.id, thread.status?.type || 'unavailable');
@@ -522,6 +524,9 @@ class AppServerHost extends EventEmitter {
       if (notification?.method === 'thread/closed') {
         const threadId = notification.params?.threadId;
         if (!threadId) return;
+        this.loadedInventoryProven = false;
+        this.clearTargetCheckpoint();
+        this.restoredTargetCheckpoint = null;
         this.threadSelectionRevision += 1;
         this.knownLoadedThreadIds.delete(threadId);
         this.threadStatuses.delete(threadId);
@@ -539,6 +544,7 @@ class AppServerHost extends EventEmitter {
     };
     this.onConnectionChanged = (event) => {
       this.threadSelectionRevision += 1;
+      this.loadedInventoryProven = false;
       this.lastStatus = this.client.status();
       if (
         !this.lastStatus.available &&
@@ -626,6 +632,7 @@ class AppServerHost extends EventEmitter {
       !threadId ||
       this.threadStatuses.get(threadId) !== 'active' ||
       !activeTurnId ||
+      !this.loadedInventoryProven ||
       !this.knownLoadedThreadIds.has(threadId)
     ) {
       this.clearTargetCheckpoint();
@@ -677,6 +684,7 @@ class AppServerHost extends EventEmitter {
   }
 
   async resolveTarget() {
+    this.loadedInventoryProven = false;
     const threadSelectionRevision = this.threadSelectionRevision;
     const restoredTargetCheckpoint = this.restoredTargetCheckpoint;
     const threadIds = [];
@@ -919,6 +927,7 @@ class AppServerHost extends EventEmitter {
       return { available: false, reason, status: 'unavailable' };
     }
     this.knownLoadedThreadIds = new Set(threadIds);
+    this.loadedInventoryProven = true;
     this.currentThreadId = thread.id;
     this.threadStatuses.set(thread.id, status);
     if (status === 'active') {
