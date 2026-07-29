@@ -1525,6 +1525,141 @@ test('gateway restart retains a durable active target when an unrelated loaded c
   }, recoveredTarget);
 });
 
+test('gateway restart retains a durable active target when an unrelated loaded child started', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-started-child-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const firstClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-before-worker-start' } };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  const idleTarget = await firstHost.resolveTarget();
+  await firstHost.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-before-worker-start',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+  firstHost.destroy();
+
+  const secondClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a', 'thread-worker'], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.threadId === 'thread-worker') {
+      return {
+        thread: {
+          id: 'thread-worker',
+          parentThreadId: 'thread-a',
+          status: { type: 'active' },
+        },
+      };
+    }
+    if (method === 'thread/read') {
+      throw new Error('child addition must not force a read of the unchanged active root');
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-before-worker-start');
+      return { turnId: params.expectedTurnId };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const secondHost = createAppServerHost(config, () => {}, { client: secondClient });
+  t.after(() => secondHost.destroy());
+
+  const recoveredTarget = await secondHost.resolveTarget();
+  assert.equal(recoveredTarget.available, true);
+  assert.equal(recoveredTarget.threadId, 'thread-a');
+  assert.equal(recoveredTarget.status, 'active');
+  assert.equal(recoveredTarget.activeTurnId, 'turn-before-worker-start');
+  assert.equal(
+    secondClient.requests.some((request) => (
+      request.method === 'thread/read' &&
+      request.params.threadId === 'thread-worker' &&
+      request.params.includeTurns === false
+    )),
+    true,
+  );
+});
+
+test('gateway restart discards a durable active target when a new top-level root appeared', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-new-root-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const firstClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-old'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-before-clear' } };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  const idleTarget = await firstHost.resolveTarget();
+  await firstHost.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-before-clear',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+  firstHost.destroy();
+
+  const secondClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-old', 'thread-after-clear'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: params.threadId === 'thread-old' ? 'active' : 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/steer') {
+      throw new Error('stale root must not receive a structured turn');
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const secondHost = createAppServerHost(config, () => {}, { client: secondClient });
+  t.after(() => secondHost.destroy());
+
+  const target = await secondHost.resolveTarget();
+  assert.equal(target.available, false);
+  assert.equal(target.reason, 'shared_app_server_thread_ambiguous');
+  assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
+});
+
 test('gateway restart discards a durable active target when the target thread is no longer loaded', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-stale-active-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
@@ -1585,6 +1720,133 @@ test('gateway restart discards a durable active target when the target thread is
   const freshTarget = await secondHost.resolveTarget();
   assert.equal(freshTarget.available, true);
   assert.equal(freshTarget.threadId, 'thread-new');
+  assert.equal(freshTarget.status, 'idle');
+  assert.equal(
+    secondClient.requests.some((request) => request.method === 'thread/read'),
+    true,
+  );
+});
+
+test('gateway restart clears a durable active target when no thread remains loaded', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-no-thread-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const firstClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-before-close' } };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  const idleTarget = await firstHost.resolveTarget();
+  await firstHost.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-before-close',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+  firstHost.destroy();
+
+  const secondClient = new FakeRpcClient(async (method) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [], nextCursor: null };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const secondHost = createAppServerHost(config, () => {}, { client: secondClient });
+  t.after(() => secondHost.destroy());
+
+  const target = await secondHost.resolveTarget();
+  assert.equal(target.available, false);
+  assert.equal(target.reason, 'shared_app_server_no_loaded_thread');
+  assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
+});
+
+test('rejected durable active target is cleared before fresh thread resolution', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-rejected-durable-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const firstClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-stale-after-restart' } };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  const idleTarget = await firstHost.resolveTarget();
+  await firstHost.startTurn({
+    threadId: idleTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-create-durable',
+    input: [{ type: 'text', text: 'start active work' }],
+  }, idleTarget);
+  firstHost.destroy();
+
+  const secondClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'turn/steer') {
+      const error = new Error('expected turn is no longer active');
+      error.code = 'shared_app_server_request_rejected';
+      error.deliveryOutcome = 'rejected';
+      throw error;
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const secondHost = createAppServerHost(config, () => {}, { client: secondClient });
+  t.after(() => secondHost.destroy());
+
+  const staleTarget = await secondHost.resolveTarget();
+  await assert.rejects(
+    secondHost.startTurn({
+      threadId: staleTarget.threadId,
+      clientUserMessageId: 'discord:c1:m-reject-durable',
+      input: [{ type: 'text', text: 'must reject stale turn' }],
+    }, staleTarget),
+    (error) => error.deliveryOutcome === 'rejected',
+  );
+  assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
+
+  secondClient.requests.length = 0;
+  const freshTarget = await secondHost.resolveTarget();
   assert.equal(freshTarget.status, 'idle');
   assert.equal(
     secondClient.requests.some((request) => request.method === 'thread/read'),

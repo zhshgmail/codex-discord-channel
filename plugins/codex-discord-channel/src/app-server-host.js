@@ -739,6 +739,13 @@ class AppServerHost extends EventEmitter {
       return { available: false, reason, status: 'unavailable' };
     }
     if (threadIds.length === 0) {
+      if (restoredTargetCheckpoint) {
+        this.currentThreadId = '';
+        this.threadStatuses.clear();
+        this.activeTurnIds.clear();
+        this.clearTargetCheckpoint();
+        this.restoredTargetCheckpoint = null;
+      }
       const reason = 'shared_app_server_no_loaded_thread';
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
@@ -746,7 +753,37 @@ class AppServerHost extends EventEmitter {
     if (!cursor) this.knownLoadedThreadIds = new Set(threadIds);
     if (restoredTargetCheckpoint) {
       const loadedThreadIds = new Set(threadIds);
-      if (!loadedThreadIds.has(restoredTargetCheckpoint.threadId)) {
+      const checkpointThreadIds = new Set(restoredTargetCheckpoint.loadedThreadIds);
+      let checkpointInvalid = !loadedThreadIds.has(restoredTargetCheckpoint.threadId);
+      if (!checkpointInvalid) {
+        const addedThreadIds = threadIds.filter((threadId) => !checkpointThreadIds.has(threadId));
+        try {
+          for (const addedThreadId of addedThreadIds) {
+            const addedResponse = await requestForTarget('thread/read', {
+              threadId: addedThreadId,
+              includeTurns: false,
+            });
+            if (this.threadSelectionRevision !== threadSelectionRevision) {
+              return this.resolveTarget();
+            }
+            const addedThread = addedResponse?.thread;
+            if (!addedThread || addedThread.id !== addedThreadId) {
+              const reason = 'shared_app_server_thread_unprovable';
+              this.lastStatus = { configured: true, available: false, reason };
+              return { available: false, reason, status: 'unavailable' };
+            }
+            if (!addedThread.parentThreadId) {
+              checkpointInvalid = true;
+              break;
+            }
+          }
+        } catch (error) {
+          const reason = error?.code || 'shared_app_server_thread_unreadable';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
+      }
+      if (checkpointInvalid) {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();

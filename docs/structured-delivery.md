@@ -67,9 +67,12 @@ current thread, delivery fails closed.
 An exact active target is checkpointed across a gateway process restart. The
 checkpoint remains usable only while its target thread is still loaded, and
 submission still uses the recorded turn id as the `turn/steer`
-`expectedTurnId` precondition. Closing or starting an unrelated subagent does
-not invalidate that target. A missing target thread or a rejected exact turn
-clears the checkpoint and returns to fresh top-level resolution.
+`expectedTurnId` precondition. Removed non-target threads do not invalidate
+that target. Newly loaded threads are read without turns and must be provable
+subagent children; a newly loaded top-level thread invalidates the checkpoint
+so an offline `/clear` cannot steer back into the old root. An empty loaded
+set, a missing target thread, or a rejected exact turn also clears the
+checkpoint and returns to fresh top-level resolution.
 
 ## FIFO And Active Turns
 
