@@ -5,7 +5,7 @@ const path = require('node:path');
 const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
-const PACKAGE_VERSION = '0.2.0';
+const PACKAGE_VERSION = '0.2.1';
 const PLUGIN_VERSION_PREFIX = `${PACKAGE_VERSION}+codex.`;
 
 function readJson(relativePath) {

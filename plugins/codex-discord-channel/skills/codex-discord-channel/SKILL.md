@@ -94,9 +94,10 @@ Unknown or ambiguous active-turn identity remains `thread_busy`, while a new
 reasoning effort, service tier, personality, cwd, sandbox, permissions,
 collaboration mode, and approval overrides.
 
-If acknowledgement is uncertain, automatic replay stops. Reconciliation must
-prove the echoed stable client user message id exists in the target thread
-before marking the queue item complete.
+Every positive acknowledgement is read back from the exact target thread.
+Automatic replay stops unless reconciliation proves that the echoed stable
+client user message id exists there. A positive RPC response without that user
+item remains `structured_ack_uncertain` and must not be described as delivered.
 
 ## History Reads
 

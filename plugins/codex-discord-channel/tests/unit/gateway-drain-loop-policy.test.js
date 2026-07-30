@@ -106,6 +106,9 @@ function createFixture(options = {}) {
       requests.push(params);
       return { turn: { id: `turn-${requests.length}` } };
     },
+    async hasDelivered(_threadId, clientUserMessageId) {
+      return requests.some((request) => request.clientUserMessageId === clientUserMessageId);
+    },
     onThreadIdle() { return () => {}; },
     onReconnect() { return () => {}; },
     onThreadClosed() { return () => {}; },

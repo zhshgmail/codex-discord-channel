@@ -840,6 +840,9 @@ test('sole gateway queues while target is down and restart delivers the event ex
       requests.push(params);
       return { turn: { id: 'turn-1' } };
     },
+    async hasDelivered(_threadId, clientUserMessageId) {
+      return requests.some((request) => request.clientUserMessageId === clientUserMessageId);
+    },
     onThreadIdle() { return () => {}; },
     onReconnect() { return () => {}; },
     onThreadClosed() { return () => {}; },

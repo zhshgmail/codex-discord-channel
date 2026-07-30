@@ -63,10 +63,12 @@ boundary. Requests include a stable Discord client message id and untrusted
 Discord context, but omit model, reasoning effort, service tier, personality,
 sandbox, cwd, and approval overrides.
 
-Queue completion is committed only after structured acceptance. If an
-acknowledgement is lost, replay is blocked. The gateway reconciles the stable
-client message id against the thread before it can mark that item complete.
-See [Structured Delivery Contract](docs/structured-delivery.md).
+Queue completion is committed only after structured acceptance **and** a
+read-back of the stable client message id from the exact target thread. A
+positive RPC response without that persisted user item is not success: replay
+is blocked and the FIFO head remains available for reconciliation. See the
+[Structured Delivery Contract](docs/structured-delivery.md) and
+[Known Issues And Operational Boundaries](docs/known-issues.md).
 
 The queue also carries a durable delivery activation id and timestamp. The id
 defaults to the real installed plugin root, so a newly installed version
@@ -124,12 +126,149 @@ unavailability. Do not claim passive or exact-console success.
 
 ## Remote Marketplace Install
 
+Prerequisites:
+
+- Node.js 22 or newer;
+- a Discord bot with Message Content intent enabled;
+- one private token file per instance; and
+- one shared Codex app-server used by both the gateway and visible TUI.
+
 ```bash
 codex plugin marketplace add zhshgmail/codex-discord-channel --ref main
 codex plugin add codex-discord-channel@personal
 ```
 
 Use a new Codex thread after installation so the MCP server is loaded.
+
+For a review branch or pinned deployment, replace `main` with the exact branch,
+tag, or commit approved for that deployment. Do not assume an open MCP
+transport has hot-loaded a replaced plugin.
+
+## Configure An Instance
+
+The default instance is `default`. Select a named instance with
+`DISCORD_INSTANCE`; the examples below use `codex01`.
+
+Create `$HOME/.codex/channels/discord/codex01/.env` locally:
+
+```env
+DISCORD_INSTANCE=codex01
+DISCORD_BOT_TOKEN=replace-locally
+DISCORD_BOT_USER_ID=replace-with-the-bot-user-id
+# Only when the host requires them:
+# DISCORD_PROXY_URL=http://proxy.example:8080
+# DISCORD_INSECURE_TLS=true
+```
+
+Never commit this file, paste it into an issue, or print it while collecting
+diagnostics.
+
+Create `access.json` in the same directory. This minimal example accepts an
+allowlisted sender in one guild channel only when the bot is mentioned:
+
+```json
+{
+  "version": 1,
+  "dmPolicy": "pairing",
+  "allowFrom": ["USER_ID"],
+  "groups": {
+    "CHANNEL_ID": {
+      "requireMention": true,
+      "allowFrom": ["USER_ID"],
+      "allowBots": false
+    }
+  },
+  "pendingPairings": {},
+  "mentionPatterns": ["<@BOT_USER_ID>"],
+  "ackReaction": "",
+  "replyToMode": "first",
+  "textChunkLimit": 2000,
+  "chunkMode": "newline",
+  "threads": {}
+}
+```
+
+Use current Discord snowflake ids. Role mentions and user mentions are
+different strings. If messages from peer bots are expected, set
+`allowBots: true`, allowlist their author ids, and include every intended bot
+or role mention pattern.
+
+`access.json` is the receive-policy authority. A legacy `state.json` may remain
+after migration, but editing it does not update current access policy.
+
+## Start The Shared Runtime
+
+Use one socket per instance:
+
+```bash
+STATE_DIR="${CODEX_HOME:-$HOME/.codex}/channels/discord/codex01"
+SOCKET="$STATE_DIR/app-server.sock"
+mkdir -p "$STATE_DIR"
+codex app-server --listen "unix://$SOCKET"
+codex --remote "unix://$SOCKET" resume <THREAD_ID>
+```
+
+Run exactly one gateway for that state directory:
+
+```bash
+DISCORD_INSTANCE=codex01 \
+DISCORD_CONFIG_DIR="$STATE_DIR" \
+codex-discord-channel gateway
+```
+
+For a user systemd service, use an absolute Node path in `ExecStart`. User
+services do not reliably inherit an interactive `nvm` shell:
+
+```ini
+[Service]
+Environment=DISCORD_INSTANCE=codex01
+Environment=DISCORD_CONFIG_DIR=%h/.codex/channels/discord/codex01
+ExecStart=/absolute/path/to/node /absolute/path/to/codex-discord-channel gateway
+Restart=always
+RestartSec=5
+```
+
+Keep any retired `discord-codex-bridge` service disabled. Two receivers sharing
+one bot make diagnosis ambiguous even when queue deduplication prevents some
+duplicates.
+
+## Use The Plugin
+
+The MCP tools are:
+
+- `discord_channel_status`
+- `discord_channel_read_owner`
+- `discord_channel_claim_owner`
+- `discord_channel_read_history`
+- `discord_channel_send`
+
+Check status before claiming live delivery. The minimum healthy evidence is:
+
+```json
+{
+  "deliveryMode": "app-server",
+  "deliverySafety": "structured_only",
+  "structuredDeliveryState": "available",
+  "sharedAppServerAvailable": true,
+  "discordStarted": true
+}
+```
+
+The command-line sender reads message text from standard input:
+
+```bash
+printf '%s' 'status update' |
+  DISCORD_INSTANCE=codex01 codex-discord-channel send \
+    --channel CHANNEL_ID
+```
+
+Add `--reply-to MESSAGE_ID` for a Discord reply. Omitting `--channel` targets
+the channel in `last-inbound.json`; use that shortcut only after checking the
+record belongs to the intended conversation.
+
+`discord_channel_read_history` is bounded to 25 sanitized messages per call.
+Use its exclusive `before` cursor to page backward. Reading history does not
+enqueue or acknowledge those messages.
 
 ## Status
 
@@ -178,6 +317,37 @@ $HOME/.codex/channels/discord/codex01/app-server.sock
 ```
 
 Do not commit `.env` or print Discord tokens.
+
+## Operations And Troubleshooting
+
+Useful non-secret checks:
+
+```bash
+systemctl --user status codex-discord-channel@codex01.service --no-pager -l
+journalctl --user -u codex-discord-channel@codex01.service -n 200 --no-pager
+jq '{blocked,itemCount:(.items|length),completed:(.completed|length)}' \
+  "$HOME/.codex/channels/discord/codex01/pending-delivery.json"
+cat "$HOME/.codex/channels/discord/codex01/session-gateway.pid"
+```
+
+Do not use `grep -c ... || echo 0` for these checks. A missing file and a clean
+file both reach the fallback; inspect the command exit code separately.
+
+| Symptom | Check | Corrective action |
+|---|---|---|
+| `node: command not found` under systemd or a noninteractive shell | `ExecStart` and the service environment | Use an absolute Node 22+ path. |
+| Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Install the intended revision, migrate the gateway, and start a new Codex thread. A closed MCP transport cannot hot-reload. |
+| `guild_mention_required` | `access.json` `requireMention`, bot user id, `mentionPatterns`, and reply audience | Correct the exact user/role mention pattern. Do not edit `owner.json` or legacy `state.json` as a workaround. |
+| Peer bot messages are absent | Group `allowFrom`, `allowBots`, current group id, and mention pattern | Allowlist the peer bot and set `allowBots: true` only for the intended group. |
+| Gateway says connected but the visible TUI receives nothing | Confirm both processes use the same `app-server.sock` | Relaunch the TUI with `codex --remote`. A direct TUI has a private embedded server. |
+| Queue is stuck at `thread_busy` | Exact current thread and active turn identity | Let the current turn advance; do not start a second receiver or inject terminal input. |
+| Queue is stuck at `structured_ack_uncertain` | Exact target thread read-back by stable client id | Preserve the queue. The gateway reconciles without replay when the user item appears. See the known issue below. |
+| Messages reappear after deployment | Runtime path and delivery activation id | Use versioned install paths. Do not reuse an old activation id across incompatible releases. |
+| Discord login or send fails behind a corporate network | Status booleans for proxy/TLS and service environment | Configure `DISCORD_PROXY_URL`; use `DISCORD_INSECURE_TLS` only where the local trust boundary explicitly requires it. Never log the values. |
+| `/clear` is followed by delivery to an old thread | Current runtime version and target checkpoint | Upgrade and verify thread rotation in the exact visible TUI. `owner.json` must not be used as the message receive gate. |
+
+The reproduced false-completion incident and its fixed boundary are documented
+in [Known Issues And Operational Boundaries](docs/known-issues.md).
 
 ## Validation
 

@@ -63,10 +63,15 @@ function activeReceiver() {
   };
 }
 
+function requestWasPersisted(requests, clientUserMessageId) {
+  return requests.some((request) => request.clientUserMessageId === clientUserMessageId);
+}
+
 function structuredFixture(overrides = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-delivery-'));
   const requests = [];
   const submittedTargets = [];
+  const persistedClientUserMessageIds = new Set();
   let target = { available: true, threadId: 'thread-current', status: 'idle' };
   let idleListener = null;
   let activeListener = null;
@@ -81,19 +86,23 @@ function structuredFixture(overrides = {}) {
     async startTurn(params, resolvedTarget) {
       requests.push(params);
       submittedTargets.push(resolvedTarget);
+      let response;
       if (typeof overrides.onStartTurn === 'function') {
-        return overrides.onStartTurn(params, {
+        response = await overrides.onStartTurn(params, {
           getTarget: () => ({ ...target }),
           setTarget: (next) => { target = { ...next }; },
         });
+      } else {
+        response = { turn: { id: `turn-${requests.length}` } };
       }
-      return { turn: { id: `turn-${requests.length}` } };
+      persistedClientUserMessageIds.add(params.clientUserMessageId);
+      return response;
     },
     async hasDelivered(threadId, clientUserMessageId) {
       if (typeof overrides.hasDelivered === 'function') {
         return overrides.hasDelivered(threadId, clientUserMessageId);
       }
-      return false;
+      return Boolean(threadId) && persistedClientUserMessageIds.has(clientUserMessageId);
     },
     onThreadIdle(listener) {
       idleListener = listener;
@@ -308,6 +317,9 @@ test('activation archives stale backlog before target resolution and delivers a 
       async startTurn(params) {
         requests.push(params);
         return { turn: { id: 'turn-fresh' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return requestWasPersisted(requests, clientUserMessageId);
       },
       onThreadIdle() { return () => {}; },
       onThreadActive() { return () => {}; },
@@ -656,6 +668,9 @@ test('same activation restart preserves the watermark and recovers a fresh pendi
         requests.push(params);
         return { turn: { id: 'turn-after-restart' } };
       },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return requestWasPersisted(requests, clientUserMessageId);
+      },
       onThreadIdle() { return () => {}; },
       onThreadActive() { return () => {}; },
       onReconnect() { return () => {}; },
@@ -781,6 +796,7 @@ test('startup and reconnect recover an active goal turn and steer the persisted 
   const requests = [];
   let available = true;
   let activeTurnId = 'goal-continuation-startup';
+  const persistedClientUserMessageIds = new Set();
   client.status = () => ({
     configured: true,
     available,
@@ -802,11 +818,21 @@ test('startup and reconnect recover an active goal turn and steer the persisted 
           id: params.threadId,
           parentThreadId: null,
           status: { type: 'active', activeFlags: [] },
-          turns: [{ id: activeTurnId, status: 'inProgress', items: [] }],
+          turns: [{
+            id: activeTurnId,
+            status: 'inProgress',
+            items: [...persistedClientUserMessageIds].map((clientId) => ({
+              type: 'userMessage',
+              clientId,
+            })),
+          }],
         },
       };
     }
-    if (method === 'turn/steer') return { turnId: params.expectedTurnId };
+    if (method === 'turn/steer') {
+      persistedClientUserMessageIds.add(params.clientUserMessageId);
+      return { turnId: params.expectedTurnId };
+    }
     throw new Error(`unexpected method ${method}`);
   };
   const host = createAppServerHost(
@@ -918,6 +944,9 @@ test('constructor defers startup drain until receiver authority is activated', a
         requests.push(params);
         return { turn: { id: 'turn-startup' } };
       },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return requestWasPersisted(requests, clientUserMessageId);
+      },
       onThreadIdle() { return () => {}; },
       status() { return { configured: true, available: true, reason: null }; },
       destroy() {},
@@ -964,7 +993,8 @@ test('startup drain advances a crashed accepted head and submits the next FIFO i
       },
       async hasDelivered(threadId, clientUserMessageId) {
         reconciliations.push({ threadId, clientUserMessageId });
-        return clientUserMessageId === 'discord:c1:m-crashed';
+        return clientUserMessageId === 'discord:c1:m-crashed' ||
+          requestWasPersisted(requests, clientUserMessageId);
       },
       onThreadIdle() { return () => {}; },
       status() { return { configured: true, available: true, reason: null }; },
@@ -973,10 +1003,16 @@ test('startup drain advances a crashed accepted head and submits the next FIFO i
   });
   await delivery.activateReceiver(activeReceiver);
 
-  assert.deepEqual(reconciliations, [{
-    threadId: 'thread-current',
-    clientUserMessageId: 'discord:c1:m-crashed',
-  }]);
+  assert.deepEqual(reconciliations, [
+    {
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-crashed',
+    },
+    {
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-next',
+    },
+  ]);
   assert.deepEqual(requests.map((request) => request.clientUserMessageId), ['discord:c1:m-next']);
   assert.deepEqual(readQueue(dir).items, []);
   assert.deepEqual(
@@ -1053,6 +1089,9 @@ test('restart retries a lease abandoned before target resolution without replay 
       async startTurn(params) {
         requests.push(params);
         return { turn: { id: 'turn-after-restart' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return requestWasPersisted(requests, clientUserMessageId);
       },
       onThreadIdle() { return () => {}; },
       status() { return { configured: true, available: true, reason: null }; },
@@ -1164,7 +1203,8 @@ test('reconnect drain reconciles an accepted head before submitting the next FIF
       },
       async hasDelivered(_threadId, clientUserMessageId) {
         if (!online) throw new Error('disconnected');
-        return clientUserMessageId === 'discord:c1:m-accepted';
+        return clientUserMessageId === 'discord:c1:m-accepted' ||
+          requestWasPersisted(requests, clientUserMessageId);
       },
       onThreadIdle() { return () => {}; },
       onReconnect(listener) {
@@ -1213,6 +1253,9 @@ test('persisted accepted message drains autonomously when the host reconnects', 
         requests.push(params);
         return { turn: { id: 'turn-reconnect' } };
       },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return requestWasPersisted(requests, clientUserMessageId);
+      },
       onThreadIdle() { return () => {}; },
       onReconnect(listener) {
         availableListener = listener;
@@ -1250,6 +1293,9 @@ test('persisted message retries autonomously after a loaded child thread closes'
       async startTurn(params) {
         requests.push(params);
         return { turn: { id: 'turn-after-child-close' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return requestWasPersisted(requests, clientUserMessageId);
       },
       onThreadIdle() { return () => {}; },
       onThreadClosed(listener) {
@@ -1292,6 +1338,9 @@ test('concurrent receivers persist and submit a Discord identity only once', asy
       markStarted();
       await pending;
       return { turn: { id: 'turn-1' } };
+    },
+    async hasDelivered(_threadId, clientUserMessageId) {
+      return requestWasPersisted(requests, clientUserMessageId);
     },
     onThreadIdle() { return () => {}; },
     status() { return { configured: true, available: true, reason: null }; },
@@ -1347,6 +1396,9 @@ test('receiver handoff waits for the incumbent delivery lease before committing 
       markTurnStarted();
       await turnReleased;
       return { turn: { id: 'turn-incumbent' } };
+    },
+    async hasDelivered(_threadId, clientUserMessageId) {
+      return requestWasPersisted(requests, clientUserMessageId);
     },
     onThreadIdle() { return () => {}; },
     onReconnect() { return () => {}; },
@@ -1413,6 +1465,55 @@ test('uncertain structured acknowledgement blocks replay and later FIFO items', 
   const queue = readQueue(fixture.dir);
   assert.deepEqual(queue.items.map((item) => item.normalized.messageId), ['m1', 'm2']);
   assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
+});
+
+test('successful response without a persisted user item is not marked complete', async () => {
+  let starts = 0;
+  const fixture = structuredFixture({
+    onStartTurn() {
+      starts += 1;
+      return { turn: { id: 'turn-acknowledged-only' } };
+    },
+    hasDelivered() {
+      return false;
+    },
+  });
+
+  const result = await fixture.delivery.deliver(discordMessage('m-ack-gap', 'must persist'));
+  const queue = readQueue(fixture.dir);
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'structured_ack_uncertain');
+  assert.equal(starts, 1);
+  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), ['m-ack-gap']);
+  assert.deepEqual(queue.completed, []);
+  assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
+  assert.equal(queue.blocked.clientUserMessageId, 'discord:c1:m-ack-gap');
+});
+
+test('unpersisted successful response reconciles later without replay', async () => {
+  let persisted = false;
+  let starts = 0;
+  const fixture = structuredFixture({
+    onStartTurn() {
+      starts += 1;
+      return { turn: { id: 'turn-delayed-persistence' } };
+    },
+    hasDelivered(_threadId, clientUserMessageId) {
+      return persisted && clientUserMessageId === 'discord:c1:m-delayed';
+    },
+  });
+
+  const unverified = await fixture.delivery.deliver(discordMessage('m-delayed', 'once'));
+  persisted = true;
+  const reconciled = await fixture.delivery.flush();
+
+  assert.equal(unverified.reason, 'structured_ack_uncertain');
+  assert.equal(reconciled.status, 'delivered');
+  assert.equal(reconciled.reason, 'turn_already_accepted');
+  assert.equal(starts, 1);
+  assert.deepEqual(readQueue(fixture.dir).items, []);
+  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-delayed']);
 });
 
 test('uncertain acknowledgement reconciles by client id without replaying turn/start', async () => {

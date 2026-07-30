@@ -2,6 +2,10 @@
 
 This directory is the plugin payload for `codex-discord-channel`.
 
+For installation, instance configuration, shared app-server startup, systemd
+operation, access-policy examples, and the troubleshooting matrix, start with
+the repository [README](../../README.md).
+
 ## Runtime Contract
 
 The Discord gateway is identified by the configured instance state directory
@@ -26,8 +30,10 @@ precondition when a goal continuation or other turn is already running.
 Unknown active-turn identity remains `thread_busy`. Turn payloads omit model,
 reasoning effort, service tier, personality, cwd, sandbox, and approval
 overrides; Discord metadata is carried only in the sanitized text envelope.
-Lost acknowledgements are reconciled by the echoed client user message id
-before completion, so the gateway does not replay speculatively.
+Every positive acknowledgement is read back from the exact thread by the
+echoed client user message id before completion. A response without a persisted
+user item remains `structured_ack_uncertain`, so the gateway neither reports a
+false completion nor replays speculatively.
 
 `pending-delivery.json` uses a durable activation id and timestamp. The id
 defaults to the real installed plugin root. A new versioned install archives
@@ -66,7 +72,9 @@ The visible TUI must be relaunched with `codex --remote <same-endpoint> ...`
 after a shared app-server is started. A direct `codex ... resume` process cannot
 be verified from this plugin. See the repository
 [Structured Delivery Contract](../../docs/structured-delivery.md) for the full
-migration and acceptance boundary.
+migration and acceptance boundary. User-visible failure signatures and
+diagnostic steps are recorded in
+[Known Issues And Operational Boundaries](../../docs/known-issues.md).
 
 ## Checks
 

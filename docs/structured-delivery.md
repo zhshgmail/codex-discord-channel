@@ -128,8 +128,12 @@ a goal continuation that wins an idle-boundary race becomes the bounded delivery
 target instead of starving the FIFO. The active turn id is a request precondition
 only, not receiver ownership or session binding.
 
-Once either structured request is acknowledged, that item is committed complete
-and the drain stops. Later items retain FIFO order and wait for another drain.
+After either structured request is acknowledged, the gateway reads the exact
+target thread and requires the stable client user message id to be present.
+Only that proof commits the item complete. A positive response without a
+persisted user item is treated as acknowledgement uncertainty, retains the FIFO
+head, and enters reconciliation without replay. Later items retain FIFO order
+and wait for another drain.
 
 The gateway also inspects the durable queue periodically. Missing endpoints,
 missing loaded threads, busy threads, and stale receiver authority retain the
@@ -154,10 +158,12 @@ thread settings remain authoritative.
 
 ## Acknowledgement And Deduplication
 
-A successful `turn/start` or `turn/steer` response is the acceptance boundary.
-If the request is known to be rejected or was not sent, the queue head remains
-retryable. If the connection or timeout makes acceptance uncertain, the FIFO is
-blocked as `structured_ack_uncertain`.
+A successful `turn/start` or `turn/steer` response is not by itself the
+completion boundary. The gateway must also read back a `userMessage` carrying
+the stable client user message id from the exact target thread. If the request
+is known to be rejected or was not sent, the queue head remains retryable. If
+the connection, timeout, or post-ack read-back makes acceptance uncertain, the
+FIFO is blocked as `structured_ack_uncertain`.
 
 The stable client user message id is echoed by the app-server on the persisted
 user item. Before clearing an uncertain block, the gateway reads the target

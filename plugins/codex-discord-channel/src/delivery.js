@@ -799,6 +799,43 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       return blocked;
     }
 
+    let persistedUserItem = false;
+    try {
+      if (typeof host.hasDelivered === 'function') {
+        persistedUserItem = await host.hasDelivered(
+          target.threadId,
+          params.clientUserMessageId,
+        );
+      }
+    } catch {}
+    if (!persistedUserItem) {
+      const unverified = await blockCurrentHead(
+        config,
+        deps,
+        next,
+        DELIVERY_ACK_UNCERTAIN,
+        {
+          messageId: next.normalized.messageId,
+          threadId: target.threadId,
+          clientUserMessageId: params.clientUserMessageId,
+          error: 'Structured turn was acknowledged but its user item was not observed.',
+        },
+        verifyReceiverOwnership,
+      );
+      activeDeliveryAttempts.delete(attemptId);
+      if (unverified.retry) continue;
+      if (unverified.receiverRejected) {
+        return receiverRejectedResult(unverified.queue, unverified.receiverRejected);
+      }
+      logger('ERROR', 'Structured Discord delivery acknowledgement was not persisted', {
+        reason: DELIVERY_ACK_UNCERTAIN,
+        channelId: next.normalized.channelId,
+        messageId: next.normalized.messageId,
+        queueDepth: claim.queueDepth,
+      });
+      return unverified.result;
+    }
+
     try {
       const committed = await withDeliveryQueueLock(config, deps, () => {
         const queue = readDeliveryQueue(config, deps);
