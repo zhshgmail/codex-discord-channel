@@ -113,6 +113,42 @@ from category parents, and threads below unknown parents remain fail-closed.
 This matches the Claude Code Discord plugin's access boundary: policy is keyed
 by `thread.parentId`, while replies continue to use the thread's own ID.
 
+## A Local Codex Reply Is Not Visible In Discord
+
+### Symptom
+
+A Discord-origin message is present in the active Codex transcript and Codex
+produces `commentary` or a final response locally, but the Discord thread shows
+no bot reply. The operator can see progress in the console while the Discord
+user has no status at all.
+
+### Cause
+
+Inbound structured delivery and outbound Discord delivery are separate
+transports. The source envelope proves where a request came from; it does not
+make ordinary Codex response items into Discord messages. In particular,
+working `commentary` is local progress output. A local final response is also
+not a Discord delivery receipt unless an outbound Discord send path actually
+returns a message identity.
+
+This failure was reproduced on 2026-07-31 in thread
+`1532884892159836281`: multiple local responses existed while the owner saw no
+Discord reply. Explicit outbound send produced message
+`1532897832485523738`, which was then read back from that exact thread.
+
+### Required Behavior
+
+For every reply-required Discord-origin turn:
+
+1. send the user-facing response explicitly to the source channel or thread;
+2. retain the returned stable Discord message ID;
+3. read that exact ID back from the exact destination; and
+4. only then claim that the user can see the response in Discord.
+
+Do not use local console visibility, a completed inbound queue item, model turn
+completion, or a successful send call without exact read-back as evidence of
+outbound delivery.
+
 ## Gateway Is Healthy But Messages Go To No Visible Console
 
 The gateway and visible TUI must share the same externally reachable Codex
