@@ -30,6 +30,19 @@ item therefore produced a false completed record and suppressed replay.
 This is an acknowledgement-boundary defect. It is not an access-policy,
 mention, Discord login, or FIFO persistence failure.
 
+### Observed Stale-Runtime Recurrence
+
+On 2026-07-30/31, a user-reported missing Discord message was investigated
+after the fix was already present in the repository at `508c340`. The active
+`codex01` systemd unit was still executing the older affected runtime
+`0.2.0+git.9b74c5c20047`, and that process had started before the fix was
+published. The queue continued to record positive `turn_accepted` results.
+
+This establishes a deployment-identity gap: a fixed checkout does not repair
+an already-running gateway. It does not, by itself, attribute a particular
+missing message when that message's Discord id is unavailable. For an exact
+incident verdict, apply the four diagnosis steps below to that id.
+
 ### Fixed Behavior
 
 After a positive structured response, the gateway now reads the exact target
