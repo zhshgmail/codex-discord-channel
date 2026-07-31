@@ -76,7 +76,7 @@ acceptance conditions and must be verified separately.
 
 Check `access.json`, not `owner.json`:
 
-- the exact guild channel or thread must exist under `groups`;
+- the guild parent channel or an exact thread override must exist under `groups`;
 - the sender must be allowed;
 - bot senders require `allowBots: true`;
 - with `requireMention: true`, the message must match the current bot user id,
