@@ -29,9 +29,15 @@ function normalizeDiscordMessage(message, referencedMessage = null) {
     : Array.from(message.attachments?.values?.() || []);
   const hasReference = Boolean(message.reference?.messageId);
   const createdTimestamp = Number(message.createdTimestamp);
+  const isThread = typeof message.channel?.isThread === 'function' && message.channel.isThread();
+  const threadParentId = isThread && message.channel.parentId
+    ? String(message.channel.parentId)
+    : null;
   return {
     source: message.guildId ? 'guild' : 'dm',
     channelId: message.channelId,
+    policyChannelId: threadParentId || message.channelId,
+    threadParentId,
     guildId: message.guildId || null,
     messageId: message.id,
     authorId: message.author?.id || message.authorId || '',

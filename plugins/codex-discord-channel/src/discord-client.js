@@ -133,6 +133,8 @@ function createDiscordMessageHandler({
         log(logger, 'INFO', 'Discord message denied by access policy', {
           reason: decision.reason,
           channelId: normalized.channelId,
+          policyChannelId: normalized.policyChannelId,
+          threadParentId: normalized.threadParentId,
           messageId: normalized.messageId,
         });
         return null;
@@ -157,6 +159,7 @@ function createDiscordMessageHandler({
         status: result.status,
         reason: result.reason,
         channelId: normalized.channelId,
+        policyChannelId: normalized.policyChannelId,
         messageId: normalized.messageId,
       });
     } catch (error) {

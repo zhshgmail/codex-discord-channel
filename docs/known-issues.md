@@ -87,6 +87,32 @@ Check `access.json`, not `owner.json`:
 individual inbound message because `/clear` can rotate thread identity while
 the same Discord state path remains active.
 
+## Thread Message Is Denied Although Its Parent Channel Is Enabled
+
+### Symptom
+
+The Discord gateway remains connected and logs current events, but a message
+inside a newly created thread is denied with `guild_channel_not_enabled`. The
+same mentioned sender is accepted in the parent channel.
+
+### Cause
+
+Releases through `0.2.1+git.92d5d37cc13b` looked up guild policy only by the
+message's exact `channelId`. Discord threads have their own channel IDs, so an
+enabled parent channel did not authorize any thread created below it. History
+lookup encoded the same incorrect exact-ID requirement in a unit test.
+
+### Fixed Behavior
+
+An exact thread policy remains an optional override. Otherwise, public,
+private, and announcement threads inherit `requireMention`, `allowFrom`, and
+`allowBots` from an enabled parent channel. The actual thread ID remains the
+delivery and reply destination. Ordinary text channels do not inherit policy
+from category parents, and threads below unknown parents remain fail-closed.
+
+This matches the Claude Code Discord plugin's access boundary: policy is keyed
+by `thread.parentId`, while replies continue to use the thread's own ID.
+
 ## Gateway Is Healthy But Messages Go To No Visible Console
 
 The gateway and visible TUI must share the same externally reachable Codex

@@ -193,6 +193,12 @@ different strings. If messages from peer bots are expected, set
 `allowBots: true`, allowlist their author ids, and include every intended bot
 or role mention pattern.
 
+Enabling a guild text channel also enables every public, private, or
+announcement thread below it. Threads inherit the parent channel's
+`requireMention`, `allowFrom`, and `allowBots` policy while replies remain in
+the actual thread. Add an exact thread id only when that thread needs an
+explicit policy override.
+
 `access.json` is the receive-policy authority. A legacy `state.json` may remain
 after migration, but editing it does not update current access policy.
 
@@ -338,6 +344,7 @@ file both reach the fallback; inspect the command exit code separately.
 | `node: command not found` under systemd or a noninteractive shell | `ExecStart` and the service environment | Use an absolute Node 22+ path. |
 | Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Install the intended revision, migrate the gateway, and start a new Codex thread. A closed MCP transport cannot hot-reload. |
 | `guild_mention_required` | `access.json` `requireMention`, bot user id, `mentionPatterns`, and reply audience | Correct the exact user/role mention pattern. Do not edit `owner.json` or legacy `state.json` as a workaround. |
+| `guild_channel_not_enabled` in a thread | Runtime revision, thread parent id, and the parent entry in `access.json` | Upgrade past `0.2.1+git.92d5d37cc13b` and enable the parent channel. New threads inherit parent policy automatically. |
 | Peer bot messages are absent | Group `allowFrom`, `allowBots`, current group id, and mention pattern | Allowlist the peer bot and set `allowBots: true` only for the intended group. |
 | Gateway says connected but the visible TUI receives nothing | Confirm both processes use the same `app-server.sock` | Relaunch the TUI with `codex --remote`. A direct TUI has a private embedded server. |
 | Queue is stuck at `thread_busy` | Exact current thread and active turn identity | Let the current turn advance; do not start a second receiver or inject terminal input. |

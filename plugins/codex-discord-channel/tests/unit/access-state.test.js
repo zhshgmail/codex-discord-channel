@@ -159,6 +159,59 @@ test('guild channel can disable mention requirement', () => {
   assert.equal(decision.allowed, true);
 });
 
+test('guild thread inherits its enabled parent channel policy', () => {
+  const state = normalizeAccessState({
+    groups: { parent: { allowFrom: ['u1'], allowBots: false } },
+  });
+  const allowed = decideAccess(state, {
+    source: 'guild',
+    channelId: 'thread',
+    policyChannelId: 'parent',
+    authorId: 'u1',
+    authorIsBot: false,
+    content: '<@bot> hi',
+    botUserId: 'bot',
+  });
+  const deniedSender = decideAccess(state, {
+    source: 'guild',
+    channelId: 'thread',
+    policyChannelId: 'parent',
+    authorId: 'u2',
+    authorIsBot: false,
+    content: '<@bot> hi',
+    botUserId: 'bot',
+  });
+  const deniedBot = decideAccess(state, {
+    source: 'guild',
+    channelId: 'thread',
+    policyChannelId: 'parent',
+    authorId: 'u1',
+    authorIsBot: true,
+    content: '<@bot> hi',
+    botUserId: 'bot',
+  });
+
+  assert.equal(allowed.allowed, true);
+  assert.equal(deniedSender.reason, 'guild_sender_denied');
+  assert.equal(deniedBot.reason, 'bot_author_denied');
+});
+
+test('guild thread with an unknown parent remains denied', () => {
+  const state = normalizeAccessState({ groups: { parent: {} } });
+  const decision = decideAccess(state, {
+    source: 'guild',
+    channelId: 'thread',
+    policyChannelId: 'unknown-parent',
+    authorId: 'u1',
+    authorIsBot: false,
+    content: '<@bot> hi',
+    botUserId: 'bot',
+  });
+
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'guild_channel_not_enabled');
+});
+
 test('bot-authored messages are denied unless channel allows bots', () => {
   const denied = decideAccess(normalizeAccessState({ groups: { c1: { requireMention: false } } }), {
     source: 'guild',
@@ -213,7 +266,7 @@ test('mentionsBot detects Discord mention or configured pattern', () => {
   assert.equal(mentionsBot('hi', '123'), false);
 });
 
-test('history target requires exact enabled guild channel or thread id', () => {
+test('history target accepts an enabled guild channel and threads under it', () => {
   const state = normalizeAccessState({ groups: { '100000000000000001': {} } });
   const channel = {
     id: '100000000000000001',
@@ -233,9 +286,44 @@ test('history target requires exact enabled guild channel or thread id', () => {
     source: 'guild',
   });
   assert.deepEqual(decideHistoryTarget(state, threadWithEnabledParent, '900000000000000001'), {
+    allowed: true,
+    reason: 'guild_channel_enabled',
+    source: 'guild',
+  });
+});
+
+test('history target does not inherit policy from a category for an ordinary text channel', () => {
+  const state = normalizeAccessState({ groups: { category: {} } });
+  const channel = {
+    id: 'channel',
+    parentId: 'category',
+    guildId: 'guild',
+    type: 0,
+  };
+
+  assert.deepEqual(decideHistoryTarget(state, channel, 'bot'), {
     allowed: false,
     reason: 'history_target_not_allowed',
   });
+});
+
+test('history filtering applies the inherited parent policy to thread messages', () => {
+  const state = normalizeAccessState({
+    groups: {
+      parent: { allowFrom: ['human'], allowBots: false },
+    },
+  });
+  const thread = { id: 'thread', parentId: 'parent', guildId: 'guild', type: 11 };
+
+  assert.equal(allowHistoryMessage(state, thread, {
+    author: { id: 'human', bot: false },
+  }, 'bot'), true);
+  assert.equal(allowHistoryMessage(state, thread, {
+    author: { id: 'other', bot: false },
+  }, 'bot'), false);
+  assert.equal(allowHistoryMessage(state, thread, {
+    author: { id: 'peer-bot', bot: true },
+  }, 'bot'), false);
 });
 
 test('history target supports only message-bearing guild channel types', () => {

@@ -286,6 +286,43 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
   assert.equal(withoutReference.repliedToContent, '');
 });
 
+test('normalizeDiscordMessage keeps the thread destination and inherits parent policy', () => {
+  const normalized = normalizeDiscordMessage({
+    channelId: 'thread',
+    guildId: 'guild',
+    channel: {
+      parentId: 'parent',
+      isThread: () => true,
+    },
+    id: 'message',
+    author: { id: 'human', username: 'alice' },
+    content: '<@bot> hi',
+    attachments: [],
+  });
+
+  assert.equal(normalized.channelId, 'thread');
+  assert.equal(normalized.policyChannelId, 'parent');
+  assert.equal(normalized.threadParentId, 'parent');
+});
+
+test('normalizeDiscordMessage does not inherit a category from a text channel', () => {
+  const normalized = normalizeDiscordMessage({
+    channelId: 'channel',
+    guildId: 'guild',
+    channel: {
+      parentId: 'category',
+      isThread: () => false,
+    },
+    id: 'message',
+    author: { id: 'human', username: 'alice' },
+    content: '<@bot> hi',
+    attachments: [],
+  });
+
+  assert.equal(normalized.policyChannelId, 'channel');
+  assert.equal(normalized.threadParentId, null);
+});
+
 test('structuredSafeText preserves Unicode while escaping every terminal control byte', () => {
   const input = 'CR\rLF\nTAB\tNUL\0ESC\x1b[200~CTRL\x03DEL\x7f汉字🙂';
   const output = structuredSafeText(input);

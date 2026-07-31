@@ -73,8 +73,20 @@ function mentionsBot(content, botUserId, patterns = []) {
   });
 }
 
+function guildPolicy(state, message) {
+  const channelId = String(message.channelId || '');
+  const policyChannelId = String(message.policyChannelId || '');
+  if (channelId && Object.hasOwn(state.groups, channelId)) {
+    return state.groups[channelId];
+  }
+  if (policyChannelId && Object.hasOwn(state.groups, policyChannelId)) {
+    return state.groups[policyChannelId];
+  }
+  return null;
+}
+
 function decideGuildEnvelopeAccess(state, message) {
-  const group = state.groups[message.channelId];
+  const group = guildPolicy(state, message);
   if (!group) return { allowed: false, reason: 'guild_channel_not_enabled' };
 
   if (message.authorIsBot && group.allowBots !== true) {
@@ -101,7 +113,7 @@ function decideAccess(state, message) {
   const envelopeDecision = decideGuildEnvelopeAccess(state, message);
   if (!envelopeDecision.allowed) return envelopeDecision;
 
-  const group = state.groups[message.channelId];
+  const group = guildPolicy(state, message);
   const currentMessageMentionsBot = mentionsBot(message.content, message.botUserId, state.mentionPatterns);
   const replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
   const referencedMessageMentionsBot = mentionsBot(
@@ -122,6 +134,21 @@ function decideAccess(state, message) {
 }
 
 const GUILD_HISTORY_CHANNEL_TYPES = new Set([0, 5, 10, 11, 12]);
+const GUILD_THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
+
+function historyGuildPolicy(state, target) {
+  const channelId = String(target.id || '');
+  if (channelId && Object.hasOwn(state.groups, channelId)) {
+    return state.groups[channelId];
+  }
+  const parentId = GUILD_THREAD_CHANNEL_TYPES.has(target.type)
+    ? String(target.parentId || '')
+    : '';
+  if (parentId && Object.hasOwn(state.groups, parentId)) {
+    return state.groups[parentId];
+  }
+  return null;
+}
 
 function dmCounterpartyId(target, botUserId) {
   if (target.recipient?.id) return String(target.recipient.id);
@@ -151,7 +178,7 @@ function decideHistoryTarget(state, target, botUserId) {
   if (
     target.guildId &&
     GUILD_HISTORY_CHANNEL_TYPES.has(target.type) &&
-    Object.hasOwn(state.groups, channelId)
+    historyGuildPolicy(state, target)
   ) {
     return { allowed: true, reason: 'guild_channel_enabled', source: 'guild' };
   }
@@ -170,7 +197,7 @@ function allowHistoryMessage(state, target, message, botUserId) {
     return authorId === targetDecision.counterpartyId;
   }
 
-  const group = state.groups[String(target.id)];
+  const group = historyGuildPolicy(state, target);
   if (message.author?.bot && group.allowBots !== true) return false;
   if (group.allowFrom.length > 0 && !group.allowFrom.includes(authorId)) return false;
   return true;
