@@ -2724,6 +2724,61 @@ test('late lifecycle signal verifies new rollout proof while thread/read hangs',
   assert.equal(client.requests.length, 1);
 });
 
+test('lifecycle signal before rollout append retries durable proof while thread/read hangs', async (t) => {
+  const clientId = 'discord:c1:m-event-before-append';
+  const { codexHome, rolloutPath } = createRolloutFixture(t, [sessionMeta()]);
+  let rolloutCloseCount = 0;
+  let firstSignalVerificationFinished;
+  const firstSignalVerification = new Promise((resolve) => {
+    firstSignalVerificationFinished = resolve;
+  });
+  const rolloutFsPromises = {
+    opendir: (...args) => fs.promises.opendir(...args),
+    open: async (...args) => {
+      const handle = await fs.promises.open(...args);
+      return {
+        stat: () => handle.stat(),
+        read: (...readArgs) => handle.read(...readArgs),
+        async close() {
+          await handle.close();
+          rolloutCloseCount += 1;
+          if (rolloutCloseCount === 2) firstSignalVerificationFinished();
+        },
+      };
+    },
+  };
+  let readStarted;
+  const started = new Promise((resolve) => { readStarted = resolve; });
+  const client = new FakeRpcClient(async (method) => {
+    assert.equal(method, 'thread/read');
+    readStarted();
+    return new Promise(() => {});
+  });
+  const host = createLocalRolloutHost(client, codexHome, {
+    rolloutFsPromises,
+    lifecycleProofRetryDelaysMs: [0, 20, 40, 80],
+  });
+  t.after(() => host.destroy());
+
+  const deliveryProof = host.hasDelivered(DELIVERY_THREAD_ID, clientId);
+  await started;
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+  await firstSignalVerification;
+  fs.appendFileSync(rolloutPath, `${JSON.stringify(deliveredUserMessage(clientId))}\n`);
+
+  const result = await Promise.race([
+    deliveryProof,
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 250)),
+  ]);
+  assert.equal(result, true);
+  assert.equal(rolloutCloseCount >= 3, true);
+  assert.equal(client.requests.length, 1);
+});
+
 test('late lifecycle signal without rollout proof cannot complete a hanging read', async (t) => {
   const clientId = 'discord:c1:m-late-signal-only';
   const { codexHome } = createRolloutFixture(t, [sessionMeta()]);
@@ -2749,6 +2804,47 @@ test('late lifecycle signal without rollout proof cannot complete a hanging read
   ]);
 
   assert.equal(result, 'timed-out');
+  host.destroy();
+  assert.equal(await deliveryProof, false);
+});
+
+test('one lifecycle signal has a strict durable-verification attempt cap', async () => {
+  const clientId = 'discord:c1:m-bounded-signal';
+  let verificationCalls = 0;
+  let boundedAttemptsFinished;
+  const attemptsFinished = new Promise((resolve) => { boundedAttemptsFinished = resolve; });
+  let readStarted;
+  const started = new Promise((resolve) => { readStarted = resolve; });
+  const client = new FakeRpcClient(async (method) => {
+    assert.equal(method, 'thread/read');
+    readStarted();
+    return new Promise(() => {});
+  });
+  const host = createAppServerHost({}, () => {}, {
+    client,
+    lifecycleProofRetryDelaysMs: [0, 0, 0, 0, 0, 0],
+    verifyRolloutDelivery: async () => {
+      verificationCalls += 1;
+      if (verificationCalls === 5) boundedAttemptsFinished();
+      return false;
+    },
+  });
+
+  const deliveryProof = host.hasDelivered(DELIVERY_THREAD_ID, clientId);
+  await started;
+  client.emit('notification', userLifecycleSignal(
+    'item/completed',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+  await attemptsFinished;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(verificationCalls, 5);
+  assert.equal(await Promise.race([
+    deliveryProof,
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 20)),
+  ]), 'timed-out');
   host.destroy();
   assert.equal(await deliveryProof, false);
 });

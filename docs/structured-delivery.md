@@ -135,7 +135,8 @@ gateway first locates one rollout JSONL whose filename and first
 bounded recent tail and accepts only an exact structured
 `event_msg.payload.type=user_message` record carrying the stable client id.
 `item/started` and `item/completed` lifecycle notifications are wake-up signals
-that retry this verifier; they are never proof themselves. Startup, reconnect,
+that start strictly bounded verifier retries; they are never proof themselves.
+Startup, reconnect,
 and missed-notification recovery perform the same local check without requiring
 a prior signal. If bounded local proof is unavailable, reconciliation reads the
 exact target thread and accepts only the same structured user item. A positive

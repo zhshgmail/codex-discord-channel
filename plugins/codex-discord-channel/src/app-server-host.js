@@ -16,6 +16,10 @@ const MAX_ROLLOUT_SEARCH_ENTRIES = 65536;
 const MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024;
 const MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024;
 const MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024;
+const MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2;
+const MAX_LIFECYCLE_PROOF_ATTEMPTS = 4;
+const MAX_LIFECYCLE_PROOF_DELAY_MS = 250;
+const DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]);
 const TARGET_CHECKPOINT_VERSION = 1;
 const CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -107,6 +111,15 @@ function rolloutSessionsDir(config, deps) {
   const home = env.HOME || os.homedir();
   const codexHome = env.CODEX_HOME || path.join(home, '.codex');
   return path.resolve(codexHome, 'sessions');
+}
+
+function lifecycleProofRetryDelays(value) {
+  const delays = Array.isArray(value) && value.length > 0
+    ? value
+    : DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS;
+  return delays.slice(0, MAX_LIFECYCLE_PROOF_ATTEMPTS).map((delay) => (
+    Math.min(MAX_LIFECYCLE_PROOF_DELAY_MS, Math.max(0, Number(delay) || 0))
+  ));
 }
 
 async function findExactRolloutPath(sessionsDir, threadId, fsPromises) {
@@ -667,6 +680,9 @@ class AppServerHost extends EventEmitter {
     this.verifiedUserMessages = new Map();
     this.deliveryWaiters = new Map();
     this.destroyed = false;
+    this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
+      deps.lifecycleProofRetryDelaysMs,
+    );
     const fsPromises = deps.rolloutFsPromises || fs.promises;
     const sessionsDir = rolloutSessionsDir(config, deps);
     this.verifyRolloutDelivery = typeof deps.verifyRolloutDelivery === 'function'
@@ -1471,39 +1487,79 @@ class AppServerHost extends EventEmitter {
         resolve({ kind: 'closed' });
       };
     });
-    let verificationRequested = false;
-    let verificationRunning = false;
-    let verificationPromise = Promise.resolve(false);
+    let waiterActive = true;
+    let verificationPromise = null;
     const requestVerification = () => {
-      if (this.destroyed) return Promise.resolve(false);
-      verificationRequested = true;
-      if (verificationRunning) return verificationPromise;
-      verificationRunning = true;
-      verificationPromise = (async () => {
-        let verified = false;
+      if (this.destroyed || !waiterActive) return Promise.resolve(false);
+      if (verificationPromise) return verificationPromise;
+      const currentVerification = (async () => {
         try {
-          while (verificationRequested && !verified && !this.destroyed) {
-            verificationRequested = false;
-            try {
-              verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
-            } catch {
-              verified = false;
-            }
-          }
+          const verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
           if (verified) {
             this.rememberVerifiedUserMessage(threadId, clientUserMessageId);
             resolveDurableProof();
           }
           return verified;
-        } finally {
-          verificationRunning = false;
+        } catch {
+          return false;
         }
       })();
-      return verificationPromise;
+      verificationPromise = currentVerification;
+      void currentVerification.finally(() => {
+        if (verificationPromise === currentVerification) verificationPromise = null;
+      });
+      return currentVerification;
+    };
+    const retryWaits = new Set();
+    const waitForRetry = (delayMs) => {
+      if (this.destroyed || !waiterActive) return Promise.resolve(false);
+      if (delayMs <= 0) return Promise.resolve(true);
+      return new Promise((resolve) => {
+        const wait = {
+          timer: null,
+          resolve: (ready) => {
+            if (!retryWaits.delete(wait)) return;
+            resolve(ready);
+          },
+        };
+        wait.timer = setTimeout(() => wait.resolve(true), delayMs);
+        retryWaits.add(wait);
+      });
+    };
+    let signalVerificationRequested = false;
+    let signalVerificationBatches = 0;
+    let signalVerificationPromise = null;
+    const requestSignalVerification = () => {
+      if (this.destroyed || !waiterActive) return Promise.resolve(false);
+      signalVerificationRequested = true;
+      if (signalVerificationPromise) return signalVerificationPromise;
+      const currentSignalVerification = (async () => {
+        while (
+          signalVerificationRequested &&
+          signalVerificationBatches < MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES &&
+          !this.destroyed &&
+          waiterActive
+        ) {
+          signalVerificationRequested = false;
+          signalVerificationBatches += 1;
+          for (const delayMs of this.lifecycleProofRetryDelaysMs) {
+            if (!await waitForRetry(delayMs)) return false;
+            if (await requestVerification()) return true;
+          }
+        }
+        return false;
+      })();
+      signalVerificationPromise = currentSignalVerification;
+      void currentSignalVerification.finally(() => {
+        if (signalVerificationPromise === currentSignalVerification) {
+          signalVerificationPromise = null;
+        }
+      });
+      return currentSignalVerification;
     };
     const waiter = {
       threadId,
-      verify: () => { void requestVerification(); },
+      verify: () => { void requestSignalVerification(); },
       close: resolveClosed,
     };
     this.addDeliveryWaiter(proofKey, waiter);
@@ -1526,16 +1582,22 @@ class AppServerHost extends EventEmitter {
       const outcome = await Promise.race([readOutcome, durableProof, closed]);
       if (outcome.kind === 'durable_proof') return true;
       if (outcome.kind === 'closed') return false;
-
-      while (verificationRunning) await verificationPromise;
-      if (this.verifiedUserMessages.has(proofKey)) return true;
-      if (outcome.kind === 'thread_read_error') throw outcome.error;
-      if (outcome.delivered) {
+      if (outcome.kind === 'thread_read' && outcome.delivered) {
         this.rememberVerifiedUserMessage(threadId, clientUserMessageId);
         return true;
       }
+
+      if (signalVerificationPromise) await signalVerificationPromise;
+      if (verificationPromise) await verificationPromise;
+      if (this.verifiedUserMessages.has(proofKey)) return true;
+      if (outcome.kind === 'thread_read_error') throw outcome.error;
       return false;
     } finally {
+      waiterActive = false;
+      for (const wait of [...retryWaits]) {
+        clearTimeout(wait.timer);
+        wait.resolve(false);
+      }
       if (readAbort) readAbort.abort();
       this.removeDeliveryWaiter(proofKey, waiter);
     }

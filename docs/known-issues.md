@@ -101,8 +101,9 @@ Positive delivery now uses bounded local rollout verification. The verifier
 selects one exact rollout filename, validates the target thread id from the
 first JSONL record, and scans only a bounded recent tail for the exact
 structured user-message client id. It does not read the full rollout. An exact
-`item/started` or `item/completed` notification wakes an in-flight verifier, but
-the event cannot complete the queue without that durable record. Unrelated ids,
+`item/started` or `item/completed` notification starts a strictly bounded set of
+verifier retries so event-before-append ordering is covered, but the event
+cannot complete the queue without that durable record. Unrelated ids,
 non-user items, malformed JSON, substring matches in command or tool text, and
 other threads cannot complete the queue head.
 
