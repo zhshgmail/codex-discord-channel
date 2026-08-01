@@ -789,6 +789,63 @@ test('authorized Discord payload starts one structured turn without TTY or runti
   assert.match(request.input[0].text, /\\x03/);
 });
 
+test('matching structured item notification completes delivery without a full thread read', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-item-ack-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new EventEmitter();
+  const requests = [];
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-current'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (params.includeTurns) return new Promise(() => {});
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      client.emit('notification', {
+        method: 'item/started',
+        params: {
+          threadId: params.threadId,
+          turnId: 'turn-item-ack',
+          item: { type: 'userMessage', clientId: params.clientUserMessageId },
+        },
+      });
+      return { turn: { id: 'turn-item-ack' } };
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, { structuredHost: host });
+  t.after(() => delivery.destroy());
+  await delivery.activateReceiver(activeReceiver);
+
+  const result = await delivery.deliver(discordMessage('m-item-ack', 'bounded proof'));
+
+  assert.equal(result.status, 'delivered');
+  assert.equal(result.reason, 'turn_accepted');
+  assert.equal(
+    requests.some((request) => (
+      request.method === 'thread/read' && request.params.includeTurns === true
+    )),
+    false,
+  );
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-item-ack']);
+});
+
 test('busy target drains one FIFO item per idle transition and dynamically follows rotation', async () => {
   const fixture = structuredFixture({
     onStartTurn(_params, controls) {
@@ -1526,6 +1583,36 @@ test('successful response without a persisted user item is not marked complete',
   assert.deepEqual(queue.completed, []);
   assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
   assert.equal(queue.blocked.clientUserMessageId, 'discord:c1:m-ack-gap');
+});
+
+test('unsupported acknowledgement recovery remains structured_ack_uncertain', async () => {
+  let starts = 0;
+  const fixture = structuredFixture({
+    onStartTurn() {
+      starts += 1;
+      return { turn: { id: 'turn-unsupported-readback' } };
+    },
+    hasDelivered() {
+      const error = new Error('Unsupported method: thread/read');
+      error.code = 'shared_app_server_request_rejected';
+      throw error;
+    },
+  });
+
+  const result = await fixture.delivery.deliver(
+    discordMessage('m-unsupported-readback', 'must remain durable'),
+  );
+  const queue = readQueue(fixture.dir);
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'structured_ack_uncertain');
+  assert.equal(starts, 1);
+  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), [
+    'm-unsupported-readback',
+  ]);
+  assert.deepEqual(queue.completed, []);
+  assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
+  assert.equal(queue.blocked.clientUserMessageId, 'discord:c1:m-unsupported-readback');
 });
 
 test('unpersisted successful response reconciles later without replay', async () => {

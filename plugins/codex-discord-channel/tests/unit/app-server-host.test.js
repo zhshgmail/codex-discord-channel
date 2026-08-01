@@ -2585,12 +2585,104 @@ test('accepted turn response remains definitive when the websocket closes immedi
   }, target), { turn: { id: 'turn-accepted' } });
 });
 
-test('hasDelivered finds the echoed client user message id without starting another turn', async () => {
+test('hasDelivered completes from exact user-message lifecycle notifications without thread/read', async () => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`notification proof must not request ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  client.emit('notification', {
+    method: 'item/started',
+    params: {
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: { type: 'userMessage', clientId: 'discord:c1:m-started' },
+    },
+  });
+  client.emit('notification', {
+    method: 'item/completed',
+    params: {
+      threadId: 'thread-a',
+      turnId: 'turn-a',
+      item: { type: 'userMessage', clientId: 'discord:c1:m-completed' },
+    },
+  });
+
+  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:m-started'), true);
+  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:m-completed'), true);
+  assert.deepEqual(client.requests, []);
+});
+
+test('hasDelivered ignores unrelated client ids, threads, and non-user lifecycle items', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    assert.equal(method, 'thread/read');
+    return { thread: { id: params.threadId, turns: [] } };
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  for (const notification of [
+    {
+      method: 'item/started',
+      params: {
+        threadId: 'thread-a',
+        item: { type: 'userMessage', clientId: 'discord:c1:other' },
+      },
+    },
+    {
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-other',
+        item: { type: 'userMessage', clientId: 'discord:c1:target' },
+      },
+    },
+    {
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-a',
+        item: { type: 'agentMessage', clientId: 'discord:c1:target' },
+      },
+    },
+  ]) {
+    client.emit('notification', notification);
+  }
+
+  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:target'), false);
+  assert.deepEqual(client.requests, [{
+    method: 'thread/read',
+    params: { threadId: 'thread-a', includeTurns: true },
+  }]);
+});
+
+test('exact notification proof bypasses a thread/read that would not complete', async () => {
+  const client = new FakeRpcClient(async (method) => {
+    if (method === 'thread/read') return new Promise(() => {});
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  client.emit('notification', {
+    method: 'item/started',
+    params: {
+      threadId: 'thread-long',
+      item: { type: 'userMessage', clientId: 'discord:c1:m-long' },
+    },
+  });
+
+  const result = await Promise.race([
+    host.hasDelivered('thread-long', 'discord:c1:m-long'),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 25)),
+  ]);
+
+  assert.equal(result, true);
+  assert.deepEqual(client.requests, []);
+});
+
+test('hasDelivered falls back to exact structured thread/read after a missed notification', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     assert.equal(method, 'thread/read');
     assert.deepEqual(params, { threadId: 'thread-a', includeTurns: true });
     return {
       thread: {
+        id: 'thread-a',
         turns: [
           { items: [{ type: 'userMessage', clientId: 'discord:c1:m1' }] },
         ],
@@ -2602,12 +2694,41 @@ test('hasDelivered finds the echoed client user message id without starting anot
   assert.equal(await host.hasDelivered('thread-a', 'discord:c1:missing'), false);
 });
 
+test('hasDelivered rejects malformed or unsupported recovery instead of producing proof', async () => {
+  let unsupported = false;
+  const client = new FakeRpcClient(async (method) => {
+    assert.equal(method, 'thread/read');
+    if (unsupported) {
+      const error = new Error('Unsupported method: thread/read');
+      error.code = 'shared_app_server_request_rejected';
+      throw error;
+    }
+    return {
+      thread: {
+        id: 'thread-other',
+        turns: [{
+          items: [{ type: 'userMessage', clientId: 'discord:c1:m-malformed' }],
+        }],
+      },
+    };
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:m-malformed'), false);
+  unsupported = true;
+  await assert.rejects(
+    host.hasDelivered('thread-a', 'discord:c1:m-unsupported'),
+    (error) => error.code === 'shared_app_server_request_rejected',
+  );
+});
+
 test('hasDelivered reconciles on the first connection without invalidating its own read', async (t) => {
   const { WebSocket } = createFakeWebSocket(async (request) => {
     if (request.method === 'initialize') return {};
     if (request.method === 'thread/read') {
       return {
         thread: {
+          id: request.params.threadId,
           turns: [{
             items: [{ type: 'userMessage', clientId: 'discord:c1:m-first-connect' }],
           }],

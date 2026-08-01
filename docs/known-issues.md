@@ -45,10 +45,12 @@ incident verdict, apply the four diagnosis steps below to that id.
 
 ### Fixed Behavior
 
-After a positive structured response, the gateway now reads the exact target
-thread and requires a `userMessage` with the same stable
-`clientUserMessageId`. Only that proof can move the Discord identity into
-`completed`.
+After a positive structured response, the gateway now requires an exact
+`userMessage` proof from the exact target thread with the same stable
+`clientUserMessageId`. An exact `item/started` or `item/completed` lifecycle
+notification supplies the normal bounded proof. Startup, reconnect, or a
+missed notification uses the existing structured `thread/read` recovery path.
+Only one of those exact proofs can move the Discord identity into `completed`.
 
 If the user item is not observable, the queue head remains durable and status
 reports `structured_ack_uncertain`. Periodic reconciliation checks for the
@@ -71,6 +73,44 @@ Read-back proves that the user item is durably attached to the intended Codex
 thread. It does not prove that the model understood every instruction, produced
 a reply, or completed the requested work. Those are application-level
 acceptance conditions and must be verified separately.
+
+## Full Thread Read Exceeds The Acknowledgement Timeout
+
+### Observed Incident
+
+On 2026-07-31, target thread
+`019f3763-d308-7871-bedc-e6489b02190e` contained 754 turns. The exact Discord
+client id `discord:1532907289823154277:1532923072833781810` was present in that
+thread's rollout as a structured `event_msg.payload.type=user_message` record.
+A live `thread/read` with `includeTurns:true` took 62.289 seconds, while the
+gateway request timeout was 30 seconds. The read timed out and the FIFO remained
+blocked at `structured_ack_uncertain` even though the user item was durable.
+
+The operational mitigation raised
+`CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS` to 120000. That allowed the full
+read to finish and the queue was cleared only after exact rollout proof. This
+is a timeout accommodation, not a source fix: recovery still scales with total
+thread history and can exceed a larger timeout as the thread grows.
+
+### Source-Level Fix
+
+Positive delivery now uses the app-server's bounded item lifecycle stream.
+Only `item/started` or `item/completed` for an exact `userMessage`, exact target
+thread id, and exact stable client id is accepted. Unrelated ids, non-user
+items, and other threads cannot complete the queue head. Once this proof has
+arrived, `hasDelivered` returns without issuing `thread/read`, so a long thread
+history is outside the normal positive acknowledgement path.
+
+The full `thread/read` remains the supported fail-closed fallback when the
+notification was missed or the gateway restarted. The returned thread id and
+structured item shape must match exactly. A timeout, unsupported request,
+malformed response, wrong thread, or missing client id remains
+`structured_ack_uncertain`; none is converted into delivered.
+
+This behavior is repository source behavior until the parent-owned deployment,
+restart, Discord send, and exact read-back checks have completed. The 120-second
+setting may remain useful operationally for fallback recovery, but it is not
+required by the event-based positive path.
 
 ## Mentioned Guild Message Is Not Accepted
 

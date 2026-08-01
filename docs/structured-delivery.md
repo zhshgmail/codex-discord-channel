@@ -128,12 +128,16 @@ a goal continuation that wins an idle-boundary race becomes the bounded delivery
 target instead of starving the FIFO. The active turn id is a request precondition
 only, not receiver ownership or session binding.
 
-After either structured request is acknowledged, the gateway reads the exact
-target thread and requires the stable client user message id to be present.
-Only that proof commits the item complete. A positive response without a
-persisted user item is treated as acknowledgement uncertainty, retains the FIFO
-head, and enters reconciliation without replay. Later items retain FIFO order
-and wait for another drain.
+After either structured request is acknowledged, the gateway requires an exact
+user-item proof from the target thread. The primary proof is an app-server
+`item/started` or `item/completed` notification whose item type is
+`userMessage` and whose client id is the stable client user message id. This
+bounded proof does not read prior turns. If that notification was missed, such
+as across startup or reconnect, reconciliation reads the exact target thread
+and accepts only the same structured user item. A positive response without
+either proof is treated as acknowledgement uncertainty, retains the FIFO head,
+and enters reconciliation without replay. Later items retain FIFO order and
+wait for another drain.
 
 The gateway also inspects the durable queue periodically. Missing endpoints,
 missing loaded threads, busy threads, and stale receiver authority retain the
@@ -159,16 +163,21 @@ thread settings remain authoritative.
 ## Acknowledgement And Deduplication
 
 A successful `turn/start` or `turn/steer` response is not by itself the
-completion boundary. The gateway must also read back a `userMessage` carrying
-the stable client user message id from the exact target thread. If the request
-is known to be rejected or was not sent, the queue head remains retryable. If
-the connection, timeout, or post-ack read-back makes acceptance uncertain, the
-FIFO is blocked as `structured_ack_uncertain`.
+completion boundary. The gateway must also observe a `userMessage` carrying
+the stable client user message id on the exact target thread, either through
+its item lifecycle notification or the structured recovery read. Unrelated
+client ids, non-user items, malformed recovery responses, and items from a
+different thread are not proof. If the request is known to be rejected or was
+not sent, the queue head remains retryable. If the connection, timeout, or
+post-ack proof makes acceptance uncertain, the FIFO is blocked as
+`structured_ack_uncertain`.
 
 The stable client user message id is echoed by the app-server on the persisted
-user item. Before clearing an uncertain block, the gateway reads the target
-thread and proves that id already exists. It then commits completion without a
-second structured submission. If proof is unavailable, the block remains.
+user item. Before clearing an uncertain block, the gateway reuses an exact
+lifecycle proof when one remains available in the process; restart and
+missed-notification recovery read the target thread and prove that id already
+exists. It then commits completion without a second structured submission. If
+proof is unavailable, the block remains.
 
 ## Live Acceptance
 

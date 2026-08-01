@@ -8,6 +8,7 @@ const TARGET_GENERATION = Symbol('appServerTargetGeneration');
 const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
 const MAX_TARGET_RESOLUTION_RESTARTS = 4;
+const MAX_OBSERVED_USER_MESSAGES = 256;
 const TARGET_CHECKPOINT_VERSION = 1;
 
 function parseTargetCheckpoint(raw) {
@@ -437,6 +438,7 @@ class AppServerHost extends EventEmitter {
     this.threadStatuses = new Map();
     this.activeTurnIds = new Map();
     this.knownLoadedThreadIds = new Set();
+    this.observedUserMessages = new Map();
     this.loadedInventoryProven = false;
     this.restoredTargetCheckpoint = this.loadTargetCheckpoint();
     if (this.restoredTargetCheckpoint) {
@@ -448,6 +450,28 @@ class AppServerHost extends EventEmitter {
     }
     this.timeoutRecoveryTarget = null;
     this.onNotification = (notification) => {
+      if (
+        notification?.method === 'item/started' ||
+        notification?.method === 'item/completed'
+      ) {
+        const threadId = notification.params?.threadId;
+        const item = notification.params?.item;
+        if (
+          typeof threadId === 'string' &&
+          threadId !== '' &&
+          item?.type === 'userMessage' &&
+          typeof item.clientId === 'string' &&
+          item.clientId !== ''
+        ) {
+          const key = JSON.stringify([threadId, item.clientId]);
+          this.observedUserMessages.delete(key);
+          this.observedUserMessages.set(key, true);
+          while (this.observedUserMessages.size > MAX_OBSERVED_USER_MESSAGES) {
+            this.observedUserMessages.delete(this.observedUserMessages.keys().next().value);
+          }
+        }
+        return;
+      }
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
         if (thread?.id) {
@@ -1102,6 +1126,9 @@ class AppServerHost extends EventEmitter {
   }
 
   async hasDelivered(threadId, clientUserMessageId) {
+    const observationKey = JSON.stringify([threadId, clientUserMessageId]);
+    if (this.observedUserMessages.has(observationKey)) return true;
+
     const params = { threadId, includeTurns: true };
     let threadSelectionRevision;
     let response;
@@ -1123,8 +1150,10 @@ class AppServerHost extends EventEmitter {
         'shared_app_server_thread_changed',
       );
     }
-    return (response?.thread?.turns || []).some((turn) => (
-      (turn.items || []).some((item) => (
+    const thread = response?.thread;
+    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return false;
+    return thread.turns.some((turn) => (
+      (Array.isArray(turn?.items) ? turn.items : []).some((item) => (
         item?.type === 'userMessage' && item.clientId === clientUserMessageId
       ))
     ));
