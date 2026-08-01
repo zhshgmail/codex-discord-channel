@@ -2,14 +2,22 @@
 
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const TARGET_GENERATION = Symbol('appServerTargetGeneration');
 const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
 const MAX_TARGET_RESOLUTION_RESTARTS = 4;
-const MAX_OBSERVED_USER_MESSAGES = 256;
+const MAX_VERIFIED_USER_MESSAGES = 256;
+const MAX_ROLLOUT_SEARCH_DEPTH = 4;
+const MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096;
+const MAX_ROLLOUT_SEARCH_ENTRIES = 65536;
+const MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024;
+const MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024;
+const MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024;
 const TARGET_CHECKPOINT_VERSION = 1;
+const CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function parseTargetCheckpoint(raw) {
   let record;
@@ -74,6 +82,192 @@ function reconnectableError(error) {
     'shared_app_server_disconnected',
     'shared_app_server_socket_missing',
   ].includes(error?.code);
+}
+
+function deliveryProofKey(threadId, clientUserMessageId) {
+  return JSON.stringify([threadId, clientUserMessageId]);
+}
+
+function isLocalAppServer(endpoint) {
+  const value = String(endpoint || '').trim();
+  if (value.startsWith('unix://')) return true;
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function rolloutSessionsDir(config, deps) {
+  if (typeof deps.rolloutSessionsDir === 'string' && deps.rolloutSessionsDir !== '') {
+    return path.resolve(deps.rolloutSessionsDir);
+  }
+  const env = config.env || process.env;
+  const home = env.HOME || os.homedir();
+  const codexHome = env.CODEX_HOME || path.join(home, '.codex');
+  return path.resolve(codexHome, 'sessions');
+}
+
+async function findExactRolloutPath(sessionsDir, threadId, fsPromises) {
+  if (!CANONICAL_THREAD_ID.test(threadId)) return null;
+  const expectedSuffix = `-${threadId}.jsonl`;
+  const pending = [{ directory: sessionsDir, depth: 0 }];
+  const candidates = [];
+  let directoryCount = 0;
+  let entryCount = 0;
+
+  while (pending.length > 0) {
+    const current = pending.shift();
+    directoryCount += 1;
+    if (directoryCount > MAX_ROLLOUT_SEARCH_DIRECTORIES) return null;
+    let directory;
+    try {
+      directory = await fsPromises.opendir(current.directory);
+      for await (const entry of directory) {
+        entryCount += 1;
+        if (entryCount > MAX_ROLLOUT_SEARCH_ENTRIES) return null;
+        const entryPath = path.join(current.directory, entry.name);
+        if (entry.isDirectory()) {
+          if (current.depth < MAX_ROLLOUT_SEARCH_DEPTH) {
+            pending.push({ directory: entryPath, depth: current.depth + 1 });
+          }
+          continue;
+        }
+        if (
+          entry.isFile() &&
+          entry.name.startsWith('rollout-') &&
+          entry.name.endsWith(expectedSuffix)
+        ) {
+          candidates.push(entryPath);
+          if (candidates.length > 1) return null;
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function parseRolloutLine(line) {
+  if (line.length === 0 || line.length > MAX_ROLLOUT_LINE_BYTES) return null;
+  const normalized = line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
+  let record;
+  try {
+    record = JSON.parse(normalized.toString('utf8'));
+  } catch {
+    return null;
+  }
+  return record && typeof record === 'object' && !Array.isArray(record) ? record : null;
+}
+
+async function readBoundedRange(handle, offset, length) {
+  const buffer = Buffer.alloc(length);
+  let total = 0;
+  while (total < length) {
+    const { bytesRead } = await handle.read(buffer, total, length - total, offset + total);
+    if (bytesRead <= 0) return null;
+    total += bytesRead;
+  }
+  return buffer;
+}
+
+async function rolloutContainsUserMessage(
+  rolloutPath,
+  threadId,
+  clientUserMessageId,
+  fsPromises,
+) {
+  let handle;
+  try {
+    handle = await fsPromises.open(rolloutPath, 'r');
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size <= 0 || !Number.isSafeInteger(stat.size)) return false;
+
+    const headerLength = Math.min(stat.size, MAX_ROLLOUT_HEADER_BYTES);
+    const header = await readBoundedRange(handle, 0, headerLength);
+    if (!header) return false;
+    const headerEnd = header.indexOf(0x0a);
+    if (headerEnd === -1) return false;
+    const sessionMeta = parseRolloutLine(header.subarray(0, headerEnd));
+    if (
+      sessionMeta?.type !== 'session_meta' ||
+      !sessionMeta.payload ||
+      typeof sessionMeta.payload !== 'object' ||
+      Array.isArray(sessionMeta.payload) ||
+      sessionMeta.payload.id !== threadId
+    ) {
+      return false;
+    }
+
+    const tailLength = Math.min(stat.size, MAX_ROLLOUT_TAIL_BYTES);
+    const tailOffset = stat.size - tailLength;
+    const tail = await readBoundedRange(handle, tailOffset, tailLength);
+    if (!tail) return false;
+    let lowerBound = 0;
+    if (tailOffset > 0) {
+      const leadingNewline = tail.indexOf(0x0a);
+      if (leadingNewline === -1) return false;
+      lowerBound = leadingNewline + 1;
+    }
+    let completeEnd = tail.length;
+    if (tail.at(-1) !== 0x0a) {
+      const trailingNewline = tail.lastIndexOf(0x0a);
+      if (trailingNewline < lowerBound) return false;
+      completeEnd = trailingNewline + 1;
+    }
+    let lineEnd = completeEnd - 1;
+    while (lineEnd >= lowerBound) {
+      const previousNewline = tail.lastIndexOf(0x0a, lineEnd - 1);
+      const lineStart = Math.max(lowerBound, previousNewline + 1);
+      const record = parseRolloutLine(tail.subarray(lineStart, lineEnd));
+      if (
+        record?.type === 'event_msg' &&
+        record.payload &&
+        typeof record.payload === 'object' &&
+        !Array.isArray(record.payload) &&
+        record.payload.type === 'user_message' &&
+        record.payload.client_id === clientUserMessageId
+      ) {
+        return true;
+      }
+      if (previousNewline < lowerBound) break;
+      lineEnd = previousNewline;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {}
+    }
+  }
+}
+
+async function verifyLocalRolloutDelivery(
+  sessionsDir,
+  threadId,
+  clientUserMessageId,
+  fsPromises = fs.promises,
+) {
+  if (
+    !CANONICAL_THREAD_ID.test(threadId) ||
+    typeof clientUserMessageId !== 'string' ||
+    clientUserMessageId === ''
+  ) {
+    return false;
+  }
+  const rolloutPath = await findExactRolloutPath(sessionsDir, threadId, fsPromises);
+  if (!rolloutPath) return false;
+  return rolloutContainsUserMessage(
+    rolloutPath,
+    threadId,
+    clientUserMessageId,
+    fsPromises,
+  );
 }
 
 class AppServerRpcClient extends EventEmitter {
@@ -341,18 +535,37 @@ class AppServerRpcClient extends EventEmitter {
     this.ws.send(JSON.stringify(payload));
   }
 
-  requestConnected(method, params) {
+  requestConnected(method, params, options = {}) {
     const id = String(this.nextId++);
     const ws = this.ws;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const signal = options.signal || null;
+      let abortListener = null;
+      const cleanup = () => {
+        const pending = this.pending.get(id);
+        if (pending) clearTimeout(pending.timer);
         this.pending.delete(id);
+        if (signal && abortListener) signal.removeEventListener('abort', abortListener);
+      };
+      const pending = {
+        timer: null,
+        resolve: (value) => {
+          cleanup();
+          resolve(value);
+        },
+        reject: (error) => {
+          cleanup();
+          reject(error);
+        },
+      };
+      pending.timer = setTimeout(() => {
+        if (this.pending.get(id) !== pending) return;
         const timeoutError = deliveryError(
           `Shared app-server request timed out: ${method}`,
           'shared_app_server_request_timeout',
           'uncertain',
         );
-        reject(timeoutError);
+        pending.reject(timeoutError);
         this.fenceConnection(
           ws,
           'shared_app_server_request_timeout',
@@ -363,13 +576,25 @@ class AppServerRpcClient extends EventEmitter {
           ),
         );
       }, this.requestTimeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, pending);
+      if (signal) {
+        abortListener = () => {
+          if (this.pending.get(id) !== pending) return;
+          pending.reject(deliveryError(
+            `Shared app-server request cancelled: ${method}`,
+            'shared_app_server_request_cancelled',
+          ));
+        };
+        signal.addEventListener('abort', abortListener, { once: true });
+        if (signal.aborted) {
+          abortListener();
+          return;
+        }
+      }
       try {
         this.sendRaw({ id, method, params });
       } catch (error) {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        reject(error);
+        pending.reject(error);
       }
     });
   }
@@ -385,6 +610,7 @@ class AppServerRpcClient extends EventEmitter {
     expectedGeneration = null,
     beforeSend = null,
     acceptCompletedResponse = false,
+    signal = null,
   ) {
     if (expectedGeneration != null && this.connectionGeneration !== expectedGeneration) {
       throw deliveryError(
@@ -401,7 +627,7 @@ class AppServerRpcClient extends EventEmitter {
       );
     }
     if (typeof beforeSend === 'function') beforeSend();
-    const result = await this.requestConnected(method, params);
+    const result = await this.requestConnected(method, params, { signal });
     if (this.connectionGeneration !== generation && !acceptCompletedResponse) {
       throw deliveryError(
         'Shared app-server connection changed during target resolution.',
@@ -438,7 +664,21 @@ class AppServerHost extends EventEmitter {
     this.threadStatuses = new Map();
     this.activeTurnIds = new Map();
     this.knownLoadedThreadIds = new Set();
-    this.observedUserMessages = new Map();
+    this.verifiedUserMessages = new Map();
+    this.deliveryWaiters = new Map();
+    this.destroyed = false;
+    const fsPromises = deps.rolloutFsPromises || fs.promises;
+    const sessionsDir = rolloutSessionsDir(config, deps);
+    this.verifyRolloutDelivery = typeof deps.verifyRolloutDelivery === 'function'
+      ? deps.verifyRolloutDelivery
+      : (isLocalAppServer(config.appServerUrl)
+        ? (threadId, clientUserMessageId) => verifyLocalRolloutDelivery(
+          sessionsDir,
+          threadId,
+          clientUserMessageId,
+          fsPromises,
+        )
+        : async () => false);
     this.loadedInventoryProven = false;
     this.restoredTargetCheckpoint = this.loadTargetCheckpoint();
     if (this.restoredTargetCheckpoint) {
@@ -463,12 +703,7 @@ class AppServerHost extends EventEmitter {
           typeof item.clientId === 'string' &&
           item.clientId !== ''
         ) {
-          const key = JSON.stringify([threadId, item.clientId]);
-          this.observedUserMessages.delete(key);
-          this.observedUserMessages.set(key, true);
-          while (this.observedUserMessages.size > MAX_OBSERVED_USER_MESSAGES) {
-            this.observedUserMessages.delete(this.observedUserMessages.keys().next().value);
-          }
+          this.wakeDeliveryWaiters(threadId, item.clientId);
         }
         return;
       }
@@ -562,6 +797,7 @@ class AppServerHost extends EventEmitter {
           this.clearTargetCheckpoint();
           this.restoredTargetCheckpoint = null;
         }
+        this.wakeThreadDeliveryWaiters(threadId);
         this.emit('threadClosed', { threadId });
       }
     };
@@ -614,10 +850,56 @@ class AppServerHost extends EventEmitter {
       } else if (this.hasConnected) {
         this.connectionWasLost = true;
       }
+      this.wakeAllDeliveryWaiters();
       if (reconnected) this.emit('reconnect', event);
     };
     this.client.on('notification', this.onNotification);
     this.client.on('connectionChanged', this.onConnectionChanged);
+  }
+
+  rememberVerifiedUserMessage(threadId, clientUserMessageId) {
+    const key = deliveryProofKey(threadId, clientUserMessageId);
+    this.verifiedUserMessages.delete(key);
+    this.verifiedUserMessages.set(key, true);
+    while (this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES) {
+      this.verifiedUserMessages.delete(this.verifiedUserMessages.keys().next().value);
+    }
+  }
+
+  addDeliveryWaiter(key, waiter) {
+    let waiters = this.deliveryWaiters.get(key);
+    if (!waiters) {
+      waiters = new Set();
+      this.deliveryWaiters.set(key, waiters);
+    }
+    waiters.add(waiter);
+  }
+
+  removeDeliveryWaiter(key, waiter) {
+    const waiters = this.deliveryWaiters.get(key);
+    if (!waiters) return;
+    waiters.delete(waiter);
+    if (waiters.size === 0) this.deliveryWaiters.delete(key);
+  }
+
+  wakeDeliveryWaiters(threadId, clientUserMessageId) {
+    const waiters = this.deliveryWaiters.get(deliveryProofKey(threadId, clientUserMessageId));
+    if (!waiters) return;
+    for (const waiter of [...waiters]) waiter.verify();
+  }
+
+  wakeThreadDeliveryWaiters(threadId) {
+    for (const waiters of this.deliveryWaiters.values()) {
+      for (const waiter of [...waiters]) {
+        if (waiter.threadId === threadId) waiter.verify();
+      }
+    }
+  }
+
+  wakeAllDeliveryWaiters() {
+    for (const waiters of this.deliveryWaiters.values()) {
+      for (const waiter of [...waiters]) waiter.verify();
+    }
   }
 
   loadTargetCheckpoint() {
@@ -1125,10 +1407,7 @@ class AppServerHost extends EventEmitter {
     return result;
   }
 
-  async hasDelivered(threadId, clientUserMessageId) {
-    const observationKey = JSON.stringify([threadId, clientUserMessageId]);
-    if (this.observedUserMessages.has(observationKey)) return true;
-
+  async readDeliveredUserMessage(threadId, clientUserMessageId, signal = null) {
     const params = { threadId, includeTurns: true };
     let threadSelectionRevision;
     let response;
@@ -1139,6 +1418,9 @@ class AppServerHost extends EventEmitter {
         'thread/read',
         params,
         this.client.connectionGeneration,
+        null,
+        false,
+        signal,
       )).result;
     } else {
       threadSelectionRevision = this.threadSelectionRevision;
@@ -1157,6 +1439,106 @@ class AppServerHost extends EventEmitter {
         item?.type === 'userMessage' && item.clientId === clientUserMessageId
       ))
     ));
+  }
+
+  async hasDelivered(threadId, clientUserMessageId) {
+    if (
+      typeof threadId !== 'string' ||
+      threadId === '' ||
+      typeof clientUserMessageId !== 'string' ||
+      clientUserMessageId === ''
+    ) {
+      return false;
+    }
+    const proofKey = deliveryProofKey(threadId, clientUserMessageId);
+    if (this.verifiedUserMessages.has(proofKey)) return true;
+
+    let durableProofResolved = false;
+    let resolveDurableProof;
+    const durableProof = new Promise((resolve) => {
+      resolveDurableProof = () => {
+        if (durableProofResolved) return;
+        durableProofResolved = true;
+        resolve({ kind: 'durable_proof' });
+      };
+    });
+    let closedResolved = false;
+    let resolveClosed;
+    const closed = new Promise((resolve) => {
+      resolveClosed = () => {
+        if (closedResolved) return;
+        closedResolved = true;
+        resolve({ kind: 'closed' });
+      };
+    });
+    let verificationRequested = false;
+    let verificationRunning = false;
+    let verificationPromise = Promise.resolve(false);
+    const requestVerification = () => {
+      if (this.destroyed) return Promise.resolve(false);
+      verificationRequested = true;
+      if (verificationRunning) return verificationPromise;
+      verificationRunning = true;
+      verificationPromise = (async () => {
+        let verified = false;
+        try {
+          while (verificationRequested && !verified && !this.destroyed) {
+            verificationRequested = false;
+            try {
+              verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
+            } catch {
+              verified = false;
+            }
+          }
+          if (verified) {
+            this.rememberVerifiedUserMessage(threadId, clientUserMessageId);
+            resolveDurableProof();
+          }
+          return verified;
+        } finally {
+          verificationRunning = false;
+        }
+      })();
+      return verificationPromise;
+    };
+    const waiter = {
+      threadId,
+      verify: () => { void requestVerification(); },
+      close: resolveClosed,
+    };
+    this.addDeliveryWaiter(proofKey, waiter);
+    const AbortControllerClass = globalThis.AbortController;
+    const readAbort = AbortControllerClass ? new AbortControllerClass() : null;
+
+    try {
+      if (this.verifiedUserMessages.has(proofKey)) return true;
+      if (await requestVerification()) return true;
+      if (this.destroyed) return false;
+
+      const readOutcome = this.readDeliveredUserMessage(
+        threadId,
+        clientUserMessageId,
+        readAbort?.signal || null,
+      ).then(
+        (delivered) => ({ kind: 'thread_read', delivered }),
+        (error) => ({ kind: 'thread_read_error', error }),
+      );
+      const outcome = await Promise.race([readOutcome, durableProof, closed]);
+      if (outcome.kind === 'durable_proof') return true;
+      if (outcome.kind === 'closed') return false;
+
+      while (verificationRunning) await verificationPromise;
+      if (this.verifiedUserMessages.has(proofKey)) return true;
+      if (outcome.kind === 'thread_read_error') throw outcome.error;
+      if (outcome.delivered) {
+        this.rememberVerifiedUserMessage(threadId, clientUserMessageId);
+        return true;
+      }
+      return false;
+    } finally {
+      if (readAbort) readAbort.abort();
+      this.removeDeliveryWaiter(proofKey, waiter);
+    }
   }
 
   onThreadIdle(listener) {
@@ -1180,6 +1562,12 @@ class AppServerHost extends EventEmitter {
   }
 
   destroy() {
+    this.destroyed = true;
+    for (const waiters of this.deliveryWaiters.values()) {
+      for (const waiter of [...waiters]) waiter.close();
+    }
+    this.deliveryWaiters.clear();
+    this.verifiedUserMessages.clear();
     this.client.off('notification', this.onNotification);
     this.client.off('connectionChanged', this.onConnectionChanged);
     if (typeof this.client.destroy === 'function') this.client.destroy();

@@ -29,6 +29,68 @@ class FakeRpcClient extends EventEmitter {
   }
 }
 
+const DELIVERY_THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190e';
+const OTHER_DELIVERY_THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190f';
+
+function sessionMeta(threadId = DELIVERY_THREAD_ID) {
+  return { type: 'session_meta', payload: { id: threadId } };
+}
+
+function deliveredUserMessage(clientId) {
+  return {
+    type: 'event_msg',
+    payload: { type: 'user_message', client_id: clientId },
+  };
+}
+
+function userLifecycleSignal(method, threadId, clientId) {
+  return {
+    method,
+    params: {
+      threadId,
+      turnId: 'turn-delivery-proof',
+      item: { type: 'userMessage', clientId },
+    },
+  };
+}
+
+function createRolloutFixture(t, records, options = {}) {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-rollout-proof-'));
+  const sessionsDir = path.join(codexHome, 'sessions', '2026', '07', '31');
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const filenameThreadId = options.filenameThreadId || DELIVERY_THREAD_ID;
+  const rolloutPath = path.join(
+    sessionsDir,
+    `rollout-2026-07-31T00-00-00-${filenameThreadId}.jsonl`,
+  );
+  const body = records
+    .map((record) => (typeof record === 'string' ? record : JSON.stringify(record)))
+    .join('\n');
+  fs.writeFileSync(rolloutPath, `${body}\n`);
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  return { codexHome, rolloutPath, sessionsDir };
+}
+
+function createSparseRolloutFixture(t, tailText, size = 160 * 1024 * 1024) {
+  const fixture = createRolloutFixture(t, [sessionMeta()]);
+  const handle = fs.openSync(fixture.rolloutPath, 'r+');
+  try {
+    fs.ftruncateSync(handle, size);
+    const tail = Buffer.from(`\n${tailText}`, 'utf8');
+    fs.writeSync(handle, tail, 0, tail.length, size - tail.length);
+  } finally {
+    fs.closeSync(handle);
+  }
+  return { ...fixture, size };
+}
+
+function createLocalRolloutHost(client, codexHome, deps = {}) {
+  return createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+    env: { CODEX_HOME: codexHome, HOME: path.dirname(codexHome) },
+  }, () => {}, { client, ...deps });
+}
+
 function createFakeWebSocket(server, options = {}) {
   const sockets = [];
 
@@ -2585,94 +2647,363 @@ test('accepted turn response remains definitive when the websocket closes immedi
   }, target), { turn: { id: 'turn-accepted' } });
 });
 
-test('hasDelivered completes from exact user-message lifecycle notifications without thread/read', async () => {
+test('signal before hasDelivered plus exact rollout proof completes without thread/read', async (t) => {
+  const clientId = 'discord:c1:m-signal-before';
+  const { codexHome } = createRolloutFixture(t, [
+    sessionMeta(),
+    deliveredUserMessage(clientId),
+  ]);
   const client = new FakeRpcClient(async (method) => {
-    throw new Error(`notification proof must not request ${method}`);
+    throw new Error(`durable rollout proof must not request ${method}`);
   });
-  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  const host = createLocalRolloutHost(client, codexHome);
+  t.after(() => host.destroy());
 
-  client.emit('notification', {
-    method: 'item/started',
-    params: {
-      threadId: 'thread-a',
-      turnId: 'turn-a',
-      item: { type: 'userMessage', clientId: 'discord:c1:m-started' },
-    },
-  });
-  client.emit('notification', {
-    method: 'item/completed',
-    params: {
-      threadId: 'thread-a',
-      turnId: 'turn-a',
-      item: { type: 'userMessage', clientId: 'discord:c1:m-completed' },
-    },
-  });
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
 
-  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:m-started'), true);
-  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:m-completed'), true);
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
   assert.deepEqual(client.requests, []);
 });
 
-test('hasDelivered ignores unrelated client ids, threads, and non-user lifecycle items', async () => {
+test('lifecycle signal without durable rollout evidence does not prove delivery', async (t) => {
+  const clientId = 'discord:c1:m-signal-only';
+  const { codexHome } = createRolloutFixture(t, [sessionMeta()]);
   const client = new FakeRpcClient(async (method, params) => {
     assert.equal(method, 'thread/read');
     return { thread: { id: params.threadId, turns: [] } };
   });
-  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  const host = createLocalRolloutHost(client, codexHome);
+  t.after(() => host.destroy());
+  client.emit('notification', userLifecycleSignal(
+    'item/completed',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
 
-  for (const notification of [
-    {
-      method: 'item/started',
-      params: {
-        threadId: 'thread-a',
-        item: { type: 'userMessage', clientId: 'discord:c1:other' },
-      },
-    },
-    {
-      method: 'item/completed',
-      params: {
-        threadId: 'thread-other',
-        item: { type: 'userMessage', clientId: 'discord:c1:target' },
-      },
-    },
-    {
-      method: 'item/completed',
-      params: {
-        threadId: 'thread-a',
-        item: { type: 'agentMessage', clientId: 'discord:c1:target' },
-      },
-    },
-  ]) {
-    client.emit('notification', notification);
-  }
-
-  assert.equal(await host.hasDelivered('thread-a', 'discord:c1:target'), false);
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
   assert.deepEqual(client.requests, [{
     method: 'thread/read',
-    params: { threadId: 'thread-a', includeTurns: true },
+    params: { threadId: DELIVERY_THREAD_ID, includeTurns: true },
   }]);
 });
 
-test('exact notification proof bypasses a thread/read that would not complete', async () => {
+test('late lifecycle signal verifies new rollout proof while thread/read hangs', async (t) => {
+  const clientId = 'discord:c1:m-late-proof';
+  const { codexHome, rolloutPath } = createRolloutFixture(t, [sessionMeta()]);
+  let readStarted;
+  const started = new Promise((resolve) => { readStarted = resolve; });
   const client = new FakeRpcClient(async (method) => {
-    if (method === 'thread/read') return new Promise(() => {});
+    if (method === 'thread/read') {
+      readStarted();
+      return new Promise(() => {});
+    }
     throw new Error(`unexpected method ${method}`);
   });
-  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
-  client.emit('notification', {
-    method: 'item/started',
-    params: {
-      threadId: 'thread-long',
-      item: { type: 'userMessage', clientId: 'discord:c1:m-long' },
-    },
-  });
+  const host = createLocalRolloutHost(client, codexHome);
+  t.after(() => host.destroy());
+
+  const deliveryProof = host.hasDelivered(DELIVERY_THREAD_ID, clientId);
+  await started;
+  fs.appendFileSync(rolloutPath, `${JSON.stringify(deliveredUserMessage(clientId))}\n`);
+  client.emit('notification', userLifecycleSignal(
+    'item/completed',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
 
   const result = await Promise.race([
-    host.hasDelivered('thread-long', 'discord:c1:m-long'),
-    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 25)),
+    deliveryProof,
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 100)),
   ]);
 
   assert.equal(result, true);
+  assert.equal(client.requests.length, 1);
+});
+
+test('late lifecycle signal without rollout proof cannot complete a hanging read', async (t) => {
+  const clientId = 'discord:c1:m-late-signal-only';
+  const { codexHome } = createRolloutFixture(t, [sessionMeta()]);
+  let readStarted;
+  const started = new Promise((resolve) => { readStarted = resolve; });
+  const client = new FakeRpcClient(async (method) => {
+    assert.equal(method, 'thread/read');
+    readStarted();
+    return new Promise(() => {});
+  });
+  const host = createLocalRolloutHost(client, codexHome);
+
+  const deliveryProof = host.hasDelivered(DELIVERY_THREAD_ID, clientId);
+  await started;
+  client.emit('notification', userLifecycleSignal(
+    'item/completed',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+  const result = await Promise.race([
+    deliveryProof,
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 50)),
+  ]);
+
+  assert.equal(result, 'timed-out');
+  host.destroy();
+  assert.equal(await deliveryProof, false);
+});
+
+test('unrelated client ids, threads, and non-user lifecycle items do not wake exact proof', async (t) => {
+  const clientId = 'discord:c1:m-exact-signal';
+  const { codexHome, rolloutPath } = createRolloutFixture(t, [sessionMeta()]);
+  let readStarted;
+  const started = new Promise((resolve) => { readStarted = resolve; });
+  const client = new FakeRpcClient(async (method) => {
+    assert.equal(method, 'thread/read');
+    readStarted();
+    return new Promise(() => {});
+  });
+  const host = createLocalRolloutHost(client, codexHome);
+  t.after(() => host.destroy());
+
+  const deliveryProof = host.hasDelivered(DELIVERY_THREAD_ID, clientId);
+  await started;
+  fs.appendFileSync(rolloutPath, `${JSON.stringify(deliveredUserMessage(clientId))}\n`);
+  for (const signal of [
+    userLifecycleSignal('item/completed', DELIVERY_THREAD_ID, 'discord:c1:other'),
+    userLifecycleSignal('item/completed', OTHER_DELIVERY_THREAD_ID, clientId),
+    {
+      method: 'item/completed',
+      params: {
+        threadId: DELIVERY_THREAD_ID,
+        item: { type: 'agentMessage', clientId },
+      },
+    },
+  ]) {
+    client.emit('notification', signal);
+  }
+
+  assert.equal(await Promise.race([
+    deliveryProof,
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 50)),
+  ]), 'timed-out');
+
+  client.emit('notification', userLifecycleSignal(
+    'item/completed',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+  assert.equal(await deliveryProof, true);
+  assert.equal(client.requests.length, 1);
+});
+
+test('exact rollout parser rejects wrong identity, wrong item, malformed data, and decoys', async (t) => {
+  const clientId = 'discord:c1:m-parser-target';
+  const cases = [
+    {
+      name: 'wrong thread rollout filename',
+      records: [sessionMeta(OTHER_DELIVERY_THREAD_ID), deliveredUserMessage(clientId)],
+      options: { filenameThreadId: OTHER_DELIVERY_THREAD_ID },
+    },
+    {
+      name: 'wrong thread session identity',
+      records: [sessionMeta(OTHER_DELIVERY_THREAD_ID), deliveredUserMessage(clientId)],
+    },
+    {
+      name: 'wrong client id',
+      records: [sessionMeta(), deliveredUserMessage('discord:c1:other')],
+    },
+    {
+      name: 'non-user event',
+      records: [
+        sessionMeta(),
+        { type: 'event_msg', payload: { type: 'agent_message', client_id: clientId } },
+      ],
+    },
+    {
+      name: 'malformed JSON only',
+      records: ['{"type":"session_meta"', `{"client_id":"${clientId}"`],
+    },
+    {
+      name: 'substring decoy in command and tool text',
+      records: [
+        sessionMeta(),
+        { type: 'event_msg', payload: { type: 'exec_command_begin', command: `echo ${clientId}` } },
+        { type: 'response_item', payload: { type: 'function_call', arguments: clientId } },
+      ],
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const { codexHome } = createRolloutFixture(subtest, entry.records, entry.options);
+      const client = new FakeRpcClient(async (_method, params) => ({
+        thread: { id: params.threadId, turns: [] },
+      }));
+      const host = createLocalRolloutHost(client, codexHome);
+      subtest.after(() => host.destroy());
+
+      assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
+      assert.equal(client.requests.length, 1);
+    });
+  }
+});
+
+test('bounded tail verifier handles sparse rollouts larger than 128 MiB', async (t) => {
+  const clientId = 'discord:c1:m-large-tail';
+  await t.test('finds an exact recent user event without reading the full file', async (subtest) => {
+    const { codexHome, size } = createSparseRolloutFixture(
+      subtest,
+      `${JSON.stringify(deliveredUserMessage(clientId))}\n`,
+    );
+    let bytesRead = 0;
+    const rolloutFsPromises = {
+      opendir: (...args) => fs.promises.opendir(...args),
+      open: async (...args) => {
+        const handle = await fs.promises.open(...args);
+        return {
+          close: () => handle.close(),
+          stat: () => handle.stat(),
+          async read(...readArgs) {
+            const result = await handle.read(...readArgs);
+            bytesRead += result.bytesRead;
+            return result;
+          },
+        };
+      },
+    };
+    const client = new FakeRpcClient(async (method) => {
+      throw new Error(`large rollout proof must not request ${method}`);
+    });
+    const host = createLocalRolloutHost(client, codexHome, { rolloutFsPromises });
+    subtest.after(() => host.destroy());
+
+    assert.equal(size > 128 * 1024 * 1024, true);
+    assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
+    assert.equal(bytesRead <= 33 * 1024 * 1024, true);
+    assert.equal(bytesRead < size, true);
+    assert.deepEqual(client.requests, []);
+  });
+
+  await t.test('falls back when the exact event is older than the bounded tail', async (subtest) => {
+    const fixture = createRolloutFixture(subtest, [
+      sessionMeta(),
+      deliveredUserMessage(clientId),
+    ]);
+    const size = 160 * 1024 * 1024;
+    const handle = fs.openSync(fixture.rolloutPath, 'r+');
+    try {
+      fs.ftruncateSync(handle, size);
+      const recent = Buffer.from(`\n${JSON.stringify(deliveredUserMessage('discord:c1:recent'))}\n`);
+      fs.writeSync(handle, recent, 0, recent.length, size - recent.length);
+    } finally {
+      fs.closeSync(handle);
+    }
+    const client = new FakeRpcClient(async (_method, params) => ({
+      thread: { id: params.threadId, turns: [] },
+    }));
+    const host = createLocalRolloutHost(client, fixture.codexHome);
+    subtest.after(() => host.destroy());
+
+    assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
+    assert.equal(client.requests.length, 1);
+  });
+
+  for (const entry of [
+    {
+      name: 'rejects wrong id and substring decoys in the recent tail',
+      tail: [
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'exec_command_begin', command: `printf ${clientId}` },
+        }),
+        JSON.stringify(deliveredUserMessage('discord:c1:wrong-large-tail')),
+        '',
+      ].join('\n'),
+    },
+    {
+      name: 'ignores an exact event in an incomplete trailing append',
+      tail: JSON.stringify(deliveredUserMessage(clientId)),
+    },
+  ]) {
+    await t.test(entry.name, async (subtest) => {
+      const { codexHome } = createSparseRolloutFixture(subtest, entry.tail);
+      const client = new FakeRpcClient(async (_method, params) => ({
+        thread: { id: params.threadId, turns: [] },
+      }));
+      const host = createLocalRolloutHost(client, codexHome);
+      subtest.after(() => host.destroy());
+
+      assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
+      assert.equal(client.requests.length, 1);
+    });
+  }
+});
+
+test('local rollout verification fails closed on ambiguous exact filenames', async (t) => {
+  const clientId = 'discord:c1:m-ambiguous';
+  const first = createRolloutFixture(t, [sessionMeta(), deliveredUserMessage(clientId)]);
+  const secondDir = path.join(first.codexHome, 'sessions', '2026', '07', '30');
+  fs.mkdirSync(secondDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(secondDir, `rollout-2026-07-30T00-00-00-${DELIVERY_THREAD_ID}.jsonl`),
+    `${JSON.stringify(sessionMeta())}\n${JSON.stringify(deliveredUserMessage(clientId))}\n`,
+  );
+  const client = new FakeRpcClient(async (_method, params) => ({
+    thread: { id: params.threadId, turns: [] },
+  }));
+  const host = createLocalRolloutHost(client, first.codexHome);
+  t.after(() => host.destroy());
+
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
+  assert.equal(client.requests.length, 1);
+});
+
+test('only verified durable results populate the bounded proof cache', async (t) => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`verified cache test must not request ${method}`);
+  });
+  const host = createAppServerHost({}, () => {}, {
+    client,
+    verifyRolloutDelivery: async () => true,
+  });
+  t.after(() => host.destroy());
+
+  for (let index = 0; index < 300; index += 1) {
+    const suffix = index.toString(16).padStart(12, '0');
+    const threadId = `019f3763-d308-7871-bedc-${suffix}`;
+    client.emit('notification', userLifecycleSignal(
+      'item/completed',
+      threadId,
+      `discord:c1:signal-${index}`,
+    ));
+  }
+  assert.equal(host.verifiedUserMessages.size, 0);
+
+  for (let index = 0; index < 300; index += 1) {
+    const suffix = index.toString(16).padStart(12, '0');
+    assert.equal(await host.hasDelivered(
+      `019f3763-d308-7871-bedc-${suffix}`,
+      `discord:c1:verified-${index}`,
+    ), true);
+  }
+  assert.equal(host.verifiedUserMessages.size, 256);
+  assert.equal(host.deliveryWaiters.size, 0);
+});
+
+test('restart without a lifecycle signal recovers from exact local rollout proof', async (t) => {
+  const clientId = 'discord:c1:m-restart-proof';
+  const { codexHome } = createRolloutFixture(t, [
+    sessionMeta(),
+    deliveredUserMessage(clientId),
+  ]);
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`restart rollout proof must not request ${method}`);
+  });
+  const host = createLocalRolloutHost(client, codexHome);
+  t.after(() => host.destroy());
+
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
   assert.deepEqual(client.requests, []);
 });
 

@@ -47,10 +47,13 @@ incident verdict, apply the four diagnosis steps below to that id.
 
 After a positive structured response, the gateway now requires an exact
 `userMessage` proof from the exact target thread with the same stable
-`clientUserMessageId`. An exact `item/started` or `item/completed` lifecycle
-notification supplies the normal bounded proof. Startup, reconnect, or a
-missed notification uses the existing structured `thread/read` recovery path.
-Only one of those exact proofs can move the Discord identity into `completed`.
+`clientUserMessageId`. On a local app-server, one exact rollout filename,
+matching `session_meta` identity, and exact structured user-message JSONL record
+supplies bounded durable proof. `item/started` and `item/completed` lifecycle
+notifications only wake that verifier and are not proof. Startup, reconnect,
+or a missed notification performs the same local verification before using the
+existing structured `thread/read` recovery path. Only a durable rollout record
+or exact readback can move the Discord identity into `completed`.
 
 If the user item is not observable, the queue head remains durable and status
 reports `structured_ack_uncertain`. Periodic reconciliation checks for the
@@ -94,23 +97,27 @@ thread history and can exceed a larger timeout as the thread grows.
 
 ### Source-Level Fix
 
-Positive delivery now uses the app-server's bounded item lifecycle stream.
-Only `item/started` or `item/completed` for an exact `userMessage`, exact target
-thread id, and exact stable client id is accepted. Unrelated ids, non-user
-items, and other threads cannot complete the queue head. Once this proof has
-arrived, `hasDelivered` returns without issuing `thread/read`, so a long thread
-history is outside the normal positive acknowledgement path.
+Positive delivery now uses bounded local rollout verification. The verifier
+selects one exact rollout filename, validates the target thread id from the
+first JSONL record, and scans only a bounded recent tail for the exact
+structured user-message client id. It does not read the full rollout. An exact
+`item/started` or `item/completed` notification wakes an in-flight verifier, but
+the event cannot complete the queue without that durable record. Unrelated ids,
+non-user items, malformed JSON, substring matches in command or tool text, and
+other threads cannot complete the queue head.
 
-The full `thread/read` remains the supported fail-closed fallback when the
-notification was missed or the gateway restarted. The returned thread id and
-structured item shape must match exactly. A timeout, unsupported request,
-malformed response, wrong thread, or missing client id remains
-`structured_ack_uncertain`; none is converted into delivered.
+Startup, reconnect, and missed-notification recovery also check the local
+rollout. The full `thread/read` remains the supported fail-closed fallback for
+remote app-servers, unavailable or ambiguous files, malformed identity, and
+records older than the bounded tail. The returned thread id and structured item
+shape must match exactly. A timeout, unsupported request, malformed response,
+wrong thread, or missing client id remains `structured_ack_uncertain`; none is
+converted into delivered.
 
 This behavior is repository source behavior until the parent-owned deployment,
 restart, Discord send, and exact read-back checks have completed. The 120-second
 setting may remain useful operationally for fallback recovery, but it is not
-required by the event-based positive path.
+required when bounded local rollout proof succeeds.
 
 ## Mentioned Guild Message Is Not Accepted
 

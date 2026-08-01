@@ -23,6 +23,23 @@ const {
 } = require('../../src/receiver-state');
 
 const TEST_ACTIVATION_ID = path.resolve(__dirname, '..', '..');
+const ROLLOUT_THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190e';
+
+function createDeliveryRollout(t) {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delivery-rollout-'));
+  const sessionsDir = path.join(codexHome, 'sessions', '2026', '07', '31');
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const rolloutPath = path.join(
+    sessionsDir,
+    `rollout-2026-07-31T00-00-00-${ROLLOUT_THREAD_ID}.jsonl`,
+  );
+  fs.writeFileSync(rolloutPath, `${JSON.stringify({
+    type: 'session_meta',
+    payload: { id: ROLLOUT_THREAD_ID },
+  })}\n`);
+  t.after(() => fs.rmSync(codexHome, { recursive: true, force: true }));
+  return { codexHome, rolloutPath };
+}
 
 function discordMessage(messageId, content = 'hello') {
   return {
@@ -789,16 +806,17 @@ test('authorized Discord payload starts one structured turn without TTY or runti
   assert.match(request.input[0].text, /\\x03/);
 });
 
-test('matching structured item notification completes delivery without a full thread read', async (t) => {
+test('matching lifecycle signal plus rollout evidence completes without a full thread read', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-item-ack-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { codexHome, rolloutPath } = createDeliveryRollout(t);
   const client = new EventEmitter();
   const requests = [];
   client.status = () => ({ configured: true, available: true, reason: null });
   client.request = async (method, params) => {
     requests.push({ method, params });
     if (method === 'thread/loaded/list') {
-      return { data: ['thread-current'], nextCursor: null };
+      return { data: [ROLLOUT_THREAD_ID], nextCursor: null };
     }
     if (method === 'thread/read') {
       if (params.includeTurns) return new Promise(() => {});
@@ -811,6 +829,13 @@ test('matching structured item notification completes delivery without a full th
       };
     }
     if (method === 'turn/start') {
+      fs.appendFileSync(rolloutPath, `${JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'user_message',
+          client_id: params.clientUserMessageId,
+        },
+      })}\n`);
       client.emit('notification', {
         method: 'item/started',
         params: {
@@ -824,7 +849,10 @@ test('matching structured item notification completes delivery without a full th
     throw new Error(`unexpected method ${method}`);
   };
   const host = createAppServerHost(
-    { appServerUrl: 'ws://127.0.0.1:4500' },
+    {
+      appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+      env: { CODEX_HOME: codexHome, HOME: path.dirname(codexHome) },
+    },
     () => {},
     { client },
   );
@@ -1613,6 +1641,58 @@ test('unsupported acknowledgement recovery remains structured_ack_uncertain', as
   assert.deepEqual(queue.completed, []);
   assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
   assert.equal(queue.blocked.clientUserMessageId, 'discord:c1:m-unsupported-readback');
+});
+
+test('remote unsupported acknowledgement read remains structured_ack_uncertain', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-remote-ack-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const client = new EventEmitter();
+  const requests = [];
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === 'thread/loaded/list') {
+      return { data: [ROLLOUT_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && !params.includeTurns) {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') return { turn: { id: 'turn-remote-ack' } };
+    if (method === 'thread/read' && params.includeTurns) {
+      const error = new Error('Unsupported method: thread/read');
+      error.code = 'shared_app_server_request_rejected';
+      throw error;
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  const host = createAppServerHost(
+    { appServerUrl: 'wss://remote.example.invalid/rpc' },
+    () => {},
+    { client },
+  );
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, { structuredHost: host });
+  t.after(() => delivery.destroy());
+  await delivery.activateReceiver(activeReceiver);
+
+  const result = await delivery.deliver(
+    discordMessage('m-remote-unsupported', 'remain durable'),
+  );
+  const queue = readQueue(dir);
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'structured_ack_uncertain');
+  assert.deepEqual(queue.completed, []);
+  assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
+  assert.equal(
+    requests.some((request) => request.method === 'thread/read' && request.params.includeTurns),
+    true,
+  );
 });
 
 test('unpersisted successful response reconciles later without replay', async () => {
