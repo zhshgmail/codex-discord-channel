@@ -29,6 +29,7 @@ $HOME/.codex/channels/discord/<instance>/access.json
 $HOME/.codex/channels/discord/<instance>/owner.json
 $HOME/.codex/channels/discord/<instance>/session-gateway.pid
 $HOME/.codex/channels/discord/<instance>/pending-delivery.json
+$HOME/.codex/channels/discord/<instance>/reply-receipts/
 $HOME/.codex/channels/discord/<instance>/app-server.sock
 ```
 
@@ -106,6 +107,18 @@ exclusive `before` message cursor, and `limit` from 1 to 25. Results are newest
 first. Guild history requires the exact enabled channel or thread; DM history
 requires the configured DM policy. The tool returns sanitized stable errors and
 bounded output.
+
+## Reply Once
+
+For a Discord-origin request, send through `discord_channel_send`. The first
+send creates a durable receipt keyed by the source channel and source message
+id. Later automatic continuations for the same source are suppressed even when
+they pass the channel explicitly. Use `followup: true` only when a second
+Discord message is intentionally required.
+
+Do not answer a Discord-origin request through a generic Discord MCP sender.
+That path does not share this plugin's reply receipt and bypasses the one-source
+one-reply guard. A new inbound Discord message gets a new receipt identity.
 
 ## Guild Reply Audience
 

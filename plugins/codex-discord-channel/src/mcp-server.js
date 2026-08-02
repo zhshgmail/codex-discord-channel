@@ -6,11 +6,11 @@ const {
   createDelivery,
   readDeliveryQueueStatus,
   readLastInboundContext,
-  resolveReplyTarget,
 } = require('./delivery');
 const { sendDiscordMessage, startDiscordClient } = require('./discord-client');
 const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
+const { sendDiscordReplyOnce } = require('./reply-delivery');
 
 const SERVER_NAME = 'Codex Discord Channel';
 const SERVER_VERSION = '0.3.0';
@@ -117,8 +117,14 @@ function toolList() {
           channelId: { type: 'string', description: 'Optional Discord channel id. Defaults to the last accepted inbound Discord message.' },
           content: { type: 'string', description: 'Message text to send.' },
           replyTo: { type: 'string', description: 'Optional Discord message id to reply to.' },
+          followup: {
+            type: 'boolean',
+            default: false,
+            description: 'Explicitly allow an additional message after this source Discord message was already answered.',
+          },
         },
         required: ['content'],
+        additionalProperties: false,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
@@ -183,6 +189,7 @@ async function callTool(context, name, args = {}) {
       sharedAppServerAvailable: Boolean(structured.available),
       sharedAppServerReason: structured.reason || null,
       gatewayPidPath: context.config.paths.gatewayPidPath,
+      replyReceiptDir: context.config.paths.replyReceiptDir,
       ownerIsReceiveGate: false,
       ...deliveryQueue,
       discordStarted: context.discordState.started,
@@ -204,9 +211,16 @@ async function callTool(context, name, args = {}) {
   }
 
   if (name === 'discord_channel_send') {
-    const target = resolveReplyTarget(args, context.config);
-    const sent = await sendDiscordMessage(context.discordState.client, { ...args, ...target });
-    return textResult(`Sent Discord message ${sent.messageId}.`, sent);
+    const sent = await sendDiscordReplyOnce({
+      args,
+      config: context.config,
+      content: args.content,
+      sender: (target) => sendDiscordMessage(context.discordState.client, { ...args, ...target }),
+    });
+    const message = sent.duplicateSuppressed
+      ? `Suppressed duplicate Discord reply for source message ${sent.sourceMessageId}.`
+      : `Sent Discord message ${sent.messageId}.`;
+    return textResult(message, sent);
   }
 
   if (name === 'discord_channel_read_history') {

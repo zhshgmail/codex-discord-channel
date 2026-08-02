@@ -441,3 +441,45 @@ test('send tool defaults to last inbound Discord message when channelId is omitt
     },
   }]);
 });
+
+test('send tool suppresses a second reply to the same inbound message', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'last-inbound.json'), JSON.stringify({
+    channelId: 'c1',
+    messageId: 'm1',
+  }));
+
+  const sends = [];
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const context = {
+    config,
+    discordState: {
+      started: true,
+      client: {
+        channels: {
+          async fetch(channelId) {
+            return {
+              async send(payload) {
+                sends.push({ channelId, payload });
+                return { channelId, id: 'sent1' };
+              },
+            };
+          },
+        },
+      },
+    },
+  };
+
+  const first = await callTool(context, 'discord_channel_send', { content: 'first' });
+  const repeated = await callTool(context, 'discord_channel_send', {
+    channelId: 'c1',
+    content: 'automatic continuation',
+  });
+
+  assert.equal(first.structuredContent.duplicateSuppressed, false);
+  assert.equal(repeated.structuredContent.duplicateSuppressed, true);
+  assert.equal(repeated.structuredContent.reason, 'source_message_already_replied');
+  assert.equal(sends.length, 1);
+});

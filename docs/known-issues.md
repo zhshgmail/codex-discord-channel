@@ -197,6 +197,41 @@ Do not use local console visibility, a completed inbound queue item, model turn
 completion, or a successful send call without exact read-back as evidence of
 outbound delivery.
 
+## One Discord Question Receives Repeated Answers
+
+### Observed Incident
+
+On 2026-08-02, source message `1533449151742869614` appeared once in Discord
+and once in the durable inbound queue. The queue moved it to `completed`, but
+Codex01 posted ten answers over later automatic continuations. Only the first
+answer referenced the source message; the other nine were ordinary channel
+messages.
+
+### Cause
+
+Inbound completion and outbound reply completion were separate facts. The
+plugin deduplicated `(channelId, messageId)` on ingress, but retained
+`last-inbound.json` indefinitely and had no durable record saying that source
+message had already received its answer. A later continuation could therefore
+send again. A generic Discord MCP sender made the gap larger because it did not
+share any plugin state.
+
+This is an outbound reply-lifecycle defect. It is not evidence that the inbound
+FIFO replayed the source message: in the observed incident, ingress completed
+once.
+
+### Fixed Behavior
+
+The plugin sender now creates one atomic receipt per source channel and source
+message id before sending. Concurrent or later default sends for that source
+are suppressed. A transport failure after the claim remains `uncertain` and
+fails closed rather than replaying. A deliberate additional message requires
+the explicit `followup` flag.
+
+Discord-origin replies must use `discord_channel_send` or the plugin CLI. A
+generic Discord MCP sender cannot participate in this receipt protocol and is
+therefore not a valid reply path for a reply-required turn.
+
 ## Gateway Is Healthy But Messages Go To No Visible Console
 
 The gateway and visible TUI must share the same externally reachable Codex
