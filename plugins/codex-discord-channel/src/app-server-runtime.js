@@ -117,4 +117,5 @@ module.exports = {
   accountStateRelationship,
   instanceDoctor,
   runAppServer,
+  sanitizedAppServerEnv,
 };

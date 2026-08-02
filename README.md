@@ -219,6 +219,21 @@ DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
 codex-discord-channel instance-doctor
 ```
 
+Use the instance launcher for the visible TUI. It validates the account login
+and bot configuration, enables and starts both systemd units, waits for the
+instance socket, and only then replaces itself with the matching Codex client:
+
+```bash
+codex-discord-instance codex02
+```
+
+An alias may select the instance, but it is not the isolation or startup
+boundary:
+
+```bash
+alias codex02='codex-discord-instance codex02'
+```
+
 `CODEX_BIN` is the Codex JavaScript entry point executed by `NODE_BIN`, not a
 shell launcher or alias. The bundled templates under
 `plugins/codex-discord-channel/systemd/` start one
@@ -226,7 +241,8 @@ app-server and one gateway per `%i`. They consume absolute executable paths
 from `account.env`; this avoids relying on an interactive `nvm` PATH. Copy both
 templates to `$HOME/.config/systemd/user/` and enable the same instance name
 for both units. Keep `account.env` mode `0600`. The visible TUI must use the
-matching account and socket:
+matching account and socket. Prefer the launcher above; the equivalent
+low-level command is:
 
 ```bash
 CODEX_HOME="$HOME/.codex-account-02" \

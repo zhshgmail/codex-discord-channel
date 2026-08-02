@@ -8,6 +8,7 @@ const { startGatewayDrainLoop } = require('../src/gateway-drain-loop');
 const { startDiscordClient } = require('../src/discord-client');
 const { claimOwner, createOwner } = require('../src/owner-state');
 const { instanceDoctor, runAppServer } = require('../src/app-server-runtime');
+const { runTui } = require('../src/instance-launcher');
 
 function usage() {
   process.stderr.write([
@@ -16,11 +17,38 @@ function usage() {
     '  codex-discord-channel gateway [--instance ID --state-dir PATH]',
     '  codex-discord-channel app-server [--instance ID --state-dir PATH]',
     '  codex-discord-channel instance-doctor [--instance ID --state-dir PATH]',
+    '  codex-discord-channel tui-check [--instance ID --state-dir PATH]',
+    '  codex-discord-channel live-check [--instance ID --state-dir PATH] --pid PID --pid PID',
+    '  codex-discord-channel tui [--instance ID --state-dir PATH] [-- CODEX_ARGS...]',
     '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID]',
     '',
     'The send command reads message text from stdin. Without --channel it replies to the last accepted inbound Discord message.',
   ].join('\n'));
   process.stderr.write('\n');
+}
+
+function parseTuiArgs(argv) {
+  const separator = argv.indexOf('--');
+  const runtimeArgs = separator === -1 ? argv : argv.slice(0, separator);
+  const codexArgs = separator === -1 ? [] : argv.slice(separator + 1);
+  return { codexArgs, runtimeArgs };
+}
+
+function parseLiveCheckArgs(argv) {
+  const runtimeArgs = [];
+  const pids = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === '--pid') {
+      const pid = Number(argv[index + 1]);
+      if (!Number.isSafeInteger(pid)) throw new Error('--pid requires an integer');
+      pids.push(pid);
+      index += 1;
+    } else {
+      runtimeArgs.push(argv[index]);
+    }
+  }
+  if (pids.length !== 2) throw new Error('live-check requires exactly two --pid values');
+  return { pids, runtimeArgs };
 }
 
 function parseRuntimeArgs(argv) {
@@ -212,6 +240,22 @@ async function main() {
     process.stdout.write(`${JSON.stringify(instanceDoctor(loadRuntimeConfig(rest)), null, 2)}\n`);
     return;
   }
+  if (command === 'tui-check') {
+    require('../src/instance-launcher').requireInstanceReady(loadRuntimeConfig(rest));
+    return;
+  }
+  if (command === 'live-check') {
+    const args = parseLiveCheckArgs(rest);
+    const config = loadRuntimeConfig(args.runtimeArgs);
+    const { verifyLiveProcess } = require('../src/instance-launcher');
+    for (const pid of args.pids) verifyLiveProcess(config, pid);
+    return;
+  }
+  if (command === 'tui') {
+    const args = parseTuiArgs(rest);
+    runTui(loadRuntimeConfig(args.runtimeArgs), args.codexArgs);
+    return;
+  }
   if (command === '-h' || command === '--help') {
     usage();
     return;
@@ -221,8 +265,10 @@ async function main() {
 
 module.exports = {
   main,
+  parseLiveCheckArgs,
   parseRuntimeArgs,
   parseSendArgs,
+  parseTuiArgs,
   readStdin,
   sendViaRest,
 };

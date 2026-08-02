@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: codex-discord-instance INSTANCE [CODEX_ARGS...]" >&2
+}
+
+if (($# < 1)); then
+  usage
+  exit 2
+fi
+
+instance=$1
+shift
+if [[ ! $instance =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+  echo "Invalid Discord instance: $instance" >&2
+  exit 2
+fi
+
+state_dir=${DISCORD_CONFIG_DIR:-"$HOME/.codex/channels/discord/$instance"}
+account_env="$state_dir/account.env"
+if [[ ! -f $account_env ]]; then
+  echo "Missing instance account file: $account_env" >&2
+  exit 1
+fi
+
+read_account_value() {
+  local key=$1
+  local count value
+  count=$(awk -F= -v key="$key" '$1 == key { count += 1 } END { print count + 0 }' "$account_env")
+  if [[ $count != 1 ]]; then
+    echo "$account_env must contain exactly one $key entry" >&2
+    exit 1
+  fi
+  value=$(awk -v key="$key" 'index($0, key "=") == 1 { print substr($0, length(key) + 2) }' "$account_env")
+  if [[ $value != /* ]]; then
+    echo "$key must be an absolute path in $account_env" >&2
+    exit 1
+  fi
+  printf '%s' "$value"
+}
+
+node_bin=$(read_account_value NODE_BIN)
+channel_bin=$(read_account_value CODEX_DISCORD_CHANNEL_BIN)
+if [[ ! -x $node_bin || ! -f $channel_bin ]]; then
+  echo "Instance executable paths are unavailable for $instance" >&2
+  exit 1
+fi
+
+runtime_args=(--instance "$instance" --state-dir "$state_dir")
+"$node_bin" "$channel_bin" tui-check "${runtime_args[@]}" >/dev/null
+
+app_service="codex-discord-app-server@$instance.service"
+gateway_service="codex-discord-channel@$instance.service"
+systemctl --user enable --now "$app_service" "$gateway_service" >/dev/null
+
+socket="$state_dir/app-server.sock"
+timeout_seconds=${CODEX_DISCORD_START_TIMEOUT_SECONDS:-15}
+if [[ ! $timeout_seconds =~ ^[0-9]+$ ]]; then
+  echo "CODEX_DISCORD_START_TIMEOUT_SECONDS must be a non-negative integer" >&2
+  exit 2
+fi
+deadline=$((SECONDS + timeout_seconds))
+while ((SECONDS <= deadline)); do
+  if systemctl --user is-active --quiet "$app_service" \
+    && systemctl --user is-active --quiet "$gateway_service" \
+    && [[ -S $socket ]]; then
+    app_pid=$(systemctl --user show --property MainPID --value "$app_service")
+    gateway_pid=$(systemctl --user show --property MainPID --value "$gateway_service")
+    "$node_bin" "$channel_bin" live-check "${runtime_args[@]}" \
+      --pid "$app_pid" --pid "$gateway_pid" >/dev/null
+    exec "$node_bin" "$channel_bin" tui "${runtime_args[@]}" -- "$@"
+  fi
+  sleep 0.1
+done
+
+echo "Discord instance $instance did not become ready within the startup timeout" >&2
+exit 1

@@ -17,10 +17,11 @@
   ],
   "main": "src/mcp-server.js",
   "bin": {
-    "codex-discord-channel": "bin/codex-discord-channel"
+    "codex-discord-channel": "bin/codex-discord-channel",
+    "codex-discord-instance": "bin/codex-discord-instance"
   },
   "scripts": {
-    "syntax": "node --check bin/codex-discord-channel && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js",
+    "syntax": "bash -n bin/codex-discord-instance && node --check bin/codex-discord-channel && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js",
     "test": "node --test tests/unit/*.test.js",
     "smoke": "node scripts/smoke.js",
     "import:bridge": "node scripts/import-bridge-state.js",
