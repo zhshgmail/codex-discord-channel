@@ -92,12 +92,16 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.DISCORD_STATE_DIR ||
     env.DISCORD_CONFIG_DIR
   );
+  const codexHomeWasExplicit = Boolean(env.CODEX_HOME);
   let initialPaths = resolvePaths(env);
-  let accountBindingLoaded = loadEnvFile(initialPaths.accountBindingPath, env, {
-    allowedKeys: ACCOUNT_BINDING_KEYS,
-    rejectConflicts: true,
-    strict: true,
-  });
+  let accountBindingLoaded = false;
+  if (!instanceWasExplicit || codexHomeWasExplicit) {
+    accountBindingLoaded = loadEnvFile(initialPaths.accountBindingPath, env, {
+      allowedKeys: ACCOUNT_BINDING_KEYS,
+      rejectConflicts: true,
+      strict: true,
+    });
+  }
   initialPaths = resolvePaths(env);
   let legacyInstanceFallbackUsed = false;
   if (!instanceWasExplicit && !accountBindingLoaded) {

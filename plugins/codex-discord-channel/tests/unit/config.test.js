@@ -189,6 +189,36 @@ test('account binding rejects a state conflict with an explicit service selectio
   );
 });
 
+test('explicit state can discover its account home before validating that account binding', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const primaryHome = path.join(home, '.codex');
+  const secondHome = path.join(home, '.codex-account-02');
+  const secondState = path.join(primaryHome, 'channels', 'discord', 'codex02');
+  fs.mkdirSync(secondHome, { recursive: true });
+  fs.mkdirSync(secondState, { recursive: true });
+  fs.writeFileSync(path.join(primaryHome, 'discord-instance.env'), [
+    'DISCORD_INSTANCE=codex01',
+    `DISCORD_CONFIG_DIR=${path.join(primaryHome, 'channels', 'discord', 'codex01')}`,
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(secondState, 'account.env'), `CODEX_HOME=${secondHome}\n`);
+  fs.writeFileSync(path.join(secondHome, 'discord-instance.env'), [
+    'DISCORD_INSTANCE=codex02',
+    `DISCORD_CONFIG_DIR=${secondState}`,
+    '',
+  ].join('\n'));
+
+  const config = loadConfig({
+    HOME: home,
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: secondState,
+  });
+
+  assert.equal(config.codexHome, secondHome);
+  assert.equal(config.accountBindingLoaded, true);
+  assert.equal(config.paths.stateDir, secondState);
+});
+
 test('network env accepts proxy keys and rejects pre-exec command overrides', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
