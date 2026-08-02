@@ -23,7 +23,7 @@ function usage() {
     '  codex-discord-channel tui [--instance ID --state-dir PATH] [-- CODEX_ARGS...]',
     '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID] [--followup]',
     '',
-    'The send command reads message text from stdin. Without --channel it replies to the last accepted inbound Discord message.',
+    'The send command reads message text from stdin. A guarded reply requires exact --channel and --reply-to values.',
   ].join('\n'));
   process.stderr.write('\n');
 }
@@ -150,7 +150,11 @@ async function sendViaRest(args) {
         body = {};
       }
       if (!response.ok) {
-        throw new Error(`Discord send failed ${response.status}: ${body.message || bodyText}`);
+        const error = new Error(`Discord send failed ${response.status}: ${body.message || bodyText}`);
+        if (response.status >= 400 && response.status < 500) {
+          error.definitiveNoSend = true;
+        }
+        throw error;
       }
       return { channelId: body.channel_id, messageId: body.id };
     },

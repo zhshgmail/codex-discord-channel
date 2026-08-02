@@ -372,18 +372,18 @@ The command-line sender reads message text from standard input:
 ```bash
 printf '%s' 'status update' |
   DISCORD_INSTANCE=codex01 codex-discord-channel send \
-    --channel CHANNEL_ID
+    --channel CHANNEL_ID --reply-to SOURCE_MESSAGE_ID
 ```
 
-Add `--reply-to MESSAGE_ID` for a Discord reply. Omitting `--channel` targets
-the channel in `last-inbound.json`; use that shortcut only after checking the
-record belongs to the intended conversation.
+Guarded replies require the exact source `--channel` and `--reply-to` values.
+The sender never infers reply identity from mutable `last-inbound.json`. Use
+`--followup` with an exact channel only for a deliberate additional message.
 
-The first reply to a source Discord message creates a durable receipt under
-`reply-receipts/`. A later automatic continuation targeting the same source is
-suppressed instead of posting another answer. Pass `--followup` only for an
-intentional additional message. Discord-origin replies must use this plugin's
-sender; a generic Discord MCP sender bypasses the receipt guard.
+Before the first network send for a source Discord message, the sender fsyncs a
+durable claim under `reply-receipts/`. A later automatic continuation targeting
+that exact source is suppressed instead of posting another answer. Discord-
+origin replies must use this plugin's sender; a generic Discord MCP sender
+bypasses the receipt guard.
 
 `discord_channel_read_history` is bounded to 25 sanitized messages per call.
 Use its exclusive `before` cursor to page backward. Reading history does not
@@ -463,7 +463,7 @@ file both reach the fallback; inspect the command exit code separately.
 | Gateway says connected but the visible TUI receives nothing | Confirm both processes use the same `app-server.sock` | Relaunch the TUI with `codex --remote`. A direct TUI has a private embedded server. |
 | Queue is stuck at `thread_busy` | Exact current thread and active turn identity | Let the current turn advance; do not start a second receiver or inject terminal input. |
 | Queue is stuck at `structured_ack_uncertain` | Exact target thread read-back by stable client id | Preserve the queue. The gateway reconciles without replay when the user item appears. See the known issue below. |
-| One Discord question receives repeated answers | Reply receipt for the source channel and message id | Use `discord_channel_send`; automatic repeats are suppressed. Use `followup` only deliberately and do not bypass the guard with a generic Discord sender. |
+| One Discord question receives repeated answers | Reply receipt for the exact source channel and message id | Use `discord_channel_send` with exact `channelId` and `replyTo`; automatic repeats are suppressed. Use `followup` only deliberately and do not bypass the guard with a generic Discord sender. |
 | Messages reappear after deployment | Runtime path and delivery activation id | Use versioned install paths. Do not reuse an old activation id across incompatible releases. |
 | Discord login or send fails behind a corporate network | Status booleans for proxy/TLS and service environment | Configure `DISCORD_PROXY_URL`; use `DISCORD_INSECURE_TLS` only where the local trust boundary explicitly requires it. Never log the values. |
 | `/clear` is followed by delivery to an old thread | Current runtime version and target checkpoint | Upgrade and verify thread rotation in the exact visible TUI. `owner.json` must not be used as the message receive gate. |

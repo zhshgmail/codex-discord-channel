@@ -7,7 +7,11 @@ const {
   readDeliveryQueueStatus,
   readLastInboundContext,
 } = require('./delivery');
-const { sendDiscordMessage, startDiscordClient } = require('./discord-client');
+const {
+  prepareDiscordMessageSend,
+  sendDiscordMessage,
+  startDiscordClient,
+} = require('./discord-client');
 const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
 const { sendDiscordReplyOnce } = require('./reply-delivery');
@@ -114,16 +118,23 @@ function toolList() {
       inputSchema: {
         type: 'object',
         properties: {
-          channelId: { type: 'string', description: 'Optional Discord channel id. Defaults to the last accepted inbound Discord message.' },
+          channelId: { type: 'string', description: 'Exact Discord channel id. Required for replies and followups.' },
           content: { type: 'string', description: 'Message text to send.' },
-          replyTo: { type: 'string', description: 'Optional Discord message id to reply to.' },
+          replyTo: { type: 'string', description: 'Exact source Discord message id. Required unless followup is true.' },
           followup: {
             type: 'boolean',
             default: false,
             description: 'Explicitly allow an additional message after this source Discord message was already answered.',
           },
         },
-        required: ['content'],
+        required: ['channelId', 'content'],
+        anyOf: [
+          { required: ['replyTo'] },
+          {
+            required: ['followup'],
+            properties: { followup: { const: true } },
+          },
+        ],
         additionalProperties: false,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -215,7 +226,15 @@ async function callTool(context, name, args = {}) {
       args,
       config: context.config,
       content: args.content,
-      sender: (target) => sendDiscordMessage(context.discordState.client, { ...args, ...target }),
+      preflight: (target) => prepareDiscordMessageSend(
+        context.discordState.client,
+        { ...args, ...target },
+      ),
+      sender: (target, prepared) => sendDiscordMessage(
+        context.discordState.client,
+        { ...args, ...target },
+        prepared,
+      ),
     });
     const message = sent.duplicateSuppressed
       ? `Suppressed duplicate Discord reply for source message ${sent.sourceMessageId}.`

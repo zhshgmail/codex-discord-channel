@@ -264,7 +264,7 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
   }
 }
 
-async function sendDiscordMessage(client, args) {
+function validateDiscordMessageSend(client, args) {
   if (!client) {
     throw new Error('Discord client is not running. Configure DISCORD_BOT_TOKEN and restart the plugin session.');
   }
@@ -274,6 +274,10 @@ async function sendDiscordMessage(client, args) {
   if (typeof args.content !== 'string' || args.content.trim() === '') {
     throw new Error('content is required.');
   }
+}
+
+async function prepareDiscordMessageSend(client, args) {
+  validateDiscordMessageSend(client, args);
   const channel = await client.channels.fetch(args.channelId.trim());
   if (!channel || typeof channel.send !== 'function') {
     throw new Error('Target channel cannot receive messages.');
@@ -282,6 +286,12 @@ async function sendDiscordMessage(client, args) {
   if (typeof args.replyTo === 'string' && args.replyTo.trim() !== '') {
     payload.reply = { messageReference: args.replyTo.trim(), failIfNotExists: false };
   }
+  return { channel, payload };
+}
+
+async function sendDiscordMessage(client, args, prepared = null) {
+  const dispatch = prepared || await prepareDiscordMessageSend(client, args);
+  const { channel, payload } = dispatch;
   const sent = await channel.send(payload);
   return { channelId: sent.channelId, messageId: sent.id };
 }
@@ -291,7 +301,9 @@ module.exports = {
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
   releaseDiscordReceiverOwnership,
+  prepareDiscordMessageSend,
   resolveReferencedMessage,
   sendDiscordMessage,
   startDiscordClient,
+  validateDiscordMessageSend,
 };

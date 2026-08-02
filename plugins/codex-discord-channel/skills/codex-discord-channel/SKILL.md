@@ -110,11 +110,12 @@ bounded output.
 
 ## Reply Once
 
-For a Discord-origin request, send through `discord_channel_send`. The first
-send creates a durable receipt keyed by the source channel and source message
-id. Later automatic continuations for the same source are suppressed even when
-they pass the channel explicitly. Use `followup: true` only when a second
-Discord message is intentionally required.
+For a Discord-origin request, send through `discord_channel_send` with the exact
+source `channelId` and `replyTo`. The sender does not infer either identity from
+`last-inbound.json`. Before the network send it fsyncs a durable claim keyed by
+that source identity. Later automatic continuations for the same source are
+suppressed. Use `followup: true` only when a second Discord message is
+intentionally required.
 
 Do not answer a Discord-origin request through a generic Discord MCP sender.
 That path does not share this plugin's reply receipt and bypasses the one-source

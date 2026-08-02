@@ -210,11 +210,12 @@ messages.
 ### Cause
 
 Inbound completion and outbound reply completion were separate facts. The
-plugin deduplicated `(channelId, messageId)` on ingress, but retained
-`last-inbound.json` indefinitely and had no durable record saying that source
-message had already received its answer. A later continuation could therefore
-send again. A generic Discord MCP sender made the gap larger because it did not
-share any plugin state.
+plugin deduplicated `(channelId, messageId)` on ingress, but had no durable
+record saying that source message had already received its answer. A later
+continuation could therefore send again. Inferring a reply from mutable
+`last-inbound.json` is also unsafe: a stale continuation can be rebound to a
+newer same-channel question. A generic Discord MCP sender made the gap larger
+because it did not share any plugin state.
 
 This is an outbound reply-lifecycle defect. It is not evidence that the inbound
 FIFO replayed the source message: in the observed incident, ingress completed
@@ -222,11 +223,13 @@ once.
 
 ### Fixed Behavior
 
-The plugin sender now creates one atomic receipt per source channel and source
-message id before sending. Concurrent or later default sends for that source
-are suppressed. A transport failure after the claim remains `uncertain` and
-fails closed rather than replaying. A deliberate additional message requires
-the explicit `followup` flag.
+The plugin sender now requires the exact source channel and message id and
+fsyncs one claim for that identity before the network send. It never derives a
+guarded reply identity from `last-inbound.json`. Concurrent or later sends for
+that source are suppressed. Deterministic preflight failures do not consume the
+reply; a transport failure after the claim remains `uncertain` and fails closed
+rather than replaying. A deliberate additional message requires the explicit
+`followup` flag.
 
 Discord-origin replies must use `discord_channel_send` or the plugin CLI. A
 generic Discord MCP sender cannot participate in this receipt protocol and is

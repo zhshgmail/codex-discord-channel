@@ -3,7 +3,6 @@
 const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { readLastInboundContext, resolveReplyTarget } = require('./delivery');
 
 function nowIso(deps = {}) {
   const value = typeof deps.now === 'function' ? deps.now() : Date.now();
@@ -34,14 +33,30 @@ function readReceipt(file, fsImpl = fs) {
   }
 }
 
+function fsyncDirectory(dir, fsImpl = fs) {
+  const fd = fsImpl.openSync(dir, 'r');
+  try {
+    fsImpl.fsyncSync(fd);
+  } finally {
+    fsImpl.closeSync(fd);
+  }
+}
+
 function writeReceipt(file, receipt, deps = {}) {
   const fsImpl = deps.fs || fs;
   fsImpl.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  let fd;
   try {
     fsImpl.writeFileSync(temp, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+    fd = fsImpl.openSync(temp, 'r');
+    fsImpl.fsyncSync(fd);
+    fsImpl.closeSync(fd);
+    fd = undefined;
     fsImpl.renameSync(temp, file);
+    fsyncDirectory(path.dirname(file), fsImpl);
   } finally {
+    if (fd !== undefined) fsImpl.closeSync(fd);
     try {
       fsImpl.rmSync(temp, { force: true });
     } catch {}
@@ -65,6 +80,10 @@ function claimReply(config, identity, content, deps = {}) {
   try {
     fd = fsImpl.openSync(file, 'wx', 0o600);
     fsImpl.writeFileSync(fd, `${JSON.stringify(receipt, null, 2)}\n`);
+    fsImpl.fsyncSync(fd);
+    fsImpl.closeSync(fd);
+    fd = undefined;
+    fsyncDirectory(path.dirname(file), fsImpl);
     return { acquired: true, file, receipt };
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error;
@@ -81,6 +100,12 @@ function claimReply(config, identity, content, deps = {}) {
   } finally {
     if (fd !== undefined) fsImpl.closeSync(fd);
   }
+}
+
+function releaseReplyClaim(claim, deps = {}) {
+  const fsImpl = deps.fs || fs;
+  fsImpl.rmSync(claim.file, { force: true });
+  fsyncDirectory(path.dirname(claim.file), fsImpl);
 }
 
 function completeReply(claim, sent, deps = {}) {
@@ -106,24 +131,33 @@ function markReplyUncertain(claim, error, deps = {}) {
 }
 
 function replyDispatch(args, config) {
-  const target = resolveReplyTarget(args, config);
+  const channelId = typeof args.channelId === 'string' ? args.channelId.trim() : '';
+  const replyTo = typeof args.replyTo === 'string' ? args.replyTo.trim() : '';
   if (args.followup === true) {
-    return { target, sourceMessageId: '', guarded: false };
+    if (!channelId) throw new Error('channelId is required for an explicit Discord followup.');
+    return {
+      target: { channelId, replyTo, usedLastInbound: false },
+      sourceMessageId: '',
+      guarded: false,
+    };
   }
-
-  const context = readLastInboundContext(config);
-  let sourceMessageId = target.replyTo;
-  if (!sourceMessageId && context?.channelId === target.channelId) {
-    sourceMessageId = context.messageId || '';
-    if (sourceMessageId) target.replyTo = sourceMessageId;
+  if (!channelId || !replyTo) {
+    throw new Error('channelId and replyTo are required for a guarded Discord reply.');
   }
-  return { target, sourceMessageId, guarded: Boolean(sourceMessageId) };
+  return {
+    target: { channelId, replyTo, usedLastInbound: false },
+    sourceMessageId: replyTo,
+    guarded: true,
+  };
 }
 
-async function sendDiscordReplyOnce({ args = {}, config, content, sender, deps = {} }) {
+async function sendDiscordReplyOnce({ args = {}, config, content, preflight, sender, deps = {} }) {
   const dispatch = replyDispatch(args, config);
+  const prepared = typeof preflight === 'function'
+    ? await preflight(dispatch.target)
+    : undefined;
   if (!dispatch.guarded) {
-    const sent = await sender(dispatch.target);
+    const sent = await sender(dispatch.target, prepared);
     return { ...sent, duplicateSuppressed: false, sourceMessageId: null };
   }
 
@@ -146,7 +180,7 @@ async function sendDiscordReplyOnce({ args = {}, config, content, sender, deps =
   }
 
   try {
-    const sent = await sender(dispatch.target);
+    const sent = await sender(dispatch.target, prepared);
     completeReply(claim, sent, deps);
     return {
       ...sent,
@@ -154,7 +188,11 @@ async function sendDiscordReplyOnce({ args = {}, config, content, sender, deps =
       duplicateSuppressed: false,
     };
   } catch (error) {
-    markReplyUncertain(claim, error, deps);
+    if (error?.definitiveNoSend === true) {
+      releaseReplyClaim(claim, deps);
+    } else {
+      markReplyUncertain(claim, error, deps);
+    }
     throw error;
   }
 }
@@ -165,6 +203,7 @@ module.exports = {
   contentDigest,
   markReplyUncertain,
   readReceipt,
+  releaseReplyClaim,
   replyDispatch,
   sendDiscordReplyOnce,
 };

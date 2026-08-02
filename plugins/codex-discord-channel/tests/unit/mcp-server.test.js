@@ -116,6 +116,19 @@ test('history tool discovery exposes a strict bounded read-only schema', () => {
   });
 });
 
+test('send tool discovery requires an exact source or explicit followup', () => {
+  const tool = toolList().find((item) => item.name === 'discord_channel_send');
+
+  assert.deepEqual(tool.inputSchema.required, ['channelId', 'content']);
+  assert.deepEqual(tool.inputSchema.anyOf, [
+    { required: ['replyTo'] },
+    {
+      required: ['followup'],
+      properties: { followup: { const: true } },
+    },
+  ]);
+});
+
 test('history tool returns structured authorized history for explicit arguments', async () => {
   const fixture = historyContext();
 
@@ -397,7 +410,7 @@ test('status ignores legacy TTY settings and reports structured-only delivery', 
   assert.equal(Object.hasOwn(result.structuredContent, 'ttyAutoSubmitCompat'), false);
 });
 
-test('send tool defaults to last inbound Discord message when channelId is omitted', async () => {
+test('send tool rejects a guarded reply without exact source identity', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
   fs.mkdirSync(stateDir, { recursive: true });
@@ -406,7 +419,6 @@ test('send tool defaults to last inbound Discord message when channelId is omitt
     messageId: 'm1',
   }));
 
-  const sends = [];
   const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
   const context = {
     config,
@@ -417,7 +429,6 @@ test('send tool defaults to last inbound Discord message when channelId is omitt
           async fetch(channelId) {
             return {
               async send(payload) {
-                sends.push({ channelId, payload });
                 return { channelId, id: 'sent1' };
               },
             };
@@ -430,16 +441,10 @@ test('send tool defaults to last inbound Discord message when channelId is omitt
     },
   };
 
-  const result = await callTool(context, 'discord_channel_send', { content: 'hello back' });
-  assert.equal(result.structuredContent.channelId, 'c1');
-  assert.equal(result.structuredContent.messageId, 'sent1');
-  assert.deepEqual(sends, [{
-    channelId: 'c1',
-    payload: {
-      content: 'hello back',
-      reply: { messageReference: 'm1', failIfNotExists: false },
-    },
-  }]);
+  await assert.rejects(
+    callTool(context, 'discord_channel_send', { content: 'hello back' }),
+    /channelId and replyTo are required/,
+  );
 });
 
 test('send tool suppresses a second reply to the same inbound message', async () => {
@@ -472,9 +477,14 @@ test('send tool suppresses a second reply to the same inbound message', async ()
     },
   };
 
-  const first = await callTool(context, 'discord_channel_send', { content: 'first' });
+  const first = await callTool(context, 'discord_channel_send', {
+    channelId: 'c1',
+    replyTo: 'm1',
+    content: 'first',
+  });
   const repeated = await callTool(context, 'discord_channel_send', {
     channelId: 'c1',
+    replyTo: 'm1',
     content: 'automatic continuation',
   });
 
