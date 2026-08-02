@@ -3,7 +3,26 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { resolvePaths } = require('./paths');
+const { expandPath, resolvePaths } = require('./paths');
+
+const ACCOUNT_BINDING_KEYS = new Set(['DISCORD_INSTANCE', 'DISCORD_CONFIG_DIR']);
+const ACCOUNT_ENV_KEYS = new Set([
+  'CODEX_HOME',
+  'CODEX_BIN',
+  'NODE_BIN',
+  'CODEX_DISCORD_CHANNEL_BIN',
+]);
+const NETWORK_ENV_KEYS = new Set([
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'NODE_TLS_REJECT_UNAUTHORIZED',
+]);
 
 function stripQuotes(value) {
   const trimmed = String(value).trim();
@@ -26,7 +45,7 @@ function parseInteger(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function loadEnvFile(file, env) {
+function loadEnvFile(file, env, options = {}) {
   if (!file || !fs.existsSync(file)) return false;
   const text = fs.readFileSync(file, 'utf8');
   for (const rawLine of text.split(/\r?\n/)) {
@@ -34,10 +53,32 @@ function loadEnvFile(file, env) {
     if (!line || line.startsWith('#')) continue;
     const normalized = line.startsWith('export ') ? line.slice(7).trim() : line;
     const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(normalized);
-    if (!match) continue;
+    if (!match) {
+      if (options.strict) {
+        const error = new Error(`Invalid environment entry in ${file}`);
+        error.code = 'invalid_environment_entry';
+        throw error;
+      }
+      continue;
+    }
     const [, key, rawValue] = match;
+    if (options.allowedKeys && !options.allowedKeys.has(key)) {
+      const error = new Error(`Environment key ${key} is not allowed in ${file}`);
+      error.code = 'environment_key_not_allowed';
+      throw error;
+    }
+    const value = stripQuotes(rawValue);
+    if (
+      options.rejectConflicts &&
+      env[key] !== undefined &&
+      String(env[key]) !== value
+    ) {
+      const error = new Error(`Environment key ${key} conflicts with the selected instance`);
+      error.code = 'environment_key_conflict';
+      throw error;
+    }
     if (env[key] === undefined) {
-      env[key] = stripQuotes(rawValue);
+      env[key] = value;
     }
   }
   return true;
@@ -45,12 +86,64 @@ function loadEnvFile(file, env) {
 
 function loadConfig(inputEnv = process.env, options = {}) {
   const env = { ...inputEnv };
-  let paths = resolvePaths(env);
-  const envLoaded = loadEnvFile(paths.envFile, env);
-  paths = resolvePaths(env);
-  if (paths.envFile !== resolvePaths(inputEnv).envFile) {
-    loadEnvFile(paths.envFile, env);
+  const instanceWasExplicit = Boolean(
+    env.DISCORD_INSTANCE ||
+    env.DISCORD_BRIDGE_INSTANCE ||
+    env.DISCORD_STATE_DIR ||
+    env.DISCORD_CONFIG_DIR
+  );
+  let initialPaths = resolvePaths(env);
+  let accountBindingLoaded = loadEnvFile(initialPaths.accountBindingPath, env, {
+    allowedKeys: ACCOUNT_BINDING_KEYS,
+    rejectConflicts: true,
+    strict: true,
+  });
+  initialPaths = resolvePaths(env);
+  let legacyInstanceFallbackUsed = false;
+  if (!instanceWasExplicit && !accountBindingLoaded) {
+    const legacyStateDir = path.join(initialPaths.baseDir, 'codex01');
+    const legacyEnvFile = path.join(legacyStateDir, '.env');
+    const defaultEnvFile = path.join(initialPaths.stateDir, '.env');
+    if (fs.existsSync(legacyEnvFile) && !fs.existsSync(defaultEnvFile)) {
+      env.DISCORD_INSTANCE = 'codex01';
+      env.DISCORD_CONFIG_DIR = legacyStateDir;
+      initialPaths = resolvePaths(env);
+      legacyInstanceFallbackUsed = true;
+    }
   }
+  env.DISCORD_INSTANCE = initialPaths.instance;
+  env.DISCORD_CONFIG_DIR = initialPaths.stateDir;
+
+  const inputCodexHome = String(env.CODEX_HOME || '').trim();
+  const accountEnvLoaded = loadEnvFile(initialPaths.accountEnvPath, env, {
+    allowedKeys: ACCOUNT_ENV_KEYS,
+    rejectConflicts: true,
+    strict: true,
+  });
+  const accountEnvCodexHome = String(env.CODEX_HOME || '').trim();
+  const accountHomeSource = inputCodexHome
+    ? 'process'
+    : (accountEnvLoaded && accountEnvCodexHome ? 'account_env' : 'default');
+  if (accountHomeSource !== 'default') {
+    env.CODEX_HOME = expandPath(env.CODEX_HOME, env);
+  }
+
+  let paths = resolvePaths(env);
+  if (paths.accountBindingPath !== initialPaths.accountBindingPath) {
+    accountBindingLoaded = loadEnvFile(paths.accountBindingPath, env, {
+      allowedKeys: ACCOUNT_BINDING_KEYS,
+      rejectConflicts: true,
+      strict: true,
+    }) || accountBindingLoaded;
+  }
+  const networkEnvLoaded = loadEnvFile(paths.networkEnvPath, env, {
+    allowedKeys: NETWORK_ENV_KEYS,
+    strict: true,
+  });
+  const envLoaded = options.loadDiscordEnv === false
+    ? false
+    : loadEnvFile(paths.envFile, env);
+  paths = resolvePaths(env);
 
   const token = env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || '';
   const botUserId = env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || '';
@@ -85,6 +178,12 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env,
     paths,
     envLoaded,
+    accountBindingLoaded,
+    legacyInstanceFallbackUsed,
+    accountEnvLoaded,
+    networkEnvLoaded,
+    accountHomeSource,
+    codexHome: expandPath(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), env),
     token,
     tokenConfigured: token !== '',
     botUserId,

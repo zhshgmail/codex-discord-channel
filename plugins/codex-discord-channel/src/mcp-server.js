@@ -13,7 +13,7 @@ const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
 
 const SERVER_NAME = 'Codex Discord Channel';
-const SERVER_VERSION = '0.2.1';
+const SERVER_VERSION = '0.3.0';
 const MAX_TOOL_RESULT_BYTES = 64 * 1024;
 
 function makeLogger() {

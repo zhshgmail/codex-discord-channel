@@ -6,6 +6,11 @@ For installation, instance configuration, shared app-server startup, systemd
 operation, access-policy examples, and the troubleshooting matrix, start with
 the repository [README](../../README.md).
 
+Multi-account deployments use one `account.env` per Discord instance. The
+repository README documents the independent `CODEX_HOME` and
+`DISCORD_CONFIG_DIR` boundaries, the fail-closed `app-server` command, and the
+bundled systemd templates.
+
 ## Runtime Contract
 
 The Discord gateway is identified by the configured instance state directory

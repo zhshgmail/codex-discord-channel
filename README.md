@@ -100,10 +100,11 @@ migration:
 2. Start a persistent app-server on the instance socket:
 
    ```bash
-   STATE_DIR="${CODEX_HOME:-$HOME/.codex}/channels/discord/codex01"
+   STATE_DIR="${DISCORD_CONFIG_DIR:-$HOME/.codex/channels/discord/codex01}"
    SOCKET="$STATE_DIR/app-server.sock"
    mkdir -p "$STATE_DIR"
-   codex app-server --listen "unix://$SOCKET"
+   DISCORD_INSTANCE=codex01 DISCORD_CONFIG_DIR="$STATE_DIR" \
+     codex-discord-channel app-server
    ```
 
 3. Relaunch the visible TUI against that same endpoint:
@@ -148,6 +149,95 @@ transport has hot-loaded a replaced plugin.
 
 The default instance is `default`. Select a named instance with
 `DISCORD_INSTANCE`; the examples below use `codex01`.
+
+### Isolate The OpenAI Account And Discord Bot
+
+Multiple instances require two independent boundaries. `CODEX_HOME` owns the
+OpenAI login, Codex configuration, and session store. `DISCORD_CONFIG_DIR`
+owns the Discord bot token, bot id, access policy, delivery queue, and shared
+app-server socket. Do not rely on `CODEX_HOME` to select both.
+
+Create an account file beside each instance's Discord files:
+
+```text
+$HOME/.codex/channels/discord/codex01/account.env
+$HOME/.codex/channels/discord/codex02/account.env
+```
+
+For example:
+
+```env
+# codex01/account.env
+CODEX_HOME=/home/USER/.codex-account-01
+CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
+NODE_BIN=/absolute/path/to/node
+CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
+```
+
+```env
+# codex02/account.env
+CODEX_HOME=/home/USER/.codex-account-02
+CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
+NODE_BIN=/absolute/path/to/node
+CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
+```
+
+Each instance still has its own `.env` containing a different
+`DISCORD_BOT_TOKEN` and `DISCORD_BOT_USER_ID`. The plugin loads `account.env`
+before `.env` and pins the selected Discord state directory before applying
+`CODEX_HOME`, so changing accounts cannot silently move the bot state.
+`account.env` is strict: only `CODEX_HOME`, `CODEX_BIN`, `NODE_BIN`, and
+`CODEX_DISCORD_CHANNEL_BIN` are accepted. Put proxy and CA variables in the
+optional instance-local `app-server-network.env`; unknown keys fail closed.
+
+Bind MCP discovery to the same instance even when a launcher does not preserve
+Discord environment variables. Create `$CODEX_HOME/discord-instance.env`:
+
+```env
+DISCORD_INSTANCE=codex02
+DISCORD_CONFIG_DIR=/home/USER/.codex/channels/discord/codex02
+```
+
+This file accepts only those two keys. Explicit command-line service selection
+must agree with it, so a stale or edited environment file cannot redirect one
+instance onto another instance's bot state.
+
+The account-isolated app-server entry point fails closed when `CODEX_HOME` is
+not explicit:
+
+```bash
+DISCORD_INSTANCE=codex02 \
+DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
+codex-discord-channel app-server
+```
+
+Inspect the non-secret effective identity before startup:
+
+```bash
+DISCORD_INSTANCE=codex02 \
+DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
+codex-discord-channel instance-doctor
+```
+
+`CODEX_BIN` is the Codex JavaScript entry point executed by `NODE_BIN`, not a
+shell launcher or alias. The bundled templates under
+`plugins/codex-discord-channel/systemd/` start one
+app-server and one gateway per `%i`. They consume absolute executable paths
+from `account.env`; this avoids relying on an interactive `nvm` PATH. Copy both
+templates to `$HOME/.config/systemd/user/` and enable the same instance name
+for both units. Keep `account.env` mode `0600`. The visible TUI must use the
+matching account and socket:
+
+```bash
+CODEX_HOME="$HOME/.codex-account-02" \
+DISCORD_INSTANCE=codex02 \
+DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
+codex --remote "unix://$HOME/.codex/channels/discord/codex02/app-server.sock"
+```
+
+The plugin MCP manifest intentionally does not hardcode `codex01`; it inherits
+the instance variables from the selected Codex process and falls back to that
+account's `discord-instance.env` binding.
 
 Create `$HOME/.codex/channels/discord/codex01/.env` locally:
 
@@ -207,10 +297,11 @@ after migration, but editing it does not update current access policy.
 Use one socket per instance:
 
 ```bash
-STATE_DIR="${CODEX_HOME:-$HOME/.codex}/channels/discord/codex01"
+STATE_DIR="${DISCORD_CONFIG_DIR:-$HOME/.codex/channels/discord/codex01}"
 SOCKET="$STATE_DIR/app-server.sock"
 mkdir -p "$STATE_DIR"
-codex app-server --listen "unix://$SOCKET"
+DISCORD_INSTANCE=codex01 DISCORD_CONFIG_DIR="$STATE_DIR" \
+  codex-discord-channel app-server
 codex --remote "unix://$SOCKET" resume <THREAD_ID>
 ```
 

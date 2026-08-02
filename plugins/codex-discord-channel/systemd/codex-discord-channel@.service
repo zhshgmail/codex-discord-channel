@@ -1,0 +1,21 @@
+[Unit]
+Description=Codex Discord Channel Gateway (%i)
+After=network-online.target codex-discord-app-server@%i.service
+Wants=network-online.target codex-discord-app-server@%i.service
+ConditionPathExists=%h/.codex/channels/discord/%i/account.env
+
+[Service]
+Type=simple
+UMask=0077
+Environment=DISCORD_INSTANCE=%i
+Environment=DISCORD_CONFIG_DIR=%h/.codex/channels/discord/%i
+EnvironmentFile=%h/.codex/channels/discord/%i/account.env
+ExecStart=/usr/bin/env ${NODE_BIN} ${CODEX_DISCORD_CHANNEL_BIN} gateway --instance %i --state-dir %h/.codex/channels/discord/%i
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+StandardOutput=append:%h/.codex/channels/discord/%i/session-gateway.log
+StandardError=append:%h/.codex/channels/discord/%i/session-gateway.log
+
+[Install]
+WantedBy=default.target

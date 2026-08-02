@@ -7,17 +7,45 @@ const { createDelivery, resolveReplyTarget } = require('../src/delivery');
 const { startGatewayDrainLoop } = require('../src/gateway-drain-loop');
 const { startDiscordClient } = require('../src/discord-client');
 const { claimOwner, createOwner } = require('../src/owner-state');
+const { instanceDoctor, runAppServer } = require('../src/app-server-runtime');
 
 function usage() {
   process.stderr.write([
     'Usage:',
     '  codex-discord-channel              # run MCP server',
-    '  codex-discord-channel gateway      # run Discord gateway without MCP stdio',
+    '  codex-discord-channel gateway [--instance ID --state-dir PATH]',
+    '  codex-discord-channel app-server [--instance ID --state-dir PATH]',
+    '  codex-discord-channel instance-doctor [--instance ID --state-dir PATH]',
     '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID]',
     '',
     'The send command reads message text from stdin. Without --channel it replies to the last accepted inbound Discord message.',
   ].join('\n'));
   process.stderr.write('\n');
+}
+
+function parseRuntimeArgs(argv) {
+  const env = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--instance') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('--instance requires a value');
+      env.DISCORD_INSTANCE = value;
+      index += 1;
+    } else if (arg === '--state-dir') {
+      const value = argv[index + 1];
+      if (!value) throw new Error('--state-dir requires a value');
+      env.DISCORD_CONFIG_DIR = value;
+      index += 1;
+    } else {
+      throw new Error(`Unknown runtime argument: ${arg}`);
+    }
+  }
+  return env;
+}
+
+function loadRuntimeConfig(argv, options = {}) {
+  return loadConfig({ ...process.env, ...parseRuntimeArgs(argv) }, options);
 }
 
 function parseSendArgs(argv) {
@@ -103,9 +131,8 @@ function enabled(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
 }
 
-async function runGateway() {
+async function runGateway(config = loadConfig()) {
   const logger = makeLogger();
-  const config = loadConfig();
   const delivery = createDelivery(config, logger);
   let discordState;
   try {
@@ -173,7 +200,16 @@ async function main() {
     return;
   }
   if (command === 'gateway') {
-    await runGateway();
+    await runGateway(loadRuntimeConfig(rest));
+    return;
+  }
+  if (command === 'app-server') {
+    const code = await runAppServer(loadRuntimeConfig(rest, { loadDiscordEnv: false }));
+    if (code !== 0) process.exitCode = code;
+    return;
+  }
+  if (command === 'instance-doctor') {
+    process.stdout.write(`${JSON.stringify(instanceDoctor(loadRuntimeConfig(rest)), null, 2)}\n`);
     return;
   }
   if (command === '-h' || command === '--help') {
@@ -185,6 +221,7 @@ async function main() {
 
 module.exports = {
   main,
+  parseRuntimeArgs,
   parseSendArgs,
   readStdin,
   sendViaRest,

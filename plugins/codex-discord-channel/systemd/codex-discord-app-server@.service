@@ -1,0 +1,23 @@
+[Unit]
+Description=Codex Discord account-isolated app server (%i)
+After=network-online.target
+Wants=network-online.target
+Before=codex-discord-channel@%i.service
+ConditionPathExists=%h/.codex/channels/discord/%i/account.env
+
+[Service]
+Type=simple
+UMask=0077
+Environment=DISCORD_INSTANCE=%i
+Environment=DISCORD_CONFIG_DIR=%h/.codex/channels/discord/%i
+EnvironmentFile=%h/.codex/channels/discord/%i/account.env
+ExecStart=/usr/bin/env ${NODE_BIN} ${CODEX_DISCORD_CHANNEL_BIN} app-server --instance %i --state-dir %h/.codex/channels/discord/%i
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

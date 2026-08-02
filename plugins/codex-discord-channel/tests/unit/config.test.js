@@ -72,6 +72,140 @@ test('loadConfig uses CODEX_HOME for instance state when configured', () => {
   );
 });
 
+test('account env changes Codex account home without moving Discord state', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
+  const accountHome = path.join(home, '.codex-account-02');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'account.env'), `CODEX_HOME=${accountHome}\n`);
+
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex02' });
+
+  assert.equal(config.accountEnvLoaded, true);
+  assert.equal(config.accountHomeSource, 'account_env');
+  assert.equal(config.codexHome, accountHome);
+  assert.equal(config.paths.stateDir, stateDir);
+  assert.equal(config.env.DISCORD_CONFIG_DIR, stateDir);
+  assert.equal(config.paths.accountEnvPath, path.join(stateDir, 'account.env'));
+  assert.equal(config.appServerUrl, `unix://${path.join(stateDir, 'app-server.sock')}`);
+});
+
+test('explicit Discord state wins when account env points at another Codex home', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, 'discord-state', 'codex02');
+  const accountHome = path.join(home, '.codex-account-02');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'account.env'), `CODEX_HOME=${accountHome}\n`);
+
+  const config = loadConfig({
+    HOME: home,
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: stateDir,
+  });
+
+  assert.equal(config.codexHome, accountHome);
+  assert.equal(config.paths.stateDir, stateDir);
+});
+
+test('account binding routes an MCP process without inherited Discord variables', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const codexHome = path.join(home, '.codex-account-02');
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, 'discord-instance.env'), [
+    'DISCORD_INSTANCE=codex02',
+    `DISCORD_CONFIG_DIR=${stateDir}`,
+    '',
+  ].join('\n'));
+
+  const config = loadConfig({ HOME: home, CODEX_HOME: codexHome });
+
+  assert.equal(config.accountBindingLoaded, true);
+  assert.equal(config.paths.instance, 'codex02');
+  assert.equal(config.paths.stateDir, stateDir);
+});
+
+test('legacy codex01 install remains routable until an account binding is created', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const legacyStateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
+  fs.mkdirSync(legacyStateDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyStateDir, '.env'), 'DISCORD_BOT_TOKEN=legacy-token\n');
+
+  const config = loadConfig({ HOME: home });
+
+  assert.equal(config.legacyInstanceFallbackUsed, true);
+  assert.equal(config.paths.instance, 'codex01');
+  assert.equal(config.paths.stateDir, legacyStateDir);
+});
+
+test('legacy codex01 fallback does not override an initialized default instance', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  for (const instance of ['default', 'codex01']) {
+    const stateDir = path.join(home, '.codex', 'channels', 'discord', instance);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, '.env'), `DISCORD_BOT_TOKEN=${instance}\n`);
+  }
+
+  const config = loadConfig({ HOME: home });
+
+  assert.equal(config.legacyInstanceFallbackUsed, false);
+  assert.equal(config.paths.instance, 'default');
+});
+
+test('account env rejects Discord keys instead of redirecting instance state', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'account.env'), [
+    `CODEX_HOME=${path.join(home, '.codex-account-02')}`,
+    'DISCORD_CONFIG_DIR=/tmp/codex01',
+    '',
+  ].join('\n'));
+
+  assert.throws(
+    () => loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex02' }),
+    (error) => error.code === 'environment_key_not_allowed',
+  );
+});
+
+test('account binding rejects a state conflict with an explicit service selection', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const codexHome = path.join(home, '.codex-account-02');
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, 'discord-instance.env'), [
+    'DISCORD_INSTANCE=codex01',
+    `DISCORD_CONFIG_DIR=${path.join(home, 'discord', 'codex01')}`,
+    '',
+  ].join('\n'));
+
+  assert.throws(
+    () => loadConfig({
+      HOME: home,
+      CODEX_HOME: codexHome,
+      DISCORD_INSTANCE: 'codex02',
+      DISCORD_CONFIG_DIR: path.join(home, 'discord', 'codex02'),
+    }),
+    (error) => error.code === 'environment_key_conflict',
+  );
+});
+
+test('network env accepts proxy keys and rejects pre-exec command overrides', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const networkFile = path.join(stateDir, 'app-server-network.env');
+  fs.writeFileSync(networkFile, 'HTTPS_PROXY=http://127.0.0.1:8080\n');
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex02' });
+  assert.equal(config.networkEnvLoaded, true);
+  assert.equal(config.env.HTTPS_PROXY, 'http://127.0.0.1:8080');
+
+  fs.writeFileSync(networkFile, 'NODE_BIN=/tmp/untrusted-node\n');
+  assert.throws(
+    () => loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex02' }),
+    (error) => error.code === 'environment_key_not_allowed',
+  );
+});
+
 test('loadConfig reads token from instance env file', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');

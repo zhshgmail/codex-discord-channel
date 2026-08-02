@@ -46,6 +46,18 @@ function resolvePaths(env = process.env) {
     instance,
     baseDir,
     stateDir,
+    accountBindingPath: expandPath(
+      firstNonEmpty(env.CODEX_DISCORD_BINDING_FILE, path.join(codexHome, 'discord-instance.env')),
+      env,
+    ),
+    accountEnvPath: expandPath(
+      firstNonEmpty(env.CODEX_ACCOUNT_ENV_FILE, path.join(stateDir, 'account.env')),
+      env,
+    ),
+    networkEnvPath: expandPath(
+      firstNonEmpty(env.CODEX_NETWORK_ENV_FILE, path.join(stateDir, 'app-server-network.env')),
+      env,
+    ),
     envFile: expandPath(firstNonEmpty(env.DISCORD_ENV_FILE, path.join(stateDir, '.env')), env),
     accessPath: expandPath(firstNonEmpty(env.DISCORD_ACCESS_FILE, path.join(stateDir, 'access.json')), env),
     ownerPath: expandPath(firstNonEmpty(env.DISCORD_OWNER_FILE, path.join(stateDir, 'owner.json')), env),
