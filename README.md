@@ -227,6 +227,16 @@ instance socket, and only then replaces itself with the matching Codex client:
 codex-discord-instance codex02
 ```
 
+On the first interactive launch, if the Discord instance configuration is
+valid and only the isolated OpenAI account login is missing, the launcher runs
+the configured `NODE_BIN` and `CODEX_BIN` as `codex login` with that instance's
+`CODEX_HOME`. It retries readiness only after login exits successfully. This
+bootstrap requires both stdin and stdout to be TTYs; cancellation, login
+failure, or a noninteractive invocation exits before either systemd service or
+the Codex TUI starts. Gateway and systemd entry points never attempt account
+login and remain fail-closed. Discord credentials are not passed to the login
+process.
+
 An alias may select the instance, but it is not the isolation or startup
 boundary:
 

@@ -76,7 +76,10 @@ test('TUI launcher replaces itself with matching Codex after the shell startup b
 test('launcher rejects an OpenAI account that is not logged in', () => {
   const config = instanceFixture();
   fs.unlinkSync(path.join(config.codexHome, 'auth.json'));
-  assert.throws(() => requireInstanceReady(config), /not logged in/);
+  assert.throws(
+    () => requireInstanceReady(config),
+    (error) => error.code === 'openai_account_login_missing' && /not logged in/.test(error.message),
+  );
 });
 
 test('launcher fails before systemd when Discord bot credentials are missing', () => {

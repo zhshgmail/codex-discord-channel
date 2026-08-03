@@ -258,6 +258,15 @@ async function main() {
     require('../src/instance-launcher').requireInstanceReady(loadRuntimeConfig(rest));
     return;
   }
+  if (command === 'tui-login-state') {
+    try {
+      require('../src/instance-launcher').requireInstanceReady(loadRuntimeConfig(rest));
+    } catch (error) {
+      if (error?.code !== 'openai_account_login_missing') throw error;
+      process.exitCode = 10;
+    }
+    return;
+  }
   if (command === 'live-check') {
     const args = parseLiveCheckArgs(rest);
     const config = loadRuntimeConfig(args.runtimeArgs);

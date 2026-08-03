@@ -9,7 +9,9 @@ the repository [README](../../README.md).
 Multi-account deployments use one `account.env` per Discord instance. The
 repository README documents the independent `CODEX_HOME` and
 `DISCORD_CONFIG_DIR` boundaries, the fail-closed `app-server` command, and the
-bundled systemd templates.
+bundled systemd templates. The interactive `codex-discord-instance` launcher
+can bootstrap a missing isolated OpenAI login only when attached to a TTY;
+gateway and systemd paths never prompt and remain fail-closed.
 
 ## Gateway Message Content Intent
 

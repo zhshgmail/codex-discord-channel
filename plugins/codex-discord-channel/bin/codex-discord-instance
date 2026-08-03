@@ -41,14 +41,42 @@ read_account_value() {
 }
 
 node_bin=$(read_account_value NODE_BIN)
+codex_bin=$(read_account_value CODEX_BIN)
+codex_home=$(read_account_value CODEX_HOME)
 channel_bin=$(read_account_value CODEX_DISCORD_CHANNEL_BIN)
-if [[ ! -x $node_bin || ! -f $channel_bin ]]; then
+if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin ]]; then
   echo "Instance executable paths are unavailable for $instance" >&2
   exit 1
 fi
 
 runtime_args=(--instance "$instance" --state-dir "$state_dir")
-"$node_bin" "$channel_bin" tui-check "${runtime_args[@]}" >/dev/null
+set +e
+"$node_bin" "$channel_bin" tui-login-state "${runtime_args[@]}" >/dev/null
+login_state=$?
+set -e
+if ((login_state == 10)); then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "OpenAI account login for $instance requires an interactive TTY" >&2
+    exit 1
+  fi
+  env \
+    -u DISCORD_BOT_TOKEN \
+    -u DISCORD_TOKEN \
+    -u DISCORD_BOT_USER_ID \
+    -u DISCORD_BOT_ID \
+    -u DISCORD_INSTANCE \
+    -u DISCORD_CONFIG_DIR \
+    -u CODEX_DISCORD_OWNER_ID \
+    -u CODEX_THREAD_ID \
+    -u CODEX_SESSION_ID \
+    -u CODEX_TARGET_THREAD_ID \
+    -u CODEX_APP_SERVER_SOCKET \
+    CODEX_HOME="$codex_home" \
+    "$node_bin" "$codex_bin" login
+  "$node_bin" "$channel_bin" tui-check "${runtime_args[@]}" >/dev/null
+elif ((login_state != 0)); then
+  exit "$login_state"
+fi
 
 app_service="codex-discord-app-server@$instance.service"
 gateway_service="codex-discord-channel@$instance.service"
