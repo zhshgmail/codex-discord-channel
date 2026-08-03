@@ -193,6 +193,7 @@ function loadConfig(inputEnv = process.env, options = {}) {
     botUserId,
     proxyUrl,
     insecureTls: parseBool(env.DISCORD_INSECURE_TLS, env.NODE_TLS_REJECT_UNAUTHORIZED === '0'),
+    messageContentIntent: parseBool(env.DISCORD_MESSAGE_CONTENT_INTENT, true),
     loginDisabled: parseBool(env.DISCORD_CHANNEL_DISABLE_LOGIN, false),
     deliveryMode,
     deliveryActivationId,

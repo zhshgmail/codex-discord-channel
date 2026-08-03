@@ -357,8 +357,9 @@ test('non-receiver MCP client logs in without claiming ownership or registering 
   const { EventEmitter } = require('node:events');
   let claims = 0;
   class FakeDiscordClient extends EventEmitter {
-    constructor() {
+    constructor(options) {
       super();
+      this.options = options;
       this.user = { id: 'bot', tag: 'bot#0001' };
       this.loginTokens = [];
     }
@@ -403,6 +404,51 @@ test('non-receiver MCP client logs in without claiming ownership or registering 
   assert.equal(result.started, true);
   assert.equal(claims, 0);
   assert.deepEqual(result.client.loginTokens, ['test-token']);
+  assert.deepEqual(result.client.options.intents, [1, 2, 4, 8]);
+  assert.equal(result.client.listenerCount('messageCreate'), 0);
+});
+
+test('explicit false omits only the privileged Message Content gateway intent', async () => {
+  const { EventEmitter } = require('node:events');
+  class FakeDiscordClient extends EventEmitter {
+    constructor(options) {
+      super();
+      this.options = options;
+      this.user = { id: 'bot', tag: 'bot#0001' };
+    }
+
+    async login() {}
+  }
+
+  const result = await startDiscordClient({
+    config: {
+      tokenConfigured: true,
+      loginDisabled: false,
+      messageContentIntent: false,
+      token: 'test-token',
+      botUserId: 'bot',
+      paths: { gatewayPidPath: '/missing/session-gateway.pid' },
+    },
+    delivery: {},
+    logger: () => {},
+    deps: {
+      discord: {
+        Client: FakeDiscordClient,
+        Events: { MessageCreate: 'messageCreate' },
+        GatewayIntentBits: {
+          DirectMessages: 1,
+          Guilds: 2,
+          GuildMessages: 4,
+          MessageContent: 8,
+        },
+        Partials: { Channel: 'channel' },
+      },
+      isActiveDiscordReceiver: () => ({ active: false, reason: 'another_gateway_active', pid: 1234 }),
+    },
+  });
+
+  assert.equal(result.started, true);
+  assert.deepEqual(result.client.options.intents, [1, 2, 4]);
   assert.equal(result.client.listenerCount('messageCreate'), 0);
 });
 

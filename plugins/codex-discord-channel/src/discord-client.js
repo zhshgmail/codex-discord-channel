@@ -201,13 +201,17 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
     Partials,
   } = deps.discord || require('discord.js');
 
+  const intents = [
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+  ];
+  if (config.messageContentIntent !== false) {
+    intents.push(GatewayIntentBits.MessageContent);
+  }
+
   const client = new Client({
-    intents: [
-      GatewayIntentBits.DirectMessages,
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-    ],
+    intents,
     partials: [Partials.Channel],
   });
 

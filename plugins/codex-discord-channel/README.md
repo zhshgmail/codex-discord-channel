@@ -11,6 +11,24 @@ repository README documents the independent `CODEX_HOME` and
 `DISCORD_CONFIG_DIR` boundaries, the fail-closed `app-server` command, and the
 bundled systemd templates.
 
+## Gateway Message Content Intent
+
+The gateway requests Discord's privileged Message Content intent by default,
+preserving existing instances such as `codex01`. For a bot whose Developer
+Portal configuration does not enable that intent, set this in the instance
+`.env`:
+
+```env
+DISCORD_MESSAGE_CONTENT_INTENT=false
+```
+
+This omits only `GatewayIntentBits.MessageContent`; Direct Messages, Guilds,
+and Guild Messages remain enabled. It does not relax sender, bot, channel,
+thread, or mention access checks. Use this mode for guild channel and thread
+policies with `requireMention: true`: Discord can expose mention-directed
+messages without the privileged intent, while unmentioned guild messages are
+still denied by the plugin and must not be expected to provide usable content.
+
 ## Runtime Contract
 
 The Discord gateway is identified by the configured instance state directory
