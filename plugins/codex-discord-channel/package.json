@@ -21,11 +21,14 @@
     "codex-discord-instance": "bin/codex-discord-instance"
   },
   "scripts": {
-    "syntax": "bash -n bin/codex-discord-instance && node --check bin/codex-discord-channel && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js",
+    "build": "npm run build:runtime",
+    "build:runtime": "node scripts/build-runtime.js",
+    "build:check": "node scripts/build-runtime.js --check",
+    "syntax": "bash -n bin/codex-discord-instance && node --check bin/codex-discord-channel && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js && node --check runtime/*.cjs",
     "test": "node --test tests/unit/*.test.js",
     "smoke": "node scripts/smoke.js",
     "import:bridge": "node scripts/import-bridge-state.js",
-    "check": "npm run syntax && npm test && npm run smoke"
+    "check": "npm run syntax && npm test && npm run build:check && npm run smoke"
   },
   "dependencies": {
     "discord.js": "^14.19.3",
@@ -42,5 +45,8 @@
     "@discordjs/rest": {
       "undici": "^6.27.0"
     }
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
   }
 }

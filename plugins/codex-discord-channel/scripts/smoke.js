@@ -30,10 +30,16 @@ assert(
   'manifest version mismatch',
 );
 assert(manifest.mcpServers === './.mcp.json', 'manifest must point at .mcp.json');
-assert(mcp.mcpServers['codex-discord-channel'], 'missing MCP server config');
+assert(
+  mcp.mcpServers['codex-discord-channel']?.args?.[0] === './runtime/mcp-server.cjs',
+  'MCP server must run the committed runtime bundle',
+);
 assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
 assert(SERVER_VERSION === PACKAGE_VERSION, 'MCP server version mismatch');
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');
+for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
+  assert(!Object.hasOwn(pkg.scripts, lifecycle), `package must not rely on ${lifecycle}`);
+}
 
 const historyTool = toolList().find((tool) => tool.name === 'discord_channel_read_history');
 assert(historyTool, 'missing discord_channel_read_history tool');
@@ -51,6 +57,8 @@ assert(mcpServerSource.includes(`const SERVER_VERSION = '${PACKAGE_VERSION}';`),
 const binPath = path.join(root, 'bin', 'codex-discord-channel');
 const mode = fs.statSync(binPath).mode;
 assert((mode & 0o111) !== 0, 'bin/codex-discord-channel must be executable');
+assert(fs.existsSync(path.join(root, 'runtime', 'mcp-server.cjs')), 'missing MCP runtime bundle');
+assert(fs.existsSync(path.join(root, 'THIRD_PARTY_NOTICES.txt')), 'missing bundled dependency notices');
 assert(!fs.existsSync(path.join(root, '.env')), 'plugin root must not contain .env');
 
 process.stdout.write('smoke passed\n');

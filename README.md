@@ -141,6 +141,12 @@ codex plugin add codex-discord-channel@personal
 
 Use a new Codex thread after installation so the MCP server is loaded.
 
+Marketplace installation copies the plugin into the Codex cache but does not
+run `npm install` or package lifecycle hooks. The MCP entrypoint therefore uses
+the committed `runtime/mcp-server.cjs` bundle, which contains `discord.js`,
+`undici`, and `ws`. `npm ci` and `npm run build:runtime` are development steps
+for regenerating that bundle, not installation requirements.
+
 For a review branch or pinned deployment, replace `main` with the exact branch,
 tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
