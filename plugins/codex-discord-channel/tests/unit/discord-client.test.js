@@ -35,7 +35,7 @@ test('guarded Discord sends carry a stable enforced nonce and require exact read
       },
     },
     async send(payload) {
-      const message = {
+      const response = {
         id: 'out1',
         channelId: 'c1',
         content: payload.content,
@@ -43,8 +43,10 @@ test('guarded Discord sends carry a stable enforced nonce and require exact read
         reference: { messageId: payload.reply.messageReference },
         author: { id: 'bot1' },
       };
-      messages.set(message.id, message);
-      return message;
+      const durable = { ...response };
+      delete durable.nonce;
+      messages.set(durable.id, durable);
+      return response;
     },
   };
   const client = {
@@ -63,11 +65,57 @@ test('guarded Discord sends carry a stable enforced nonce and require exact read
   assert.equal(prepared.payload.nonce, 'cdr-stable');
   assert.equal(prepared.payload.enforceNonce, true);
   assert.equal(prepared.payload.reply.failIfNotExists, true);
-  const sent = await channel.send(prepared.payload);
-  assert.deepEqual(await confirmDiscordMessage(client, args, prepared, {
-    channelId: sent.channelId,
-    messageId: sent.id,
-  }), { channelId: 'c1', messageId: 'out1' });
+  const sent = await sendDiscordMessage(client, args, prepared);
+  assert.deepEqual(sent, { channelId: 'c1', messageId: 'out1' });
+  assert.deepEqual(await confirmDiscordMessage(client, args, prepared, sent), {
+    channelId: 'c1', messageId: 'out1',
+  });
+});
+
+test('guarded Discord sends reject a conflicting nonce in the immediate POST response', async () => {
+  const prepared = {
+    channel: {
+      async send() {
+        return { id: 'out1', channelId: 'c1', nonce: 'foreign-nonce' };
+      },
+    },
+    payload: { content: 'answer', nonce: 'cdr-stable', enforceNonce: true },
+  };
+
+  await assert.rejects(sendDiscordMessage({}, {
+    channelId: 'c1', nonce: 'cdr-stable', enforceNonce: true,
+  }, prepared), (error) => error.code === 'reply_send_response_nonce_mismatch');
+});
+
+test('stable reply confirmation rejects foreign message identity fields without requiring GET nonce', async () => {
+  const args = {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'cdr-stable', enforceNonce: true,
+  };
+  const baseline = {
+    id: 'out1', channelId: 'c1', content: 'answer',
+    reference: { messageId: 'm1' }, author: { id: 'bot1' },
+  };
+  const attacks = [
+    ['message id', { id: 'foreign-id' }],
+    ['channel', { channelId: 'foreign-channel' }],
+    ['content', { content: 'foreign-content' }],
+    ['reply source', { reference: { messageId: 'foreign-source' } }],
+    ['bot author', { author: { id: 'foreign-bot' } }],
+  ];
+
+  for (const [label, mutation] of attacks) {
+    const channel = {
+      messages: { async fetch() { return { ...baseline, ...mutation }; } },
+    };
+    const client = {
+      user: { id: 'bot1' }, channels: { async fetch() { return channel; } },
+    };
+    await assert.rejects(
+      confirmDiscordMessage(client, args, { channel }, { channelId: 'c1', messageId: 'out1' }),
+      (error) => error.code === 'reply_confirmation_mismatch',
+      label,
+    );
+  }
 });
 
 test('reply reconciliation requires nonce source content channel and bot identity', async () => {
@@ -104,6 +152,31 @@ test('reply reconciliation requires nonce source content channel and bot identit
   });
   messages.delete('right');
   assert.deepEqual(await reconcileDiscordMessage(client, args, { channel }, {}), { found: false });
+});
+
+test('reply reconciliation with a durable message id never substitutes a different nonce match', async () => {
+  const exact = {
+    id: 'foreign-id', channelId: 'c1', content: 'answer', nonce: 'cdr-stable',
+    reference: { messageId: 'm1' }, author: { id: 'bot1' },
+  };
+  const substitute = {
+    ...exact, id: 'substitute-id',
+  };
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (typeof query === 'string') return exact;
+        return new Map([[substitute.id, substitute]]);
+      },
+    },
+  };
+  const client = {
+    user: { id: 'bot1' }, channels: { async fetch() { return channel; } },
+  };
+
+  assert.deepEqual(await reconcileDiscordMessage(client, {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'cdr-stable', enforceNonce: true,
+  }, { channel }, { outboundMessageId: 'out1' }), { found: false });
 });
 
 test('guarded Discord preflight fails closed for missing or cross-channel sources', async () => {

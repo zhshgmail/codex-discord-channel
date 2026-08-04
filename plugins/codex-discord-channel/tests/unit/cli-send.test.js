@@ -127,6 +127,100 @@ test('CLI reply POST matches the real discord.js MessagePayload contract', async
   assert.equal(sent.messageId, 'out-1');
 });
 
+test('CLI confirms exact stable GET identity when Discord omits the POST nonce', async () => {
+  const { config } = fixture();
+  const harness = restHarness({
+    post({ init, messages, postCount }) {
+      const payload = JSON.parse(init.body);
+      const responseMessage = {
+        id: `out-${postCount}`, channel_id: 'c1', content: payload.content,
+        nonce: payload.nonce, message_reference: payload.message_reference,
+        author: { id: 'bot1' },
+      };
+      const durableMessage = { ...responseMessage };
+      delete durableMessage.nonce;
+      messages.set(durableMessage.id, durableMessage);
+      return response(200, responseMessage);
+    },
+  });
+
+  const sent = await runCli(config, harness.fetchImpl);
+
+  assert.equal(sent.messageId, 'out-1');
+  assert.equal(sent.duplicateSuppressed, false);
+  assert.equal(harness.postCount(), 1);
+});
+
+test('CLI stable GET confirmation rejects foreign message identity fields', async () => {
+  const attacks = [
+    ['message id', { id: 'foreign-id' }],
+    ['channel', { channel_id: 'foreign-channel' }],
+    ['content', { content: 'foreign-content' }],
+    ['reply source', { message_reference: { message_id: 'foreign-source' } }],
+    ['bot author', { author: { id: 'foreign-bot' } }],
+  ];
+
+  for (const [label, mutation] of attacks) {
+    const { config } = fixture();
+    const harness = restHarness({
+      post({ init, messages, postCount }) {
+        const payload = JSON.parse(init.body);
+        const responseMessage = {
+          id: `out-${postCount}`, channel_id: 'c1', content: payload.content,
+          nonce: payload.nonce, message_reference: payload.message_reference,
+          author: { id: 'bot1' },
+        };
+        const durableMessage = { ...responseMessage, ...mutation };
+        delete durableMessage.nonce;
+        messages.set(responseMessage.id, durableMessage);
+        return response(200, responseMessage);
+      },
+    });
+
+    await assert.rejects(
+      runCli(config, harness.fetchImpl),
+      (error) => error.code === 'reply_confirmation_mismatch',
+      label,
+    );
+    assert.equal(harness.postCount(), 1, label);
+  }
+});
+
+test('CLI lost-ack replay reuses the enforced nonce and confirms one durable message', async () => {
+  const { config } = fixture();
+  let acceptedResponse = null;
+  const harness = restHarness({
+    post({ init, messages, postCount }) {
+      const payload = JSON.parse(init.body);
+      if (!acceptedResponse) {
+        acceptedResponse = {
+          id: `out-${postCount}`, channel_id: 'c1', content: payload.content,
+          nonce: payload.nonce, message_reference: payload.message_reference,
+          author: { id: 'bot1' },
+        };
+        const durableMessage = { ...acceptedResponse };
+        delete durableMessage.nonce;
+        messages.set(durableMessage.id, durableMessage);
+        throw new Error('response lost after Discord accepted the message');
+      }
+      assert.equal(payload.nonce, acceptedResponse.nonce);
+      assert.equal(payload.enforce_nonce, true);
+      return response(200, acceptedResponse);
+    },
+  });
+
+  await assert.rejects(runCli(config, harness.fetchImpl), /response lost/);
+  const retry = await runCli(config, harness.fetchImpl);
+  const duplicate = await runCli(config, harness.fetchImpl);
+
+  assert.equal(harness.postCount(), 2);
+  assert.equal(harness.messages.size, 1);
+  assert.equal(retry.messageId, 'out-1');
+  assert.equal(retry.duplicateSuppressed, false);
+  assert.equal(duplicate.duplicateSuppressed, true);
+  assert.equal(duplicate.reason, 'source_message_already_replied');
+});
+
 test('CLI reconciles fetch failure then confirms exact source thread and readback', async () => {
   const { config } = fixture();
   let failFirst = true;

@@ -478,7 +478,7 @@ test('send tool suppresses a second reply to the same inbound message', async ()
               },
               async send(payload) {
                 sends.push({ channelId, payload });
-                const message = {
+                const response = {
                   channelId,
                   id: 'sent1',
                   nonce: payload.nonce,
@@ -486,8 +486,10 @@ test('send tool suppresses a second reply to the same inbound message', async ()
                   reference: { messageId: payload.reply.messageReference },
                   author: { id: 'bot1' },
                 };
-                messages.set(message.id, message);
-                return message;
+                const durable = { ...response };
+                delete durable.nonce;
+                messages.set(durable.id, durable);
+                return response;
               },
             };
           },

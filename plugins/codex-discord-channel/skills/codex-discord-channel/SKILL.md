@@ -115,12 +115,14 @@ source `channelId` and `replyTo`. The sender does not infer either identity from
 `last-inbound.json`. Before the network send it fsyncs a recoverable `in_flight`
 receipt keyed by that source identity under a per-source cross-process lock.
 The request uses a deterministic enforced nonce. Success is terminal only after
-the returned message id is read back with the exact channel, source reply,
-nonce, content, and bot identity.
+any nonce in the create-message response matches and the returned message id is
+read back with that exact id, channel, source reply, content, and bot identity.
+Discord may omit nonce from the later GET.
 
-An interrupted send is reconciled by recorded message id or stable nonce. A
-same-nonce retry is allowed only when no message id was returned and the bounded
-enforcement window is still open; otherwise uncertainty remains fail-closed.
+An interrupted send is reconciled by recorded message id or any available
+stable nonce identity. A same-nonce retry is allowed only when no message id was
+returned and the bounded enforcement window is still open; nonce enforcement
+must deduplicate that replay. Otherwise uncertainty remains fail-closed.
 Confirmed replies suppress later automatic continuations. Use `followup: true`
 only when a second Discord message is intentionally required.
 

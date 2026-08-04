@@ -398,16 +398,19 @@ The sender never infers reply identity from mutable `last-inbound.json`. Use
 Before the first network send for a source Discord message, the sender fsyncs an
 `in_flight` receipt under `reply-receipts/` while holding that source's
 cross-process lock. The Discord request carries a deterministic nonce with
-nonce enforcement. A returned message id becomes terminal only after an exact
-read-back proves the same channel, source reply, nonce, content, and bot author.
+nonce enforcement. When the create-message response includes that nonce, it
+must match. Its returned message id is the durable anchor and becomes terminal
+only after an exact read-back proves the same message id, channel, source reply,
+content, and bot author; Discord may omit nonce from that later GET.
 
 If a process or network acknowledgement is lost, a later process first
-reconciles the recorded message id or stable nonce. A request may be repeated
-with the same enforced nonce only when no message id was returned and the
-bounded replay window is still open. Otherwise it remains fail-closed. A
-confirmed receipt suppresses every later automatic continuation. Discord-origin
-replies must use this plugin's sender; a generic Discord MCP sender bypasses the
-receipt guard.
+reconciles the recorded message id or any available stable nonce identity. A
+request may be repeated with the same enforced nonce only when no message id was
+returned and the bounded replay window is still open; Discord nonce enforcement
+then returns the original message instead of creating another one. Otherwise it
+remains fail-closed. A confirmed receipt suppresses every later automatic
+continuation. Discord-origin replies must use this plugin's sender; a generic
+Discord MCP sender bypasses the receipt guard.
 
 `discord_channel_read_history` is bounded to 25 sanitized messages per call.
 Use its exclusive `before` cursor to page backward. Reading history does not

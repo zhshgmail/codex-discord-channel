@@ -377,6 +377,19 @@ async function sendDiscordMessage(client, args, prepared = null) {
       'Discord send response did not include the exact target message identity.',
     );
   }
+  const responseNonce = sent.nonce === null || sent.nonce === undefined
+    ? ''
+    : String(sent.nonce);
+  if (
+    args.enforceNonce === true
+    && responseNonce !== ''
+    && responseNonce !== String(args.nonce || '')
+  ) {
+    throw replyProtocolError(
+      'reply_send_response_nonce_mismatch',
+      'Discord send response did not preserve the enforced nonce.',
+    );
+  }
   return { channelId: sent.channelId, messageId: sent.id };
 }
 
@@ -384,16 +397,22 @@ function messageReplySourceId(message) {
   return String(message?.reference?.messageId || message?.messageReference?.messageId || '');
 }
 
-function messageMatchesReplyIdentity(client, message, args, expectedMessageId = '') {
+function messageMatchesStableReplyIdentity(client, message, args, expectedMessageId = '') {
   if (!message) return false;
   const botUserId = expectedBotUserId(client);
   if (!botUserId) return false;
   if (expectedMessageId && String(message.id || '') !== String(expectedMessageId)) return false;
   if (String(message.channelId || '') !== String(args.channelId || '')) return false;
-  if (String(message.nonce || '') !== String(args.nonce || '')) return false;
   if (String(message.content || '') !== String(args.content || '')) return false;
   if (messageReplySourceId(message) !== String(args.replyTo || '')) return false;
   return String(message.author?.id || '') === botUserId;
+}
+
+function messageMatchesReplyNonce(client, message, args) {
+  const nonce = String(message?.nonce || '');
+  return nonce !== ''
+    && nonce === String(args.nonce || '')
+    && messageMatchesStableReplyIdentity(client, message, args);
 }
 
 function replyConfirmationError(code) {
@@ -416,7 +435,7 @@ async function confirmDiscordMessage(client, args, prepared, sent) {
   requireExpectedBotUserId(client, 'reply_confirmation_author_unavailable');
   const channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId);
   const message = await fetchReplyMessage(channel, sent.messageId);
-  if (!messageMatchesReplyIdentity(client, message, args, sent.messageId)) {
+  if (!messageMatchesStableReplyIdentity(client, message, args, sent.messageId)) {
     throw replyConfirmationError('reply_confirmation_mismatch');
   }
   return { channelId: String(message.channelId), messageId: String(message.id) };
@@ -436,9 +455,10 @@ async function reconcileDiscordMessage(client, args, prepared, receipt) {
   }
   if (receipt?.outboundMessageId) {
     const exact = await fetchReplyMessage(channel, receipt.outboundMessageId);
-    if (messageMatchesReplyIdentity(client, exact, args, receipt.outboundMessageId)) {
+    if (messageMatchesStableReplyIdentity(client, exact, args, receipt.outboundMessageId)) {
       return { found: true, channelId: String(exact.channelId), messageId: String(exact.id) };
     }
+    return { found: false };
   }
   let recent;
   try {
@@ -447,7 +467,7 @@ async function reconcileDiscordMessage(client, args, prepared, receipt) {
     throw replyConfirmationError('reply_reconciliation_failed');
   }
   const match = messageValues(recent).find((message) => (
-    messageMatchesReplyIdentity(client, message, args)
+    messageMatchesReplyNonce(client, message, args)
   ));
   return match
     ? { found: true, channelId: String(match.channelId), messageId: String(match.id) }

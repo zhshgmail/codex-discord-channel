@@ -228,19 +228,21 @@ fsyncs a versioned state receipt for that identity before the network send. It
 never derives a guarded reply identity from `last-inbound.json`. Receipt
 transitions are serialized by a per-source cross-process lock: `in_flight` is
 leased and recoverable after process death, `uncertain` must reconcile by exact
-outbound message id or deterministic Discord nonce, and `confirmed` is
-terminal.
+outbound message id or, before an id is known, deterministic Discord nonce, and
+`confirmed` is terminal.
 
 Every guarded send uses the same source-derived nonce with Discord nonce
-enforcement. A returned message id is not confirmed until an exact read-back
-matches channel, source reply, nonce, content, and bot author. When the network
-fails before acknowledgement, a retry first searches by that stable identity.
-If no match is found and no Discord message id was returned, the same enforced
-nonce may be retried only inside a bounded window. A returned message id and
-stale uncertainty remain fail-closed. This repairs the case
-where an ordinary network error created no message but the old pre-send claim
-permanently consumed the source reply right, without turning uncertain sends
-into blind replays.
+enforcement. The create-message response nonce, when present, must match. Its
+returned message id is not confirmed until an exact GET matches that id,
+channel, source reply, content, and bot author; Discord may omit nonce from the
+GET. When the network fails before acknowledgement, a retry first reconciles
+any durable identity available. If no match is found and no Discord message id
+was returned, the same enforced nonce may be retried only inside a bounded
+window, allowing Discord to return the original message without duplicating it.
+A returned message id and stale uncertainty remain fail-closed. This repairs
+the case where an ordinary network error created no message but the old pre-send
+claim permanently consumed the source reply right, without turning uncertain
+sends into blind replays.
 
 Deterministic preflight failures do not consume the reply. A deliberate
 additional message requires the explicit `followup` flag.

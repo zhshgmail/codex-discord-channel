@@ -93074,15 +93074,25 @@ var require_discord_client = __commonJS({
           "reply_send_response_invalid",
           "Discord send response did not include the exact target message identity."
         );
+      let responseNonce = sent.nonce === null || sent.nonce === void 0 ? "" : String(sent.nonce);
+      if (args.enforceNonce === !0 && responseNonce !== "" && responseNonce !== String(args.nonce || ""))
+        throw replyProtocolError(
+          "reply_send_response_nonce_mismatch",
+          "Discord send response did not preserve the enforced nonce."
+        );
       return { channelId: sent.channelId, messageId: sent.id };
     }
     function messageReplySourceId(message) {
       return String(message?.reference?.messageId || message?.messageReference?.messageId || "");
     }
-    function messageMatchesReplyIdentity(client, message, args, expectedMessageId = "") {
+    function messageMatchesStableReplyIdentity(client, message, args, expectedMessageId = "") {
       if (!message) return !1;
       let botUserId = expectedBotUserId(client);
-      return !botUserId || expectedMessageId && String(message.id || "") !== String(expectedMessageId) || String(message.channelId || "") !== String(args.channelId || "") || String(message.nonce || "") !== String(args.nonce || "") || String(message.content || "") !== String(args.content || "") || messageReplySourceId(message) !== String(args.replyTo || "") ? !1 : String(message.author?.id || "") === botUserId;
+      return !botUserId || expectedMessageId && String(message.id || "") !== String(expectedMessageId) || String(message.channelId || "") !== String(args.channelId || "") || String(message.content || "") !== String(args.content || "") || messageReplySourceId(message) !== String(args.replyTo || "") ? !1 : String(message.author?.id || "") === botUserId;
+    }
+    function messageMatchesReplyNonce(client, message, args) {
+      let nonce = String(message?.nonce || "");
+      return nonce !== "" && nonce === String(args.nonce || "") && messageMatchesStableReplyIdentity(client, message, args);
     }
     function replyConfirmationError(code) {
       return replyProtocolError(code);
@@ -93100,7 +93110,7 @@ var require_discord_client = __commonJS({
     async function confirmDiscordMessage2(client, args, prepared, sent) {
       requireExpectedBotUserId(client, "reply_confirmation_author_unavailable");
       let channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId), message = await fetchReplyMessage(channel, sent.messageId);
-      if (!messageMatchesReplyIdentity(client, message, args, sent.messageId))
+      if (!messageMatchesStableReplyIdentity(client, message, args, sent.messageId))
         throw replyConfirmationError("reply_confirmation_mismatch");
       return { channelId: String(message.channelId), messageId: String(message.id) };
     }
@@ -93114,8 +93124,7 @@ var require_discord_client = __commonJS({
         throw replyConfirmationError("reply_reconciliation_unavailable");
       if (receipt?.outboundMessageId) {
         let exact = await fetchReplyMessage(channel, receipt.outboundMessageId);
-        if (messageMatchesReplyIdentity(client, exact, args, receipt.outboundMessageId))
-          return { found: !0, channelId: String(exact.channelId), messageId: String(exact.id) };
+        return messageMatchesStableReplyIdentity(client, exact, args, receipt.outboundMessageId) ? { found: !0, channelId: String(exact.channelId), messageId: String(exact.id) } : { found: !1 };
       }
       let recent;
       try {
@@ -93123,7 +93132,7 @@ var require_discord_client = __commonJS({
       } catch {
         throw replyConfirmationError("reply_reconciliation_failed");
       }
-      let match = messageValues(recent).find((message) => messageMatchesReplyIdentity(client, message, args));
+      let match = messageValues(recent).find((message) => messageMatchesReplyNonce(client, message, args));
       return match ? { found: !0, channelId: String(match.channelId), messageId: String(match.id) } : { found: !1 };
     }
     module2.exports = {
