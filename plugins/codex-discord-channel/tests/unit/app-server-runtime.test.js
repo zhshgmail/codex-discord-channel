@@ -118,10 +118,15 @@ test('runtime arguments provide an immutable systemd instance selection', () => 
   assert.throws(() => parseRuntimeArgs(['--unknown']), /Unknown runtime argument/);
 });
 
-test('plugin MCP manifest inherits the selected instance instead of hardcoding codex01', () => {
+test('plugin MCP manifest explicitly inherits the complete selected account identity', () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', '..', '.mcp.json')));
   const server = manifest.mcpServers['codex-discord-channel'];
   assert.equal(Object.hasOwn(server, 'env'), false);
+  assert.deepEqual(server.env_vars, [
+    'CODEX_HOME',
+    'DISCORD_INSTANCE',
+    'DISCORD_CONFIG_DIR',
+  ]);
 });
 
 test('systemd templates load absolute runtime paths from each instance account file', () => {

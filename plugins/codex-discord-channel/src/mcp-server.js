@@ -1,7 +1,7 @@
 'use strict';
 
 const readline = require('node:readline');
-const { loadConfig } = require('./config');
+const { loadMcpConfig } = require('./mcp-config');
 const {
   createDelivery,
   readDeliveryQueueStatus,
@@ -306,7 +306,7 @@ async function handleRequest(context, message) {
 
 async function main() {
   const logger = makeLogger();
-  const config = loadConfig();
+  const config = loadMcpConfig();
   claimOwner(config.paths.ownerPath, createOwner(config));
   const delivery = createDelivery(config, logger);
   const discordState = await startDiscordClient({ config, delivery, logger }).catch((error) => {

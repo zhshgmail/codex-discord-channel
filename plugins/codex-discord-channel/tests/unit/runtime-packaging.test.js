@@ -113,6 +113,12 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
     fs.mkdirSync(directory, { recursive: true });
   }
   const stateDir = path.join(xdgState, 'discord', 'packaging-test');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexHome, 'discord-instance.env'),
+    `DISCORD_INSTANCE=packaging-test\nDISCORD_CONFIG_DIR=${stateDir}\n`,
+  );
+  fs.writeFileSync(path.join(stateDir, 'account.env'), `CODEX_HOME=${codexHome}\n`);
   const env = {
     HOME: home,
     CODEX_HOME: codexHome,

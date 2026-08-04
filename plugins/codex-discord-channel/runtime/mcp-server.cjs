@@ -157,7 +157,7 @@ var require_config = __commonJS({
       }
       return !0;
     }
-    function loadConfig2(inputEnv = process.env, options = {}) {
+    function loadConfig(inputEnv = process.env, options = {}) {
       let env = { ...inputEnv }, instanceWasExplicit = !!(env.DISCORD_INSTANCE || env.DISCORD_BRIDGE_INSTANCE || env.DISCORD_STATE_DIR || env.DISCORD_CONFIG_DIR), codexHomeWasExplicit = !!env.CODEX_HOME, initialPaths = resolvePaths(env), accountBindingLoaded = !1;
       (!instanceWasExplicit || codexHomeWasExplicit) && (accountBindingLoaded = loadEnvFile(initialPaths.accountBindingPath, env, {
         allowedKeys: ACCOUNT_BINDING_KEYS,
@@ -228,11 +228,50 @@ var require_config = __commonJS({
       };
     }
     module2.exports = {
-      loadConfig: loadConfig2,
+      loadConfig,
       loadEnvFile,
       parseInteger,
       parseBool,
       stripQuotes
+    };
+  }
+});
+
+// src/mcp-config.js
+var require_mcp_config = __commonJS({
+  "src/mcp-config.js"(exports2, module2) {
+    "use strict";
+    var path = require("node:path"), { loadConfig } = require_config(), REQUIRED_MCP_IDENTITY_KEYS = [
+      "CODEX_HOME",
+      "DISCORD_INSTANCE",
+      "DISCORD_CONFIG_DIR"
+    ];
+    function requireMcpIdentity(inputEnv) {
+      let env = { ...inputEnv }, missing = REQUIRED_MCP_IDENTITY_KEYS.filter(
+        (key) => String(env[key] || "").trim() === ""
+      );
+      if (missing.length > 0) {
+        let error = new Error(`MCP account identity is missing: ${missing.join(", ")}`);
+        throw error.code = "mcp_account_identity_missing", error;
+      }
+      if (!path.isAbsolute(env.CODEX_HOME) || !path.isAbsolute(env.DISCORD_CONFIG_DIR)) {
+        let error = new Error("MCP account identity paths must be absolute");
+        throw error.code = "mcp_account_identity_invalid", error;
+      }
+      return env;
+    }
+    function loadMcpConfig2(inputEnv = process.env) {
+      let env = requireMcpIdentity(inputEnv), config = loadConfig(env);
+      if (!(config.accountBindingLoaded && path.resolve(config.codexHome) === path.resolve(env.CODEX_HOME) && config.paths.instance === env.DISCORD_INSTANCE && path.resolve(config.paths.stateDir) === path.resolve(env.DISCORD_CONFIG_DIR))) {
+        let error = new Error("MCP account identity does not match its durable account binding");
+        throw error.code = "mcp_account_identity_mismatch", error;
+      }
+      return config;
+    }
+    module2.exports = {
+      REQUIRED_MCP_IDENTITY_KEYS,
+      loadMcpConfig: loadMcpConfig2,
+      requireMcpIdentity
     };
   }
 });
@@ -94255,7 +94294,7 @@ var require_reply_delivery = __commonJS({
 });
 
 // src/mcp-server.js
-var readline = require("node:readline"), { loadConfig } = require_config(), {
+var readline = require("node:readline"), { loadMcpConfig } = require_mcp_config(), {
   createDelivery,
   readDeliveryQueueStatus,
   readLastInboundContext
@@ -94517,7 +94556,7 @@ async function handleRequest(context, message) {
   id !== void 0 && sendError(id, -32601, `Method not found: ${method}`);
 }
 async function main() {
-  let logger = makeLogger(), config = loadConfig();
+  let logger = makeLogger(), config = loadMcpConfig();
   claimOwner(config.paths.ownerPath, createOwner(config));
   let delivery = createDelivery(config, logger), discordState = await startDiscordClient({ config, delivery, logger }).catch((error) => (logger("ERROR", "Discord startup failed", { error: error instanceof Error ? error.message : String(error) }), { started: !1, client: null, reason: "startup_failed" })), context = makeContext(config, discordState, delivery);
   readline.createInterface({ input: process.stdin, crlfDelay: 1 / 0 }).on("line", (line) => {

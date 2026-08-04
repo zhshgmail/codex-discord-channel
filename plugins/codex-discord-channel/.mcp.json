@@ -5,6 +5,11 @@
       "command": "/home/zheng/.nvm/versions/node/v22.22.2/bin/node",
       "args": [
         "./runtime/mcp-server.cjs"
+      ],
+      "env_vars": [
+        "CODEX_HOME",
+        "DISCORD_INSTANCE",
+        "DISCORD_CONFIG_DIR"
       ]
     }
   }
