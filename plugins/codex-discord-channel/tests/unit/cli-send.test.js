@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { MessagePayload } = require('discord.js');
 const { sendViaRest } = require('../../bin/codex-discord-channel');
 const { beginReply } = require('../../src/reply-delivery');
 
@@ -96,6 +97,36 @@ function runCli(config, fetchImpl, content = 'answer') {
   });
 }
 
+function discordJsMessageBody(options) {
+  const channel = {
+    client: { options: { allowedMentions: undefined, failIfNotExists: true } },
+    messages: {
+      resolveId(reference) {
+        return typeof reference === 'string' ? reference : reference?.id;
+      },
+    },
+  };
+  return MessagePayload.create(channel, options).resolveBody().body;
+}
+
+test('CLI reply POST matches the real discord.js MessagePayload contract', async () => {
+  const { config } = fixture();
+  const harness = restHarness();
+
+  const sent = await runCli(config, harness.fetchImpl);
+  const post = harness.requests.find((item) => item.method === 'POST');
+  const actual = JSON.parse(post.body);
+  const expected = JSON.parse(JSON.stringify(discordJsMessageBody({
+    content: 'answer',
+    nonce: actual.nonce,
+    enforceNonce: true,
+    reply: { messageReference: 'm1', failIfNotExists: true },
+  })));
+
+  assert.deepEqual(actual, expected);
+  assert.equal(sent.messageId, 'out-1');
+});
+
 test('CLI reconciles fetch failure then confirms exact source thread and readback', async () => {
   const { config } = fixture();
   let failFirst = true;
@@ -129,7 +160,7 @@ test('CLI reconciles fetch failure then confirms exact source thread and readbac
   assert.equal(firstPayload.nonce, retryPayload.nonce);
   assert.equal(retryPayload.enforce_nonce, true);
   assert.deepEqual(retryPayload.message_reference, {
-    message_id: 'm1', channel_id: 'c1', fail_if_not_exists: true,
+    message_id: 'm1', fail_if_not_exists: true,
   });
   assert.ok(harness.requests.some((item) => item.pathname.endsWith(`/messages/${retry.messageId}`)));
   assert.equal(retry.duplicateSuppressed, false);

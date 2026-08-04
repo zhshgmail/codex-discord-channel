@@ -78,7 +78,7 @@ function createDiscordRestClient({ token, botUserId, fetchImpl = globalThis.fetc
         },
       },
       async send(payload) {
-        const body = { content: payload.content };
+        const body = { content: payload.content, tts: false };
         if (typeof payload.nonce === 'string' && payload.nonce !== '') {
           body.nonce = payload.nonce;
           body.enforce_nonce = payload.enforceNonce === true;
@@ -86,7 +86,6 @@ function createDiscordRestClient({ token, botUserId, fetchImpl = globalThis.fetc
         if (payload.reply?.messageReference) {
           body.message_reference = {
             message_id: payload.reply.messageReference,
-            channel_id: channelId,
             fail_if_not_exists: payload.reply.failIfNotExists === true,
           };
         }
