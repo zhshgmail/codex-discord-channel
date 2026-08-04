@@ -127,6 +127,137 @@ new_capture_id() {
   printf '%s-%s-%s-%s' "$BASHPID" "$RANDOM" "$RANDOM" "$(date +%s%N)"
 }
 
+option_requires_value() {
+  case $1 in
+    -c|--config|--enable|--disable|--remote|--remote-auth-token-env|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+reconstruct_recovery_args() {
+  local recovery_thread=$1
+  local arg candidate
+  local -i arg_index image_value_count resume_index=-1
+  local -i args_count=${#codex_args[@]}
+
+  arg_index=0
+  while ((arg_index < args_count)); do
+    arg=${codex_args[$arg_index]}
+    if [[ $arg == resume ]]; then
+      resume_index=$arg_index
+      break
+    fi
+    if option_requires_value "$arg"; then
+      arg_index=$((arg_index + 2))
+      continue
+    fi
+    if [[ $arg == -i || $arg == --image ]]; then
+      arg_index=$((arg_index + 1))
+      image_value_count=0
+      while ((arg_index < args_count)); do
+        candidate=${codex_args[$arg_index]}
+        if [[ $candidate == resume && $image_value_count -gt 0 ]]; then
+          resume_index=$arg_index
+          break 2
+        fi
+        [[ $candidate == -* ]] && break
+        image_value_count=$((image_value_count + 1))
+        arg_index=$((arg_index + 1))
+      done
+      continue
+    fi
+    [[ $arg == -- ]] && break
+    arg_index=$((arg_index + 1))
+  done
+
+  recovered_args=("${codex_args[@]}")
+  if ((resume_index < 0)); then
+    recovered_args+=(resume "$recovery_thread")
+    return
+  fi
+
+  local -A positional_indices=()
+  local -a image_starts=() image_ends=()
+  local -i definite_positionals=0 last_index=-1
+  local -i block_start block_end scan_index
+  arg_index=$((resume_index + 1))
+  while ((arg_index < args_count)); do
+    arg=${codex_args[$arg_index]}
+    if [[ $arg == --last ]]; then
+      last_index=$arg_index
+      arg_index=$((arg_index + 1))
+      continue
+    fi
+    if [[ $arg == -- ]]; then
+      arg_index=$((arg_index + 1))
+      while ((arg_index < args_count)); do
+        positional_indices[$arg_index]=1
+        definite_positionals=$((definite_positionals + 1))
+        arg_index=$((arg_index + 1))
+      done
+      break
+    fi
+    if option_requires_value "$arg"; then
+      arg_index=$((arg_index + 2))
+      continue
+    fi
+    if [[ $arg == -i || $arg == --image ]]; then
+      block_start=$((arg_index + 1))
+      block_end=$block_start
+      while ((block_end < args_count)) && [[ ${codex_args[$block_end]} != -* ]]; do
+        block_end=$((block_end + 1))
+      done
+      if ((block_end > block_start)); then
+        image_starts+=("$block_start")
+        image_ends+=("$((block_end - 1))")
+      fi
+      arg_index=$block_end
+      continue
+    fi
+    if [[ $arg == --*=* || $arg == -* ]]; then
+      arg_index=$((arg_index + 1))
+      continue
+    fi
+    positional_indices[$arg_index]=1
+    definite_positionals=$((definite_positionals + 1))
+    arg_index=$((arg_index + 1))
+  done
+
+  if ((last_index >= 0)); then
+    recovered_args[$last_index]=$recovery_thread
+    return
+  fi
+
+  local -i remaining_positionals=$((2 - definite_positionals))
+  ((remaining_positionals < 0)) && remaining_positionals=0
+  local -i block_index available take first_positional
+  for ((block_index = 0; block_index < ${#image_starts[@]} && remaining_positionals > 0; block_index += 1)); do
+    block_start=${image_starts[$block_index]}
+    block_end=${image_ends[$block_index]}
+    available=$((block_end - block_start))
+    ((available <= 0)) && continue
+    take=$available
+    ((take > remaining_positionals)) && take=$remaining_positionals
+    first_positional=$((block_end - take + 1))
+    for ((scan_index = first_positional; scan_index <= block_end; scan_index += 1)); do
+      positional_indices[$scan_index]=1
+    done
+    remaining_positionals=$((remaining_positionals - take))
+  done
+
+  for ((scan_index = resume_index + 1; scan_index < args_count; scan_index += 1)); do
+    if [[ -n ${positional_indices[$scan_index]+x} ]]; then
+      recovered_args[$scan_index]=$recovery_thread
+      return
+    fi
+  done
+  recovered_args+=("$recovery_thread")
+}
+
 watcher_pid=''
 watcher_stop=''
 stop_watcher() {
@@ -233,71 +364,7 @@ while ((SECONDS <= deadline)); do
       fi
       recovery_stamps+=("$now_seconds")
 
-      recovered_args=()
-      found_resume=0
-      arg_index=0
-      while ((arg_index < ${#codex_args[@]})); do
-        arg=${codex_args[$arg_index]}
-        if [[ $arg == resume ]]; then
-          recovered_args+=(resume)
-          found_resume=1
-          arg_index=$((arg_index + 1))
-
-          replaced_resume_operand=0
-          while ((arg_index < ${#codex_args[@]})); do
-            resume_arg=${codex_args[$arg_index]}
-            case $resume_arg in
-              --last)
-                recovered_args+=("$recovery_thread")
-                replaced_resume_operand=1
-                arg_index=$((arg_index + 1))
-                break
-                ;;
-              --)
-                recovered_args+=(-- "$recovery_thread")
-                replaced_resume_operand=1
-                arg_index=$((arg_index + 1))
-                if ((arg_index < ${#codex_args[@]})); then
-                  arg_index=$((arg_index + 1))
-                fi
-                break
-                ;;
-              -c|--config|--enable|--disable|--remote|--remote-auth-token-env|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir)
-                recovered_args+=("$resume_arg")
-                arg_index=$((arg_index + 1))
-                if ((arg_index >= ${#codex_args[@]})); then
-                  break
-                fi
-                recovered_args+=("${codex_args[$arg_index]}")
-                arg_index=$((arg_index + 1))
-                ;;
-              --*=*|-*)
-                recovered_args+=("$resume_arg")
-                arg_index=$((arg_index + 1))
-                ;;
-              *)
-                recovered_args+=("$recovery_thread")
-                replaced_resume_operand=1
-                arg_index=$((arg_index + 1))
-                break
-                ;;
-            esac
-          done
-          if ((replaced_resume_operand == 0)); then
-            recovered_args+=("$recovery_thread")
-          fi
-          while ((arg_index < ${#codex_args[@]})); do
-            recovered_args+=("${codex_args[$arg_index]}")
-            arg_index=$((arg_index + 1))
-          done
-          break
-        fi
-        recovered_args+=("$arg")
-        arg_index=$((arg_index + 1))
-      done
-      if ((found_resume == 0)); then
-        recovered_args+=(resume "$recovery_thread")
-      fi
+      reconstruct_recovery_args "$recovery_thread"
       codex_args=("${recovered_args[@]}")
       echo "App-server generation changed; resuming thread $recovery_thread." >&2
     done

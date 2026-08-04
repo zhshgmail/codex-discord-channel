@@ -47,7 +47,7 @@ function fixture() {
     `TUI_COUNT_CONST=${shellLiteral(path.join(home, 'tui-count'))}`,
     'if [[ $1 == "$FAKE_CHANNEL_BIN_CONST" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
-    '    clear) rm -f "$STATE_DIR_CONST/tui-recovery-target.json" "$STATE_DIR_CONST/tui-recovery-capture-id"; exit 0 ;;',
+    '    clear) rm -f "$STATE_DIR_CONST/tui-recovery-target.json" "$STATE_DIR_CONST/tui-recovery-target.invalid" "$STATE_DIR_CONST/tui-recovery-capture-id"; exit 0 ;;',
     '    snapshot)',
     '      if [[ -f $STATE_DIR_CONST/app-server-target.json ]]; then',
     '        cp "$STATE_DIR_CONST/app-server-target.json" "$STATE_DIR_CONST/tui-recovery-target.json"',
@@ -352,4 +352,96 @@ test('recovery replaces only the resume operand and preserves all trailing argum
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen old-thread-id continue the first prompt then preserve the second prompt`,
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen 019f3763-d308-7871-bedc-e6489b02190e continue the first prompt then preserve the second prompt`,
   ]);
+});
+
+test('recovery preserves variadic image values and replaces only the parsed resume operand', () => {
+  const cases = [
+    {
+      name: 'images after resume',
+      args: ['resume', '-i', 'one.png', 'two.png', 'old-thread', 'continue'],
+      recovered: 'resume -i one.png two.png 019f3763-d308-7871-bedc-e6489b02190e continue',
+    },
+    {
+      name: 'images before resume',
+      args: ['-i', 'one.png', 'two.png', 'resume', 'old-thread', 'continue'],
+      recovered: '-i one.png two.png resume 019f3763-d308-7871-bedc-e6489b02190e continue',
+    },
+    {
+      name: 'images after the resume operand',
+      args: ['resume', 'old-thread', '--image', 'one.png', 'two.png', 'continue'],
+      recovered: 'resume 019f3763-d308-7871-bedc-e6489b02190e --image one.png two.png continue',
+    },
+    {
+      name: 'resume options after images',
+      args: [
+        '--profile',
+        'before',
+        'resume',
+        '--image',
+        'one.png',
+        'two.png',
+        '--sandbox',
+        'read-only',
+        'old-thread',
+        'continue',
+      ],
+      recovered: '--profile before resume --image one.png two.png --sandbox read-only 019f3763-d308-7871-bedc-e6489b02190e continue',
+    },
+  ];
+
+  for (const item of cases) {
+    const setup = fixture();
+    fs.writeFileSync(setup.transportFailMarker, '1\n');
+    const result = spawnSync(launcher, ['codex02', ...item.args], {
+      encoding: 'utf8',
+      env: launchEnv(setup),
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, `${item.name}: ${result.stderr}`);
+    const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+      .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+    assert.equal(
+      tuiLaunches[1],
+      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${item.recovered}`,
+      item.name,
+    );
+  }
+});
+
+test('recovery appends resume without consuming image values or option values as a subcommand', () => {
+  const cases = [
+    {
+      name: 'separated variadic images without resume',
+      args: ['-i', 'one.png', 'two.png', 'prompt'],
+      recovered: '-i one.png two.png prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
+    },
+    {
+      name: 'resume is a global option value',
+      args: ['--profile', 'resume', '--image=one.png,two.png'],
+      recovered: '--profile resume --image=one.png,two.png resume 019f3763-d308-7871-bedc-e6489b02190e',
+    },
+    {
+      name: 'resume option value before separated variadic images',
+      args: ['--profile', 'resume', '-i', 'one.png', 'two.png', 'prompt'],
+      recovered: '--profile resume -i one.png two.png prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
+    },
+  ];
+
+  for (const item of cases) {
+    const setup = fixture();
+    fs.writeFileSync(setup.transportFailMarker, '1\n');
+    const result = spawnSync(launcher, ['codex02', ...item.args], {
+      encoding: 'utf8',
+      env: launchEnv(setup),
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, `${item.name}: ${result.stderr}`);
+    const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+      .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+    assert.equal(
+      tuiLaunches[1],
+      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${item.recovered}`,
+      item.name,
+    );
+  }
 });

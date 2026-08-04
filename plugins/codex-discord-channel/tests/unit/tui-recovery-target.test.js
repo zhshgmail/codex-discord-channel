@@ -15,6 +15,7 @@ const {
 const THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190e';
 const CAPTURE_ID_A = 'capture-a';
 const CAPTURE_ID_B = 'capture-b';
+const CAPTURE_ID_C = 'capture-c';
 
 function fixture() {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-tui-target-'));
@@ -95,7 +96,7 @@ test('missing live checkpoint invalidates the previously captured thread', () =>
   assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
 });
 
-test('failed invalidation cannot make an old capture readable under the new identity', () => {
+test('failed invalidation tombstones every prior capture even when stale cleanup also fails', () => {
   const { config, live } = fixture();
   assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_A), true);
   assert.equal(readRecoveryThread(config, CAPTURE_ID_A), THREAD_ID);
@@ -107,16 +108,57 @@ test('failed invalidation cannot make an old capture readable under the new iden
     loadedThreadIds: [THREAD_ID, '019f3763-d308-7871-bedc-e6489b02190f'],
   })}\n`);
 
-  fs.chmodSync(config.paths.stateDir, 0o500);
-  try {
-    assert.throws(
-      () => captureRecoveryTarget(config, 0, CAPTURE_ID_B),
-      (error) => error?.code === 'EACCES',
-    );
-    assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
-  } finally {
-    fs.chmodSync(config.paths.stateDir, 0o700);
-  }
+  const recovery = path.join(config.paths.stateDir, 'tui-recovery-target.json');
+  const tombstone = path.join(config.paths.stateDir, 'tui-recovery-target.invalid');
+  const forcedFs = {
+    ...fs,
+    renameSync(source, destination) {
+      if (destination === recovery) {
+        const error = new Error('forced recovery target replacement failure');
+        error.code = 'EIO';
+        throw error;
+      }
+      return fs.renameSync(source, destination);
+    },
+    unlinkSync(file) {
+      if (file === recovery) {
+        const error = new Error('forced stale recovery target deletion failure');
+        error.code = 'EBUSY';
+        throw error;
+      }
+      return fs.unlinkSync(file);
+    },
+  };
+
+  assert.throws(
+    () => captureRecoveryTarget(config, 0, CAPTURE_ID_B, { fs: forcedFs }),
+    (error) => error instanceof AggregateError
+      && error.errors.some((item) => item?.code === 'EIO')
+      && error.errors.some((item) => item?.code === 'EBUSY'),
+  );
+  assert.equal(fs.existsSync(tombstone), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(recovery, 'utf8')), {
+    version: 1,
+    threadId: THREAD_ID,
+    status: 'active',
+    activeTurnId: '019fce01-eab5-7381-a3bd-a15ad0ac634a',
+    loadedThreadIds: [THREAD_ID],
+    captureId: CAPTURE_ID_A,
+  });
+  assert.deepEqual(JSON.parse(fs.readFileSync(tombstone, 'utf8')), {
+    version: 1,
+    status: 'invalid',
+    captureId: CAPTURE_ID_B,
+  });
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_A), '');
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
+
+  const valid = JSON.parse(fs.readFileSync(live, 'utf8'));
+  valid.loadedThreadIds = [THREAD_ID];
+  fs.writeFileSync(live, `${JSON.stringify(valid)}\n`);
+  assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_C), true);
+  assert.equal(fs.existsSync(tombstone), false);
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
 });
 
 test('integer launch threshold rejects a fractional same-millisecond prelaunch checkpoint', () => {
