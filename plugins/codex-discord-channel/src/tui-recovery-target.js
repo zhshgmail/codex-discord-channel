@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const TARGET_VERSION = 1;
+const CAPTURE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
 
 function targetPaths(config) {
   return {
@@ -34,6 +35,13 @@ function parseRecoveryTarget(raw) {
   return record;
 }
 
+function requireCaptureId(captureId) {
+  if (typeof captureId !== 'string' || !CAPTURE_ID_PATTERN.test(captureId)) {
+    throw new Error('recovery capture identity is required');
+  }
+  return captureId;
+}
+
 function writeAtomic(file, content, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
   const now = dependencies.now || Date.now;
@@ -51,38 +59,46 @@ function writeAtomic(file, content, dependencies = {}) {
   }
 }
 
-function invalidateRecoveryTarget(file, dependencies = {}) {
+function invalidateRecoveryTarget(file, captureId, dependencies = {}) {
   writeAtomic(file, `${JSON.stringify({
     version: TARGET_VERSION,
     status: 'invalid',
+    captureId,
   }, null, 2)}\n`, dependencies);
 }
 
-function captureRecoveryTarget(config, minimumMtimeMs = 0, dependencies = {}) {
+function captureRecoveryTarget(config, minimumMtimeMs = 0, captureIdentity, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
   const files = targetPaths(config);
+  const captureId = requireCaptureId(captureIdentity);
+  if (!Number.isSafeInteger(minimumMtimeMs) || minimumMtimeMs < 0) {
+    throw new Error('minimum recovery target mtime must be a non-negative integer');
+  }
   let record;
   try {
-    if (minimumMtimeMs && fsImpl.statSync(files.live).mtimeMs < minimumMtimeMs) {
-      invalidateRecoveryTarget(files.recovery, dependencies);
+    const liveMtimeMs = Math.floor(fsImpl.statSync(files.live).mtimeMs);
+    if (!Number.isFinite(liveMtimeMs)) throw new Error('recovery target mtime is invalid');
+    if (liveMtimeMs <= minimumMtimeMs) {
+      invalidateRecoveryTarget(files.recovery, captureId, dependencies);
       return false;
     }
     record = parseRecoveryTarget(fsImpl.readFileSync(files.live, 'utf8'));
   } catch (error) {
-    invalidateRecoveryTarget(files.recovery, dependencies);
+    invalidateRecoveryTarget(files.recovery, captureId, dependencies);
     if (error?.code === 'ENOENT') return false;
     throw error;
   }
   if (!record) {
-    invalidateRecoveryTarget(files.recovery, dependencies);
+    invalidateRecoveryTarget(files.recovery, captureId, dependencies);
     return false;
   }
-  writeAtomic(files.recovery, `${JSON.stringify(record, null, 2)}\n`, dependencies);
+  writeAtomic(files.recovery, `${JSON.stringify({ ...record, captureId }, null, 2)}\n`, dependencies);
   return true;
 }
 
-function readRecoveryThread(config, dependencies = {}) {
+function readRecoveryThread(config, captureIdentity, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
+  const captureId = requireCaptureId(captureIdentity);
   let record;
   try {
     record = parseRecoveryTarget(fsImpl.readFileSync(targetPaths(config).recovery, 'utf8'));
@@ -90,7 +106,8 @@ function readRecoveryThread(config, dependencies = {}) {
     if (error?.code !== 'ENOENT') throw error;
     return '';
   }
-  return record?.threadId || '';
+  if (record?.captureId !== captureId) return '';
+  return record.threadId || '';
 }
 
 function clearRecoveryTarget(config, dependencies = {}) {

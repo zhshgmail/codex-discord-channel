@@ -29,7 +29,9 @@ function usage() {
     '  codex-discord-channel tui-check [--instance ID --state-dir PATH]',
     '  codex-discord-channel live-check [--instance ID --state-dir PATH] --pid PID --pid PID',
     '  codex-discord-channel tui [--instance ID --state-dir PATH] [-- CODEX_ARGS...]',
-    '  codex-discord-channel tui-recovery-target ACTION [MIN_MTIME_MS] [--instance ID --state-dir PATH]',
+    '  codex-discord-channel tui-recovery-target snapshot CAPTURE_ID MIN_MTIME_MS [--instance ID --state-dir PATH]',
+    '  codex-discord-channel tui-recovery-target read CAPTURE_ID [--instance ID --state-dir PATH]',
+    '  codex-discord-channel tui-recovery-target clear [--instance ID --state-dir PATH]',
     '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID] [--followup]',
     '',
     'The send command reads message text from stdin. A guarded reply requires exact --channel and --reply-to values.',
@@ -282,22 +284,25 @@ async function main() {
     return;
   }
   if (command === 'tui-recovery-target') {
-    const [action, maybeMtime, ...runtimeTail] = rest;
-    const hasMtime = action === 'snapshot';
-    const runtimeArgs = hasMtime ? runtimeTail : rest.slice(1);
-    const minimumMtimeMs = hasMtime ? Number(maybeMtime) : 0;
+    const [action, captureId, maybeMtime, ...snapshotRuntimeArgs] = rest;
     if (!['snapshot', 'read', 'clear'].includes(action)) {
       throw new Error('tui-recovery-target action must be snapshot, read, or clear');
     }
-    if (hasMtime && (!/^\d+$/.test(maybeMtime || '') || !Number.isSafeInteger(minimumMtimeMs))) {
+    const minimumMtimeMs = action === 'snapshot' ? Number(maybeMtime) : 0;
+    if (action === 'snapshot' && (!/^\d+$/.test(maybeMtime || '') || !Number.isSafeInteger(minimumMtimeMs))) {
       throw new Error('tui-recovery-target snapshot requires a non-negative millisecond timestamp');
     }
+    const runtimeArgs = action === 'snapshot'
+      ? snapshotRuntimeArgs
+      : action === 'read'
+        ? rest.slice(2)
+        : rest.slice(1);
     const config = loadRuntimeConfig(runtimeArgs);
     const target = require('../src/tui-recovery-target');
     if (action === 'snapshot') {
-      if (!target.captureRecoveryTarget(config, minimumMtimeMs)) process.exitCode = 10;
+      if (!target.captureRecoveryTarget(config, minimumMtimeMs, captureId)) process.exitCode = 10;
     } else if (action === 'read') {
-      const threadId = target.readRecoveryThread(config);
+      const threadId = target.readRecoveryThread(config, captureId);
       if (!threadId) process.exitCode = 10;
       else process.stdout.write(`${threadId}\n`);
     } else {

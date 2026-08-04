@@ -13,12 +13,18 @@ function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
 }
 
+function shellLiteral(value) {
+  return `'${String(value).replaceAll("'", "'\\\"'\\\"'")}'`;
+}
+
 function fixture() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-launch-script-'));
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
   const binDir = path.join(home, 'bin');
   const trace = path.join(home, 'trace.log');
   const loginMarker = path.join(home, 'login-complete');
+  const loginExitMarker = path.join(home, 'login-exit');
+  const transportFailMarker = path.join(home, 'transport-fail-once');
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
   const fakeChannel = path.join(binDir, 'codex-discord-channel');
@@ -30,49 +36,59 @@ function fixture() {
   fs.writeFileSync(fakeChannel, '// fixture\n');
   executable(fakeNode, [
     '#!/usr/bin/env bash',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
+    `FAKE_CHANNEL_BIN_CONST=${shellLiteral(fakeChannel)}`,
+    `FAKE_CODEX_BIN_CONST=${shellLiteral(fakeCodex)}`,
+    `LOGIN_MARKER_CONST=${shellLiteral(loginMarker)}`,
+    `LOGIN_EXIT_MARKER_CONST=${shellLiteral(loginExitMarker)}`,
+    `STATE_DIR_CONST=${shellLiteral(stateDir)}`,
+    `THREAD_ID_CONST=${shellLiteral('019f3763-d308-7871-bedc-e6489b02190e')}`,
+    `TRACE_CONST=${shellLiteral(trace)}`,
+    `TRANSPORT_FAIL_MARKER_CONST=${shellLiteral(transportFailMarker)}`,
+    `TUI_COUNT_CONST=${shellLiteral(path.join(home, 'tui-count'))}`,
+    'if [[ $1 == "$FAKE_CHANNEL_BIN_CONST" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
-    '    clear) rm -f "$STATE_DIR/tui-recovery-target.json"; exit 0 ;;',
+    '    clear) rm -f "$STATE_DIR_CONST/tui-recovery-target.json" "$STATE_DIR_CONST/tui-recovery-capture-id"; exit 0 ;;',
     '    snapshot)',
-    '      if [[ -f $STATE_DIR/app-server-target.json ]]; then',
-    '        cp "$STATE_DIR/app-server-target.json" "$STATE_DIR/tui-recovery-target.json"',
+    '      if [[ -f $STATE_DIR_CONST/app-server-target.json ]]; then',
+    '        cp "$STATE_DIR_CONST/app-server-target.json" "$STATE_DIR_CONST/tui-recovery-target.json"',
+    '        printf "%s\\n" "$4" >"$STATE_DIR_CONST/tui-recovery-capture-id"',
     '        exit 0',
     '      fi',
     '      exit 10',
     '      ;;',
     '    read)',
-    '      if [[ -f $STATE_DIR/tui-recovery-target.json ]]; then',
-    '        printf "%s\\n" "$THREAD_ID"',
+    '      if [[ -f $STATE_DIR_CONST/tui-recovery-target.json && -f $STATE_DIR_CONST/tui-recovery-capture-id && $(<"$STATE_DIR_CONST/tui-recovery-capture-id") == "$4" ]]; then',
+    '        printf "%s\\n" "$THREAD_ID_CONST"',
     '        exit 0',
     '      fi',
     '      exit 10',
     '      ;;',
     '  esac',
     'fi',
-    'printf "node %s\\n" "$*" >>"$TRACE"',
-    'if [[ ${LOGIN_REQUIRED:-0} == 1 && $2 == tui-login-state && ! -f $LOGIN_MARKER ]]; then exit 10; fi',
-    'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == login ]]; then',
-    '  if [[ -n ${DISCORD_BOT_TOKEN+x} || -n ${DISCORD_BOT_USER_ID+x} ]]; then exit 91; fi',
-    '  if [[ ${LOGIN_EXIT:-0} != 0 ]]; then exit "$LOGIN_EXIT"; fi',
-    '  touch "$LOGIN_MARKER"',
-    'fi',
-    'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${CHECK_DISCORD_ENV_CLEAN:-0} == 1 ]]; then',
-    '  while IFS= read -r key; do',
+    'printf "node %s\\n" "$*" >>"$TRACE_CONST"',
+    'if [[ ${LOGIN_REQUIRED:-0} == 1 && $2 == tui-login-state && ! -f $LOGIN_MARKER_CONST ]]; then exit 10; fi',
+    'if [[ $1 == "$FAKE_CODEX_BIN_CONST" ]]; then',
+    '  while IFS= read -r -d "" entry; do',
+    '    key=${entry%%=*}',
     '    case $key in',
     '      DISCORD_*|CODEX_DISCORD_*) printf "leaked environment: %s\\n" "$key" >&2; exit 92 ;;',
     '    esac',
-    '  done < <(compgen -e)',
+    '  done < <(/usr/bin/env -0)',
     'fi',
-    'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${TRANSPORT_FAIL_ONCE:-0} == 1 ]]; then',
+    'if [[ $1 == "$FAKE_CODEX_BIN_CONST" && $2 == login ]]; then',
+    '  if [[ -f $LOGIN_EXIT_MARKER_CONST ]]; then read -r login_exit <"$LOGIN_EXIT_MARKER_CONST"; exit "$login_exit"; fi',
+    '  touch "$LOGIN_MARKER_CONST"',
+    'fi',
+    'if [[ $1 == "$FAKE_CODEX_BIN_CONST" && $2 == --remote && -f $TRANSPORT_FAIL_MARKER_CONST ]]; then',
     '  count=0',
-    '  [[ -f $TUI_COUNT ]] && read -r count <"$TUI_COUNT"',
+    '  [[ -f $TUI_COUNT_CONST ]] && read -r count <"$TUI_COUNT_CONST"',
     '  count=$((count + 1))',
-    '  printf "%s\\n" "$count" >"$TUI_COUNT"',
+    '  printf "%s\\n" "$count" >"$TUI_COUNT_CONST"',
     '  if ((count == 1)); then',
-    '    printf "{\\"version\\":1,\\"threadId\\":\\"%s\\",\\"status\\":\\"active\\",\\"activeTurnId\\":\\"turn-1\\",\\"loadedThreadIds\\":[\\"%s\\"]}\\n" "$THREAD_ID" "$THREAD_ID" >"$STATE_DIR/app-server-target.json"',
+    '    printf "{\\"version\\":1,\\"threadId\\":\\"%s\\",\\"status\\":\\"active\\",\\"activeTurnId\\":\\"turn-1\\",\\"loadedThreadIds\\":[\\"%s\\"]}\\n" "$THREAD_ID_CONST" "$THREAD_ID_CONST" >"$STATE_DIR_CONST/app-server-target.json"',
     '    sleep 0.4',
-    '    rm -f "$STATE_DIR/app-server.sock"',
-    '    python3 - "$STATE_DIR/app-server.sock" <<\'PY\'',
+    '    rm -f "$STATE_DIR_CONST/app-server.sock"',
+    '    python3 - "$STATE_DIR_CONST/app-server.sock" <<\'PY\'',
     'import socket, sys',
     'sock = socket.socket(socket.AF_UNIX)',
     'sock.bind(sys.argv[1])',
@@ -112,9 +128,11 @@ function fixture() {
     fakeChannel,
     fakeCodex,
     home,
+    loginExitMarker,
     loginMarker,
     stateDir,
     trace,
+    transportFailMarker,
     tuiCount: path.join(home, 'tui-count'),
   };
 }
@@ -183,9 +201,10 @@ test('first-run TTY login succeeds before services and the TUI start', () => {
 
 test('cancelled first-run TTY login starts neither service nor TUI', () => {
   const setup = fixture();
+  fs.writeFileSync(setup.loginExitMarker, '130\n');
   const result = spawnSync('/usr/bin/script', ['-qec', `${launcher} codex02`, '/dev/null'], {
     encoding: 'utf8',
-    env: launchEnv(setup, { LOGIN_EXIT: '130', LOGIN_REQUIRED: '1' }),
+    env: launchEnv(setup, { LOGIN_REQUIRED: '1' }),
   });
 
   assert.equal(result.status, 130);
@@ -228,12 +247,13 @@ test('shell launcher rejects duplicate executable authority before starting syst
 
 test('shell launcher resumes the exact captured thread after app-server replacement', () => {
   const setup = fixture();
+  fs.writeFileSync(setup.transportFailMarker, '1\n');
   const result = spawnSync(
     launcher,
     ['codex02', '--dangerously-bypass-approvals-and-sandbox', 'resume', '--last'],
     {
       encoding: 'utf8',
-      env: launchEnv(setup, { TRANSPORT_FAIL_ONCE: '1' }),
+      env: launchEnv(setup),
       timeout: 5000,
     },
   );
@@ -247,13 +267,14 @@ test('shell launcher resumes the exact captured thread after app-server replacem
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
 });
 
-test('shell launcher strips every Discord-prefixed variable from the Codex child', () => {
+test('shell launcher strips every Discord-prefixed variable from the TUI child', () => {
   const setup = fixture();
   const result = spawnSync(launcher, ['codex02', 'resume', 'thread-2'], {
     encoding: 'utf8',
     env: launchEnv(setup, {
-      CHECK_DISCORD_ENV_CLEAN: '1',
+      'CODEX_DISCORD_BAD-NAME': 'invalid-codex-discord-name',
       CODEX_DISCORD_UNKNOWN_SECRET: 'unknown-codex-discord-secret',
+      'DISCORD_BAD-NAME': 'invalid-discord-name',
       DISCORD_PROXY_URL: 'fixture-proxy-secret',
       DISCORD_UNKNOWN_SECRET: 'unknown-discord-secret',
     }),
@@ -262,14 +283,32 @@ test('shell launcher strips every Discord-prefixed variable from the Codex child
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('shell launcher strips invalid Discord-prefixed names from the login child', () => {
+  const setup = fixture();
+  const command = `${launcher} codex02`;
+  const result = spawnSync('/usr/bin/script', ['-qec', command, '/dev/null'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      'CODEX_DISCORD_BAD-NAME': 'invalid-codex-discord-name',
+      'DISCORD_BAD-NAME': 'invalid-discord-name',
+      DISCORD_PROXY_URL: 'fixture-proxy-secret',
+      LOGIN_REQUIRED: '1',
+    }),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(setup.loginMarker), true);
+});
+
 test('recovery appends exact resume while preserving flags from a non-resume launch', () => {
   const setup = fixture();
+  fs.writeFileSync(setup.transportFailMarker, '1\n');
   const result = spawnSync(
     launcher,
     ['codex02', '--dangerously-bypass-approvals-and-sandbox', '--profile', 'review'],
     {
       encoding: 'utf8',
-      env: launchEnv(setup, { TRANSPORT_FAIL_ONCE: '1' }),
+      env: launchEnv(setup),
       timeout: 5000,
     },
   );
@@ -279,5 +318,38 @@ test('recovery appends exact resume while preserving flags from a non-resume lau
   assert.deepEqual(tuiLaunches, [
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review`,
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+  ]);
+});
+
+test('recovery replaces only the resume operand and preserves all trailing arguments in order', () => {
+  const setup = fixture();
+  fs.writeFileSync(setup.transportFailMarker, '1\n');
+  const result = spawnSync(
+    launcher,
+    [
+      'codex02',
+      '--dangerously-bypass-approvals-and-sandbox',
+      'resume',
+      '--profile',
+      'after',
+      '--sandbox',
+      'read-only',
+      '--no-alt-screen',
+      'old-thread-id',
+      'continue the first prompt',
+      'then preserve the second prompt',
+    ],
+    {
+      encoding: 'utf8',
+      env: launchEnv(setup),
+      timeout: 5000,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+  assert.deepEqual(tuiLaunches, [
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen old-thread-id continue the first prompt then preserve the second prompt`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen 019f3763-d308-7871-bedc-e6489b02190e continue the first prompt then preserve the second prompt`,
   ]);
 });

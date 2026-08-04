@@ -50,18 +50,25 @@ if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin
 fi
 
 runtime_args=(--instance "$instance" --state-dir "$state_dir")
-codex_env=(env)
-while IFS= read -r key; do
-  case $key in
-    DISCORD_*|CODEX_DISCORD_*) codex_env+=(-u "$key") ;;
-  esac
-done < <(compgen -e)
-codex_env+=(
-  -u CODEX_THREAD_ID
-  -u CODEX_SESSION_ID
-  -u CODEX_TARGET_THREAD_ID
-  -u CODEX_APP_SERVER_SOCKET
+codex_env=(env -i)
+codex_env_allowlist=(
+  HOME PATH USER LOGNAME SHELL
+  TERM COLORTERM TERMINFO NO_COLOR FORCE_COLOR
+  LANG LANGUAGE LC_ALL LC_CTYPE TZ TMPDIR
+  XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME
+  SSH_AUTH_SOCK
+  HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+  http_proxy https_proxy all_proxy no_proxy
+  SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE REQUESTS_CA_BUNDLE NODE_EXTRA_CA_CERTS
+  OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORGANIZATION OPENAI_PROJECT
+  AZURE_OPENAI_API_KEY AZURE_OPENAI_ENDPOINT
 )
+for key in "${codex_env_allowlist[@]}"; do
+  if [[ -v $key ]]; then
+    codex_env+=("$key=${!key}")
+  fi
+done
+codex_env+=("CODEX_HOME=$codex_home")
 set +e
 "$node_bin" "$channel_bin" tui-login-state "${runtime_args[@]}" >/dev/null
 login_state=$?
@@ -72,7 +79,6 @@ if ((login_state == 10)); then
     exit 1
   fi
   "${codex_env[@]}" \
-    CODEX_HOME="$codex_home" \
     "$node_bin" "$codex_bin" login
   "$node_bin" "$channel_bin" tui-check "${runtime_args[@]}" >/dev/null
 elif ((login_state != 0)); then
@@ -107,12 +113,18 @@ clear_recovery_target() {
 
 snapshot_recovery_target() {
   local minimum_mtime_ms=$1
-  "$node_bin" "$channel_bin" tui-recovery-target snapshot "$minimum_mtime_ms" \
+  local capture_id=$2
+  "$node_bin" "$channel_bin" tui-recovery-target snapshot "$capture_id" "$minimum_mtime_ms" \
     "${runtime_args[@]}" >/dev/null
 }
 
 read_recovery_target() {
-  "$node_bin" "$channel_bin" tui-recovery-target read "${runtime_args[@]}"
+  local capture_id=$1
+  "$node_bin" "$channel_bin" tui-recovery-target read "$capture_id" "${runtime_args[@]}"
+}
+
+new_capture_id() {
+  printf '%s-%s-%s-%s' "$BASHPID" "$RANDOM" "$RANDOM" "$(date +%s%N)"
 }
 
 watcher_pid=''
@@ -151,7 +163,10 @@ while ((SECONDS <= deadline)); do
       rm -f "$watcher_stop"
       (
         while [[ ! -e $watcher_stop ]]; do
-          snapshot_recovery_target "$launch_mtime_ms" 2>/dev/null || true
+          watcher_capture_id=$(new_capture_id)
+          if snapshot_recovery_target "$launch_mtime_ms" "$watcher_capture_id" 2>/dev/null; then
+            :
+          fi
           sleep 0.2
         done
       ) &
@@ -159,15 +174,22 @@ while ((SECONDS <= deadline)); do
 
       set +e
       "${codex_env[@]}" \
-        CODEX_HOME="$codex_home" \
         "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}"
       tui_status=$?
       set -e
       stop_watcher
-      snapshot_recovery_target "$launch_mtime_ms" 2>/dev/null || true
 
       if ((tui_status == 0 || tui_status == 130 || tui_status == 143)); then
         clear_recovery_target
+        exit "$tui_status"
+      fi
+
+      recovery_capture_id=$(new_capture_id)
+      set +e
+      snapshot_recovery_target "$launch_mtime_ms" "$recovery_capture_id" 2>/dev/null
+      recovery_capture_status=$?
+      set -e
+      if ((recovery_capture_status != 0)); then
         exit "$tui_status"
       fi
 
@@ -190,7 +212,7 @@ while ((SECONDS <= deadline)); do
       fi
 
       set +e
-      recovery_thread=$(read_recovery_target 2>/dev/null)
+      recovery_thread=$(read_recovery_target "$recovery_capture_id" 2>/dev/null)
       recovery_target_status=$?
       set -e
       if ((recovery_target_status != 0)) || [[ -z $recovery_thread ]]; then
@@ -213,13 +235,65 @@ while ((SECONDS <= deadline)); do
 
       recovered_args=()
       found_resume=0
-      for arg in "${codex_args[@]}"; do
+      arg_index=0
+      while ((arg_index < ${#codex_args[@]})); do
+        arg=${codex_args[$arg_index]}
         if [[ $arg == resume ]]; then
-          recovered_args+=(resume "$recovery_thread")
+          recovered_args+=(resume)
           found_resume=1
+          arg_index=$((arg_index + 1))
+
+          replaced_resume_operand=0
+          while ((arg_index < ${#codex_args[@]})); do
+            resume_arg=${codex_args[$arg_index]}
+            case $resume_arg in
+              --last)
+                recovered_args+=("$recovery_thread")
+                replaced_resume_operand=1
+                arg_index=$((arg_index + 1))
+                break
+                ;;
+              --)
+                recovered_args+=(-- "$recovery_thread")
+                replaced_resume_operand=1
+                arg_index=$((arg_index + 1))
+                if ((arg_index < ${#codex_args[@]})); then
+                  arg_index=$((arg_index + 1))
+                fi
+                break
+                ;;
+              -c|--config|--enable|--disable|--remote|--remote-auth-token-env|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir)
+                recovered_args+=("$resume_arg")
+                arg_index=$((arg_index + 1))
+                if ((arg_index >= ${#codex_args[@]})); then
+                  break
+                fi
+                recovered_args+=("${codex_args[$arg_index]}")
+                arg_index=$((arg_index + 1))
+                ;;
+              --*=*|-*)
+                recovered_args+=("$resume_arg")
+                arg_index=$((arg_index + 1))
+                ;;
+              *)
+                recovered_args+=("$recovery_thread")
+                replaced_resume_operand=1
+                arg_index=$((arg_index + 1))
+                break
+                ;;
+            esac
+          done
+          if ((replaced_resume_operand == 0)); then
+            recovered_args+=("$recovery_thread")
+          fi
+          while ((arg_index < ${#codex_args[@]})); do
+            recovered_args+=("${codex_args[$arg_index]}")
+            arg_index=$((arg_index + 1))
+          done
           break
         fi
         recovered_args+=("$arg")
+        arg_index=$((arg_index + 1))
       done
       if ((found_resume == 0)); then
         recovered_args+=(resume "$recovery_thread")
