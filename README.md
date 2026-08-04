@@ -227,11 +227,19 @@ codex-discord-channel instance-doctor
 
 Use the instance launcher for the visible TUI. It validates the account login
 and bot configuration, enables and starts both systemd units, waits for the
-instance socket, and only then replaces itself with the matching Codex client:
+instance socket, and then supervises the matching Codex client:
 
 ```bash
 codex-discord-instance codex02
 ```
+
+The supervisor snapshots the one proven active top-level thread while the TUI
+is running. If the app-server process crashes and systemd replaces its Unix
+socket, the supervisor reconnects and resumes that exact thread. It does not
+recover an ordinary Codex command failure, an ambiguous target, a user exit,
+or more than five app-server replacements in one minute. Use the instance
+launcher for recovery; a direct `codex --remote ...` process has no supervising
+parent and exits when its WebSocket transport is reset.
 
 On the first interactive launch, if the Discord instance configuration is
 valid and only the isolated OpenAI account login is missing, the launcher runs
@@ -258,7 +266,7 @@ from `account.env`; this avoids relying on an interactive `nvm` PATH. Copy both
 templates to `$HOME/.config/systemd/user/` and enable the same instance name
 for both units. Keep `account.env` mode `0600`. The visible TUI must use the
 matching account and socket. Prefer the launcher above; the equivalent
-low-level command is:
+low-level command below deliberately has no automatic recovery:
 
 ```bash
 CODEX_HOME="$HOME/.codex-account-02" \
@@ -266,6 +274,28 @@ DISCORD_INSTANCE=codex02 \
 DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
 codex --remote "unix://$HOME/.codex/channels/discord/codex02/app-server.sock"
 ```
+
+### Runtime Updates Without Dropping The TUI
+
+Install plugin revisions into versioned directories. After changing only
+`CODEX_DISCORD_CHANNEL_BIN` in `account.env`, restart the gateway service:
+
+```bash
+systemctl --user restart codex-discord-channel@codex02.service
+```
+
+Do not restart `codex-discord-app-server@codex02.service` from a TUI attached
+to that instance. The app-server is the TUI transport; restarting it terminates
+an unsupervised client immediately and invokes supervisor recovery for a client
+started by `codex-discord-instance`. The bundled app-server unit sets
+`RefuseManualStop=yes` so an accidental `stop` or `restart` fails closed.
+Systemd may still recover an app-server process that crashes on its own.
+
+A planned app-server replacement is a separate maintenance operation: first
+ensure the visible TUI was started by `codex-discord-instance`, preserve its
+exact thread checkpoint, and obtain explicit operator approval. Updating the
+Discord gateway or its dependencies does not require replacing the Codex
+app-server.
 
 The plugin MCP manifest intentionally does not hardcode `codex01`; it inherits
 the instance variables from the selected Codex process and falls back to that

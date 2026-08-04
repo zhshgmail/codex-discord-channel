@@ -135,6 +135,16 @@ test('systemd templates load absolute runtime paths from each instance account f
     assert.match(unit, /--instance %i --state-dir %h\/\.codex\/channels\/discord\/%i/);
     assert.doesNotMatch(unit, /nvm\/versions\/node/);
   }
+  const appServerUnit = fs.readFileSync(
+    path.join(systemdDir, 'codex-discord-app-server@.service'),
+    'utf8',
+  );
+  assert.match(appServerUnit, /^RefuseManualStop=yes$/m);
+  const gatewayUnit = fs.readFileSync(
+    path.join(systemdDir, 'codex-discord-channel@.service'),
+    'utf8',
+  );
+  assert.doesNotMatch(gatewayUnit, /^RefuseManualStop=yes$/m);
 });
 
 test('real app-server entrypoint execs two processes with isolated account and Discord state', () => {

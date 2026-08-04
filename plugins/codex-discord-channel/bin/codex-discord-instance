@@ -88,6 +88,49 @@ if [[ ! $timeout_seconds =~ ^[0-9]+$ ]]; then
   echo "CODEX_DISCORD_START_TIMEOUT_SECONDS must be a non-negative integer" >&2
   exit 2
 fi
+recovery_timeout_seconds=${CODEX_DISCORD_RECOVERY_TIMEOUT_SECONDS:-30}
+if [[ ! $recovery_timeout_seconds =~ ^[0-9]+$ ]] \
+  || ((recovery_timeout_seconds < 1 || recovery_timeout_seconds > 300)); then
+  echo "CODEX_DISCORD_RECOVERY_TIMEOUT_SECONDS must be an integer from 1 to 300" >&2
+  exit 2
+fi
+
+socket_generation() {
+  [[ -S $socket ]] || return 1
+  stat -Lc '%d:%i:%z' "$socket"
+}
+
+clear_recovery_target() {
+  "$node_bin" "$channel_bin" tui-recovery-target clear "${runtime_args[@]}" >/dev/null
+}
+
+snapshot_recovery_target() {
+  local minimum_mtime_ms=$1
+  "$node_bin" "$channel_bin" tui-recovery-target snapshot "$minimum_mtime_ms" \
+    "${runtime_args[@]}" >/dev/null
+}
+
+read_recovery_target() {
+  "$node_bin" "$channel_bin" tui-recovery-target read "${runtime_args[@]}"
+}
+
+watcher_pid=''
+watcher_stop=''
+stop_watcher() {
+  if [[ -n $watcher_stop ]]; then
+    : >"$watcher_stop"
+  fi
+  if [[ -n $watcher_pid ]]; then
+    wait "$watcher_pid" 2>/dev/null || true
+  fi
+  if [[ -n $watcher_stop ]]; then
+    rm -f "$watcher_stop"
+  fi
+  watcher_pid=''
+  watcher_stop=''
+}
+trap stop_watcher EXIT
+
 deadline=$((SECONDS + timeout_seconds))
 while ((SECONDS <= deadline)); do
   if systemctl --user is-active --quiet "$app_service" \
@@ -97,7 +140,102 @@ while ((SECONDS <= deadline)); do
     gateway_pid=$(systemctl --user show --property MainPID --value "$gateway_service")
     "$node_bin" "$channel_bin" live-check "${runtime_args[@]}" \
       --pid "$app_pid" --pid "$gateway_pid" >/dev/null
-    exec "$node_bin" "$channel_bin" tui "${runtime_args[@]}" -- "$@"
+    clear_recovery_target
+    codex_args=("$@")
+    recovery_stamps=()
+    while true; do
+      launch_generation=$(socket_generation)
+      launch_mtime_ms=$(date +%s%3N)
+      watcher_stop=$(mktemp "$state_dir/.tui-recovery-stop.XXXXXX")
+      rm -f "$watcher_stop"
+      (
+        while [[ ! -e $watcher_stop ]]; do
+          snapshot_recovery_target "$launch_mtime_ms" 2>/dev/null || true
+          sleep 0.2
+        done
+      ) &
+      watcher_pid=$!
+
+      set +e
+      env \
+        -u DISCORD_BOT_TOKEN \
+        -u DISCORD_TOKEN \
+        -u DISCORD_BOT_USER_ID \
+        -u DISCORD_BOT_ID \
+        -u CODEX_THREAD_ID \
+        -u CODEX_SESSION_ID \
+        -u CODEX_TARGET_THREAD_ID \
+        -u CODEX_APP_SERVER_SOCKET \
+        CODEX_HOME="$codex_home" \
+        DISCORD_INSTANCE="$instance" \
+        DISCORD_CONFIG_DIR="$state_dir" \
+        "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}"
+      tui_status=$?
+      set -e
+      stop_watcher
+      snapshot_recovery_target "$launch_mtime_ms" 2>/dev/null || true
+
+      if ((tui_status == 0 || tui_status == 130 || tui_status == 143)); then
+        clear_recovery_target
+        exit "$tui_status"
+      fi
+
+      current_generation=$(socket_generation 2>/dev/null || true)
+      if [[ -n $current_generation && $current_generation == "$launch_generation" ]]; then
+        exit "$tui_status"
+      fi
+
+      recovery_deadline=$((SECONDS + recovery_timeout_seconds))
+      next_generation=''
+      while ((SECONDS <= recovery_deadline)); do
+        next_generation=$(socket_generation 2>/dev/null || true)
+        if [[ -n $next_generation && $next_generation != "$launch_generation" ]]; then
+          break
+        fi
+        sleep 0.1
+      done
+      if [[ -z $next_generation || $next_generation == "$launch_generation" ]]; then
+        exit "$tui_status"
+      fi
+
+      set +e
+      recovery_thread=$(read_recovery_target 2>/dev/null)
+      recovery_target_status=$?
+      set -e
+      if ((recovery_target_status != 0)) || [[ -z $recovery_thread ]]; then
+        exit "$tui_status"
+      fi
+
+      now_seconds=$(date +%s)
+      retained_stamps=()
+      for stamp in "${recovery_stamps[@]}"; do
+        if ((now_seconds - stamp < 60)); then
+          retained_stamps+=("$stamp")
+        fi
+      done
+      recovery_stamps=("${retained_stamps[@]}")
+      if ((${#recovery_stamps[@]} >= 5)); then
+        echo "App-server recovery stopped after five replacements in one minute" >&2
+        exit 75
+      fi
+      recovery_stamps+=("$now_seconds")
+
+      recovered_args=()
+      found_resume=0
+      for arg in "${codex_args[@]}"; do
+        if [[ $arg == resume ]]; then
+          recovered_args+=(resume "$recovery_thread")
+          found_resume=1
+          break
+        fi
+        recovered_args+=("$arg")
+      done
+      if ((found_resume == 0)); then
+        recovered_args=(resume "$recovery_thread")
+      fi
+      codex_args=("${recovered_args[@]}")
+      echo "App-server generation changed; resuming thread $recovery_thread." >&2
+    done
   fi
   sleep 0.1
 done
