@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { loadConfig } = require('../../src/config');
 const { callTool, handleRequest, toolList } = require('../../src/mcp-server');
+const { beginReply } = require('../../src/reply-delivery');
 
 const CHANNEL_ID = '100000000000000001';
 const GUILD_ID = '200000000000000001';
@@ -470,6 +471,7 @@ test('send tool suppresses a second reply to the same inbound message', async ()
             return {
               messages: {
                 async fetch(query) {
+                  if (query === 'm1') return { id: 'm1', channelId };
                   if (typeof query === 'string') return messages.get(query) || null;
                   return new Map(messages.entries());
                 },
@@ -510,6 +512,7 @@ test('send tool suppresses a second reply to the same inbound message', async ()
   assert.equal(repeated.structuredContent.reason, 'source_message_already_replied');
   assert.equal(sends.length, 1);
   assert.equal(sends[0].payload.reply.messageReference, 'm1');
+  assert.equal(sends[0].payload.reply.failIfNotExists, true);
   assert.equal(sends[0].payload.enforceNonce, true);
   assert.match(sends[0].payload.nonce, /^cdr-[0-9a-f]{21}$/);
 });
@@ -525,6 +528,7 @@ test('send tool recovers a failed network send without consuming the exact sourc
   const channel = {
     messages: {
       async fetch(query) {
+        if (query === 'm1') return { id: 'm1', channelId: 'c1' };
         if (typeof query === 'string') return messages.get(query) || null;
         return new Map(messages.entries());
       },
@@ -580,4 +584,133 @@ test('send tool recovers a failed network send without consuming the exact sourc
   assert.equal(retry.structuredContent.duplicateSuppressed, false);
   assert.equal(duplicate.structuredContent.duplicateSuppressed, true);
   assert.equal(duplicate.structuredContent.messageId, 'sent-after-retry');
+});
+
+test('send tool creates no message when exact source binding is missing or cross-channel', async () => {
+  for (const source of [null, { id: 'm1', channelId: 'other-channel' }]) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+    const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+    let sendCount = 0;
+    const context = {
+      config,
+      discordState: {
+        started: true,
+        client: {
+          user: { id: 'bot1' },
+          channels: { async fetch() {
+            return {
+              messages: { async fetch() { return source; } },
+              async send() { sendCount += 1; },
+            };
+          } },
+        },
+      },
+    };
+
+    await assert.rejects(callTool(context, 'discord_channel_send', {
+      channelId: 'c1', replyTo: 'm1', content: 'answer',
+    }), /Exact Discord reply source/);
+    assert.equal(sendCount, 0);
+    assert.deepEqual(fs.readdirSync(config.paths.replyReceiptDir), []);
+  }
+});
+
+test('send tool releases a structured Discord 4xx claim for an exact retry', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const messages = new Map();
+  let rejectFirst = true;
+  let sendCount = 0;
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (query === 'm1') return { id: 'm1', channelId: 'c1' };
+        if (typeof query === 'string') return messages.get(query) || null;
+        return new Map(messages.entries());
+      },
+    },
+    async send(payload) {
+      sendCount += 1;
+      if (rejectFirst) {
+        rejectFirst = false;
+        const error = new Error('Invalid Form Body');
+        error.status = 400;
+        error.code = 50035;
+        throw error;
+      }
+      const message = {
+        id: 'retry-id', channelId: 'c1', content: payload.content, nonce: payload.nonce,
+        reference: { messageId: payload.reply.messageReference }, author: { id: 'bot1' },
+      };
+      messages.set(message.id, message);
+      return message;
+    },
+  };
+  const context = {
+    config,
+    discordState: { started: true, client: {
+      user: { id: 'bot1' }, channels: { async fetch() { return channel; } },
+    } },
+  };
+  const args = { channelId: 'c1', replyTo: 'm1', content: 'answer' };
+
+  await assert.rejects(callTool(context, 'discord_channel_send', args), /Invalid Form Body/);
+  assert.deepEqual(fs.readdirSync(config.paths.replyReceiptDir), []);
+  const retry = await callTool(context, 'discord_channel_send', args);
+  assert.equal(sendCount, 2);
+  assert.equal(retry.structuredContent.messageId, 'retry-id');
+});
+
+test('send tool rejects a foreign receipt before Discord network access', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const claimed = await beginReply(config, { channelId: 'c1', sourceMessageId: 'm1' }, 'answer');
+  const foreign = JSON.parse(fs.readFileSync(claimed.file, 'utf8'));
+  foreign.sourceMessageId = 'foreign-source';
+  fs.writeFileSync(claimed.file, `${JSON.stringify(foreign)}\n`);
+  let networkCount = 0;
+  const context = {
+    config,
+    discordState: { started: true, client: {
+      user: { id: 'bot1' },
+      channels: { async fetch() { networkCount += 1; throw new Error('must not fetch'); } },
+    } },
+  };
+
+  const result = await callTool(context, 'discord_channel_send', {
+    channelId: 'c1', replyTo: 'm1', content: 'answer',
+  });
+  assert.equal(networkCount, 0);
+  assert.equal(result.structuredContent.duplicateSuppressed, true);
+  assert.equal(result.structuredContent.reason, 'source_message_reply_receipt_identity_mismatch');
+});
+
+test('send tool cannot reconcile when the expected bot author is unavailable', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const claimed = await beginReply(config, { channelId: 'c1', sourceMessageId: 'm1' }, 'answer');
+  const uncertain = JSON.parse(fs.readFileSync(claimed.file, 'utf8'));
+  uncertain.status = 'uncertain';
+  fs.writeFileSync(claimed.file, `${JSON.stringify(uncertain)}\n`);
+  let sendCount = 0;
+  const context = {
+    config,
+    discordState: { started: true, client: {
+      user: { id: '' },
+      channels: { async fetch() {
+        return {
+          messages: { async fetch() {
+            return { id: 'm1', channelId: 'c1', content: 'answer', nonce: uncertain.nonce,
+              reference: { messageId: 'm1' }, author: { id: 'foreign-bot' } };
+          } },
+          async send() { sendCount += 1; },
+        };
+      } },
+    } },
+  };
+
+  await assert.rejects(callTool(context, 'discord_channel_send', {
+    channelId: 'c1', replyTo: 'm1', content: 'answer',
+  }), /Expected Discord bot author identity is unavailable/);
+  assert.equal(sendCount, 0);
 });

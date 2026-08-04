@@ -93011,29 +93011,81 @@ var require_discord_client = __commonJS({
       if (typeof args.content != "string" || args.content.trim() === "")
         throw new Error("content is required.");
     }
+    function replyProtocolError(code, message) {
+      let error = new Error(message || code);
+      return error.code = code, error;
+    }
+    function expectedBotUserId(client) {
+      return String(client?.user?.id || "").trim();
+    }
+    function requireExpectedBotUserId(client, code) {
+      let botUserId = expectedBotUserId(client);
+      if (!botUserId)
+        throw replyProtocolError(code, "Expected Discord bot author identity is unavailable.");
+      return botUserId;
+    }
+    function isDefinitiveDiscordNoSendError(error) {
+      let status = Number(error?.status ?? error?.statusCode), code = error?.code ?? error?.rawError?.code;
+      return Number.isInteger(status) && status >= 400 && status < 500 && (Number.isInteger(code) || /^\d+$/.test(String(code || "")));
+    }
+    async function fetchExactReplySource(channel, channelId, sourceMessageId) {
+      if (typeof channel?.messages?.fetch != "function")
+        throw replyProtocolError(
+          "reply_source_binding_unavailable",
+          "Exact Discord reply source binding is unavailable."
+        );
+      let source;
+      try {
+        source = await channel.messages.fetch(sourceMessageId);
+      } catch {
+        throw replyProtocolError(
+          "reply_source_binding_failed",
+          "Exact Discord reply source could not be fetched."
+        );
+      }
+      if (String(source?.id || "") !== sourceMessageId || String(source?.channelId || "") !== channelId)
+        throw replyProtocolError(
+          "reply_source_binding_mismatch",
+          "Exact Discord reply source does not belong to the target channel."
+        );
+      return source;
+    }
     async function prepareDiscordMessageSend2(client, args) {
       validateDiscordMessageSend(client, args);
-      let channel = await client.channels.fetch(args.channelId.trim());
+      let channelId = args.channelId.trim(), channel = await client.channels.fetch(channelId);
       if (!channel || typeof channel.send != "function")
         throw new Error("Target channel cannot receive messages.");
       let payload = { content: args.content };
-      return typeof args.nonce == "string" && args.nonce !== "" && (payload.nonce = args.nonce, payload.enforceNonce = args.enforceNonce === !0), typeof args.replyTo == "string" && args.replyTo.trim() !== "" && (payload.reply = { messageReference: args.replyTo.trim(), failIfNotExists: !1 }), { channel, payload };
+      if (typeof args.nonce == "string" && args.nonce !== "" && (payload.nonce = args.nonce, payload.enforceNonce = args.enforceNonce === !0), typeof args.replyTo == "string" && args.replyTo.trim() !== "") {
+        let sourceMessageId = args.replyTo.trim();
+        args.enforceNonce === !0 && requireExpectedBotUserId(client, "reply_confirmation_author_unavailable"), await fetchExactReplySource(channel, channelId, sourceMessageId), payload.reply = { messageReference: sourceMessageId, failIfNotExists: !0 };
+      }
+      return { channel, payload };
     }
     async function sendDiscordMessage2(client, args, prepared = null) {
-      let dispatch = prepared || await prepareDiscordMessageSend2(client, args), { channel, payload } = dispatch, sent = await channel.send(payload);
+      let dispatch = prepared || await prepareDiscordMessageSend2(client, args), { channel, payload } = dispatch, sent;
+      try {
+        sent = await channel.send(payload);
+      } catch (error) {
+        throw isDefinitiveDiscordNoSendError(error) && (error.definitiveNoSend = !0), error;
+      }
+      if (!sent?.id || String(sent.channelId || "") !== String(args.channelId || ""))
+        throw replyProtocolError(
+          "reply_send_response_invalid",
+          "Discord send response did not include the exact target message identity."
+        );
       return { channelId: sent.channelId, messageId: sent.id };
     }
     function messageReplySourceId(message) {
       return String(message?.reference?.messageId || message?.messageReference?.messageId || "");
     }
     function messageMatchesReplyIdentity(client, message, args, expectedMessageId = "") {
-      if (!message || expectedMessageId && String(message.id || "") !== String(expectedMessageId) || String(message.channelId || "") !== String(args.channelId || "") || String(message.nonce || "") !== String(args.nonce || "") || String(message.content || "") !== String(args.content || "") || messageReplySourceId(message) !== String(args.replyTo || "")) return !1;
-      let botUserId = String(client?.user?.id || "");
-      return !botUserId || String(message.author?.id || "") === botUserId;
+      if (!message) return !1;
+      let botUserId = expectedBotUserId(client);
+      return !botUserId || expectedMessageId && String(message.id || "") !== String(expectedMessageId) || String(message.channelId || "") !== String(args.channelId || "") || String(message.nonce || "") !== String(args.nonce || "") || String(message.content || "") !== String(args.content || "") || messageReplySourceId(message) !== String(args.replyTo || "") ? !1 : String(message.author?.id || "") === botUserId;
     }
     function replyConfirmationError(code) {
-      let error = new Error(code);
-      return error.code = code, error;
+      return replyProtocolError(code);
     }
     async function fetchReplyMessage(channel, messageId) {
       if (typeof channel?.messages?.fetch != "function")
@@ -93046,6 +93098,7 @@ var require_discord_client = __commonJS({
       }
     }
     async function confirmDiscordMessage2(client, args, prepared, sent) {
+      requireExpectedBotUserId(client, "reply_confirmation_author_unavailable");
       let channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId), message = await fetchReplyMessage(channel, sent.messageId);
       if (!messageMatchesReplyIdentity(client, message, args, sent.messageId))
         throw replyConfirmationError("reply_confirmation_mismatch");
@@ -93055,6 +93108,7 @@ var require_discord_client = __commonJS({
       return Array.isArray(collection) ? collection : collection && typeof collection.values == "function" ? [...collection.values()] : [];
     }
     async function reconcileDiscordMessage2(client, args, prepared, receipt) {
+      requireExpectedBotUserId(client, "reply_reconciliation_author_unavailable");
       let channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId);
       if (!channel || typeof channel.messages?.fetch != "function")
         throw replyConfirmationError("reply_reconciliation_unavailable");
@@ -93083,6 +93137,7 @@ var require_discord_client = __commonJS({
       resolveReferencedMessage,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2,
+      isDefinitiveDiscordNoSendError,
       validateDiscordMessageSend
     };
   }
@@ -93312,6 +93367,14 @@ var require_reply_delivery = __commonJS({
       let key = createHash("sha256").update(`${channelId}\0${sourceMessageId}`, "utf8").digest("hex");
       return path.join(dir, `${key}.json`);
     }
+    function receiptIdentityMatches(config, file, receipt, identity, nonce) {
+      if (receipt?.version !== RECEIPT_VERSION || receipt.channelId !== identity.channelId || receipt.sourceMessageId !== identity.sourceMessageId || receipt.nonce !== nonce) return !1;
+      try {
+        return path.resolve(receiptPath(config, receipt.channelId, receipt.sourceMessageId)) === path.resolve(file);
+      } catch {
+        return !1;
+      }
+    }
     function readReceipt(file, fsImpl = fs) {
       try {
         let parsed = JSON.parse(fsImpl.readFileSync(file, "utf8")), validV1 = parsed?.version === 1 && typeof parsed.status == "string", validV2 = parsed?.version === RECEIPT_VERSION && ["in_flight", "uncertain", "confirmed"].includes(parsed.status);
@@ -93451,10 +93514,12 @@ var require_reply_delivery = __commonJS({
         let fsImpl = deps.fs || fs, existing = readReceipt(file, fsImpl);
         if (!existing && fsImpl.existsSync(file))
           return suppressResult(identity, null, "source_message_reply_receipt_unreadable");
-        if (receiptStatusIsConfirmed(existing))
-          return suppressResult(identity, existing, "source_message_already_replied");
         if (existing?.version === 1)
           return suppressResult(identity, existing, "source_message_reply_legacy_uncertain");
+        if (existing && !receiptIdentityMatches(config, file, existing, identity, nonce))
+          return suppressResult(identity, existing, "source_message_reply_receipt_identity_mismatch");
+        if (receiptStatusIsConfirmed(existing))
+          return suppressResult(identity, existing, "source_message_already_replied");
         if (existing && existing.contentSha256 !== digest)
           return suppressResult(identity, existing, "source_message_reply_content_mismatch");
         if (existing?.status === "in_flight" && receiptLeaseIsLive(existing, config, deps))
@@ -93491,7 +93556,7 @@ var require_reply_delivery = __commonJS({
     async function transitionReply(config, state, deps, update) {
       return withReceiptLock(state.file, config, deps, async () => {
         let current = readReceipt(state.file, deps.fs || fs);
-        if (!current || current.operationId !== state.receipt.operationId) return current;
+        if (!current || current.operationId !== state.receipt.operationId || current.channelId !== state.receipt.channelId || current.sourceMessageId !== state.receipt.sourceMessageId || current.nonce !== state.receipt.nonce) return current;
         let next = update(current);
         return next === null ? ((deps.fs || fs).rmSync(state.file, { force: !0 }), fsyncDirectory(path.dirname(state.file), deps.fs || fs), null) : (writeReceipt(state.file, next, deps), next);
       });
@@ -93500,13 +93565,23 @@ var require_reply_delivery = __commonJS({
       return transitionReply(config, state, deps, () => null);
     }
     async function completeReply(config, state, sent, deps = {}) {
-      return transitionReply(config, state, deps, (current) => ({
+      let channelId = String(sent?.channelId || ""), messageId = String(sent?.messageId || "");
+      if (channelId !== state.receipt.channelId || !messageId) {
+        let error = new Error("Discord reply confirmation did not match the claimed source identity.");
+        throw error.code = "reply_confirmation_mismatch", error;
+      }
+      let completed = await transitionReply(config, state, deps, (current) => ({
         ...current,
         status: "confirmed",
-        outboundMessageId: sent.messageId,
+        outboundMessageId: messageId,
         confirmedAt: nowIso(deps),
         updatedAt: nowIso(deps)
       }));
+      if (completed?.status !== "confirmed" || completed.channelId !== state.receipt.channelId || completed.sourceMessageId !== state.receipt.sourceMessageId || completed.nonce !== state.receipt.nonce || completed.outboundMessageId !== messageId) {
+        let error = new Error("Discord reply receipt changed before confirmation.");
+        throw error.code = "reply_receipt_changed", error;
+      }
+      return completed;
     }
     async function markReplyUncertain(config, state, error, deps = {}, sent = null) {
       return transitionReply(config, state, deps, (current) => ({
@@ -93559,7 +93634,7 @@ var require_reply_delivery = __commonJS({
           enforceNonce: !0
         });
         await markReplyUncertain(config, state, null, deps, sent);
-        let confirmed = typeof confirmer == "function" ? await confirmer(target, prepared, sent, state.receipt) : sent;
+        let confirmed = await confirmer(target, prepared, sent, state.receipt);
         return await completeReply(config, state, confirmed, deps), {
           ...confirmed,
           sourceMessageId: state.receipt.sourceMessageId,
@@ -93587,11 +93662,22 @@ var require_reply_delivery = __commonJS({
       let identity = {
         channelId: dispatch.target.channelId,
         sourceMessageId: dispatch.sourceMessageId
-      }, sendIdentity = {
-        nonce: replyNonce(identity.channelId, identity.sourceMessageId),
-        enforceNonce: !0
-      }, prepared = typeof preflight == "function" ? await preflight(dispatch.target, sendIdentity) : void 0, state = await beginReply(config, identity, content, deps);
+      }, state = await beginReply(config, identity, content, deps);
       if (state.mode === "suppress") return state.result;
+      if (state.mode === "send" && typeof confirmer != "function") {
+        await releaseReplyClaim(config, state, deps);
+        let error = new Error("Guarded Discord replies require exact readback confirmation.");
+        throw error.code = "reply_confirmation_required", error;
+      }
+      let sendIdentity = {
+        nonce: state.receipt.nonce,
+        enforceNonce: !0
+      }, prepared;
+      try {
+        prepared = typeof preflight == "function" ? await preflight(dispatch.target, sendIdentity) : void 0;
+      } catch (error) {
+        throw state.mode === "send" ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps), error;
+      }
       if (state.mode === "reconcile") {
         if (typeof reconciler != "function") {
           let uncertain = await markReplyUncertain(config, state, null, deps);
@@ -93612,6 +93698,10 @@ var require_reply_delivery = __commonJS({
             reconciled: !0
           };
         if (!replayWindowOpen(state.receipt, config, deps)) {
+          let uncertain = await markReplyUncertain(config, state, null, deps);
+          return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
+        }
+        if (typeof confirmer != "function") {
           let uncertain = await markReplyUncertain(config, state, null, deps);
           return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
         }

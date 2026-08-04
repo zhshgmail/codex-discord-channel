@@ -44,6 +44,19 @@ function receiptPath(config, channelId, sourceMessageId) {
   return path.join(dir, `${key}.json`);
 }
 
+function receiptIdentityMatches(config, file, receipt, identity, nonce) {
+  if (receipt?.version !== RECEIPT_VERSION) return false;
+  if (receipt.channelId !== identity.channelId) return false;
+  if (receipt.sourceMessageId !== identity.sourceMessageId) return false;
+  if (receipt.nonce !== nonce) return false;
+  try {
+    return path.resolve(receiptPath(config, receipt.channelId, receipt.sourceMessageId))
+      === path.resolve(file);
+  } catch {
+    return false;
+  }
+}
+
 function readReceipt(file, fsImpl = fs) {
   try {
     const parsed = JSON.parse(fsImpl.readFileSync(file, 'utf8'));
@@ -230,11 +243,14 @@ async function beginReply(config, identity, content, deps = {}) {
     if (!existing && fsImpl.existsSync(file)) {
       return suppressResult(identity, null, 'source_message_reply_receipt_unreadable');
     }
-    if (receiptStatusIsConfirmed(existing)) {
-      return suppressResult(identity, existing, 'source_message_already_replied');
-    }
     if (existing?.version === 1) {
       return suppressResult(identity, existing, 'source_message_reply_legacy_uncertain');
+    }
+    if (existing && !receiptIdentityMatches(config, file, existing, identity, nonce)) {
+      return suppressResult(identity, existing, 'source_message_reply_receipt_identity_mismatch');
+    }
+    if (receiptStatusIsConfirmed(existing)) {
+      return suppressResult(identity, existing, 'source_message_already_replied');
     }
     if (existing && existing.contentSha256 !== digest) {
       return suppressResult(identity, existing, 'source_message_reply_content_mismatch');
@@ -281,6 +297,11 @@ async function transitionReply(config, state, deps, update) {
   return withReceiptLock(state.file, config, deps, async () => {
     const current = readReceipt(state.file, deps.fs || fs);
     if (!current || current.operationId !== state.receipt.operationId) return current;
+    if (
+      current.channelId !== state.receipt.channelId
+      || current.sourceMessageId !== state.receipt.sourceMessageId
+      || current.nonce !== state.receipt.nonce
+    ) return current;
     const next = update(current);
     if (next === null) {
       (deps.fs || fs).rmSync(state.file, { force: true });
@@ -297,13 +318,32 @@ async function releaseReplyClaim(config, state, deps = {}) {
 }
 
 async function completeReply(config, state, sent, deps = {}) {
-  return transitionReply(config, state, deps, (current) => ({
+  const channelId = String(sent?.channelId || '');
+  const messageId = String(sent?.messageId || '');
+  if (channelId !== state.receipt.channelId || !messageId) {
+    const error = new Error('Discord reply confirmation did not match the claimed source identity.');
+    error.code = 'reply_confirmation_mismatch';
+    throw error;
+  }
+  const completed = await transitionReply(config, state, deps, (current) => ({
     ...current,
     status: 'confirmed',
-    outboundMessageId: sent.messageId,
+    outboundMessageId: messageId,
     confirmedAt: nowIso(deps),
     updatedAt: nowIso(deps),
   }));
+  if (
+    completed?.status !== 'confirmed'
+    || completed.channelId !== state.receipt.channelId
+    || completed.sourceMessageId !== state.receipt.sourceMessageId
+    || completed.nonce !== state.receipt.nonce
+    || completed.outboundMessageId !== messageId
+  ) {
+    const error = new Error('Discord reply receipt changed before confirmation.');
+    error.code = 'reply_receipt_changed';
+    throw error;
+  }
+  return completed;
 }
 
 async function markReplyUncertain(config, state, error, deps = {}, sent = null) {
@@ -363,9 +403,7 @@ async function sendAndConfirm({
       enforceNonce: true,
     });
     await markReplyUncertain(config, state, null, deps, sent);
-    const confirmed = typeof confirmer === 'function'
-      ? await confirmer(target, prepared, sent, state.receipt)
-      : sent;
+    const confirmed = await confirmer(target, prepared, sent, state.receipt);
     await completeReply(config, state, confirmed, deps);
     return {
       ...confirmed,
@@ -403,15 +441,33 @@ async function sendDiscordReplyOnce({
     channelId: dispatch.target.channelId,
     sourceMessageId: dispatch.sourceMessageId,
   };
-  const sendIdentity = {
-    nonce: replyNonce(identity.channelId, identity.sourceMessageId),
-    enforceNonce: true,
-  };
-  const prepared = typeof preflight === 'function'
-    ? await preflight(dispatch.target, sendIdentity)
-    : undefined;
   const state = await beginReply(config, identity, content, deps);
   if (state.mode === 'suppress') return state.result;
+
+  if (state.mode === 'send' && typeof confirmer !== 'function') {
+    await releaseReplyClaim(config, state, deps);
+    const error = new Error('Guarded Discord replies require exact readback confirmation.');
+    error.code = 'reply_confirmation_required';
+    throw error;
+  }
+
+  const sendIdentity = {
+    nonce: state.receipt.nonce,
+    enforceNonce: true,
+  };
+  let prepared;
+  try {
+    prepared = typeof preflight === 'function'
+      ? await preflight(dispatch.target, sendIdentity)
+      : undefined;
+  } catch (error) {
+    if (state.mode === 'send') {
+      await releaseReplyClaim(config, state, deps);
+    } else {
+      await markReplyUncertain(config, state, error, deps);
+    }
+    throw error;
+  }
 
   if (state.mode === 'reconcile') {
     if (typeof reconciler !== 'function') {
@@ -436,6 +492,10 @@ async function sendDiscordReplyOnce({
       };
     }
     if (!replayWindowOpen(state.receipt, config, deps)) {
+      const uncertain = await markReplyUncertain(config, state, null, deps);
+      return suppressResult(identity, uncertain, 'source_message_reply_uncertain').result;
+    }
+    if (typeof confirmer !== 'function') {
       const uncertain = await markReplyUncertain(config, state, null, deps);
       return suppressResult(identity, uncertain, 'source_message_reply_uncertain').result;
     }

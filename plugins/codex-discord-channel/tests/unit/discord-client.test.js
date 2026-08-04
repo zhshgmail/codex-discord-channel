@@ -21,11 +21,12 @@ const {
   reconcileDiscordMessage,
   releaseDiscordReceiverOwnership,
   resolveReferencedMessage,
+  sendDiscordMessage,
   startDiscordClient,
 } = require('../../src/discord-client');
 
 test('guarded Discord sends carry a stable enforced nonce and require exact readback', async () => {
-  const messages = new Map();
+  const messages = new Map([['m1', { id: 'm1', channelId: 'c1' }]]);
   const channel = {
     messages: {
       async fetch(query) {
@@ -61,6 +62,7 @@ test('guarded Discord sends carry a stable enforced nonce and require exact read
   const prepared = await prepareDiscordMessageSend(client, args);
   assert.equal(prepared.payload.nonce, 'cdr-stable');
   assert.equal(prepared.payload.enforceNonce, true);
+  assert.equal(prepared.payload.reply.failIfNotExists, true);
   const sent = await channel.send(prepared.payload);
   assert.deepEqual(await confirmDiscordMessage(client, args, prepared, {
     channelId: sent.channelId,
@@ -102,6 +104,62 @@ test('reply reconciliation requires nonce source content channel and bot identit
   });
   messages.delete('right');
   assert.deepEqual(await reconcileDiscordMessage(client, args, { channel }, {}), { found: false });
+});
+
+test('guarded Discord preflight fails closed for missing or cross-channel sources', async () => {
+  for (const source of [null, { id: 'm1', channelId: 'other-channel' }]) {
+    let sendCount = 0;
+    const channel = {
+      messages: { async fetch() { return source; } },
+      async send() { sendCount += 1; },
+    };
+    const client = {
+      user: { id: 'bot1' },
+      channels: { async fetch() { return channel; } },
+    };
+
+    await assert.rejects(prepareDiscordMessageSend(client, {
+      channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'stable', enforceNonce: true,
+    }), /Exact Discord reply source/);
+    assert.equal(sendCount, 0);
+  }
+});
+
+test('structured Discord 4xx errors release sends but response-loss errors stay uncertain', async () => {
+  const prepared = {
+    channel: {
+      async send() {
+        const error = new Error('Invalid Form Body');
+        error.status = 400;
+        error.code = 50035;
+        throw error;
+      },
+    },
+    payload: { content: 'answer' },
+  };
+  await assert.rejects(
+    sendDiscordMessage({}, { channelId: 'c1' }, prepared),
+    (error) => error.definitiveNoSend === true,
+  );
+
+  prepared.channel.send = async () => { throw new Error('fetch failed after write'); };
+  await assert.rejects(
+    sendDiscordMessage({}, { channelId: 'c1' }, prepared),
+    (error) => error.definitiveNoSend !== true,
+  );
+});
+
+test('reconciliation rejects an unavailable expected bot author before fetching', async () => {
+  let fetchCount = 0;
+  const channel = {
+    messages: { async fetch() { fetchCount += 1; return new Map(); } },
+  };
+  const client = { user: { id: '' }, channels: { async fetch() { return channel; } } };
+
+  await assert.rejects(reconcileDiscordMessage(client, {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'stable', enforceNonce: true,
+  }, { channel }, {}), (error) => error.code === 'reply_reconciliation_author_unavailable');
+  assert.equal(fetchCount, 0);
 });
 
 test('reference resolver fetches references for enabled guild channels', async () => {

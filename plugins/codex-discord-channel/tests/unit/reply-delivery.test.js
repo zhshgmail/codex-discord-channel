@@ -6,7 +6,19 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { beginReply, sendDiscordReplyOnce } = require('../../src/reply-delivery');
+const {
+  beginReply,
+  sendDiscordReplyOnce: sendDiscordReplyOnceRaw,
+} = require('../../src/reply-delivery');
+
+const confirmSent = async (_target, _prepared, sent) => sent;
+
+function sendDiscordReplyOnce(options) {
+  if (options.args?.followup === true || Object.hasOwn(options, 'confirmer')) {
+    return sendDiscordReplyOnceRaw(options);
+  }
+  return sendDiscordReplyOnceRaw({ ...options, confirmer: confirmSent });
+}
 
 function fixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-reply-once-'));
@@ -204,6 +216,65 @@ test('an unreadable durable receipt fails closed instead of being overwritten', 
   assert.equal(result.duplicateSuppressed, true);
   assert.equal(result.reason, 'source_message_reply_receipt_unreadable');
   assert.equal(fs.readFileSync(claimed.file, 'utf8'), '{not-json');
+});
+
+test('foreign receipt channel source and nonce identities fail closed before network', async () => {
+  for (const mutation of [
+    ['channelId', 'foreign-channel'],
+    ['sourceMessageId', 'foreign-source'],
+    ['nonce', 'foreign-nonce'],
+  ]) {
+    const { config } = fixture();
+    const claimed = await beginReply(config, {
+      channelId: 'c1', sourceMessageId: 'm1',
+    }, 'answer');
+    const receipt = JSON.parse(fs.readFileSync(claimed.file, 'utf8'));
+    receipt[mutation[0]] = mutation[1];
+    fs.writeFileSync(claimed.file, `${JSON.stringify(receipt)}\n`);
+    let networkCount = 0;
+
+    const result = await sendDiscordReplyOnceRaw({
+      args: sourceArgs(),
+      config,
+      content: 'answer',
+      preflight: async () => { networkCount += 1; },
+      sender: async () => { networkCount += 1; },
+      confirmer: confirmSent,
+    });
+
+    assert.equal(networkCount, 0, mutation[0]);
+    assert.equal(result.duplicateSuppressed, true, mutation[0]);
+    assert.equal(result.reason, 'source_message_reply_receipt_identity_mismatch', mutation[0]);
+  }
+});
+
+test('a guarded send without a confirmer cannot send or become confirmed', async () => {
+  const { config } = fixture();
+  let sendCount = 0;
+
+  await assert.rejects(sendDiscordReplyOnceRaw({
+    args: sourceArgs(),
+    config,
+    content: 'answer',
+    sender: async () => {
+      sendCount += 1;
+      return { channelId: 'c1', messageId: 'must-not-send' };
+    },
+  }), /require exact readback confirmation/);
+
+  const retry = await sendDiscordReplyOnceRaw({
+    args: sourceArgs(),
+    config,
+    content: 'answer',
+    sender: async () => {
+      sendCount += 1;
+      return { channelId: 'c1', messageId: 'confirmed-after-retry' };
+    },
+    confirmer: confirmSent,
+  });
+
+  assert.equal(sendCount, 1);
+  assert.equal(retry.messageId, 'confirmed-after-retry');
 });
 
 test('preflight failure does not consume the source reply', async () => {
