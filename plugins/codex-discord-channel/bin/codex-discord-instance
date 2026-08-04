@@ -50,6 +50,18 @@ if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin
 fi
 
 runtime_args=(--instance "$instance" --state-dir "$state_dir")
+codex_env=(env)
+while IFS= read -r key; do
+  case $key in
+    DISCORD_*|CODEX_DISCORD_*) codex_env+=(-u "$key") ;;
+  esac
+done < <(compgen -e)
+codex_env+=(
+  -u CODEX_THREAD_ID
+  -u CODEX_SESSION_ID
+  -u CODEX_TARGET_THREAD_ID
+  -u CODEX_APP_SERVER_SOCKET
+)
 set +e
 "$node_bin" "$channel_bin" tui-login-state "${runtime_args[@]}" >/dev/null
 login_state=$?
@@ -59,18 +71,7 @@ if ((login_state == 10)); then
     echo "OpenAI account login for $instance requires an interactive TTY" >&2
     exit 1
   fi
-  env \
-    -u DISCORD_BOT_TOKEN \
-    -u DISCORD_TOKEN \
-    -u DISCORD_BOT_USER_ID \
-    -u DISCORD_BOT_ID \
-    -u DISCORD_INSTANCE \
-    -u DISCORD_CONFIG_DIR \
-    -u CODEX_DISCORD_OWNER_ID \
-    -u CODEX_THREAD_ID \
-    -u CODEX_SESSION_ID \
-    -u CODEX_TARGET_THREAD_ID \
-    -u CODEX_APP_SERVER_SOCKET \
+  "${codex_env[@]}" \
     CODEX_HOME="$codex_home" \
     "$node_bin" "$codex_bin" login
   "$node_bin" "$channel_bin" tui-check "${runtime_args[@]}" >/dev/null
@@ -157,18 +158,8 @@ while ((SECONDS <= deadline)); do
       watcher_pid=$!
 
       set +e
-      env \
-        -u DISCORD_BOT_TOKEN \
-        -u DISCORD_TOKEN \
-        -u DISCORD_BOT_USER_ID \
-        -u DISCORD_BOT_ID \
-        -u CODEX_THREAD_ID \
-        -u CODEX_SESSION_ID \
-        -u CODEX_TARGET_THREAD_ID \
-        -u CODEX_APP_SERVER_SOCKET \
+      "${codex_env[@]}" \
         CODEX_HOME="$codex_home" \
-        DISCORD_INSTANCE="$instance" \
-        DISCORD_CONFIG_DIR="$state_dir" \
         "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}"
       tui_status=$?
       set -e
@@ -231,7 +222,7 @@ while ((SECONDS <= deadline)); do
         recovered_args+=("$arg")
       done
       if ((found_resume == 0)); then
-        recovered_args=(resume "$recovery_thread")
+        recovered_args+=(resume "$recovery_thread")
       fi
       codex_args=("${recovered_args[@]}")
       echo "App-server generation changed; resuming thread $recovery_thread." >&2

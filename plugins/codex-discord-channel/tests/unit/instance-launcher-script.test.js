@@ -56,6 +56,13 @@ function fixture() {
     '  if [[ ${LOGIN_EXIT:-0} != 0 ]]; then exit "$LOGIN_EXIT"; fi',
     '  touch "$LOGIN_MARKER"',
     'fi',
+    'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${CHECK_DISCORD_ENV_CLEAN:-0} == 1 ]]; then',
+    '  while IFS= read -r key; do',
+    '    case $key in',
+    '      DISCORD_*|CODEX_DISCORD_*) printf "leaked environment: %s\\n" "$key" >&2; exit 92 ;;',
+    '    esac',
+    '  done < <(compgen -e)',
+    'fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${TRANSPORT_FAIL_ONCE:-0} == 1 ]]; then',
     '  count=0',
     '  [[ -f $TUI_COUNT ]] && read -r count <"$TUI_COUNT"',
@@ -238,4 +245,39 @@ test('shell launcher resumes the exact captured thread after app-server replacem
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
+});
+
+test('shell launcher strips every Discord-prefixed variable from the Codex child', () => {
+  const setup = fixture();
+  const result = spawnSync(launcher, ['codex02', 'resume', 'thread-2'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      CHECK_DISCORD_ENV_CLEAN: '1',
+      CODEX_DISCORD_UNKNOWN_SECRET: 'unknown-codex-discord-secret',
+      DISCORD_PROXY_URL: 'fixture-proxy-secret',
+      DISCORD_UNKNOWN_SECRET: 'unknown-discord-secret',
+    }),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('recovery appends exact resume while preserving flags from a non-resume launch', () => {
+  const setup = fixture();
+  const result = spawnSync(
+    launcher,
+    ['codex02', '--dangerously-bypass-approvals-and-sandbox', '--profile', 'review'],
+    {
+      encoding: 'utf8',
+      env: launchEnv(setup, { TRANSPORT_FAIL_ONCE: '1' }),
+      timeout: 5000,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+  assert.deepEqual(tuiLaunches, [
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+  ]);
 });

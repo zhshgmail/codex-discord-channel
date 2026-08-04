@@ -51,18 +51,32 @@ function writeAtomic(file, content, dependencies = {}) {
   }
 }
 
+function invalidateRecoveryTarget(file, dependencies = {}) {
+  writeAtomic(file, `${JSON.stringify({
+    version: TARGET_VERSION,
+    status: 'invalid',
+  }, null, 2)}\n`, dependencies);
+}
+
 function captureRecoveryTarget(config, minimumMtimeMs = 0, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
   const files = targetPaths(config);
   let record;
   try {
-    if (minimumMtimeMs && fsImpl.statSync(files.live).mtimeMs < minimumMtimeMs) return false;
+    if (minimumMtimeMs && fsImpl.statSync(files.live).mtimeMs < minimumMtimeMs) {
+      invalidateRecoveryTarget(files.recovery, dependencies);
+      return false;
+    }
     record = parseRecoveryTarget(fsImpl.readFileSync(files.live, 'utf8'));
   } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+    invalidateRecoveryTarget(files.recovery, dependencies);
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+  if (!record) {
+    invalidateRecoveryTarget(files.recovery, dependencies);
     return false;
   }
-  if (!record) return false;
   writeAtomic(files.recovery, `${JSON.stringify(record, null, 2)}\n`, dependencies);
   return true;
 }

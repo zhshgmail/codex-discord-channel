@@ -58,7 +58,37 @@ test('capture binds one exact active thread and read returns only that id', () =
 
 test('capture refuses a checkpoint older than the supervised launch', () => {
   const { config, live } = fixture();
+  assert.equal(captureRecoveryTarget(config), true);
+  assert.equal(readRecoveryThread(config), THREAD_ID);
   const afterLiveWrite = fs.statSync(live).mtimeMs + 1;
   assert.equal(captureRecoveryTarget(config, afterLiveWrite), false);
+  assert.equal(readRecoveryThread(config), '');
+});
+
+test('rejected ambiguous capture atomically invalidates the previously captured thread', () => {
+  const { config, live } = fixture();
+  assert.equal(captureRecoveryTarget(config), true);
+  assert.equal(readRecoveryThread(config), THREAD_ID);
+
+  fs.writeFileSync(live, `${JSON.stringify({
+    version: 1,
+    threadId: THREAD_ID,
+    status: 'active',
+    activeTurnId: 'turn-2',
+    loadedThreadIds: [THREAD_ID, '019f3763-d308-7871-bedc-e6489b02190f'],
+  })}\n`);
+
+  assert.equal(captureRecoveryTarget(config), false);
+  assert.equal(readRecoveryThread(config), '');
+});
+
+test('missing live checkpoint invalidates the previously captured thread', () => {
+  const { config, live } = fixture();
+  assert.equal(captureRecoveryTarget(config), true);
+  assert.equal(readRecoveryThread(config), THREAD_ID);
+
+  fs.unlinkSync(live);
+
+  assert.equal(captureRecoveryTarget(config), false);
   assert.equal(readRecoveryThread(config), '');
 });
