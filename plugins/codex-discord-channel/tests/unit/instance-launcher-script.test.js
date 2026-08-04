@@ -47,7 +47,7 @@ function fixture() {
     `TUI_COUNT_CONST=${shellLiteral(path.join(home, 'tui-count'))}`,
     'if [[ $1 == "$FAKE_CHANNEL_BIN_CONST" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
-    '    clear) rm -f "$STATE_DIR_CONST/tui-recovery-target.json" "$STATE_DIR_CONST/tui-recovery-target.invalid" "$STATE_DIR_CONST/tui-recovery-capture-id"; exit 0 ;;',
+    '    clear) rm -f "$STATE_DIR_CONST/tui-recovery-target.json" "$STATE_DIR_CONST/tui-recovery-target.invalid" "$STATE_DIR_CONST/tui-recovery-target.ready" "$STATE_DIR_CONST/tui-recovery-capture-id"; exit 0 ;;',
     '    snapshot)',
     '      if [[ -f $STATE_DIR_CONST/app-server-target.json ]]; then',
     '        cp "$STATE_DIR_CONST/app-server-target.json" "$STATE_DIR_CONST/tui-recovery-target.json"',
@@ -357,6 +357,62 @@ test('recovery replaces only the resume operand and preserves all trailing argum
 test('recovery preserves variadic image values and replaces only the parsed resume operand', () => {
   const cases = [
     {
+      name: 'repeated mixed image options after resume',
+      args: [
+        'resume',
+        '-i',
+        'one.png',
+        'two.png',
+        '--image',
+        'three.png',
+        'four.png',
+        'old-thread',
+        'prompt',
+      ],
+      recovered: 'resume -i one.png two.png --image three.png four.png 019f3763-d308-7871-bedc-e6489b02190e prompt',
+    },
+    {
+      name: 'repeated short image options after resume',
+      args: ['resume', '-i', 'one.png', 'two.png', '-i', 'three.png', 'four.png', 'old-thread', 'prompt'],
+      recovered: 'resume -i one.png two.png -i three.png four.png 019f3763-d308-7871-bedc-e6489b02190e prompt',
+    },
+    {
+      name: 'repeated long and short image options before resume',
+      args: [
+        '--profile',
+        'before',
+        '--image',
+        'one.png',
+        'two.png',
+        '-i',
+        'three.png',
+        'four.png',
+        'resume',
+        '--sandbox',
+        'read-only',
+        'old-thread',
+        'prompt',
+      ],
+      recovered: '--profile before --image one.png two.png -i three.png four.png resume --sandbox read-only 019f3763-d308-7871-bedc-e6489b02190e prompt',
+    },
+    {
+      name: 'image options before and after resume',
+      args: [
+        '--image',
+        'before-one.png',
+        'before-two.png',
+        'resume',
+        '--profile',
+        'after',
+        '-i',
+        'after-one.png',
+        'after-two.png',
+        'old-thread',
+        'prompt',
+      ],
+      recovered: '--image before-one.png before-two.png resume --profile after -i after-one.png after-two.png 019f3763-d308-7871-bedc-e6489b02190e prompt',
+    },
+    {
       name: 'images after resume',
       args: ['resume', '-i', 'one.png', 'two.png', 'old-thread', 'continue'],
       recovered: 'resume -i one.png two.png 019f3763-d308-7871-bedc-e6489b02190e continue',
@@ -386,6 +442,11 @@ test('recovery preserves variadic image values and replaces only the parsed resu
         'continue',
       ],
       recovered: '--profile before resume --image one.png two.png --sandbox read-only 019f3763-d308-7871-bedc-e6489b02190e continue',
+    },
+    {
+      name: 'terminator after resume',
+      args: ['resume', '-i', 'one.png', 'two.png', '--', 'old-thread', 'prompt'],
+      recovered: 'resume -i one.png two.png -- 019f3763-d308-7871-bedc-e6489b02190e prompt',
     },
   ];
 
@@ -425,6 +486,21 @@ test('recovery appends resume without consuming image values or option values as
       args: ['--profile', 'resume', '-i', 'one.png', 'two.png', 'prompt'],
       recovered: '--profile resume -i one.png two.png prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
     },
+    {
+      name: 'terminator makes resume a positional value',
+      args: ['--image', 'one.png', 'two.png', '--', 'resume', 'old-thread', 'prompt'],
+      recovered: '--image one.png two.png -- resume old-thread prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
+    },
+    {
+      name: 'repeated image options without resume',
+      args: ['-i', 'one.png', 'two.png', '--image', 'three.png', 'four.png', 'prompt'],
+      recovered: '-i one.png two.png --image three.png four.png prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
+    },
+    {
+      name: 'malformed fixed option without resume',
+      args: ['--profile'],
+      recovered: '--profile resume 019f3763-d308-7871-bedc-e6489b02190e',
+    },
   ];
 
   for (const item of cases) {
@@ -443,5 +519,26 @@ test('recovery appends resume without consuming image values or option values as
       `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${item.recovered}`,
       item.name,
     );
+  }
+});
+
+test('recovery fails closed without a second launch for malformed resume options', () => {
+  const cases = [
+    { name: 'image option without a value', args: ['resume', '--image'] },
+    { name: 'fixed option without a value', args: ['resume', '--profile'] },
+  ];
+
+  for (const item of cases) {
+    const setup = fixture();
+    fs.writeFileSync(setup.transportFailMarker, '1\n');
+    const result = spawnSync(launcher, ['codex02', ...item.args], {
+      encoding: 'utf8',
+      env: launchEnv(setup),
+      timeout: 5000,
+    });
+    assert.equal(result.status, 71, `${item.name}: ${result.stderr}`);
+    const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+      .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+    assert.equal(tuiLaunches.length, 1, item.name);
   }
 });

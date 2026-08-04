@@ -202,6 +202,9 @@ reconstruct_recovery_args() {
       break
     fi
     if option_requires_value "$arg"; then
+      if ((arg_index + 1 >= args_count)); then
+        return 1
+      fi
       arg_index=$((arg_index + 2))
       continue
     fi
@@ -211,10 +214,11 @@ reconstruct_recovery_args() {
       while ((block_end < args_count)) && [[ ${codex_args[$block_end]} != -* ]]; do
         block_end=$((block_end + 1))
       done
-      if ((block_end > block_start)); then
-        image_starts+=("$block_start")
-        image_ends+=("$((block_end - 1))")
+      if ((block_end == block_start)); then
+        return 1
       fi
+      image_starts+=("$block_start")
+      image_ends+=("$((block_end - 1))")
       arg_index=$block_end
       continue
     fi
@@ -235,7 +239,7 @@ reconstruct_recovery_args() {
   local -i remaining_positionals=$((2 - definite_positionals))
   ((remaining_positionals < 0)) && remaining_positionals=0
   local -i block_index available take first_positional
-  for ((block_index = 0; block_index < ${#image_starts[@]} && remaining_positionals > 0; block_index += 1)); do
+  for ((block_index = ${#image_starts[@]} - 1; block_index >= 0 && remaining_positionals > 0; block_index -= 1)); do
     block_start=${image_starts[$block_index]}
     block_end=${image_ends[$block_index]}
     available=$((block_end - block_start))
@@ -364,7 +368,9 @@ while ((SECONDS <= deadline)); do
       fi
       recovery_stamps+=("$now_seconds")
 
-      reconstruct_recovery_args "$recovery_thread"
+      if ! reconstruct_recovery_args "$recovery_thread"; then
+        exit "$tui_status"
+      fi
       codex_args=("${recovered_args[@]}")
       echo "App-server generation changed; resuming thread $recovery_thread." >&2
     done

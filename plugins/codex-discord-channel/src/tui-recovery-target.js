@@ -9,6 +9,7 @@ const CAPTURE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
 function targetPaths(config) {
   return {
     live: path.join(config.paths.stateDir, 'app-server-target.json'),
+    publication: path.join(config.paths.stateDir, 'tui-recovery-target.ready'),
     recovery: path.join(config.paths.stateDir, 'tui-recovery-target.json'),
     tombstone: path.join(config.paths.stateDir, 'tui-recovery-target.invalid'),
   };
@@ -77,8 +78,54 @@ function invalidationRecord(captureId) {
   }, null, 2)}\n`;
 }
 
+function publicationRecord(captureId) {
+  return `${JSON.stringify({
+    version: TARGET_VERSION,
+    status: 'published',
+    captureId,
+  }, null, 2)}\n`;
+}
+
+function readPublication(file, dependencies = {}) {
+  const fsImpl = dependencies.fs || fs;
+  let raw;
+  try {
+    raw = fsImpl.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  let record;
+  try {
+    record = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    record?.version !== TARGET_VERSION
+    || record.status !== 'published'
+    || typeof record.captureId !== 'string'
+    || !CAPTURE_ID_PATTERN.test(record.captureId)
+  ) {
+    return null;
+  }
+  return { raw, record };
+}
+
+function tombstoneExists(file, dependencies = {}) {
+  const fsImpl = dependencies.fs || fs;
+  try {
+    fsImpl.statSync(file);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 function replaceRecoveryTarget(files, content, captureId, clearTombstone, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
+  unlinkIfExists(files.publication, dependencies);
   writeAtomic(files.tombstone, invalidationRecord(captureId), dependencies);
   try {
     writeAtomic(files.recovery, content, dependencies);
@@ -93,7 +140,10 @@ function replaceRecoveryTarget(files, content, captureId, clearTombstone, depend
     }
     throw writeError;
   }
-  if (clearTombstone) unlinkIfExists(files.tombstone, { ...dependencies, fs: fsImpl });
+  if (clearTombstone) {
+    unlinkIfExists(files.tombstone, { ...dependencies, fs: fsImpl });
+    writeAtomic(files.publication, publicationRecord(captureId), dependencies);
+  }
 }
 
 function invalidateRecoveryTarget(files, captureId, dependencies = {}) {
@@ -141,12 +191,9 @@ function readRecoveryThread(config, captureIdentity, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
   const captureId = requireCaptureId(captureIdentity);
   const files = targetPaths(config);
-  try {
-    fsImpl.statSync(files.tombstone);
-    return '';
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
+  const firstPublication = readPublication(files.publication, dependencies);
+  if (firstPublication?.record.captureId !== captureId) return '';
+  if (tombstoneExists(files.tombstone, dependencies)) return '';
   let record;
   try {
     record = parseRecoveryTarget(fsImpl.readFileSync(files.recovery, 'utf8'));
@@ -154,18 +201,16 @@ function readRecoveryThread(config, captureIdentity, dependencies = {}) {
     if (error?.code !== 'ENOENT') throw error;
     return '';
   }
-  try {
-    fsImpl.statSync(files.tombstone);
-    return '';
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
+  if (tombstoneExists(files.tombstone, dependencies)) return '';
+  const secondPublication = readPublication(files.publication, dependencies);
+  if (secondPublication?.raw !== firstPublication.raw) return '';
   if (record?.captureId !== captureId) return '';
   return record.threadId || '';
 }
 
 function clearRecoveryTarget(config, dependencies = {}) {
   const files = targetPaths(config);
+  unlinkIfExists(files.publication, dependencies);
   unlinkIfExists(files.recovery, dependencies);
   unlinkIfExists(files.tombstone, dependencies);
 }

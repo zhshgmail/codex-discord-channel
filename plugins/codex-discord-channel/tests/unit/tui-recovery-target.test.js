@@ -10,6 +10,7 @@ const {
   clearRecoveryTarget,
   parseRecoveryTarget,
   readRecoveryThread,
+  targetPaths,
 } = require('../../src/tui-recovery-target');
 
 const THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190e';
@@ -160,6 +161,53 @@ test('failed invalidation tombstones every prior capture even when stale cleanup
   assert.equal(fs.existsSync(tombstone), false);
   assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
 });
+
+for (const failurePoint of ['temp-write', 'rename']) {
+  test(`tombstone ${failurePoint} failure leaves every prior capture unpublished`, () => {
+    const { config } = fixture();
+    assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_A), true);
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_A), THREAD_ID);
+
+    const files = targetPaths(config);
+    const forcedFs = {
+      ...fs,
+      writeFileSync(file, ...args) {
+        if (failurePoint === 'temp-write' && file.startsWith(`${files.tombstone}.tmp-`)) {
+          const error = new Error('forced tombstone temp-write failure');
+          error.code = 'EIO';
+          throw error;
+        }
+        return fs.writeFileSync(file, ...args);
+      },
+      renameSync(source, destination) {
+        if (failurePoint === 'rename' && destination === files.tombstone) {
+          const error = new Error('forced tombstone rename failure');
+          error.code = 'EIO';
+          throw error;
+        }
+        return fs.renameSync(source, destination);
+      },
+    };
+
+    assert.throws(
+      () => captureRecoveryTarget(config, 0, CAPTURE_ID_B, { fs: forcedFs }),
+      (error) => error?.code === 'EIO',
+    );
+    assert.equal(fs.existsSync(files.tombstone), false);
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_A), '');
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
+
+    fs.writeFileSync(files.tombstone, '{');
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_A), '');
+    fs.unlinkSync(files.tombstone);
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_A), '');
+
+    assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_C), true);
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_A), '');
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
+    assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
+  });
+}
 
 test('integer launch threshold rejects a fractional same-millisecond prelaunch checkpoint', () => {
   const { config, live } = fixture();
