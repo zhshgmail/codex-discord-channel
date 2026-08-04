@@ -32,7 +32,7 @@
   },
   "dependencies": {
     "discord.js": "^14.19.3",
-    "undici": "^7.10.0",
+    "undici": "^7.29.0",
     "ws": "^8.21.0"
   },
   "engines": {
@@ -40,10 +40,10 @@
   },
   "overrides": {
     "discord.js": {
-      "undici": "^6.27.0"
+      "undici": "^6.28.0"
     },
     "@discordjs/rest": {
-      "undici": "^6.27.0"
+      "undici": "^6.28.0"
     }
   },
   "devDependencies": {

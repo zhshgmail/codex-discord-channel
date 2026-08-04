@@ -6974,13 +6974,21 @@ var require_request = __commonJS({
           else {
             if (typeof val[i] == "object")
               throw new InvalidArgumentError(`invalid ${key} header`);
-            arr.push(`${val[i]}`);
+            {
+              let str = `${val[i]}`;
+              if (!isValidHeaderValue(str))
+                throw new InvalidArgumentError(`invalid ${key} header`);
+              arr.push(str);
+            }
           }
         val = arr;
       } else if (typeof val == "string") {
         if (!isValidHeaderValue(val))
           throw new InvalidArgumentError(`invalid ${key} header`);
-      } else val === null ? val = "" : val = `${val}`;
+      } else if (val === null)
+        val = "";
+      else if (val = `${val}`, !isValidHeaderValue(val))
+        throw new InvalidArgumentError(`invalid ${key} header`);
       if (headerName === "host") {
         if (request.host !== null)
           throw new InvalidArgumentError("duplicate host header");
@@ -10212,6 +10220,7 @@ var require_client_h1 = __commonJS({
       RequestContentLengthMismatchError,
       ResponseContentLengthMismatchError,
       RequestAbortedError,
+      InvalidArgumentError,
       HeadersTimeoutError,
       HeadersOverflowError,
       SocketError,
@@ -10670,7 +10679,15 @@ var require_client_h1 = __commonJS({
         extractBody || (extractBody = require_body().extractBody);
         let [bodyStream, contentType] = extractBody(body);
         request.contentType == null && headers.push("content-type", contentType), body = bodyStream.stream, contentLength = bodyStream.length;
-      } else util.isBlobLike(body) && request.contentType == null && body.type && headers.push("content-type", body.type);
+      } else if (util.isBlobLike(body) && request.contentType == null) {
+        let contentType = body.type;
+        if (contentType) {
+          let contentTypeValue = `${contentType}`;
+          if (!util.isValidHeaderValue(contentTypeValue))
+            return util.errorRequest(client, request, new InvalidArgumentError("invalid content-type header")), !1;
+          headers.push("content-type", contentTypeValue);
+        }
+      }
       body && typeof body.read == "function" && body.read(0);
       let bodyLength = util.bodyLength(body);
       if (contentLength = bodyLength ?? contentLength, contentLength === null && (contentLength = request.contentLength), contentLength === 0 && !expectsPayload && (contentLength = null), shouldSendContentLength(method) && contentLength > 0 && request.contentLength !== null && request.contentLength !== contentLength) {
@@ -12908,6 +12925,17 @@ var require_retry_handler = __commonJS({
       let retryTime = new Date(retryAfter).getTime();
       return isNaN(retryTime) ? 0 : retryTime - Date.now();
     }
+    function validatePartialResponseContentLength(headers, range, statusCode, retryCount) {
+      let contentLength = headers["content-length"];
+      if (contentLength == null || !Number.isFinite(range.start) || !Number.isFinite(range.end))
+        return;
+      let length = Number(contentLength), expectedLength = range.end - range.start + 1;
+      if (!Number.isFinite(length) || length !== expectedLength)
+        throw new RequestRetryError("Content-Length mismatch", statusCode, {
+          headers,
+          data: { count: retryCount }
+        });
+    }
     var RetryHandler = class _RetryHandler {
       constructor(opts, { dispatch, handler }) {
         let { retryOptions, ...dispatchOpts } = opts, {
@@ -13042,6 +13070,7 @@ var require_retry_handler = __commonJS({
               headers,
               data: { count: this.retryCount }
             });
+          validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount);
           let { start, size, end = size ? size - 1 : null } = contentRange;
           assert(this.start === start, "content-range mismatch"), assert(this.end == null || this.end === end, "content-range mismatch");
           return;
@@ -13058,6 +13087,7 @@ var require_retry_handler = __commonJS({
               );
               return;
             }
+            validatePartialResponseContentLength(headers, range, statusCode, this.retryCount);
             let { start, size, end = size ? size - 1 : null } = range;
             assert(
               start != null && Number.isFinite(start),
@@ -15997,8 +16027,71 @@ var require_cache = __commonJS({
     var {
       safeHTTPMethods,
       pathHasQueryOrFragment,
-      hasSafeIterator
-    } = require_util(), { serializePathWithQuery } = require_util();
+      hasSafeIterator,
+      isValidHTTPToken
+    } = require_util(), { serializePathWithQuery } = require_util(), MAX_DELTA_SECONDS = 2147483647, RESTRICTIVE_DIRECTIVE_NAMES = ["no-store", "private", "no-cache"], kInvalidCacheControlDirectives = /* @__PURE__ */ Symbol("invalid cache-control directives");
+    function trimOWS(value) {
+      return value.replace(/^[\t ]+|[\t ]+$/g, "");
+    }
+    function arrayIncludes(array, value) {
+      for (let i = 0; i < array.length; i++)
+        if (array[i] === value)
+          return !0;
+      return !1;
+    }
+    function trimOWSStart(value) {
+      return value.replace(/^[\t ]+/, "");
+    }
+    function trimOWSEnd(value) {
+      return value.replace(/[\t ]+$/, "");
+    }
+    function findUnescapedQuote(value, start) {
+      let escaped = !1;
+      for (let i = start; i < value.length; i++)
+        if (escaped)
+          escaped = !1;
+        else if (value[i] === "\\")
+          escaped = !0;
+        else if (value[i] === '"')
+          return i;
+      return -1;
+    }
+    function splitCacheControlHeaderValue(value) {
+      let directives = [], start = 0, quoteStart = -1, inQuote = !1, escaped = !1;
+      for (let i = 0; i < value.length; i++)
+        inQuote ? escaped ? escaped = !1 : value[i] === "\\" ? escaped = !0 : value[i] === '"' && (inQuote = !1, quoteStart = -1) : value[i] === '"' ? (inQuote = !0, quoteStart = i) : value[i] === "," && (directives.push({ value: value.substring(start, i), fromMalformedQuote: !1 }), start = i + 1);
+      if (!inQuote)
+        return directives.push({ value: value.substring(start), fromMalformedQuote: !1 }), directives;
+      let tail = value.substring(start), quoteOffset = quoteStart - start, tailStart = 0;
+      for (let i = 0; i < tail.length; i++)
+        tail[i] === "," && (directives.push({
+          value: tail.substring(tailStart, i),
+          fromMalformedQuote: tailStart > quoteOffset
+        }), tailStart = i + 1);
+      return directives.push({
+        value: tail.substring(tailStart),
+        fromMalformedQuote: tailStart > quoteOffset
+      }), directives;
+    }
+    function markInvalidCacheControlDirective(directives, key) {
+      let invalidDirectives = directives[kInvalidCacheControlDirectives];
+      invalidDirectives === void 0 && (invalidDirectives = /* @__PURE__ */ new Set(), Object.defineProperty(directives, kInvalidCacheControlDirectives, {
+        value: invalidDirectives
+      })), invalidDirectives.add(key);
+    }
+    function hasInvalidCacheControlDirective(directives, key) {
+      return directives[kInvalidCacheControlDirectives]?.has(key) === !0;
+    }
+    function getMalformedRestrictiveDirectiveName(key) {
+      for (let directiveName of RESTRICTIVE_DIRECTIVE_NAMES)
+        if (key.startsWith(directiveName) && key.length > directiveName.length && !isValidHTTPToken(key[directiveName.length]))
+          return directiveName;
+      let tokenOnlyKey = "", hasInvalidTokenChar = !1;
+      for (let i = 0; i < key.length; i++)
+        isValidHTTPToken(key[i]) ? tokenOnlyKey += key[i] : hasInvalidTokenChar = !0;
+      if (hasInvalidTokenChar && arrayIncludes(RESTRICTIVE_DIRECTIVE_NAMES, tokenOnlyKey))
+        return tokenOnlyKey;
+    }
     function makeCacheKey(opts) {
       if (!opts.origin)
         throw new Error("opts.origin is undefined");
@@ -16009,6 +16102,10 @@ var require_cache = __commonJS({
         path: fullPath,
         headers: opts.headers
       };
+    }
+    function appendHeader(headers, key, val) {
+      let headerName = key.toLowerCase(), current = headers[headerName], values = Array.isArray(val) ? val : [val];
+      current === void 0 ? headers[headerName] = Array.isArray(val) ? val.slice() : val : Array.isArray(current) ? current.push(...values) : headers[headerName] = [current, ...values];
     }
     function normalizeHeaders(opts) {
       let headers;
@@ -16022,11 +16119,11 @@ var require_cache = __commonJS({
             let [key, val] = x;
             if (typeof key != "string" || typeof val != "string")
               throw new Error("opts.headers is not a valid header map");
-            headers[key.toLowerCase()] = val;
+            appendHeader(headers, key, val);
           }
         else
           for (let key of Object.keys(opts.headers))
-            headers[key.toLowerCase()] = opts.headers[key];
+            appendHeader(headers, key, opts.headers[key]);
       else
         throw new Error("opts.headers is not an object");
       return headers;
@@ -16056,68 +16153,101 @@ var require_cache = __commonJS({
         throw new TypeError(`expected value.etag to be string, got ${typeof value.etag}`);
     }
     function parseCacheControlHeader(header) {
-      let output = {}, directives;
-      if (Array.isArray(header)) {
-        directives = [];
-        for (let directive of header)
-          directives.push(...directive.split(","));
-      } else
-        directives = header.split(",");
+      let output = {}, invalidNumericDirectives = /* @__PURE__ */ new Set(), invalidNoArgumentDirectives = /* @__PURE__ */ new Set(), directives = splitCacheControlHeaderValue(Array.isArray(header) ? header.join(",") : header);
       for (let i = 0; i < directives.length; i++) {
-        let directive = directives[i].toLowerCase(), keyValueDelimiter = directive.indexOf("="), key, value;
-        switch (keyValueDelimiter !== -1 ? (key = directive.substring(0, keyValueDelimiter).trimStart(), value = directive.substring(keyValueDelimiter + 1)) : key = directive.trim(), key) {
+        let directiveRecord = directives[i], directive = directiveRecord.value.toLowerCase(), fromMalformedQuote = directiveRecord.fromMalformedQuote, keyValueDelimiter = directive.indexOf("="), key, value, keyHasTrailingWhitespace = !1, valueHasLeadingWhitespace = !1;
+        if (keyValueDelimiter !== -1) {
+          let rawKey = directive.substring(0, keyValueDelimiter), rawValue = directive.substring(keyValueDelimiter + 1);
+          keyHasTrailingWhitespace = trimOWSEnd(rawKey) !== rawKey, valueHasLeadingWhitespace = trimOWSStart(rawValue) !== rawValue, key = trimOWS(rawKey), value = trimOWSStart(rawValue);
+        } else
+          key = trimOWS(directive);
+        let malformedRestrictiveDirectiveName = getMalformedRestrictiveDirectiveName(key);
+        if (malformedRestrictiveDirectiveName !== void 0) {
+          output[malformedRestrictiveDirectiveName] = !0;
+          continue;
+        }
+        switch (key) {
           case "min-fresh":
           case "max-stale":
           case "max-age":
           case "s-maxage":
           case "stale-while-revalidate":
           case "stale-if-error": {
-            if (value === void 0 || value[0] === " ")
+            if (fromMalformedQuote || invalidNumericDirectives.has(key))
               continue;
-            value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"' && (value = value.substring(1, value.length - 1));
-            let parsedValue = parseInt(value, 10);
-            if (parsedValue !== parsedValue || key === "max-age" && key in output && output[key] >= parsedValue)
+            if (value === void 0 || keyHasTrailingWhitespace || valueHasLeadingWhitespace) {
+              delete output[key], invalidNumericDirectives.add(key), markInvalidCacheControlDirective(output, key);
               continue;
-            output[key] = parsedValue;
+            }
+            if (value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"' && (value = value.substring(1, value.length - 1)), !/^[0-9]+$/.test(value)) {
+              delete output[key], invalidNumericDirectives.add(key), markInvalidCacheControlDirective(output, key);
+              continue;
+            }
+            let parsedValue = Math.min(parseInt(value, 10), MAX_DELTA_SECONDS);
+            key === "min-fresh" ? (!(key in output) || output[key] < parsedValue) && (output[key] = parsedValue) : (!(key in output) || output[key] > parsedValue) && (output[key] = parsedValue);
             break;
           }
           case "private":
-          case "no-cache":
+          case "no-cache": {
+            if (fromMalformedQuote) {
+              output[key] = !0;
+              break;
+            }
+            if (value !== void 0 && value.length === 0) {
+              output[key] = !0;
+              break;
+            }
             if (value) {
               if (value[0] === '"') {
-                let headers = [value.substring(1)], foundEndingQuote = value[value.length - 1] === '"';
-                if (!foundEndingQuote)
+                value = trimOWSEnd(value);
+                let fieldList = "", lastQuotedPart = i, foundEndingQuote = !1, closingQuote = findUnescapedQuote(value, 1);
+                if (closingQuote !== -1)
+                  fieldList = value.substring(1, closingQuote), foundEndingQuote = !0;
+                else {
+                  let fieldListParts = [value.substring(1)];
                   for (let j = i + 1; j < directives.length; j++) {
-                    let nextPart = directives[j], nextPartLength = nextPart.length;
-                    if (headers.push(nextPart.trim()), nextPartLength !== 0 && nextPart[nextPartLength - 1] === '"') {
-                      foundEndingQuote = !0;
+                    let nextPart = trimOWS(directives[j].value), closingQuote2 = findUnescapedQuote(nextPart, 0);
+                    if (lastQuotedPart = j, closingQuote2 !== -1) {
+                      fieldListParts.push(nextPart.substring(0, closingQuote2)), foundEndingQuote = !0;
                       break;
                     }
+                    fieldListParts.push(nextPart);
                   }
-                if (foundEndingQuote) {
-                  let lastHeader = headers[headers.length - 1];
-                  lastHeader[lastHeader.length - 1] === '"' && (lastHeader = lastHeader.substring(0, lastHeader.length - 1), headers[headers.length - 1] = lastHeader);
-                  for (let j = 0; j < headers.length; j++)
-                    headers[j] = headers[j].trim();
-                  key in output ? output[key] = output[key].concat(headers) : output[key] = headers;
+                  fieldList = fieldListParts.join(",");
                 }
+                if (!foundEndingQuote) {
+                  output[key] = !0;
+                  break;
+                }
+                i = lastQuotedPart;
+                let headers = fieldList.split(","), validFieldNames = !0;
+                for (let j = 0; j < headers.length; j++)
+                  headers[j] = trimOWS(headers[j]), isValidHTTPToken(headers[j]) || (validFieldNames = !1);
+                validFieldNames ? output[key] !== !0 && (key in output ? output[key] = output[key].concat(headers) : output[key] = headers) : output[key] = !0;
               } else {
-                let fieldName = value.trim();
-                key in output ? output[key] = output[key].concat(fieldName) : output[key] = [fieldName];
+                let fieldName = trimOWS(value);
+                isValidHTTPToken(fieldName) ? output[key] !== !0 && (key in output ? output[key] = output[key].concat(fieldName) : output[key] = [fieldName]) : output[key] = !0;
               }
               break;
             }
+          }
           // eslint-disable-next-line no-fallthrough
           case "public":
-          case "no-store":
           case "must-revalidate":
           case "proxy-revalidate":
           case "immutable":
           case "no-transform":
           case "must-understand":
           case "only-if-cached":
-            if (value)
+            if (fromMalformedQuote || invalidNoArgumentDirectives.has(key))
               continue;
+            if (value !== void 0) {
+              delete output[key], invalidNoArgumentDirectives.add(key);
+              continue;
+            }
+            output[key] = !0;
+            break;
+          case "no-store":
             output[key] = !0;
             break;
           default:
@@ -16126,18 +16256,42 @@ var require_cache = __commonJS({
       }
       return output;
     }
+    function splitVaryHeader(varyHeader) {
+      let values = Array.isArray(varyHeader) ? varyHeader : [varyHeader], output = [];
+      for (let i = 0; i < values.length; i++) {
+        let parts = values[i].split(",");
+        for (let j = 0; j < parts.length; j++)
+          output.push(parts[j]);
+      }
+      return output;
+    }
+    function hasVaryStar(varyHeader) {
+      let values = splitVaryHeader(varyHeader);
+      for (let i = 0; i < values.length; i++)
+        if (trimOWS(values[i]).indexOf("*") !== -1)
+          return !0;
+      return !1;
+    }
     function parseVaryHeader(varyHeader, headers) {
-      if (typeof varyHeader == "string" && varyHeader.includes("*"))
+      if (hasVaryStar(varyHeader))
         return headers;
       let output = (
         /** @type {Record<string, string | string[] | null>} */
         {}
-      ), varyingHeaders = typeof varyHeader == "string" ? varyHeader.split(",") : varyHeader;
+      ), varyingHeaders = splitVaryHeader(varyHeader);
       for (let header of varyingHeaders) {
-        let trimmedHeader = header.trim().toLowerCase();
-        output[trimmedHeader] = headers[trimmedHeader] ?? null;
+        let trimmedHeader = trimOWS(header).toLowerCase();
+        if (trimmedHeader.length === 0)
+          continue;
+        if (!isValidHTTPToken(trimmedHeader))
+          return;
+        let headerValue = headers[trimmedHeader];
+        output[trimmedHeader] = Array.isArray(headerValue) ? headerValue.slice() : headerValue ?? null;
       }
       return output;
+    }
+    function isInvalidOrWildcardVaryHeader(varyHeader) {
+      return hasVaryStar(varyHeader) || parseVaryHeader(varyHeader, {}) === void 0;
     }
     function isEtagUsable(etag) {
       return etag.length <= 2 ? !1 : etag[0] === '"' && etag[etag.length - 1] === '"' ? !(etag[1] === '"' || etag.startsWith('"W/')) : etag.startsWith('W/"') && etag[etag.length - 1] === '"' ? etag.length !== 4 : !1;
@@ -16155,7 +16309,7 @@ var require_cache = __commonJS({
       if (methods.length === 0)
         throw new TypeError(`${name} needs to have at least one method`);
       for (let method of methods)
-        if (!safeHTTPMethods.includes(method))
+        if (!arrayIncludes(safeHTTPMethods, method))
           throw new TypeError(`element of ${name}-array needs to be one of following values: ${safeHTTPMethods.join(", ")}, got ${method}`);
     }
     function makeDeduplicationKey(cacheKey, excludeHeaders) {
@@ -16173,7 +16327,10 @@ var require_cache = __commonJS({
       assertCacheKey,
       assertCacheValue,
       parseCacheControlHeader,
+      hasInvalidCacheControlDirective,
       parseVaryHeader,
+      hasVaryStar,
+      isInvalidOrWildcardVaryHeader,
       isEtagUsable,
       assertCacheMethods,
       assertCacheStore,
@@ -16195,6 +16352,10 @@ var require_date = __commonJS({
         default:
           return parseRfc850Date(date);
       }
+    }
+    function makeDate(year, monthIdx, day, hour, minute, second, weekday) {
+      let result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
+      return year >= 0 && year <= 99 && result.setUTCFullYear(year), result.getUTCFullYear() === year && result.getUTCMonth() === monthIdx && result.getUTCDate() === day && result.getUTCHours() === hour && result.getUTCMinutes() === minute && result.getUTCSeconds() === second && result.getUTCDay() === weekday ? result : void 0;
     }
     function parseImfDate(date) {
       if (date.length !== 29 || date[4] !== " " || date[7] !== " " || date[11] !== " " || date[16] !== " " || date[19] !== ":" || date[22] !== ":" || date[25] !== " " || date[26] !== "G" || date[27] !== "M" || date[28] !== "T")
@@ -16329,8 +16490,7 @@ var require_date = __commonJS({
           return;
         second = (code1 - 48) * 10 + (code2 - 48);
       }
-      let result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
-      return result.getUTCDay() === weekday ? result : void 0;
+      return makeDate(year, monthIdx, day, hour, minute, second, weekday);
     }
     function parseAscTimeDate(date) {
       if (date.length !== 24 || date[7] !== " " || date[10] !== " " || date[19] !== " ")
@@ -16465,8 +16625,8 @@ var require_date = __commonJS({
       let yearDigit4 = date.charCodeAt(23);
       if (yearDigit4 < 48 || yearDigit4 > 57)
         return;
-      let year = (yearDigit1 - 48) * 1e3 + (yearDigit2 - 48) * 100 + (yearDigit3 - 48) * 10 + (yearDigit4 - 48), result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
-      return result.getUTCDay() === weekday ? result : void 0;
+      let year = (yearDigit1 - 48) * 1e3 + (yearDigit2 - 48) * 100 + (yearDigit3 - 48) * 10 + (yearDigit4 - 48);
+      return makeDate(year, monthIdx, day, hour, minute, second, weekday);
     }
     function parseRfc850Date(date) {
       let commaIndex = -1, weekday = -1;
@@ -16579,8 +16739,7 @@ var require_date = __commonJS({
           return;
         second = (code1 - 48) * 10 + (code2 - 48);
       }
-      let result = new Date(Date.UTC(year, monthIdx, day, hour, minute, second));
-      return result.getUTCDay() === weekday ? result : void 0;
+      return makeDate(year, monthIdx, day, hour, minute, second, weekday);
     }
     module2.exports = {
       parseHttpDate
@@ -16594,7 +16753,10 @@ var require_cache_handler = __commonJS({
     "use strict";
     var util = require_util(), {
       parseCacheControlHeader,
+      hasInvalidCacheControlDirective,
       parseVaryHeader,
+      hasVaryStar,
+      isInvalidOrWildcardVaryHeader,
       isEtagUsable
     } = require_cache(), { parseHttpDate } = require_date();
     function noop() {
@@ -16614,7 +16776,63 @@ var require_cache_handler = __commonJS({
       501
     ], NOT_UNDERSTOOD_STATUS_CODES = [
       206
-    ], MAX_RESPONSE_AGE = 2147483647e3, CacheHandler = class {
+    ], MAX_RESPONSE_AGE = 2147483647e3;
+    function trimOWS(value) {
+      return value.replace(/^[\t ]+|[\t ]+$/g, "");
+    }
+    function arrayIncludes(array, value) {
+      for (let i = 0; i < array.length; i++)
+        if (array[i] === value)
+          return !0;
+      return !1;
+    }
+    function appendConnectionHeaderTokens(headersToRemove, connectionHeader) {
+      let values = Array.isArray(connectionHeader) ? connectionHeader : [connectionHeader];
+      for (let i = 0; i < values.length; i++) {
+        let tokens = values[i].split(",");
+        for (let j = 0; j < tokens.length; j++)
+          headersToRemove.push(trimOWS(tokens[j]).toLowerCase());
+      }
+    }
+    function getSameOriginPath(cacheKey, location) {
+      if (typeof location != "string")
+        return;
+      let originUrl, requestUrl, locationUrl;
+      try {
+        originUrl = new URL(cacheKey.origin), requestUrl = new URL(cacheKey.path, originUrl), locationUrl = new URL(location, requestUrl);
+      } catch {
+        return;
+      }
+      if (locationUrl.origin === originUrl.origin)
+        return locationUrl.pathname + locationUrl.search;
+    }
+    function deleteCachedUri(store, cacheKey, path) {
+      deleteCachedValue(store, {
+        ...cacheKey,
+        path
+      });
+      for (let i = 0; i < util.safeHTTPMethods.length; i++) {
+        let method = util.safeHTTPMethods[i];
+        method !== cacheKey.method && deleteCachedValue(store, {
+          ...cacheKey,
+          method,
+          path
+        });
+      }
+    }
+    function deleteLocationTargets(store, cacheKey, headerValue) {
+      if (headerValue === void 0)
+        return;
+      let values = Array.isArray(headerValue) ? headerValue : [headerValue];
+      for (let i = 0; i < values.length; i++) {
+        let path = getSameOriginPath(cacheKey, values[i]);
+        path !== void 0 && deleteCachedUri(store, cacheKey, path);
+      }
+    }
+    function invalidateUnsafeRequest(store, cacheKey, resHeaders) {
+      deleteCachedUri(store, cacheKey, cacheKey.path), deleteLocationTargets(store, cacheKey, resHeaders.location), deleteLocationTargets(store, cacheKey, resHeaders["content-location"]);
+    }
+    var CacheHandler = class {
       /**
        * @type {import('../../types/cache-interceptor.d.ts').default.CacheKey}
        */
@@ -16666,38 +16884,36 @@ var require_cache_handler = __commonJS({
           resHeaders,
           statusMessage
         ), handler = this;
-        if (!util.safeHTTPMethods.includes(this.#cacheKey.method) && statusCode >= 200 && statusCode <= 399) {
-          try {
-            this.#store.delete(this.#cacheKey)?.catch?.(noop);
-          } catch {
-          }
-          return downstreamOnHeaders();
-        }
-        let cacheControlHeader = resHeaders["cache-control"], heuristicallyCacheable = resHeaders["last-modified"] && HEURISTICALLY_CACHEABLE_STATUS_CODES.includes(statusCode);
+        if (!arrayIncludes(util.safeHTTPMethods, this.#cacheKey.method) && statusCode >= 200 && statusCode <= 399)
+          return invalidateUnsafeRequest(this.#store, this.#cacheKey, resHeaders), downstreamOnHeaders();
+        let cacheControlHeader = resHeaders["cache-control"], heuristicallyCacheable = resHeaders["last-modified"] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode);
         if (!cacheControlHeader && !resHeaders.expires && !heuristicallyCacheable && !this.#cacheByDefault)
-          return downstreamOnHeaders();
+          return statusCode === 304 && resHeaders.vary && isInvalidOrWildcardVaryHeader(resHeaders.vary) && deleteCachedValue(this.#store, this.#cacheKey), downstreamOnHeaders();
         let cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {};
         if (!canCacheResponse(this.#cacheType, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers))
-          return downstreamOnHeaders();
-        let now = Date.now(), resAge = resHeaders.age ? getAge(resHeaders.age) : void 0;
-        if (resAge && resAge >= MAX_RESPONSE_AGE)
-          return downstreamOnHeaders();
-        let resDate = typeof resHeaders.date == "string" ? parseHttpDate(resHeaders.date) : void 0, staleAt = determineStaleAt(this.#cacheType, now, resAge, resHeaders, resDate, cacheControlDirectives) ?? this.#cacheByDefault;
-        if (staleAt === void 0 || resAge && resAge > staleAt)
-          return downstreamOnHeaders();
-        let baseTime = resDate ? resDate.getTime() : now, absoluteStaleAt = staleAt + baseTime;
+          return statusCode === 304 && (cacheControlHeader || revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives)) && deleteCachedValue(this.#store, this.#cacheKey), downstreamOnHeaders();
+        let now = Date.now(), resAge = Object.hasOwn(resHeaders, "age") ? getAge(resHeaders.age) : void 0;
+        if (resAge !== void 0 && resAge >= MAX_RESPONSE_AGE)
+          return deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey), downstreamOnHeaders();
+        let resDate = Object.hasOwn(resHeaders, "date") ? getDate(resHeaders.date) : void 0;
+        if (resDate === null)
+          return deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey), downstreamOnHeaders();
+        let apparentAge = resDate ? Math.max(0, now - resDate.getTime()) : 0, currentAge = Math.max(apparentAge, resAge ?? 0), staleAt = determineStaleAt(this.#cacheType, now, resAge, resHeaders, resDate, cacheControlDirectives) ?? this.#cacheByDefault;
+        if (staleAt === void 0 || currentAge >= staleAt)
+          return (cacheControlHeader || staleAt !== void 0) && deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey), downstreamOnHeaders();
+        let baseTime = now - currentAge, absoluteStaleAt = staleAt + baseTime;
         if (now >= absoluteStaleAt)
-          return downstreamOnHeaders();
+          return deleteCachedValueIfNotModified(statusCode, this.#store, this.#cacheKey), downstreamOnHeaders();
         let varyDirectives;
         if (this.#cacheKey.headers && resHeaders.vary && (varyDirectives = parseVaryHeader(resHeaders.vary, this.#cacheKey.headers), !varyDirectives))
           return downstreamOnHeaders();
-        let deleteAt = determineDeleteAt(baseTime, cacheControlDirectives, absoluteStaleAt), strippedHeaders = stripNecessaryHeaders(resHeaders, cacheControlDirectives), value = {
+        let cachedAt = baseTime, deleteAt = determineDeleteAt(baseTime, now, cacheControlDirectives, absoluteStaleAt), strippedHeaders = stripNecessaryHeaders(resHeaders, cacheControlDirectives), value = {
           statusCode,
           statusMessage,
           headers: strippedHeaders,
           vary: varyDirectives,
           cacheControlDirectives,
-          cachedAt: resAge ? now - resAge : now,
+          cachedAt,
           staleAt: absoluteStaleAt,
           deleteAt
         };
@@ -16705,7 +16921,7 @@ var require_cache_handler = __commonJS({
           let handle304 = (cachedValue) => {
             if (!cachedValue)
               return downstreamOnHeaders();
-            if (value.statusCode = cachedValue.statusCode, value.statusMessage = cachedValue.statusMessage, value.etag = cachedValue.etag, value.headers = { ...cachedValue.headers, ...strippedHeaders }, downstreamOnHeaders(), this.#writeStream = this.#store.createWriteStream(this.#cacheKey, value), !(!this.#writeStream || !cachedValue?.body))
+            if (value.statusCode = cachedValue.statusCode, value.statusMessage = cachedValue.statusMessage, value.etag = cachedValue.etag, value.vary = varyDirectives ?? cachedValue.vary, value.headers = { ...cachedValue.headers, ...strippedHeaders }, downstreamOnHeaders(), this.#writeStream = this.#store.createWriteStream(this.#cacheKey, value), !(!this.#writeStream || !cachedValue?.body))
               if (typeof cachedValue.body.values == "function") {
                 let bodyIterator = cachedValue.body.values(), streamCachedBody = () => {
                   for (let chunk of bodyIterator) {
@@ -16754,41 +16970,83 @@ var require_cache_handler = __commonJS({
         this.#writeStream?.destroy(err), this.#writeStream = void 0, this.#handler.onResponseError?.(controller, err);
       }
     };
+    function deleteCachedValue(store, cacheKey) {
+      try {
+        store.delete(cacheKey)?.catch?.(noop);
+      } catch {
+      }
+    }
+    function deleteCachedValueIfNotModified(statusCode, store, cacheKey) {
+      statusCode === 304 && deleteCachedValue(store, cacheKey);
+    }
+    function revalidationResponseDisallowsCachedReuse(cacheType, resHeaders, cacheControlDirectives) {
+      return cacheControlDirectives["no-store"] === !0 || cacheType === "shared" && cacheControlDirectives.private === !0 || (resHeaders.vary ? isInvalidOrWildcardVaryHeader(resHeaders.vary) : !1);
+    }
     function canCacheResponse(cacheType, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
-      return !(statusCode < 200 || NOT_UNDERSTOOD_STATUS_CODES.includes(statusCode) || !HEURISTICALLY_CACHEABLE_STATUS_CODES.includes(statusCode) && !resHeaders.expires && !cacheControlDirectives.public && cacheControlDirectives["max-age"] === void 0 && // RFC 9111: a private response directive, if the cache is not shared
-      !(cacheControlDirectives.private && cacheType === "private") && !(cacheControlDirectives["s-maxage"] !== void 0 && cacheType === "shared") || cacheControlDirectives["no-store"] || cacheType === "shared" && cacheControlDirectives.private === !0 || resHeaders.vary?.includes("*") || reqHeaders?.authorization && (!cacheControlDirectives.public && !cacheControlDirectives["s-maxage"] && !cacheControlDirectives["must-revalidate"] || typeof reqHeaders.authorization != "string" || Array.isArray(cacheControlDirectives["no-cache"]) && cacheControlDirectives["no-cache"].includes("authorization") || Array.isArray(cacheControlDirectives.private) && cacheControlDirectives.private.includes("authorization")));
+      return !(statusCode < 200 || arrayIncludes(NOT_UNDERSTOOD_STATUS_CODES, statusCode) || !arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode) && !resHeaders.expires && !cacheControlDirectives.public && cacheControlDirectives["max-age"] === void 0 && // RFC 9111: a private response directive, if the cache is not shared
+      !(cacheControlDirectives.private && cacheType === "private") && !(cacheControlDirectives["s-maxage"] !== void 0 && cacheType === "shared") || cacheControlDirectives["no-store"] || cacheType === "shared" && cacheControlDirectives.private === !0 || resHeaders.vary && hasVaryStar(resHeaders.vary) || reqHeaders != null && Object.hasOwn(reqHeaders, "authorization") && (!cacheControlDirectives.public && !cacheControlDirectives["s-maxage"] && !cacheControlDirectives["must-revalidate"] || typeof reqHeaders.authorization != "string" || Array.isArray(cacheControlDirectives["no-cache"]) && arrayIncludes(cacheControlDirectives["no-cache"], "authorization") || Array.isArray(cacheControlDirectives.private) && arrayIncludes(cacheControlDirectives.private, "authorization")));
+    }
+    function getDate(dateHeader) {
+      let dateValue = dateHeader;
+      if (Array.isArray(dateValue)) {
+        if (dateValue.length !== 1)
+          return null;
+        dateValue = dateValue[0];
+      }
+      return typeof dateValue != "string" ? null : parseHttpDate(dateValue);
     }
     function getAge(ageHeader) {
-      let age = parseInt(Array.isArray(ageHeader) ? ageHeader[0] : ageHeader);
-      return isNaN(age) ? void 0 : age * 1e3;
+      let ageValue = ageHeader;
+      if (Array.isArray(ageValue)) {
+        if (ageValue.length !== 1)
+          return MAX_RESPONSE_AGE;
+        ageValue = ageValue[0];
+      }
+      if (typeof ageValue != "string" || !/^[\t ]*[0-9]+[\t ]*$/.test(ageValue))
+        return MAX_RESPONSE_AGE;
+      let age = BigInt(ageValue.replace(/^[\t ]+|[\t ]+$/g, ""));
+      return age >= BigInt(MAX_RESPONSE_AGE / 1e3) ? MAX_RESPONSE_AGE : Number(age) * 1e3;
     }
     function determineStaleAt(cacheType, now, age, resHeaders, responseDate, cacheControlDirectives) {
       if (cacheType === "shared") {
+        if (hasInvalidCacheControlDirective(cacheControlDirectives, "s-maxage"))
+          return 0;
         let sMaxAge = cacheControlDirectives["s-maxage"];
         if (sMaxAge !== void 0)
-          return sMaxAge > 0 ? sMaxAge * 1e3 : void 0;
+          return sMaxAge * 1e3;
       }
+      if (hasInvalidCacheControlDirective(cacheControlDirectives, "max-age"))
+        return 0;
       let maxAge = cacheControlDirectives["max-age"];
       if (maxAge !== void 0)
-        return maxAge > 0 ? maxAge * 1e3 : void 0;
-      if (typeof resHeaders.expires == "string") {
+        return maxAge * 1e3;
+      if (Object.hasOwn(resHeaders, "expires")) {
+        if (typeof resHeaders.expires != "string")
+          return 0;
         let expiresDate = parseHttpDate(resHeaders.expires);
-        if (expiresDate)
-          return now >= expiresDate.getTime() || responseDate && (responseDate >= expiresDate || age !== void 0 && age > expiresDate - responseDate) ? void 0 : expiresDate.getTime() - now;
+        if (!expiresDate || now >= expiresDate.getTime())
+          return 0;
+        if (responseDate) {
+          if (responseDate >= expiresDate)
+            return 0;
+          let freshnessLifetime = expiresDate.getTime() - responseDate.getTime();
+          return age !== void 0 && age >= freshnessLifetime ? 0 : freshnessLifetime;
+        }
+        return expiresDate.getTime() - now;
       }
       if (typeof resHeaders["last-modified"] == "string") {
-        let lastModified = new Date(resHeaders["last-modified"]);
-        if (isValidDate(lastModified))
+        let lastModified = parseHttpDate(resHeaders["last-modified"]);
+        if (lastModified)
           return lastModified.getTime() >= now ? void 0 : (now - lastModified.getTime()) * 0.1;
       }
       if (cacheControlDirectives.immutable)
-        return 31536e3;
+        return 31536e6;
     }
-    function determineDeleteAt(now, cacheControlDirectives, staleAt) {
+    function determineDeleteAt(baseTime, cachedAt, cacheControlDirectives, staleAt) {
       let staleWhileRevalidate = -1 / 0, staleIfError = -1 / 0, immutable = -1 / 0;
-      if (cacheControlDirectives["stale-while-revalidate"] && (staleWhileRevalidate = staleAt + cacheControlDirectives["stale-while-revalidate"] * 1e3), cacheControlDirectives["stale-if-error"] && (staleIfError = staleAt + cacheControlDirectives["stale-if-error"] * 1e3), cacheControlDirectives.immutable && staleWhileRevalidate === -1 / 0 && staleIfError === -1 / 0 && (immutable = now + 31536e6), staleWhileRevalidate === -1 / 0 && staleIfError === -1 / 0 && immutable === -1 / 0) {
-        let freshnessLifetime = staleAt - now;
-        return staleAt + freshnessLifetime;
+      if (cacheControlDirectives["stale-while-revalidate"] && (staleWhileRevalidate = staleAt + cacheControlDirectives["stale-while-revalidate"] * 1e3), cacheControlDirectives["stale-if-error"] && (staleIfError = staleAt + cacheControlDirectives["stale-if-error"] * 1e3), cacheControlDirectives.immutable && staleWhileRevalidate === -1 / 0 && staleIfError === -1 / 0 && (immutable = cachedAt + 31536e6), staleWhileRevalidate === -1 / 0 && staleIfError === -1 / 0 && immutable === -1 / 0) {
+        let freshnessLifetime = staleAt - baseTime, datePrecisionPadding = Math.min(Math.max(cachedAt - baseTime, 0), 1e3);
+        return staleAt + freshnessLifetime + datePrecisionPadding;
       }
       return Math.max(staleAt, staleWhileRevalidate, staleIfError, immutable);
     }
@@ -16805,14 +17063,11 @@ var require_cache_handler = __commonJS({
         // We'll add age back when serving it
         "age"
       ];
-      resHeaders.connection && (Array.isArray(resHeaders.connection) ? headersToRemove.push(...resHeaders.connection.map((header) => header.trim())) : headersToRemove.push(...resHeaders.connection.split(",").map((header) => header.trim()))), Array.isArray(cacheControlDirectives["no-cache"]) && headersToRemove.push(...cacheControlDirectives["no-cache"]), Array.isArray(cacheControlDirectives.private) && headersToRemove.push(...cacheControlDirectives.private);
+      resHeaders.connection && appendConnectionHeaderTokens(headersToRemove, resHeaders.connection), Array.isArray(cacheControlDirectives["no-cache"]) && headersToRemove.push(...cacheControlDirectives["no-cache"]), Array.isArray(cacheControlDirectives.private) && headersToRemove.push(...cacheControlDirectives.private);
       let strippedHeaders;
       for (let headerName of headersToRemove)
-        resHeaders[headerName] && (strippedHeaders ??= { ...resHeaders }, delete strippedHeaders[headerName]);
+        Object.hasOwn(resHeaders, headerName) && (strippedHeaders ??= { ...resHeaders }, delete strippedHeaders[headerName]);
       return strippedHeaders ?? resHeaders;
-    }
-    function isValidDate(date) {
-      return date instanceof Date && Number.isFinite(date.valueOf());
     }
     module2.exports = CacheHandler;
   }
@@ -16942,7 +17197,34 @@ var require_memory_cache_store = __commonJS({
       }
     };
     function findEntry(key, entries, now) {
-      return entries.find((entry) => entry.deleteAt > now && entry.method === key.method && (entry.vary == null || Object.keys(entry.vary).every((headerName) => entry.vary[headerName] === null ? key.headers[headerName] === void 0 : entry.vary[headerName] === key.headers[headerName])));
+      for (let i = 0; i < entries.length; i++) {
+        let entry = entries[i];
+        if (entry.deleteAt > now && entry.method === key.method && varyMatches(key, entry))
+          return entry;
+      }
+    }
+    function varyMatches(key, entry) {
+      if (entry.vary == null)
+        return !0;
+      for (let headerName in entry.vary)
+        if (Object.hasOwn(entry.vary, headerName) && !headerValueEquals(key.headers?.[headerName], entry.vary[headerName]))
+          return !1;
+      return !0;
+    }
+    function headerValueEquals(lhs, rhs) {
+      if (lhs == null && rhs == null)
+        return !0;
+      if (lhs == null && rhs != null || lhs != null && rhs == null)
+        return !1;
+      if (Array.isArray(lhs) && Array.isArray(rhs)) {
+        if (lhs.length !== rhs.length)
+          return !1;
+        for (let i = 0; i < lhs.length; i++)
+          if (lhs[i] !== rhs[i])
+            return !1;
+        return !0;
+      }
+      return lhs === rhs;
     }
     module2.exports = MemoryCacheStore;
   }
@@ -16955,7 +17237,7 @@ var require_cache_revalidation_handler = __commonJS({
     var assert = require("node:assert"), CacheRevalidationHandler = class {
       #successful = !1;
       /**
-       * @type {((boolean, any) => void) | null}
+       * @type {((success: boolean, context?: any, statusCode?: number, headers?: import('../../types/header.d.ts').IncomingHttpHeaders) => void) | null}
        */
       #callback;
       /**
@@ -16968,7 +17250,7 @@ var require_cache_revalidation_handler = __commonJS({
        */
       #allowErrorStatusCodes;
       /**
-       * @param {(boolean) => void} callback Function to call if the cached value is valid
+       * @param {(success: boolean, context?: any, statusCode?: number, headers?: import('../../types/header.d.ts').IncomingHttpHeaders) => void} callback Function to call if the cached value is valid
        * @param {import('../../types/dispatcher.d.ts').default.DispatchHandlers} handler
        * @param {boolean} allowErrorStatusCodes
        */
@@ -16984,7 +17266,7 @@ var require_cache_revalidation_handler = __commonJS({
         this.#handler.onRequestUpgrade?.(controller, statusCode, headers, socket);
       }
       onResponseStart(controller, statusCode, headers, statusMessage) {
-        if (assert(this.#callback != null), this.#successful = statusCode === 304 || this.#allowErrorStatusCodes && statusCode >= 500 && statusCode <= 504, this.#callback(this.#successful, this.#context), this.#callback = null, this.#successful)
+        if (assert(this.#callback != null), this.#successful = statusCode === 304 || this.#allowErrorStatusCodes && statusCode >= 500 && statusCode <= 504, this.#callback(this.#successful, this.#context, statusCode, headers), this.#callback = null, this.#successful)
           return !0;
         this.#handler.onRequestStart?.(controller, this.#context), this.#handler.onResponseStart?.(
           controller,
@@ -17016,7 +17298,7 @@ var require_cache_revalidation_handler = __commonJS({
 var require_cache2 = __commonJS({
   "node_modules/undici/lib/interceptor/cache.js"(exports2, module2) {
     "use strict";
-    var assert = require("node:assert"), { Readable } = require("node:stream"), util = require_util(), CacheHandler = require_cache_handler(), MemoryCacheStore = require_memory_cache_store(), CacheRevalidationHandler = require_cache_revalidation_handler(), { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader } = require_cache(), { AbortError } = require_errors();
+    var assert = require("node:assert"), { Readable } = require("node:stream"), util = require_util(), CacheHandler = require_cache_handler(), MemoryCacheStore = require_memory_cache_store(), CacheRevalidationHandler = require_cache_revalidation_handler(), { assertCacheStore, assertCacheMethods, makeCacheKey, normalizeHeaders, parseCacheControlHeader, isInvalidOrWildcardVaryHeader } = require_cache(), { AbortError } = require_errors(), { parseHttpDate } = require_date();
     function assertCacheOrigins(origins, name) {
       if (origins !== void 0) {
         if (!Array.isArray(origins))
@@ -17030,13 +17312,76 @@ var require_cache2 = __commonJS({
     }
     var nop = () => {
     };
+    function trimOWS(value) {
+      return value.replace(/^[\t ]+|[\t ]+$/g, "");
+    }
+    function arrayIncludes(array, value) {
+      for (let i = 0; i < array.length; i++)
+        if (array[i] === value)
+          return !0;
+      return !1;
+    }
+    function hasPragmaNoCache(headers) {
+      let pragma = headers?.pragma;
+      if (!pragma)
+        return !1;
+      let values = Array.isArray(pragma) ? pragma : [pragma];
+      for (let i = 0; i < values.length; i++) {
+        let value = values[i];
+        if (typeof value != "string")
+          continue;
+        let directives = value.split(",");
+        for (let j = 0; j < directives.length; j++)
+          if (trimOWS(directives[j]).toLowerCase() === "no-cache")
+            return !0;
+      }
+      return !1;
+    }
     function needsRevalidation(result, cacheControlDirectives, { headers = {} }) {
       return !!(cacheControlDirectives?.["no-cache"] || result.cacheControlDirectives?.["no-cache"] && !Array.isArray(result.cacheControlDirectives["no-cache"]) || headers["if-modified-since"] || headers["if-none-match"]);
     }
-    function isStale(result, cacheControlDirectives) {
+    function staleResponseRequiresRevalidation(result, cacheType) {
+      return result.cacheControlDirectives?.["must-revalidate"] === !0 || cacheType === "shared" && (result.cacheControlDirectives?.["proxy-revalidate"] === !0 || // https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.10
+      // s-maxage implies proxy-revalidate for shared caches.
+      result.cacheControlDirectives?.["s-maxage"] !== void 0);
+    }
+    function revalidationResponseDisallowsCachedReuse(cacheType, headers) {
+      if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary))
+        return !0;
+      let cacheControl = headers["cache-control"];
+      if (!cacheControl)
+        return !1;
+      let cacheControlDirectives = parseCacheControlHeader(cacheControl);
+      return cacheControlDirectives["no-store"] === !0 || cacheType === "shared" && cacheControlDirectives.private === !0;
+    }
+    function revalidationResponseUpdatesCacheControl(headers) {
+      return headers["cache-control"] !== void 0;
+    }
+    function deleteCachedValue(store, cacheKey) {
+      try {
+        store.delete(cacheKey)?.catch?.(nop);
+      } catch {
+      }
+    }
+    function getUsableLastModified(headers) {
+      let lastModified = headers?.["last-modified"];
+      if (typeof lastModified == "string" && parseHttpDate(lastModified))
+        return lastModified;
+    }
+    function makeRevalidationHeaders(opts, result) {
+      let headers = {
+        ...opts.headers,
+        "if-modified-since": getUsableLastModified(result.headers) ?? new Date(result.cachedAt).toUTCString()
+      };
+      if (result.etag && (headers["if-none-match"] = result.etag), result.vary)
+        for (let key in result.vary)
+          result.vary[key] != null && (headers[key] = result.vary[key]);
+      return headers;
+    }
+    function isStale(result, cacheControlDirectives, cacheType) {
       let now = Date.now();
       if (now > result.staleAt) {
-        if (cacheControlDirectives?.["max-stale"]) {
+        if (!staleResponseRequiresRevalidation(result, cacheType) && cacheControlDirectives?.["max-stale"]) {
           let gracePeriod = result.staleAt + cacheControlDirectives["max-stale"] * 1e3;
           return now > gracePeriod;
         }
@@ -17048,9 +17393,9 @@ var require_cache2 = __commonJS({
       }
       return !1;
     }
-    function withinStaleWhileRevalidateWindow(result) {
+    function withinStaleWhileRevalidateWindow(result, cacheType) {
       let staleWhileRevalidate = result.cacheControlDirectives?.["stale-while-revalidate"];
-      if (!staleWhileRevalidate)
+      if (!staleWhileRevalidate || staleResponseRequiresRevalidation(result, cacheType))
         return !1;
       let now = Date.now(), staleWhileRevalidateExpiry = result.staleAt + staleWhileRevalidate * 1e3;
       return now <= staleWhileRevalidateExpiry;
@@ -17115,22 +17460,13 @@ var require_cache2 = __commonJS({
       let now = Date.now();
       if (now > result.deleteAt)
         return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler));
-      let age = Math.round((now - result.cachedAt) / 1e3);
-      if (reqCacheControl?.["max-age"] && age >= reqCacheControl["max-age"])
-        return dispatch(opts, handler);
-      let stale = isStale(result, reqCacheControl), revalidate = needsRevalidation(result, reqCacheControl, opts);
+      let age = Math.round((now - result.cachedAt) / 1e3), requestMaxAgeExpired = reqCacheControl?.["max-age"] !== void 0 && age >= reqCacheControl["max-age"], stale = requestMaxAgeExpired || isStale(result, reqCacheControl, globalOpts.type), revalidate = requestMaxAgeExpired || needsRevalidation(result, reqCacheControl, opts);
       if (stale || revalidate) {
         if (util.isStream(opts.body) && util.bodyLength(opts.body) !== 0)
           return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler));
-        if (!revalidate && withinStaleWhileRevalidateWindow(result))
+        if (!revalidate && withinStaleWhileRevalidateWindow(result, globalOpts.type))
           return sendCachedValue(handler, opts, result, age, null, !0), queueMicrotask(() => {
-            let headers2 = {
-              ...opts.headers,
-              "if-modified-since": new Date(result.cachedAt).toUTCString()
-            };
-            if (result.etag && (headers2["if-none-match"] = result.etag), result.vary)
-              for (let key in result.vary)
-                result.vary[key] != null && (headers2[key] = result.vary[key]);
+            let headers2 = makeRevalidationHeaders(opts, result);
             dispatch(
               {
                 ...opts,
@@ -17153,23 +17489,27 @@ var require_cache2 = __commonJS({
               })
             );
           }), !0;
-        let withinStaleIfErrorThreshold = !1, staleIfErrorExpiry = result.cacheControlDirectives["stale-if-error"] ?? reqCacheControl?.["stale-if-error"];
-        staleIfErrorExpiry && (withinStaleIfErrorThreshold = now < result.staleAt + staleIfErrorExpiry * 1e3);
-        let headers = {
-          ...opts.headers,
-          "if-modified-since": new Date(result.cachedAt).toUTCString()
-        };
-        if (result.etag && (headers["if-none-match"] = result.etag), result.vary)
-          for (let key in result.vary)
-            result.vary[key] != null && (headers[key] = result.vary[key]);
+        let withinStaleIfErrorThreshold = !1;
+        if (!staleResponseRequiresRevalidation(result, globalOpts.type)) {
+          let staleIfErrorExpiry = result.cacheControlDirectives["stale-if-error"] ?? reqCacheControl?.["stale-if-error"];
+          staleIfErrorExpiry && (withinStaleIfErrorThreshold = now < result.staleAt + staleIfErrorExpiry * 1e3);
+        }
+        let headers = makeRevalidationHeaders(opts, result);
         return dispatch(
           {
             ...opts,
             headers
           },
           new CacheRevalidationHandler(
-            (success, context) => {
-              success ? sendCachedValue(handler, opts, result, age, context, stale) : util.isStream(result.body) && result.body.on("error", nop).destroy();
+            (success, context, statusCode, headers2) => {
+              if (success) {
+                if (statusCode === 304) {
+                  if (revalidationResponseDisallowsCachedReuse(globalOpts.type, headers2))
+                    return util.isStream(result.body) && result.body.on("error", nop).destroy(), deleteCachedValue(globalOpts.store, cacheKey), dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler));
+                  revalidationResponseUpdatesCacheControl(headers2) && deleteCachedValue(globalOpts.store, cacheKey);
+                }
+                sendCachedValue(handler, opts, result, age, context, stale);
+              } else util.isStream(result.body) && result.body.on("error", nop).destroy();
             },
             new CacheHandler(globalOpts, cacheKey, handler),
             withinStaleIfErrorThreshold
@@ -17197,9 +17537,13 @@ var require_cache2 = __commonJS({
         methods,
         cacheByDefault,
         type
-      }, safeMethodsToNotCache = util.safeHTTPMethods.filter((method) => methods.includes(method) === !1);
+      }, safeMethodsToNotCache = [];
+      for (let i = 0; i < util.safeHTTPMethods.length; i++) {
+        let method = util.safeHTTPMethods[i];
+        arrayIncludes(methods, method) || safeMethodsToNotCache.push(method);
+      }
       return (dispatch) => (opts2, handler) => {
-        if (!opts2.origin || safeMethodsToNotCache.includes(opts2.method))
+        if (!opts2.origin || arrayIncludes(safeMethodsToNotCache, opts2.method))
           return dispatch(opts2, handler);
         if (origins !== void 0) {
           let requestOrigin = opts2.origin.toString().toLowerCase(), isAllowed = !1;
@@ -17222,7 +17566,7 @@ var require_cache2 = __commonJS({
           ...opts2,
           headers: normalizeHeaders(opts2)
         };
-        let reqCacheControl = opts2.headers?.["cache-control"] ? parseCacheControlHeader(opts2.headers["cache-control"]) : void 0;
+        let reqCacheControl = opts2.headers?.["cache-control"] ? parseCacheControlHeader(opts2.headers["cache-control"]) : hasPragmaNoCache(opts2.headers) ? { "no-cache": !0 } : void 0;
         if (reqCacheControl?.["no-store"])
           return dispatch(opts2, handler);
         let cacheKey = makeCacheKey(opts2), result = store.get(cacheKey);
@@ -18068,7 +18412,19 @@ var require_sqlite_cache_store = __commonJS({
       }
     };
     function headerValueEquals(lhs, rhs) {
-      return lhs == null && rhs == null ? !0 : lhs == null && rhs != null || lhs != null && rhs == null ? !1 : Array.isArray(lhs) && Array.isArray(rhs) ? lhs.length !== rhs.length ? !1 : lhs.every((x, i) => x === rhs[i]) : lhs === rhs;
+      if (lhs == null && rhs == null)
+        return !0;
+      if (lhs == null && rhs != null || lhs != null && rhs == null)
+        return !1;
+      if (Array.isArray(lhs) && Array.isArray(rhs)) {
+        if (lhs.length !== rhs.length)
+          return !1;
+        for (let i = 0; i < lhs.length; i++)
+          if (lhs[i] !== rhs[i])
+            return !1;
+        return !0;
+      }
+      return lhs === rhs;
     }
   }
 });
@@ -20648,13 +21004,40 @@ var require_util4 = __commonJS({
       for (let i = 0; i < path.length; ++i) {
         let code = path.charCodeAt(i);
         if (code < 32 || // exclude CTLs (0-31)
-        code === 127 || // DEL
+        code > 126 || // exclude DEL and non-ascii
         code === 59)
           throw new Error("Invalid cookie path");
       }
     }
+    function isLetterOrDigit(code) {
+      return code >= 48 && code <= 57 || // 0-9
+      code >= 65 && code <= 90 || // A-Z
+      code >= 97 && code <= 122;
+    }
     function validateCookieDomain(domain) {
-      if (domain.startsWith("-") || domain.endsWith(".") || domain.endsWith("-"))
+      if (domain === " ")
+        return;
+      if (domain.length > 255)
+        throw new Error("Invalid cookie domain");
+      let labelLength = 0;
+      for (let i = 0; i < domain.length; ++i) {
+        let code = domain.charCodeAt(i);
+        if (code === 46) {
+          if (labelLength === 0)
+            throw new Error("Invalid cookie domain");
+          if (domain.charCodeAt(i - 1) === 45)
+            throw new Error("Invalid cookie domain");
+          labelLength = 0;
+          continue;
+        }
+        if (labelLength === 0 && !isLetterOrDigit(code))
+          throw new Error("Invalid cookie domain");
+        if (!isLetterOrDigit(code) && code !== 45)
+          throw new Error("Invalid cookie domain");
+        if (++labelLength > 63)
+          throw new Error("Invalid cookie domain");
+      }
+      if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 45)
         throw new Error("Invalid cookie domain");
     }
     var IMFDays = [
@@ -20695,8 +21078,8 @@ var require_util4 = __commonJS({
       for (let part of cookie.unparsed) {
         if (!part.includes("="))
           throw new Error("Invalid unparsed");
-        let [key, ...value] = part.split("=");
-        out.push(`${key.trim()}=${value.join("=")}`);
+        let [key, ...value] = part.split("="), trimmedKey = key.trim(), joinedValue = value.join("=");
+        validateCookieName(trimmedKey), validateCookieValue(joinedValue), out.push(`${trimmedKey}=${joinedValue}`);
       }
       return out.join("; ");
     }
@@ -24825,13 +25208,21 @@ var require_request3 = __commonJS({
           else {
             if (typeof val[i] == "object")
               throw new InvalidArgumentError(`invalid ${key} header`);
-            arr.push(`${val[i]}`);
+            {
+              let str = `${val[i]}`;
+              if (!isValidHeaderValue(str))
+                throw new InvalidArgumentError(`invalid ${key} header`);
+              arr.push(str);
+            }
           }
         val = arr;
       } else if (typeof val == "string") {
         if (!isValidHeaderValue(val))
           throw new InvalidArgumentError(`invalid ${key} header`);
-      } else val === null ? val = "" : val = `${val}`;
+      } else if (val === null)
+        val = "";
+      else if (val = `${val}`, !isValidHeaderValue(val))
+        throw new InvalidArgumentError(`invalid ${key} header`);
       if (headerName === "host") {
         if (request.host !== null)
           throw new InvalidArgumentError("duplicate host header");
@@ -27550,6 +27941,7 @@ var require_client_h12 = __commonJS({
       RequestContentLengthMismatchError,
       ResponseContentLengthMismatchError,
       RequestAbortedError,
+      InvalidArgumentError,
       HeadersTimeoutError,
       HeadersOverflowError,
       SocketError,
@@ -27911,7 +28303,15 @@ var require_client_h12 = __commonJS({
         extractBody || (extractBody = require_body2().extractBody);
         let [bodyStream, contentType] = extractBody(body);
         request.contentType == null && headers.push("content-type", contentType), body = bodyStream.stream, contentLength = bodyStream.length;
-      } else util.isBlobLike(body) && request.contentType == null && body.type && headers.push("content-type", body.type);
+      } else if (util.isBlobLike(body) && request.contentType == null) {
+        let contentType = body.type;
+        if (contentType) {
+          let contentTypeValue = `${contentType}`;
+          if (!util.isValidHeaderValue(contentTypeValue))
+            return util.errorRequest(client, request, new InvalidArgumentError("invalid content-type header")), !1;
+          headers.push("content-type", contentTypeValue);
+        }
+      }
       body && typeof body.read == "function" && body.read(0);
       let bodyLength = util.bodyLength(body);
       if (contentLength = bodyLength ?? contentLength, contentLength === null && (contentLength = request.contentLength), contentLength === 0 && !expectsPayload && (contentLength = null), shouldSendContentLength(method) && contentLength > 0 && request.contentLength !== null && request.contentLength !== contentLength) {
@@ -29459,6 +29859,16 @@ var require_retry_handler2 = __commonJS({
       let current = Date.now();
       return new Date(retryAfter).getTime() - current;
     }
+    function validatePartialResponseContentLength(headers, range, statusCode, retryCount) {
+      let contentLength = headers["content-length"];
+      if (contentLength == null || !Number.isFinite(range.start) || !Number.isFinite(range.end))
+        return null;
+      let length = Number(contentLength), expectedLength = range.end - range.start + 1;
+      return !Number.isFinite(length) || length !== expectedLength ? new RequestRetryError("Content-Length mismatch", statusCode, {
+        headers,
+        data: { count: retryCount }
+      }) : null;
+    }
     var RetryHandler = class _RetryHandler {
       constructor(opts, handlers) {
         let { retryOptions, ...dispatchOpts } = opts, {
@@ -29585,6 +29995,9 @@ var require_retry_handler2 = __commonJS({
                 data: { count: this.retryCount }
               })
             ), !1;
+          let contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount);
+          if (contentLengthError != null)
+            return this.abort(contentLengthError), !1;
           let { start, size, end = size - 1 } = contentRange;
           return assert(this.start === start, "content-range mismatch"), assert(this.end == null || this.end === end, "content-range mismatch"), this.resume = resume, !0;
         }
@@ -29598,6 +30011,9 @@ var require_retry_handler2 = __commonJS({
                 resume,
                 statusMessage
               );
+            let contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount);
+            if (contentLengthError != null)
+              return this.abort(contentLengthError), !1;
             let { start, size, end = size - 1 } = range;
             assert(
               start != null && Number.isFinite(start),
@@ -34390,13 +34806,40 @@ var require_util12 = __commonJS({
       for (let i = 0; i < path.length; ++i) {
         let code = path.charCodeAt(i);
         if (code < 32 || // exclude CTLs (0-31)
-        code === 127 || // DEL
+        code > 126 || // exclude DEL and non-ascii
         code === 59)
           throw new Error("Invalid cookie path");
       }
     }
+    function isLetterOrDigit(code) {
+      return code >= 48 && code <= 57 || // 0-9
+      code >= 65 && code <= 90 || // A-Z
+      code >= 97 && code <= 122;
+    }
     function validateCookieDomain(domain) {
-      if (domain.startsWith("-") || domain.endsWith(".") || domain.endsWith("-"))
+      if (domain === " ")
+        return;
+      if (domain.length > 255)
+        throw new Error("Invalid cookie domain");
+      let labelLength = 0;
+      for (let i = 0; i < domain.length; ++i) {
+        let code = domain.charCodeAt(i);
+        if (code === 46) {
+          if (labelLength === 0)
+            throw new Error("Invalid cookie domain");
+          if (domain.charCodeAt(i - 1) === 45)
+            throw new Error("Invalid cookie domain");
+          labelLength = 0;
+          continue;
+        }
+        if (labelLength === 0 && !isLetterOrDigit(code))
+          throw new Error("Invalid cookie domain");
+        if (!isLetterOrDigit(code) && code !== 45)
+          throw new Error("Invalid cookie domain");
+        if (++labelLength > 63)
+          throw new Error("Invalid cookie domain");
+      }
+      if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 45)
         throw new Error("Invalid cookie domain");
     }
     var IMFDays = [
@@ -34437,8 +34880,8 @@ var require_util12 = __commonJS({
       for (let part of cookie.unparsed) {
         if (!part.includes("="))
           throw new Error("Invalid unparsed");
-        let [key, ...value] = part.split("=");
-        out.push(`${key.trim()}=${value.join("=")}`);
+        let [key, ...value] = part.split("="), trimmedKey = key.trim(), joinedValue = value.join("=");
+        validateCookieName(trimmedKey), validateCookieValue(joinedValue), out.push(`${trimmedKey}=${joinedValue}`);
       }
       return out.join("; ");
     }
@@ -47053,13 +47496,21 @@ var require_request5 = __commonJS({
           else {
             if (typeof val[i] == "object")
               throw new InvalidArgumentError(`invalid ${key} header`);
-            arr.push(`${val[i]}`);
+            {
+              let str = `${val[i]}`;
+              if (!isValidHeaderValue(str))
+                throw new InvalidArgumentError(`invalid ${key} header`);
+              arr.push(str);
+            }
           }
         val = arr;
       } else if (typeof val == "string") {
         if (!isValidHeaderValue(val))
           throw new InvalidArgumentError(`invalid ${key} header`);
-      } else val === null ? val = "" : val = `${val}`;
+      } else if (val === null)
+        val = "";
+      else if (val = `${val}`, !isValidHeaderValue(val))
+        throw new InvalidArgumentError(`invalid ${key} header`);
       if (headerName === "host") {
         if (request.host !== null)
           throw new InvalidArgumentError("duplicate host header");
@@ -49778,6 +50229,7 @@ var require_client_h13 = __commonJS({
       RequestContentLengthMismatchError,
       ResponseContentLengthMismatchError,
       RequestAbortedError,
+      InvalidArgumentError,
       HeadersTimeoutError,
       HeadersOverflowError,
       SocketError,
@@ -50139,7 +50591,15 @@ var require_client_h13 = __commonJS({
         extractBody || (extractBody = require_body3().extractBody);
         let [bodyStream, contentType] = extractBody(body);
         request.contentType == null && headers.push("content-type", contentType), body = bodyStream.stream, contentLength = bodyStream.length;
-      } else util.isBlobLike(body) && request.contentType == null && body.type && headers.push("content-type", body.type);
+      } else if (util.isBlobLike(body) && request.contentType == null) {
+        let contentType = body.type;
+        if (contentType) {
+          let contentTypeValue = `${contentType}`;
+          if (!util.isValidHeaderValue(contentTypeValue))
+            return util.errorRequest(client, request, new InvalidArgumentError("invalid content-type header")), !1;
+          headers.push("content-type", contentTypeValue);
+        }
+      }
       body && typeof body.read == "function" && body.read(0);
       let bodyLength = util.bodyLength(body);
       if (contentLength = bodyLength ?? contentLength, contentLength === null && (contentLength = request.contentLength), contentLength === 0 && !expectsPayload && (contentLength = null), shouldSendContentLength(method) && contentLength > 0 && request.contentLength !== null && request.contentLength !== contentLength) {
@@ -51687,6 +52147,16 @@ var require_retry_handler3 = __commonJS({
       let current = Date.now();
       return new Date(retryAfter).getTime() - current;
     }
+    function validatePartialResponseContentLength(headers, range, statusCode, retryCount) {
+      let contentLength = headers["content-length"];
+      if (contentLength == null || !Number.isFinite(range.start) || !Number.isFinite(range.end))
+        return null;
+      let length = Number(contentLength), expectedLength = range.end - range.start + 1;
+      return !Number.isFinite(length) || length !== expectedLength ? new RequestRetryError("Content-Length mismatch", statusCode, {
+        headers,
+        data: { count: retryCount }
+      }) : null;
+    }
     var RetryHandler = class _RetryHandler {
       constructor(opts, handlers) {
         let { retryOptions, ...dispatchOpts } = opts, {
@@ -51813,6 +52283,9 @@ var require_retry_handler3 = __commonJS({
                 data: { count: this.retryCount }
               })
             ), !1;
+          let contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount);
+          if (contentLengthError != null)
+            return this.abort(contentLengthError), !1;
           let { start, size, end = size - 1 } = contentRange;
           return assert(this.start === start, "content-range mismatch"), assert(this.end == null || this.end === end, "content-range mismatch"), this.resume = resume, !0;
         }
@@ -51826,6 +52299,9 @@ var require_retry_handler3 = __commonJS({
                 resume,
                 statusMessage
               );
+            let contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount);
+            if (contentLengthError != null)
+              return this.abort(contentLengthError), !1;
             let { start, size, end = size - 1 } = range;
             assert(
               start != null && Number.isFinite(start),
@@ -56618,13 +57094,40 @@ var require_util20 = __commonJS({
       for (let i = 0; i < path.length; ++i) {
         let code = path.charCodeAt(i);
         if (code < 32 || // exclude CTLs (0-31)
-        code === 127 || // DEL
+        code > 126 || // exclude DEL and non-ascii
         code === 59)
           throw new Error("Invalid cookie path");
       }
     }
+    function isLetterOrDigit(code) {
+      return code >= 48 && code <= 57 || // 0-9
+      code >= 65 && code <= 90 || // A-Z
+      code >= 97 && code <= 122;
+    }
     function validateCookieDomain(domain) {
-      if (domain.startsWith("-") || domain.endsWith(".") || domain.endsWith("-"))
+      if (domain === " ")
+        return;
+      if (domain.length > 255)
+        throw new Error("Invalid cookie domain");
+      let labelLength = 0;
+      for (let i = 0; i < domain.length; ++i) {
+        let code = domain.charCodeAt(i);
+        if (code === 46) {
+          if (labelLength === 0)
+            throw new Error("Invalid cookie domain");
+          if (domain.charCodeAt(i - 1) === 45)
+            throw new Error("Invalid cookie domain");
+          labelLength = 0;
+          continue;
+        }
+        if (labelLength === 0 && !isLetterOrDigit(code))
+          throw new Error("Invalid cookie domain");
+        if (!isLetterOrDigit(code) && code !== 45)
+          throw new Error("Invalid cookie domain");
+        if (++labelLength > 63)
+          throw new Error("Invalid cookie domain");
+      }
+      if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 45)
         throw new Error("Invalid cookie domain");
     }
     var IMFDays = [
@@ -56665,8 +57168,8 @@ var require_util20 = __commonJS({
       for (let part of cookie.unparsed) {
         if (!part.includes("="))
           throw new Error("Invalid unparsed");
-        let [key, ...value] = part.split("=");
-        out.push(`${key.trim()}=${value.join("=")}`);
+        let [key, ...value] = part.split("="), trimmedKey = key.trim(), joinedValue = value.join("=");
+        validateCookieName(trimmedKey), validateCookieValue(joinedValue), out.push(`${trimmedKey}=${joinedValue}`);
       }
       return out.join("; ");
     }
