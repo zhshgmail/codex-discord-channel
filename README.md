@@ -402,6 +402,8 @@ nonce enforcement. When the create-message response includes that nonce, it
 must match. Its returned message id is the durable anchor and becomes terminal
 only after an exact read-back proves the same message id, channel, source reply,
 content, and bot author; Discord may omit nonce from that later GET.
+If the response returns an id with a conflicting nonce, the receipt preserves
+that id as permanently uncertain and suppresses both reconciliation and replay.
 
 If a process or network acknowledgement is lost, a later process first
 reconciles the recorded message id or any available stable nonce identity. A

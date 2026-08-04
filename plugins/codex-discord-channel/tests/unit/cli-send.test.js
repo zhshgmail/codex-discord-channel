@@ -186,6 +186,80 @@ test('CLI stable GET confirmation rejects foreign message identity fields', asyn
   }
 });
 
+test('CLI nonce mismatch preserves the durable id and permanently suppresses another POST', async () => {
+  const { config } = fixture();
+  const harness = restHarness({
+    post({ init, messages, postCount }) {
+      const payload = JSON.parse(init.body);
+      const responseMessage = {
+        id: `out-${postCount}`, channel_id: 'c1', content: payload.content,
+        nonce: 'foreign-nonce', message_reference: payload.message_reference,
+        author: { id: 'bot1' },
+      };
+      const durableMessage = { ...responseMessage };
+      delete durableMessage.nonce;
+      messages.set(durableMessage.id, durableMessage);
+      return response(200, responseMessage);
+    },
+  });
+
+  await assert.rejects(
+    runCli(config, harness.fetchImpl),
+    (error) => error.code === 'reply_send_response_nonce_mismatch',
+  );
+  const requestsAfterMismatch = harness.requests.length;
+  const retry = await runCli(config, harness.fetchImpl);
+  const [receiptName] = fs.readdirSync(config.paths.replyReceiptDir);
+  const receipt = JSON.parse(fs.readFileSync(
+    path.join(config.paths.replyReceiptDir, receiptName),
+    'utf8',
+  ));
+
+  assert.equal(harness.postCount(), 1);
+  assert.equal(harness.requests.length, requestsAfterMismatch);
+  assert.equal(retry.duplicateSuppressed, true);
+  assert.equal(retry.reason, 'source_message_reply_nonce_mismatch');
+  assert.equal(retry.messageId, 'out-1');
+  assert.equal(receipt.status, 'uncertain');
+  assert.equal(receipt.outboundMessageId, 'out-1');
+  assert.equal(receipt.errorCode, 'reply_send_response_nonce_mismatch');
+});
+
+test('CLI nonce mismatch cannot reconcile to another exact nonce match', async () => {
+  const { config } = fixture();
+  const harness = restHarness({
+    post({ init, messages }) {
+      const payload = JSON.parse(init.body);
+      const responseMessage = {
+        id: 'out-1', channel_id: 'c1', content: payload.content,
+        nonce: 'foreign-nonce', message_reference: payload.message_reference,
+        author: { id: 'bot1' },
+      };
+      const durableMessage = { ...responseMessage };
+      delete durableMessage.nonce;
+      messages.set(durableMessage.id, durableMessage);
+      messages.set('substitute-id', {
+        ...durableMessage, id: 'substitute-id', nonce: payload.nonce,
+      });
+      return response(200, responseMessage);
+    },
+  });
+
+  await assert.rejects(
+    runCli(config, harness.fetchImpl),
+    (error) => error.code === 'reply_send_response_nonce_mismatch',
+  );
+  const requestsAfterMismatch = harness.requests.length;
+  const retry = await runCli(config, harness.fetchImpl);
+
+  assert.equal(harness.postCount(), 1);
+  assert.equal(harness.requests.length, requestsAfterMismatch);
+  assert.equal(retry.duplicateSuppressed, true);
+  assert.equal(retry.reason, 'source_message_reply_nonce_mismatch');
+  assert.equal(retry.messageId, 'out-1');
+  assert.notEqual(retry.messageId, 'substitute-id');
+});
+
 test('CLI lost-ack replay reuses the enforced nonce and confirms one durable message', async () => {
   const { config } = fixture();
   let acceptedResponse = null;

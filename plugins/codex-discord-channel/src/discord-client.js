@@ -385,10 +385,15 @@ async function sendDiscordMessage(client, args, prepared = null) {
     && responseNonce !== ''
     && responseNonce !== String(args.nonce || '')
   ) {
-    throw replyProtocolError(
+    const error = replyProtocolError(
       'reply_send_response_nonce_mismatch',
       'Discord send response did not preserve the enforced nonce.',
     );
+    error.replySendIdentity = {
+      channelId: String(sent.channelId),
+      messageId: String(sent.id),
+    };
+    throw error;
   }
   return { channelId: sent.channelId, messageId: sent.id };
 }

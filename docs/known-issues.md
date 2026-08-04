@@ -235,14 +235,16 @@ Every guarded send uses the same source-derived nonce with Discord nonce
 enforcement. The create-message response nonce, when present, must match. Its
 returned message id is not confirmed until an exact GET matches that id,
 channel, source reply, content, and bot author; Discord may omit nonce from the
-GET. When the network fails before acknowledgement, a retry first reconciles
-any durable identity available. If no match is found and no Discord message id
-was returned, the same enforced nonce may be retried only inside a bounded
-window, allowing Discord to return the original message without duplicating it.
-A returned message id and stale uncertainty remain fail-closed. This repairs
-the case where an ordinary network error created no message but the old pre-send
-claim permanently consumed the source reply right, without turning uncertain
-sends into blind replays.
+GET. A response id paired with a conflicting nonce is preserved in a permanently
+uncertain receipt that suppresses both reconciliation and replay. When the
+network fails before acknowledgement, a retry first reconciles any durable
+identity available. If no match is found and no Discord message id was returned,
+the same enforced nonce may be retried only inside a bounded window, allowing
+Discord to return the original message without duplicating it. A returned
+message id and stale uncertainty remain fail-closed. This repairs the case where
+an ordinary network error created no message but the old pre-send claim
+permanently consumed the source reply right, without turning uncertain sends
+into blind replays.
 
 Deterministic preflight failures do not consume the reply. A deliberate
 additional message requires the explicit `followup` flag.

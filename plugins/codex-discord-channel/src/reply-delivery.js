@@ -211,6 +211,13 @@ function receiptStatusIsConfirmed(receipt) {
   return receipt?.status === 'confirmed' || (receipt?.version === 1 && receipt?.status === 'sent');
 }
 
+function receiptHasPermanentNonceMismatch(receipt) {
+  return receipt?.status === 'uncertain'
+    && receipt?.errorCode === 'reply_send_response_nonce_mismatch'
+    && typeof receipt?.outboundMessageId === 'string'
+    && receipt.outboundMessageId !== '';
+}
+
 function receiptLeaseIsLive(receipt, config, deps = {}) {
   const timestamp = Date.parse(receipt?.updatedAt || receipt?.claimedAt || '');
   const ageMs = Number.isFinite(timestamp) ? Math.max(0, nowMs(deps) - timestamp) : Infinity;
@@ -254,6 +261,9 @@ async function beginReply(config, identity, content, deps = {}) {
     }
     if (existing && existing.contentSha256 !== digest) {
       return suppressResult(identity, existing, 'source_message_reply_content_mismatch');
+    }
+    if (receiptHasPermanentNonceMismatch(existing)) {
+      return suppressResult(identity, existing, 'source_message_reply_nonce_mismatch');
     }
     if (existing?.status === 'in_flight' && receiptLeaseIsLive(existing, config, deps)) {
       return suppressResult(identity, existing, 'source_message_reply_in_progress');
@@ -414,7 +424,7 @@ async function sendAndConfirm({
     if (error?.definitiveNoSend === true) {
       await releaseReplyClaim(config, state, deps);
     } else {
-      await markReplyUncertain(config, state, error, deps);
+      await markReplyUncertain(config, state, error, deps, error?.replySendIdentity);
     }
     throw error;
   }

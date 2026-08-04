@@ -118,6 +118,8 @@ The request uses a deterministic enforced nonce. Success is terminal only after
 any nonce in the create-message response matches and the returned message id is
 read back with that exact id, channel, source reply, content, and bot identity.
 Discord may omit nonce from the later GET.
+If the response returns an id with a conflicting nonce, the receipt preserves
+that id as permanently uncertain and suppresses both reconciliation and replay.
 
 An interrupted send is reconciled by recorded message id or any available
 stable nonce identity. A same-nonce retry is allowed only when no message id was

@@ -93075,11 +93075,16 @@ var require_discord_client = __commonJS({
           "Discord send response did not include the exact target message identity."
         );
       let responseNonce = sent.nonce === null || sent.nonce === void 0 ? "" : String(sent.nonce);
-      if (args.enforceNonce === !0 && responseNonce !== "" && responseNonce !== String(args.nonce || ""))
-        throw replyProtocolError(
+      if (args.enforceNonce === !0 && responseNonce !== "" && responseNonce !== String(args.nonce || "")) {
+        let error = replyProtocolError(
           "reply_send_response_nonce_mismatch",
           "Discord send response did not preserve the enforced nonce."
         );
+        throw error.replySendIdentity = {
+          channelId: String(sent.channelId),
+          messageId: String(sent.id)
+        }, error;
+      }
       return { channelId: sent.channelId, messageId: sent.id };
     }
     function messageReplySourceId(message) {
@@ -93500,6 +93505,9 @@ var require_reply_delivery = __commonJS({
     function receiptStatusIsConfirmed(receipt) {
       return receipt?.status === "confirmed" || receipt?.version === 1 && receipt?.status === "sent";
     }
+    function receiptHasPermanentNonceMismatch(receipt) {
+      return receipt?.status === "uncertain" && receipt?.errorCode === "reply_send_response_nonce_mismatch" && typeof receipt?.outboundMessageId == "string" && receipt.outboundMessageId !== "";
+    }
     function receiptLeaseIsLive(receipt, config, deps = {}) {
       let timestamp = Date.parse(receipt?.updatedAt || receipt?.claimedAt || ""), ageMs = Number.isFinite(timestamp) ? Math.max(0, nowMs(deps) - timestamp) : 1 / 0, leaseMs = Number(config.replyReceiptInFlightLeaseMs) || DEFAULT_IN_FLIGHT_LEASE_MS;
       return ageMs < leaseMs && (deps.isProcessAlive || isProcessAlive)(Number(receipt?.pid) || 0);
@@ -93531,6 +93539,8 @@ var require_reply_delivery = __commonJS({
           return suppressResult(identity, existing, "source_message_already_replied");
         if (existing && existing.contentSha256 !== digest)
           return suppressResult(identity, existing, "source_message_reply_content_mismatch");
+        if (receiptHasPermanentNonceMismatch(existing))
+          return suppressResult(identity, existing, "source_message_reply_nonce_mismatch");
         if (existing?.status === "in_flight" && receiptLeaseIsLive(existing, config, deps))
           return suppressResult(identity, existing, "source_message_reply_in_progress");
         let id = operationId(deps), timestamp = nowIso(deps);
@@ -93650,7 +93660,7 @@ var require_reply_delivery = __commonJS({
           duplicateSuppressed: !1
         };
       } catch (error) {
-        throw error?.definitiveNoSend === !0 ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps), error;
+        throw error?.definitiveNoSend === !0 ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps, error?.replySendIdentity), error;
       }
     }
     async function sendDiscordReplyOnce2({

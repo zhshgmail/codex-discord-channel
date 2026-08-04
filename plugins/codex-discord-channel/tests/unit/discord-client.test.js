@@ -84,7 +84,11 @@ test('guarded Discord sends reject a conflicting nonce in the immediate POST res
 
   await assert.rejects(sendDiscordMessage({}, {
     channelId: 'c1', nonce: 'cdr-stable', enforceNonce: true,
-  }, prepared), (error) => error.code === 'reply_send_response_nonce_mismatch');
+  }, prepared), (error) => {
+    assert.equal(error.code, 'reply_send_response_nonce_mismatch');
+    assert.deepEqual(error.replySendIdentity, { channelId: 'c1', messageId: 'out1' });
+    return true;
+  });
 });
 
 test('stable reply confirmation rejects foreign message identity fields without requiring GET nonce', async () => {
