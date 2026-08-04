@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const launcher = path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-instance');
+const productionChannel = path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-channel');
 
 function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
@@ -38,6 +39,8 @@ function fixture() {
     '#!/usr/bin/env bash',
     `FAKE_CHANNEL_BIN_CONST=${shellLiteral(fakeChannel)}`,
     `FAKE_CODEX_BIN_CONST=${shellLiteral(fakeCodex)}`,
+    `REAL_CHANNEL_BIN_CONST=${shellLiteral(productionChannel)}`,
+    `REAL_NODE_BIN_CONST=${shellLiteral(process.execPath)}`,
     `LOGIN_MARKER_CONST=${shellLiteral(loginMarker)}`,
     `LOGIN_EXIT_MARKER_CONST=${shellLiteral(loginExitMarker)}`,
     `STATE_DIR_CONST=${shellLiteral(stateDir)}`,
@@ -46,24 +49,7 @@ function fixture() {
     `TRANSPORT_FAIL_MARKER_CONST=${shellLiteral(transportFailMarker)}`,
     `TUI_COUNT_CONST=${shellLiteral(path.join(home, 'tui-count'))}`,
     'if [[ $1 == "$FAKE_CHANNEL_BIN_CONST" && $2 == tui-recovery-target ]]; then',
-    '  case $3 in',
-    '    clear) rm -f "$STATE_DIR_CONST/tui-recovery-target.json" "$STATE_DIR_CONST/tui-recovery-target.invalid" "$STATE_DIR_CONST/tui-recovery-target.ready" "$STATE_DIR_CONST/tui-recovery-capture-id"; exit 0 ;;',
-    '    snapshot)',
-    '      if [[ -f $STATE_DIR_CONST/app-server-target.json ]]; then',
-    '        cp "$STATE_DIR_CONST/app-server-target.json" "$STATE_DIR_CONST/tui-recovery-target.json"',
-    '        printf "%s\\n" "$4" >"$STATE_DIR_CONST/tui-recovery-capture-id"',
-    '        exit 0',
-    '      fi',
-    '      exit 10',
-    '      ;;',
-    '    read)',
-    '      if [[ -f $STATE_DIR_CONST/tui-recovery-target.json && -f $STATE_DIR_CONST/tui-recovery-capture-id && $(<"$STATE_DIR_CONST/tui-recovery-capture-id") == "$4" ]]; then',
-    '        printf "%s\\n" "$THREAD_ID_CONST"',
-    '        exit 0',
-    '      fi',
-    '      exit 10',
-    '      ;;',
-    '  esac',
+    '  exec /usr/bin/env -u CODEX_HOME -u CODEX_BIN -u NODE_BIN -u CODEX_DISCORD_CHANNEL_BIN "$REAL_NODE_BIN_CONST" "$REAL_CHANNEL_BIN_CONST" "${@:2}"',
     'fi',
     'printf "node %s\\n" "$*" >>"$TRACE_CONST"',
     'if [[ ${LOGIN_REQUIRED:-0} == 1 && $2 == tui-login-state && ! -f $LOGIN_MARKER_CONST ]]; then exit 10; fi',
@@ -80,11 +66,13 @@ function fixture() {
     '  touch "$LOGIN_MARKER_CONST"',
     'fi',
     'if [[ $1 == "$FAKE_CODEX_BIN_CONST" && $2 == --remote && -f $TRANSPORT_FAIL_MARKER_CONST ]]; then',
+    '  failures=1',
+    '  read -r failures <"$TRANSPORT_FAIL_MARKER_CONST"',
     '  count=0',
     '  [[ -f $TUI_COUNT_CONST ]] && read -r count <"$TUI_COUNT_CONST"',
     '  count=$((count + 1))',
     '  printf "%s\\n" "$count" >"$TUI_COUNT_CONST"',
-    '  if ((count == 1)); then',
+    '  if ((count <= failures)); then',
     '    printf "{\\"version\\":1,\\"threadId\\":\\"%s\\",\\"status\\":\\"active\\",\\"activeTurnId\\":\\"turn-1\\",\\"loadedThreadIds\\":[\\"%s\\"]}\\n" "$THREAD_ID_CONST" "$THREAD_ID_CONST" >"$STATE_DIR_CONST/app-server-target.json"',
     '    sleep 0.4',
     '    rm -f "$STATE_DIR_CONST/app-server.sock"',
@@ -265,6 +253,9 @@ test('shell launcher resumes the exact captured thread after app-server replacem
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
+  assert.equal(fs.existsSync(path.join(setup.stateDir, 'tui-recovery-capture-id')), false);
+  assert.ok(fs.readdirSync(path.join(setup.stateDir, 'tui-recovery-attempts')).length >= 2);
+  assert.ok(fs.readdirSync(path.join(setup.stateDir, 'tui-recovery-publications')).length >= 2);
 });
 
 test('shell launcher strips every Discord-prefixed variable from the TUI child', () => {
@@ -352,6 +343,41 @@ test('recovery replaces only the resume operand and preserves all trailing argum
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen old-thread-id continue the first prompt then preserve the second prompt`,
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen 019f3763-d308-7871-bedc-e6489b02190e continue the first prompt then preserve the second prompt`,
   ]);
+});
+
+test('recovery keeps shell metacharacters as argv data', () => {
+  const setup = fixture();
+  const injectionMarker = path.join(setup.home, 'must-not-exist');
+  const payload = `;touch ${injectionMarker};`;
+  fs.writeFileSync(setup.transportFailMarker, '1\n');
+  const result = spawnSync(launcher, ['codex02', 'resume', 'old-thread', payload], {
+    encoding: 'utf8',
+    env: launchEnv(setup),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(injectionMarker), false);
+  const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+  assert.equal(
+    tuiLaunches[1],
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume 019f3763-d308-7871-bedc-e6489b02190e ${payload}`,
+  );
+});
+
+test('recovery stops after five app-server replacements in one minute', () => {
+  const setup = fixture();
+  fs.writeFileSync(setup.transportFailMarker, '6\n');
+  const result = spawnSync(launcher, ['codex02', 'resume', 'old-thread'], {
+    encoding: 'utf8',
+    env: launchEnv(setup),
+    timeout: 15000,
+  });
+  assert.equal(result.status, 75, result.stderr);
+  assert.match(result.stderr, /stopped after five replacements in one minute/);
+  const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+  assert.equal(tuiLaunches.length, 6);
 });
 
 test('recovery preserves variadic image values and replaces only the parsed resume operand', () => {
@@ -443,11 +469,6 @@ test('recovery preserves variadic image values and replaces only the parsed resu
       ],
       recovered: '--profile before resume --image one.png two.png --sandbox read-only 019f3763-d308-7871-bedc-e6489b02190e continue',
     },
-    {
-      name: 'terminator after resume',
-      args: ['resume', '-i', 'one.png', 'two.png', '--', 'old-thread', 'prompt'],
-      recovered: 'resume -i one.png two.png -- 019f3763-d308-7871-bedc-e6489b02190e prompt',
-    },
   ];
 
   for (const item of cases) {
@@ -487,19 +508,9 @@ test('recovery appends resume without consuming image values or option values as
       recovered: '--profile resume -i one.png two.png prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
     },
     {
-      name: 'terminator makes resume a positional value',
-      args: ['--image', 'one.png', 'two.png', '--', 'resume', 'old-thread', 'prompt'],
-      recovered: '--image one.png two.png -- resume old-thread prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
-    },
-    {
       name: 'repeated image options without resume',
       args: ['-i', 'one.png', 'two.png', '--image', 'three.png', 'four.png', 'prompt'],
       recovered: '-i one.png two.png --image three.png four.png prompt resume 019f3763-d308-7871-bedc-e6489b02190e',
-    },
-    {
-      name: 'malformed fixed option without resume',
-      args: ['--profile'],
-      recovered: '--profile resume 019f3763-d308-7871-bedc-e6489b02190e',
     },
   ];
 
@@ -522,10 +533,24 @@ test('recovery appends resume without consuming image values or option values as
   }
 });
 
-test('recovery fails closed without a second launch for malformed resume options', () => {
+test('recovery fails closed without a second launch for malformed or terminated argv', () => {
   const cases = [
     { name: 'image option without a value', args: ['resume', '--image'] },
     { name: 'fixed option without a value', args: ['resume', '--profile'] },
+    { name: 'fixed option without a value before resume', args: ['--profile'] },
+    {
+      name: 'fixed option followed by another option',
+      args: ['--profile', '--sandbox', 'read-only'],
+    },
+    { name: 'bare non-resume positional', args: ['prompt'] },
+    {
+      name: 'terminator after resume',
+      args: ['resume', '-i', 'one.png', 'two.png', '--', 'old-thread', 'prompt'],
+    },
+    {
+      name: 'terminator before positional resume',
+      args: ['--image', 'one.png', 'two.png', '--', 'resume', 'old-thread', 'prompt'],
+    },
   ];
 
   for (const item of cases) {

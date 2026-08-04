@@ -4,11 +4,16 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const TARGET_VERSION = 1;
+const PUBLICATION_VERSION = 2;
 const CAPTURE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
+const ATTEMPT_FILE_PATTERN = /^([1-9][0-9]*)\.attempt$/;
 
 function targetPaths(config) {
   return {
     live: path.join(config.paths.stateDir, 'app-server-target.json'),
+    attempts: path.join(config.paths.stateDir, 'tui-recovery-attempts'),
+    publications: path.join(config.paths.stateDir, 'tui-recovery-publications'),
+    targets: path.join(config.paths.stateDir, 'tui-recovery-targets'),
     publication: path.join(config.paths.stateDir, 'tui-recovery-target.ready'),
     recovery: path.join(config.paths.stateDir, 'tui-recovery-target.json'),
     tombstone: path.join(config.paths.stateDir, 'tui-recovery-target.invalid'),
@@ -44,15 +49,72 @@ function requireCaptureId(captureId) {
   return captureId;
 }
 
-function writeAtomic(file, content, dependencies = {}) {
+function attemptPath(files, sequence) {
+  return path.join(files.attempts, `${sequence}.attempt`);
+}
+
+function publicationPath(files, sequence) {
+  return path.join(files.publications, `${sequence}.json`);
+}
+
+function recoveryPath(files, sequence) {
+  return path.join(files.targets, `${sequence}.json`);
+}
+
+function latestAttemptSequence(files, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
-  const now = dependencies.now || Date.now;
-  const temp = `${file}.tmp-${process.pid}-${now()}`;
+  let names;
+  try {
+    names = fsImpl.readdirSync(files.attempts);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return 0;
+    throw error;
+  }
+  let latest = 0;
+  for (const name of names) {
+    const match = ATTEMPT_FILE_PATTERN.exec(name);
+    if (!match) return null;
+    const sequence = Number(match[1]);
+    if (!Number.isSafeInteger(sequence) || String(sequence) !== match[1]) return null;
+    if (sequence > latest) latest = sequence;
+  }
+  return latest;
+}
+
+function allocateAttempt(files, operationId, dependencies = {}) {
+  const fsImpl = dependencies.fs || fs;
+  fsImpl.mkdirSync(files.attempts, { recursive: true, mode: 0o700 });
+  let latest = latestAttemptSequence(files, dependencies);
+  if (latest === null || latest >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('recovery attempt ledger is invalid or exhausted');
+  }
+  while (latest < Number.MAX_SAFE_INTEGER) {
+    const sequence = latest + 1;
+    const content = `${JSON.stringify({
+      version: PUBLICATION_VERSION,
+      sequence,
+      status: 'started',
+      operationId,
+    }, null, 2)}\n`;
+    try {
+      fsImpl.writeFileSync(attemptPath(files, sequence), content, { flag: 'wx', mode: 0o600 });
+      return sequence;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      latest = sequence;
+    }
+  }
+  throw new Error('recovery attempt ledger is exhausted');
+}
+
+function writeAtomic(file, content, sequence, dependencies = {}) {
+  const fsImpl = dependencies.fs || fs;
+  const temp = `${file}.tmp-${process.pid}-${sequence}`;
   fsImpl.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   try {
-    fsImpl.writeFileSync(temp, content, { mode: 0o600 });
+    fsImpl.writeFileSync(temp, content, { flag: 'wx', mode: 0o600 });
+    fsImpl.chmodSync(temp, 0o600);
     fsImpl.renameSync(temp, file);
-    fsImpl.chmodSync(file, 0o600);
   } catch (error) {
     try {
       fsImpl.unlinkSync(temp);
@@ -61,40 +123,16 @@ function writeAtomic(file, content, dependencies = {}) {
   }
 }
 
-function unlinkIfExists(file, dependencies = {}) {
-  const fsImpl = dependencies.fs || fs;
-  try {
-    fsImpl.unlinkSync(file);
-  } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
-  }
-}
-
-function invalidationRecord(captureId) {
+function publicationRecord(sequence, status, identity) {
   return `${JSON.stringify({
-    version: TARGET_VERSION,
-    status: 'invalid',
-    captureId,
+    version: PUBLICATION_VERSION,
+    sequence,
+    status,
+    ...identity,
   }, null, 2)}\n`;
 }
 
-function publicationRecord(captureId) {
-  return `${JSON.stringify({
-    version: TARGET_VERSION,
-    status: 'published',
-    captureId,
-  }, null, 2)}\n`;
-}
-
-function readPublication(file, dependencies = {}) {
-  const fsImpl = dependencies.fs || fs;
-  let raw;
-  try {
-    raw = fsImpl.readFileSync(file, 'utf8');
-  } catch (error) {
-    if (error?.code === 'ENOENT') return null;
-    throw error;
-  }
+function parsePublication(raw, sequence) {
   let record;
   try {
     record = JSON.parse(raw);
@@ -102,53 +140,26 @@ function readPublication(file, dependencies = {}) {
     return null;
   }
   if (
-    record?.version !== TARGET_VERSION
-    || record.status !== 'published'
-    || typeof record.captureId !== 'string'
-    || !CAPTURE_ID_PATTERN.test(record.captureId)
+    record?.version !== PUBLICATION_VERSION
+    || record.sequence !== sequence
+    || !['published', 'invalid', 'cleared'].includes(record.status)
   ) {
     return null;
   }
-  return { raw, record };
+  return record;
 }
 
-function tombstoneExists(file, dependencies = {}) {
-  const fsImpl = dependencies.fs || fs;
-  try {
-    fsImpl.statSync(file);
-    return true;
-  } catch (error) {
-    if (error?.code === 'ENOENT') return false;
-    throw error;
-  }
+function publish(files, sequence, status, identity, dependencies = {}) {
+  writeAtomic(
+    publicationPath(files, sequence),
+    publicationRecord(sequence, status, identity),
+    sequence,
+    dependencies,
+  );
 }
 
-function replaceRecoveryTarget(files, content, captureId, clearTombstone, dependencies = {}) {
-  const fsImpl = dependencies.fs || fs;
-  unlinkIfExists(files.publication, dependencies);
-  writeAtomic(files.tombstone, invalidationRecord(captureId), dependencies);
-  try {
-    writeAtomic(files.recovery, content, dependencies);
-  } catch (writeError) {
-    try {
-      unlinkIfExists(files.recovery, dependencies);
-    } catch (deleteError) {
-      throw new AggregateError(
-        [writeError, deleteError],
-        'recovery target replacement and stale target deletion both failed',
-      );
-    }
-    throw writeError;
-  }
-  if (clearTombstone) {
-    unlinkIfExists(files.tombstone, { ...dependencies, fs: fsImpl });
-    writeAtomic(files.publication, publicationRecord(captureId), dependencies);
-  }
-}
-
-function invalidateRecoveryTarget(files, captureId, dependencies = {}) {
-  const invalid = invalidationRecord(captureId);
-  replaceRecoveryTarget(files, invalid, captureId, false, dependencies);
+function publishInvalid(files, sequence, captureId, dependencies = {}) {
+  publish(files, sequence, 'invalid', { captureId }, dependencies);
 }
 
 function captureRecoveryTarget(config, minimumMtimeMs = 0, captureIdentity, dependencies = {}) {
@@ -158,6 +169,8 @@ function captureRecoveryTarget(config, minimumMtimeMs = 0, captureIdentity, depe
   if (!Number.isSafeInteger(minimumMtimeMs) || minimumMtimeMs < 0) {
     throw new Error('minimum recovery target mtime must be a non-negative integer');
   }
+
+  const sequence = allocateAttempt(files, captureId, dependencies);
   let liveMtimeMs;
   let record;
   try {
@@ -165,25 +178,22 @@ function captureRecoveryTarget(config, minimumMtimeMs = 0, captureIdentity, depe
     if (!Number.isFinite(liveMtimeMs)) throw new Error('recovery target mtime is invalid');
     record = parseRecoveryTarget(fsImpl.readFileSync(files.live, 'utf8'));
   } catch (error) {
-    invalidateRecoveryTarget(files, captureId, dependencies);
+    publishInvalid(files, sequence, captureId, dependencies);
     if (error?.code === 'ENOENT') return false;
     throw error;
   }
-  if (liveMtimeMs <= minimumMtimeMs) {
-    invalidateRecoveryTarget(files, captureId, dependencies);
+  if (liveMtimeMs <= minimumMtimeMs || !record) {
+    publishInvalid(files, sequence, captureId, dependencies);
     return false;
   }
-  if (!record) {
-    invalidateRecoveryTarget(files, captureId, dependencies);
-    return false;
-  }
-  replaceRecoveryTarget(
-    files,
+
+  writeAtomic(
+    recoveryPath(files, sequence),
     `${JSON.stringify({ ...record, captureId }, null, 2)}\n`,
-    captureId,
-    true,
+    sequence,
     dependencies,
   );
+  publish(files, sequence, 'published', { captureId }, dependencies);
   return true;
 }
 
@@ -191,28 +201,34 @@ function readRecoveryThread(config, captureIdentity, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
   const captureId = requireCaptureId(captureIdentity);
   const files = targetPaths(config);
-  const firstPublication = readPublication(files.publication, dependencies);
-  if (firstPublication?.record.captureId !== captureId) return '';
-  if (tombstoneExists(files.tombstone, dependencies)) return '';
-  let record;
+  const firstSequence = latestAttemptSequence(files, dependencies);
+  if (!firstSequence) return '';
+
+  let publication;
+  let target;
   try {
-    record = parseRecoveryTarget(fsImpl.readFileSync(files.recovery, 'utf8'));
+    publication = parsePublication(
+      fsImpl.readFileSync(publicationPath(files, firstSequence), 'utf8'),
+      firstSequence,
+    );
+    if (publication?.status !== 'published' || publication.captureId !== captureId) return '';
+    target = parseRecoveryTarget(fsImpl.readFileSync(recoveryPath(files, firstSequence), 'utf8'));
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
     return '';
   }
-  if (tombstoneExists(files.tombstone, dependencies)) return '';
-  const secondPublication = readPublication(files.publication, dependencies);
-  if (secondPublication?.raw !== firstPublication.raw) return '';
-  if (record?.captureId !== captureId) return '';
-  return record.threadId || '';
+  const secondSequence = latestAttemptSequence(files, dependencies);
+  if (secondSequence !== firstSequence) return '';
+  if (target?.captureId !== captureId) return '';
+  return target.threadId || '';
 }
 
 function clearRecoveryTarget(config, dependencies = {}) {
   const files = targetPaths(config);
-  unlinkIfExists(files.publication, dependencies);
-  unlinkIfExists(files.recovery, dependencies);
-  unlinkIfExists(files.tombstone, dependencies);
+  const now = dependencies.now || Date.now;
+  const operationId = `clear-${process.pid}-${now()}`;
+  const sequence = allocateAttempt(files, operationId, dependencies);
+  publish(files, sequence, 'cleared', { operationId }, dependencies);
 }
 
 module.exports = {

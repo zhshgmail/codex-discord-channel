@@ -141,7 +141,7 @@ option_requires_value() {
 reconstruct_recovery_args() {
   local recovery_thread=$1
   local arg candidate
-  local -i arg_index image_value_count resume_index=-1
+  local -i arg_index image_value_count resume_index=-1 unsafe_positional=0
   local -i args_count=${#codex_args[@]}
 
   arg_index=0
@@ -152,6 +152,9 @@ reconstruct_recovery_args() {
       break
     fi
     if option_requires_value "$arg"; then
+      if ((arg_index + 1 >= args_count)) || [[ ${codex_args[$((arg_index + 1))]} == -* ]]; then
+        return 1
+      fi
       arg_index=$((arg_index + 2))
       continue
     fi
@@ -160,6 +163,7 @@ reconstruct_recovery_args() {
       image_value_count=0
       while ((arg_index < args_count)); do
         candidate=${codex_args[$arg_index]}
+        [[ $candidate == -- ]] && return 1
         if [[ $candidate == resume && $image_value_count -gt 0 ]]; then
           resume_index=$arg_index
           break 2
@@ -168,14 +172,17 @@ reconstruct_recovery_args() {
         image_value_count=$((image_value_count + 1))
         arg_index=$((arg_index + 1))
       done
+      ((image_value_count == 0)) && return 1
       continue
     fi
-    [[ $arg == -- ]] && break
+    [[ $arg == -- ]] && return 1
+    [[ $arg != -* ]] && unsafe_positional=1
     arg_index=$((arg_index + 1))
   done
 
   recovered_args=("${codex_args[@]}")
   if ((resume_index < 0)); then
+    ((unsafe_positional > 0)) && return 1
     recovered_args+=(resume "$recovery_thread")
     return
   fi
@@ -193,16 +200,10 @@ reconstruct_recovery_args() {
       continue
     fi
     if [[ $arg == -- ]]; then
-      arg_index=$((arg_index + 1))
-      while ((arg_index < args_count)); do
-        positional_indices[$arg_index]=1
-        definite_positionals=$((definite_positionals + 1))
-        arg_index=$((arg_index + 1))
-      done
-      break
+      return 1
     fi
     if option_requires_value "$arg"; then
-      if ((arg_index + 1 >= args_count)); then
+      if ((arg_index + 1 >= args_count)) || [[ ${codex_args[$((arg_index + 1))]} == -* ]]; then
         return 1
       fi
       arg_index=$((arg_index + 2))
