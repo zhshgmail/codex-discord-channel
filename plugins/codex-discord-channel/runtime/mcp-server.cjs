@@ -262,7 +262,7 @@ var require_mcp_config = __commonJS({
     }
     function loadMcpConfig2(inputEnv = process.env) {
       let env = requireMcpIdentity(inputEnv), config = loadConfig(env);
-      if (!(config.accountBindingLoaded && path.resolve(config.codexHome) === path.resolve(env.CODEX_HOME) && config.paths.instance === env.DISCORD_INSTANCE && path.resolve(config.paths.stateDir) === path.resolve(env.DISCORD_CONFIG_DIR))) {
+      if (!(config.accountBindingLoaded && config.accountEnvLoaded && path.resolve(config.codexHome) === path.resolve(env.CODEX_HOME) && config.paths.instance === env.DISCORD_INSTANCE && path.resolve(config.paths.stateDir) === path.resolve(env.DISCORD_CONFIG_DIR))) {
         let error = new Error("MCP account identity does not match its durable account binding");
         throw error.code = "mcp_account_identity_mismatch", error;
       }

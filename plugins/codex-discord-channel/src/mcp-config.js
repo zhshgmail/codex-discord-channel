@@ -31,6 +31,7 @@ function loadMcpConfig(inputEnv = process.env) {
   const env = requireMcpIdentity(inputEnv);
   const config = loadConfig(env);
   const matches = config.accountBindingLoaded
+    && config.accountEnvLoaded
     && path.resolve(config.codexHome) === path.resolve(env.CODEX_HOME)
     && config.paths.instance === env.DISCORD_INSTANCE
     && path.resolve(config.paths.stateDir) === path.resolve(env.DISCORD_CONFIG_DIR);

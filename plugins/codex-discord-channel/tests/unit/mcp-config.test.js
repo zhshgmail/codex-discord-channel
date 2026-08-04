@@ -87,6 +87,14 @@ test('MCP config rejects every explicit identity conflict and a missing durable 
   );
 
   fs.writeFileSync(accountEnv, `CODEX_HOME=${fixture.env.CODEX_HOME}\n`);
+  fs.rmSync(accountEnv);
+  assert.throws(
+    () => loadMcpConfig(fixture.env),
+    /does not match its durable account binding/,
+    'missing reverse account.env binding',
+  );
+
+  fs.writeFileSync(accountEnv, `CODEX_HOME=${fixture.env.CODEX_HOME}\n`);
   fs.rmSync(path.join(fixture.env.CODEX_HOME, 'discord-instance.env'));
   assert.throws(
     () => loadMcpConfig(fixture.env),

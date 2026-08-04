@@ -227,4 +227,15 @@ test('packaged MCP missing any selected identity exits before owner or Discord s
     assert.equal(result.stdout, '');
     assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), false, missing);
   }
+
+  fs.rmSync(path.join(stateDir, 'account.env'));
+  const missingReverse = await runMcpExpectFailure(
+    process.execPath,
+    ['./runtime/mcp-server.cjs'],
+    { cwd: installedRoot, env: completeEnv },
+  );
+  assert.equal(missingReverse.code, 1);
+  assert.match(missingReverse.stderr, /does not match its durable account binding/);
+  assert.equal(missingReverse.stdout, '');
+  assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), false);
 });
