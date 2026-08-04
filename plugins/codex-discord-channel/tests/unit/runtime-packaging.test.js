@@ -67,6 +67,34 @@ function requestMcp(command, args, options, requests) {
   });
 }
 
+function runMcpExpectFailure(command, args, options) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('Timed out waiting for isolated MCP identity failure'));
+    }, 5000);
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stderr, stdout });
+    });
+  });
+}
+
 test('marketplace cache starts MCP without node_modules in an isolated Codex environment', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-cache-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -155,4 +183,48 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
   assert.equal(status.result.structuredContent.discordReason, 'token_missing');
   assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), true);
   assert.equal(fs.existsSync(path.join(home, '.codex')), false);
+});
+
+test('packaged MCP missing any selected identity exits before owner or Discord state', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-identity-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const codexHome = path.join(root, 'codex-home');
+  const stateDir = path.join(root, 'discord', 'codex02');
+  const installedRoot = path.join(root, 'installed-plugin');
+  fs.cpSync(pluginRoot, installedRoot, {
+    recursive: true,
+    filter(source) {
+      return !['node_modules', '.env'].includes(path.basename(source));
+    },
+  });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexHome, 'discord-instance.env'),
+    `DISCORD_INSTANCE=codex02\nDISCORD_CONFIG_DIR=${stateDir}\n`,
+  );
+  fs.writeFileSync(path.join(stateDir, 'account.env'), `CODEX_HOME=${codexHome}\n`);
+
+  const completeEnv = {
+    HOME: root,
+    CODEX_HOME: codexHome,
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: stateDir,
+    DISCORD_BOT_TOKEN: 'must-not-be-used',
+    NODE_PATH: '',
+  };
+  for (const missing of ['CODEX_HOME', 'DISCORD_INSTANCE', 'DISCORD_CONFIG_DIR']) {
+    const env = { ...completeEnv };
+    delete env[missing];
+    const result = await runMcpExpectFailure(
+      process.execPath,
+      ['./runtime/mcp-server.cjs'],
+      { cwd: installedRoot, env },
+    );
+    assert.equal(result.code, 1, missing);
+    assert.match(result.stderr, new RegExp(`MCP account identity is missing:.*${missing}`));
+    assert.equal(result.stdout, '');
+    assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), false, missing);
+  }
 });

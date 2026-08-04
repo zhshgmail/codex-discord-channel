@@ -55,12 +55,42 @@ test('MCP config fails closed when Codex filters any identity variable', () => {
   }
 });
 
-test('MCP config rejects an explicit identity that conflicts with its binding', (t) => {
+test('MCP config rejects every explicit identity conflict and a missing durable binding', (t) => {
   const fixture = makeIdentityFixture();
   t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
 
+  const conflicts = [
+    {
+      name: 'instance',
+      mutate: () => ({ ...fixture.env, DISCORD_INSTANCE: 'codex01' }),
+      pattern: /DISCORD_INSTANCE conflicts|does not match its durable account binding/,
+    },
+    {
+      name: 'state directory',
+      mutate: () => ({
+        ...fixture.env,
+        DISCORD_CONFIG_DIR: path.join(fixture.root, 'discord', 'other'),
+      }),
+      pattern: /DISCORD_CONFIG_DIR conflicts|does not match its durable account binding/,
+    },
+  ];
+  for (const conflict of conflicts) {
+    assert.throws(() => loadMcpConfig(conflict.mutate()), conflict.pattern, conflict.name);
+  }
+
+  const accountEnv = path.join(fixture.env.DISCORD_CONFIG_DIR, 'account.env');
+  fs.writeFileSync(accountEnv, `CODEX_HOME=${path.join(fixture.root, 'other-home')}\n`);
   assert.throws(
-    () => loadMcpConfig({ ...fixture.env, DISCORD_INSTANCE: 'codex01' }),
-    /DISCORD_INSTANCE conflicts|does not match its durable account binding/,
+    () => loadMcpConfig(fixture.env),
+    /CODEX_HOME conflicts|does not match its durable account binding/,
+    'reverse account.env CODEX_HOME binding',
+  );
+
+  fs.writeFileSync(accountEnv, `CODEX_HOME=${fixture.env.CODEX_HOME}\n`);
+  fs.rmSync(path.join(fixture.env.CODEX_HOME, 'discord-instance.env'));
+  assert.throws(
+    () => loadMcpConfig(fixture.env),
+    /does not match its durable account binding/,
+    'missing discord-instance.env binding',
   );
 });

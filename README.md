@@ -196,17 +196,24 @@ before `.env` and pins the selected Discord state directory before applying
 `CODEX_DISCORD_CHANNEL_BIN` are accepted. Put proxy and CA variables in the
 optional instance-local `app-server-network.env`; unknown keys fail closed.
 
-Bind MCP discovery to the same instance even when a launcher does not preserve
-Discord environment variables. Create `$CODEX_HOME/discord-instance.env`:
+Bind MCP discovery to the same instance by preserving all three identity
+variables from the selected Codex process. The plugin MCP manifest explicitly
+requests `CODEX_HOME`, `DISCORD_INSTANCE`, and `DISCORD_CONFIG_DIR`; if Codex
+does not pass any one of them, the MCP process exits before claiming an owner
+or starting Discord. Create `$CODEX_HOME/discord-instance.env` as the durable
+validation record:
 
 ```env
 DISCORD_INSTANCE=codex02
 DISCORD_CONFIG_DIR=/home/USER/.codex/channels/discord/codex02
 ```
 
-This file accepts only those two keys. Explicit command-line service selection
-must agree with it, so a stale or edited environment file cannot redirect one
-instance onto another instance's bot state.
+This file accepts only those two keys. The explicit MCP identity must agree
+with it, and the selected state's `account.env` must point back to the same
+`CODEX_HOME`, so a stale or edited environment file cannot redirect one
+instance onto another instance's bot state. This binding validates an explicit
+identity; it is not a fallback for identity variables filtered out by an MCP
+launcher.
 
 The account-isolated app-server entry point fails closed when `CODEX_HOME` is
 not explicit:
@@ -297,9 +304,11 @@ exact thread checkpoint, and obtain explicit operator approval. Updating the
 Discord gateway or its dependencies does not require replacing the Codex
 app-server.
 
-The plugin MCP manifest intentionally does not hardcode `codex01`; it inherits
-the instance variables from the selected Codex process and falls back to that
-account's `discord-instance.env` binding.
+The plugin MCP manifest intentionally does not hardcode `codex01`; it requests
+the complete account identity from the selected Codex process and checks it
+against that account's `discord-instance.env` plus instance-local
+`account.env`. Missing or conflicting identity fails closed before owner state
+or Discord state can be touched.
 
 Create `$HOME/.codex/channels/discord/codex01/.env` locally:
 
