@@ -224,12 +224,26 @@ once.
 ### Fixed Behavior
 
 The plugin sender now requires the exact source channel and message id and
-fsyncs one claim for that identity before the network send. It never derives a
-guarded reply identity from `last-inbound.json`. Concurrent or later sends for
-that source are suppressed. Deterministic preflight failures do not consume the
-reply; a transport failure after the claim remains `uncertain` and fails closed
-rather than replaying. A deliberate additional message requires the explicit
-`followup` flag.
+fsyncs a versioned state receipt for that identity before the network send. It
+never derives a guarded reply identity from `last-inbound.json`. Receipt
+transitions are serialized by a per-source cross-process lock: `in_flight` is
+leased and recoverable after process death, `uncertain` must reconcile by exact
+outbound message id or deterministic Discord nonce, and `confirmed` is
+terminal.
+
+Every guarded send uses the same source-derived nonce with Discord nonce
+enforcement. A returned message id is not confirmed until an exact read-back
+matches channel, source reply, nonce, content, and bot author. When the network
+fails before acknowledgement, a retry first searches by that stable identity.
+If no match is found and no Discord message id was returned, the same enforced
+nonce may be retried only inside a bounded window. A returned message id and
+stale uncertainty remain fail-closed. This repairs the case
+where an ordinary network error created no message but the old pre-send claim
+permanently consumed the source reply right, without turning uncertain sends
+into blind replays.
+
+Deterministic preflight failures do not consume the reply. A deliberate
+additional message requires the explicit `followup` flag.
 
 Discord-origin replies must use `discord_channel_send` or the plugin CLI. A
 generic Discord MCP sender cannot participate in this receipt protocol and is

@@ -8,7 +8,9 @@ const {
   readLastInboundContext,
 } = require('./delivery');
 const {
+  confirmDiscordMessage,
   prepareDiscordMessageSend,
+  reconcileDiscordMessage,
   sendDiscordMessage,
   startDiscordClient,
 } = require('./discord-client');
@@ -226,14 +228,26 @@ async function callTool(context, name, args = {}) {
       args,
       config: context.config,
       content: args.content,
-      preflight: (target) => prepareDiscordMessageSend(
+      preflight: (target, identity) => prepareDiscordMessageSend(
         context.discordState.client,
-        { ...args, ...target },
+        { ...args, ...target, ...identity },
       ),
-      sender: (target, prepared) => sendDiscordMessage(
+      sender: (target, prepared, identity) => sendDiscordMessage(
         context.discordState.client,
-        { ...args, ...target },
+        { ...args, ...target, ...identity },
         prepared,
+      ),
+      confirmer: (target, prepared, sent, receipt) => confirmDiscordMessage(
+        context.discordState.client,
+        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true },
+        prepared,
+        sent,
+      ),
+      reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
+        context.discordState.client,
+        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true },
+        prepared,
+        receipt,
       ),
     });
     const message = sent.duplicateSuppressed

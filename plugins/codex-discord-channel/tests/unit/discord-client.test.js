@@ -14,12 +14,95 @@ const {
   readReceiverAuthoritySnapshot,
 } = require('../../src/receiver-state');
 const {
+  confirmDiscordMessage,
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
+  prepareDiscordMessageSend,
+  reconcileDiscordMessage,
   releaseDiscordReceiverOwnership,
   resolveReferencedMessage,
   startDiscordClient,
 } = require('../../src/discord-client');
+
+test('guarded Discord sends carry a stable enforced nonce and require exact readback', async () => {
+  const messages = new Map();
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (typeof query === 'string') return messages.get(query) || null;
+        return new Map(messages.entries());
+      },
+    },
+    async send(payload) {
+      const message = {
+        id: 'out1',
+        channelId: 'c1',
+        content: payload.content,
+        nonce: payload.nonce,
+        reference: { messageId: payload.reply.messageReference },
+        author: { id: 'bot1' },
+      };
+      messages.set(message.id, message);
+      return message;
+    },
+  };
+  const client = {
+    user: { id: 'bot1' },
+    channels: { async fetch() { return channel; } },
+  };
+  const args = {
+    channelId: 'c1',
+    replyTo: 'm1',
+    content: 'answer',
+    nonce: 'cdr-stable',
+    enforceNonce: true,
+  };
+
+  const prepared = await prepareDiscordMessageSend(client, args);
+  assert.equal(prepared.payload.nonce, 'cdr-stable');
+  assert.equal(prepared.payload.enforceNonce, true);
+  const sent = await channel.send(prepared.payload);
+  assert.deepEqual(await confirmDiscordMessage(client, args, prepared, {
+    channelId: sent.channelId,
+    messageId: sent.id,
+  }), { channelId: 'c1', messageId: 'out1' });
+});
+
+test('reply reconciliation requires nonce source content channel and bot identity', async () => {
+  const messages = new Map([
+    ['wrong-source', {
+      id: 'wrong-source', channelId: 'c1', content: 'answer', nonce: 'cdr-stable',
+      reference: { messageId: 'other' }, author: { id: 'bot1' },
+    }],
+    ['right', {
+      id: 'right', channelId: 'c1', content: 'answer', nonce: 'cdr-stable',
+      reference: { messageId: 'm1' }, author: { id: 'bot1' },
+    }],
+  ]);
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (typeof query === 'string') return messages.get(query) || null;
+        return new Map(messages.entries());
+      },
+    },
+  };
+  const client = {
+    user: { id: 'bot1' },
+    channels: { async fetch() { return channel; } },
+  };
+  const args = {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'cdr-stable', enforceNonce: true,
+  };
+
+  assert.deepEqual(await reconcileDiscordMessage(client, args, { channel }, {}), {
+    found: true,
+    channelId: 'c1',
+    messageId: 'right',
+  });
+  messages.delete('right');
+  assert.deepEqual(await reconcileDiscordMessage(client, args, { channel }, {}), { found: false });
+});
 
 test('reference resolver fetches references for enabled guild channels', async () => {
   const referenced = { author: { id: 'peer' }, content: 'hello <@bot>' };

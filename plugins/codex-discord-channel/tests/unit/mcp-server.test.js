@@ -457,18 +457,35 @@ test('send tool suppresses a second reply to the same inbound message', async ()
   }));
 
   const sends = [];
+  const messages = new Map();
   const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
   const context = {
     config,
     discordState: {
       started: true,
       client: {
+        user: { id: 'bot1' },
         channels: {
           async fetch(channelId) {
             return {
+              messages: {
+                async fetch(query) {
+                  if (typeof query === 'string') return messages.get(query) || null;
+                  return new Map(messages.entries());
+                },
+              },
               async send(payload) {
                 sends.push({ channelId, payload });
-                return { channelId, id: 'sent1' };
+                const message = {
+                  channelId,
+                  id: 'sent1',
+                  nonce: payload.nonce,
+                  content: payload.content,
+                  reference: { messageId: payload.reply.messageReference },
+                  author: { id: 'bot1' },
+                };
+                messages.set(message.id, message);
+                return message;
               },
             };
           },
@@ -492,4 +509,75 @@ test('send tool suppresses a second reply to the same inbound message', async ()
   assert.equal(repeated.structuredContent.duplicateSuppressed, true);
   assert.equal(repeated.structuredContent.reason, 'source_message_already_replied');
   assert.equal(sends.length, 1);
+  assert.equal(sends[0].payload.reply.messageReference, 'm1');
+  assert.equal(sends[0].payload.enforceNonce, true);
+  assert.match(sends[0].payload.nonce, /^cdr-[0-9a-f]{21}$/);
+});
+
+test('send tool recovers a failed network send without consuming the exact source reply', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const messages = new Map();
+  const sends = [];
+  let failFirst = true;
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (typeof query === 'string') return messages.get(query) || null;
+        return new Map(messages.entries());
+      },
+    },
+    async send(payload) {
+      sends.push(payload);
+      if (failFirst) {
+        failFirst = false;
+        throw new Error('fetch failed');
+      }
+      const message = {
+        id: 'sent-after-retry',
+        channelId: 'c1',
+        nonce: payload.nonce,
+        content: payload.content,
+        reference: { messageId: payload.reply.messageReference },
+        author: { id: 'bot1' },
+      };
+      messages.set(message.id, message);
+      return message;
+    },
+  };
+  const context = {
+    config,
+    discordState: {
+      started: true,
+      client: {
+        user: { id: 'bot1' },
+        channels: { async fetch() { return channel; } },
+      },
+    },
+  };
+  const args = { channelId: 'c1', replyTo: 'm1', content: 'answer' };
+
+  await assert.rejects(callTool(context, 'discord_channel_send', args), /fetch failed/);
+  assert.equal(messages.size, 0);
+  const receiptFiles = fs.readdirSync(config.paths.replyReceiptDir);
+  assert.equal(receiptFiles.length, 1);
+  const uncertain = JSON.parse(fs.readFileSync(
+    path.join(config.paths.replyReceiptDir, receiptFiles[0]),
+    'utf8',
+  ));
+  assert.equal(uncertain.status, 'uncertain');
+  assert.equal(uncertain.sourceMessageId, 'm1');
+  assert.equal(uncertain.outboundMessageId, undefined);
+  const retry = await callTool(context, 'discord_channel_send', args);
+  const duplicate = await callTool(context, 'discord_channel_send', args);
+
+  assert.equal(sends.length, 2);
+  assert.equal(sends[0].nonce, sends[1].nonce);
+  assert.equal(sends[1].reply.messageReference, 'm1');
+  assert.equal(retry.structuredContent.messageId, 'sent-after-retry');
+  assert.equal(retry.structuredContent.duplicateSuppressed, false);
+  assert.equal(duplicate.structuredContent.duplicateSuppressed, true);
+  assert.equal(duplicate.structuredContent.messageId, 'sent-after-retry');
 });

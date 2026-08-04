@@ -112,10 +112,17 @@ bounded output.
 
 For a Discord-origin request, send through `discord_channel_send` with the exact
 source `channelId` and `replyTo`. The sender does not infer either identity from
-`last-inbound.json`. Before the network send it fsyncs a durable claim keyed by
-that source identity. Later automatic continuations for the same source are
-suppressed. Use `followup: true` only when a second Discord message is
-intentionally required.
+`last-inbound.json`. Before the network send it fsyncs a recoverable `in_flight`
+receipt keyed by that source identity under a per-source cross-process lock.
+The request uses a deterministic enforced nonce. Success is terminal only after
+the returned message id is read back with the exact channel, source reply,
+nonce, content, and bot identity.
+
+An interrupted send is reconciled by recorded message id or stable nonce. A
+same-nonce retry is allowed only when no message id was returned and the bounded
+enforcement window is still open; otherwise uncertainty remains fail-closed.
+Confirmed replies suppress later automatic continuations. Use `followup: true`
+only when a second Discord message is intentionally required.
 
 Do not answer a Discord-origin request through a generic Discord MCP sender.
 That path does not share this plugin's reply receipt and bypasses the one-source

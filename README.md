@@ -395,11 +395,19 @@ Guarded replies require the exact source `--channel` and `--reply-to` values.
 The sender never infers reply identity from mutable `last-inbound.json`. Use
 `--followup` with an exact channel only for a deliberate additional message.
 
-Before the first network send for a source Discord message, the sender fsyncs a
-durable claim under `reply-receipts/`. A later automatic continuation targeting
-that exact source is suppressed instead of posting another answer. Discord-
-origin replies must use this plugin's sender; a generic Discord MCP sender
-bypasses the receipt guard.
+Before the first network send for a source Discord message, the sender fsyncs an
+`in_flight` receipt under `reply-receipts/` while holding that source's
+cross-process lock. The Discord request carries a deterministic nonce with
+nonce enforcement. A returned message id becomes terminal only after an exact
+read-back proves the same channel, source reply, nonce, content, and bot author.
+
+If a process or network acknowledgement is lost, a later process first
+reconciles the recorded message id or stable nonce. A request may be repeated
+with the same enforced nonce only when no message id was returned and the
+bounded replay window is still open. Otherwise it remains fail-closed. A
+confirmed receipt suppresses every later automatic continuation. Discord-origin
+replies must use this plugin's sender; a generic Discord MCP sender bypasses the
+receipt guard.
 
 `discord_channel_read_history` is bounded to 25 sanitized messages per call.
 Use its exclusive `before` cursor to page backward. Reading history does not

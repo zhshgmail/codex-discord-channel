@@ -287,6 +287,10 @@ async function prepareDiscordMessageSend(client, args) {
     throw new Error('Target channel cannot receive messages.');
   }
   const payload = { content: args.content };
+  if (typeof args.nonce === 'string' && args.nonce !== '') {
+    payload.nonce = args.nonce;
+    payload.enforceNonce = args.enforceNonce === true;
+  }
   if (typeof args.replyTo === 'string' && args.replyTo.trim() !== '') {
     payload.reply = { messageReference: args.replyTo.trim(), failIfNotExists: false };
   }
@@ -300,12 +304,87 @@ async function sendDiscordMessage(client, args, prepared = null) {
   return { channelId: sent.channelId, messageId: sent.id };
 }
 
+function messageReplySourceId(message) {
+  return String(message?.reference?.messageId || message?.messageReference?.messageId || '');
+}
+
+function messageMatchesReplyIdentity(client, message, args, expectedMessageId = '') {
+  if (!message) return false;
+  if (expectedMessageId && String(message.id || '') !== String(expectedMessageId)) return false;
+  if (String(message.channelId || '') !== String(args.channelId || '')) return false;
+  if (String(message.nonce || '') !== String(args.nonce || '')) return false;
+  if (String(message.content || '') !== String(args.content || '')) return false;
+  if (messageReplySourceId(message) !== String(args.replyTo || '')) return false;
+  const botUserId = String(client?.user?.id || '');
+  return !botUserId || String(message.author?.id || '') === botUserId;
+}
+
+function replyConfirmationError(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+async function fetchReplyMessage(channel, messageId) {
+  if (typeof channel?.messages?.fetch !== 'function') {
+    throw replyConfirmationError('reply_confirmation_unavailable');
+  }
+  try {
+    return await channel.messages.fetch(messageId);
+  } catch (error) {
+    if (error?.status === 404 || error?.statusCode === 404 || error?.code === 10008) return null;
+    throw replyConfirmationError('reply_confirmation_failed');
+  }
+}
+
+async function confirmDiscordMessage(client, args, prepared, sent) {
+  const channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId);
+  const message = await fetchReplyMessage(channel, sent.messageId);
+  if (!messageMatchesReplyIdentity(client, message, args, sent.messageId)) {
+    throw replyConfirmationError('reply_confirmation_mismatch');
+  }
+  return { channelId: String(message.channelId), messageId: String(message.id) };
+}
+
+function messageValues(collection) {
+  if (Array.isArray(collection)) return collection;
+  if (collection && typeof collection.values === 'function') return [...collection.values()];
+  return [];
+}
+
+async function reconcileDiscordMessage(client, args, prepared, receipt) {
+  const channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId);
+  if (!channel || typeof channel.messages?.fetch !== 'function') {
+    throw replyConfirmationError('reply_reconciliation_unavailable');
+  }
+  if (receipt?.outboundMessageId) {
+    const exact = await fetchReplyMessage(channel, receipt.outboundMessageId);
+    if (messageMatchesReplyIdentity(client, exact, args, receipt.outboundMessageId)) {
+      return { found: true, channelId: String(exact.channelId), messageId: String(exact.id) };
+    }
+  }
+  let recent;
+  try {
+    recent = await channel.messages.fetch({ limit: 100 });
+  } catch {
+    throw replyConfirmationError('reply_reconciliation_failed');
+  }
+  const match = messageValues(recent).find((message) => (
+    messageMatchesReplyIdentity(client, message, args)
+  ));
+  return match
+    ? { found: true, channelId: String(match.channelId), messageId: String(match.id) }
+    : { found: false };
+}
+
 module.exports = {
+  confirmDiscordMessage,
   configureNetwork,
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
   releaseDiscordReceiverOwnership,
   prepareDiscordMessageSend,
+  reconcileDiscordMessage,
   resolveReferencedMessage,
   sendDiscordMessage,
   startDiscordClient,
