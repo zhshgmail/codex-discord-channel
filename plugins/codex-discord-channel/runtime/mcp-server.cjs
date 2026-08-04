@@ -131,7 +131,7 @@ var require_config = __commonJS({
     }
     function loadEnvFile(file, env, options = {}) {
       if (!file || !fs.existsSync(file)) return !1;
-      let text = fs.readFileSync(file, "utf8");
+      let text = fs.readFileSync(file, "utf8"), seenKeys = /* @__PURE__ */ new Set();
       for (let rawLine of text.split(/\r?\n/)) {
         let line = rawLine.trim();
         if (!line || line.startsWith("#")) continue;
@@ -148,12 +148,22 @@ var require_config = __commonJS({
           let error = new Error(`Environment key ${key} is not allowed in ${file}`);
           throw error.code = "environment_key_not_allowed", error;
         }
+        if (options.rejectDuplicateKeys && seenKeys.has(key)) {
+          let error = new Error(`Environment key ${key} is duplicated in ${file}`);
+          throw error.code = "environment_key_duplicated", error;
+        }
+        seenKeys.add(key);
         let value = stripQuotes(rawValue);
         if (options.rejectConflicts && env[key] !== void 0 && String(env[key]) !== value) {
           let error = new Error(`Environment key ${key} conflicts with the selected instance`);
           throw error.code = "environment_key_conflict", error;
         }
         env[key] === void 0 && (env[key] = value);
+      }
+      let missing = [...options.requiredKeys || []].filter((key) => !seenKeys.has(key));
+      if (missing.length > 0) {
+        let error = new Error(`Environment file ${file} is missing: ${missing.join(", ")}`);
+        throw error.code = "environment_required_key_missing", error;
       }
       return !0;
     }
@@ -228,6 +238,8 @@ var require_config = __commonJS({
       };
     }
     module2.exports = {
+      ACCOUNT_BINDING_KEYS,
+      ACCOUNT_ENV_KEYS,
       loadConfig,
       loadEnvFile,
       parseInteger,
@@ -241,7 +253,12 @@ var require_config = __commonJS({
 var require_mcp_config = __commonJS({
   "src/mcp-config.js"(exports2, module2) {
     "use strict";
-    var path = require("node:path"), { loadConfig } = require_config(), REQUIRED_MCP_IDENTITY_KEYS = [
+    var path = require("node:path"), {
+      ACCOUNT_BINDING_KEYS,
+      ACCOUNT_ENV_KEYS,
+      loadConfig,
+      loadEnvFile
+    } = require_config(), REQUIRED_MCP_IDENTITY_KEYS = [
       "CODEX_HOME",
       "DISCORD_INSTANCE",
       "DISCORD_CONFIG_DIR"
@@ -261,8 +278,24 @@ var require_mcp_config = __commonJS({
       return env;
     }
     function loadMcpConfig2(inputEnv = process.env) {
-      let env = requireMcpIdentity(inputEnv), config = loadConfig(env);
-      if (!(config.accountBindingLoaded && config.accountEnvLoaded && path.resolve(config.codexHome) === path.resolve(env.CODEX_HOME) && config.paths.instance === env.DISCORD_INSTANCE && path.resolve(config.paths.stateDir) === path.resolve(env.DISCORD_CONFIG_DIR))) {
+      let env = requireMcpIdentity(inputEnv), config = loadConfig(env), durableBinding = {}, durableAccount = {}, durableRecordsLoaded = !1;
+      try {
+        let bindingLoaded = loadEnvFile(config.paths.accountBindingPath, durableBinding, {
+          allowedKeys: ACCOUNT_BINDING_KEYS,
+          rejectDuplicateKeys: !0,
+          requiredKeys: ACCOUNT_BINDING_KEYS,
+          strict: !0
+        }), accountLoaded = loadEnvFile(config.paths.accountEnvPath, durableAccount, {
+          allowedKeys: ACCOUNT_ENV_KEYS,
+          rejectDuplicateKeys: !0,
+          requiredKeys: /* @__PURE__ */ new Set(["CODEX_HOME"]),
+          strict: !0
+        });
+        durableRecordsLoaded = bindingLoaded && accountLoaded;
+      } catch {
+        durableRecordsLoaded = !1;
+      }
+      if (!(durableRecordsLoaded && config.accountBindingLoaded && config.accountEnvLoaded && durableBinding.DISCORD_INSTANCE === env.DISCORD_INSTANCE && path.resolve(durableBinding.DISCORD_CONFIG_DIR) === path.resolve(env.DISCORD_CONFIG_DIR) && path.resolve(durableAccount.CODEX_HOME) === path.resolve(env.CODEX_HOME) && path.resolve(config.codexHome) === path.resolve(env.CODEX_HOME) && config.paths.instance === env.DISCORD_INSTANCE && path.resolve(config.paths.stateDir) === path.resolve(env.DISCORD_CONFIG_DIR))) {
         let error = new Error("MCP account identity does not match its durable account binding");
         throw error.code = "mcp_account_identity_mismatch", error;
       }

@@ -238,4 +238,29 @@ test('packaged MCP missing any selected identity exits before owner or Discord s
   assert.match(missingReverse.stderr, /does not match its durable account binding/);
   assert.equal(missingReverse.stdout, '');
   assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), false);
+
+  const bindingPath = path.join(codexHome, 'discord-instance.env');
+  const accountPath = path.join(stateDir, 'account.env');
+  const validBinding = `DISCORD_INSTANCE=codex02\nDISCORD_CONFIG_DIR=${stateDir}\n`;
+  const validAccount = `CODEX_HOME=${codexHome}\n`;
+  const incompleteRecords = [
+    { path: bindingPath, content: '', label: 'empty account binding' },
+    { path: bindingPath, content: 'DISCORD_INSTANCE=codex02\n', label: 'partial account binding' },
+    { path: accountPath, content: '', label: 'empty reverse binding' },
+    { path: accountPath, content: 'CODEX_BIN=/opt/codex\n', label: 'partial reverse binding' },
+  ];
+  for (const attack of incompleteRecords) {
+    fs.writeFileSync(bindingPath, validBinding);
+    fs.writeFileSync(accountPath, validAccount);
+    fs.writeFileSync(attack.path, attack.content);
+    const result = await runMcpExpectFailure(
+      process.execPath,
+      ['./runtime/mcp-server.cjs'],
+      { cwd: installedRoot, env: completeEnv },
+    );
+    assert.equal(result.code, 1, attack.label);
+    assert.match(result.stderr, /does not match its durable account binding/, attack.label);
+    assert.equal(result.stdout, '', attack.label);
+    assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), false, attack.label);
+  }
 });

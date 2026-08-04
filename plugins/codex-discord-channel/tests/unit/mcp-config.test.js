@@ -102,3 +102,41 @@ test('MCP config rejects every explicit identity conflict and a missing durable 
     'missing discord-instance.env binding',
   );
 });
+
+test('MCP config rejects empty, partial, and duplicate durable identity records', (t) => {
+  const fixture = makeIdentityFixture();
+  t.after(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+
+  const accountBinding = path.join(fixture.env.CODEX_HOME, 'discord-instance.env');
+  const accountEnv = path.join(fixture.env.DISCORD_CONFIG_DIR, 'account.env');
+  const validBinding = `DISCORD_INSTANCE=codex02\nDISCORD_CONFIG_DIR=${fixture.env.DISCORD_CONFIG_DIR}\n`;
+  const validAccount = `CODEX_HOME=${fixture.env.CODEX_HOME}\n`;
+  const attacks = [
+    { file: accountBinding, content: '', label: 'empty account binding' },
+    { file: accountBinding, content: '# no identity\n', label: 'comment-only account binding' },
+    { file: accountBinding, content: 'DISCORD_INSTANCE=codex02\n', label: 'partial account binding' },
+    {
+      file: accountBinding,
+      content: `${validBinding}DISCORD_INSTANCE=codex02\n`,
+      label: 'duplicate account binding key',
+    },
+    { file: accountEnv, content: '', label: 'empty reverse binding' },
+    { file: accountEnv, content: '# no identity\n', label: 'comment-only reverse binding' },
+    { file: accountEnv, content: 'CODEX_BIN=/opt/codex\n', label: 'partial reverse binding' },
+    {
+      file: accountEnv,
+      content: `${validAccount}CODEX_HOME=${fixture.env.CODEX_HOME}\n`,
+      label: 'duplicate reverse binding key',
+    },
+  ];
+  for (const attack of attacks) {
+    fs.writeFileSync(accountBinding, validBinding);
+    fs.writeFileSync(accountEnv, validAccount);
+    fs.writeFileSync(attack.file, attack.content);
+    assert.throws(
+      () => loadMcpConfig(fixture.env),
+      /does not match its durable account binding/,
+      attack.label,
+    );
+  }
+});

@@ -1,7 +1,12 @@
 'use strict';
 
 const path = require('node:path');
-const { loadConfig } = require('./config');
+const {
+  ACCOUNT_BINDING_KEYS,
+  ACCOUNT_ENV_KEYS,
+  loadConfig,
+  loadEnvFile,
+} = require('./config');
 
 const REQUIRED_MCP_IDENTITY_KEYS = [
   'CODEX_HOME',
@@ -30,8 +35,32 @@ function requireMcpIdentity(inputEnv) {
 function loadMcpConfig(inputEnv = process.env) {
   const env = requireMcpIdentity(inputEnv);
   const config = loadConfig(env);
-  const matches = config.accountBindingLoaded
+  const durableBinding = {};
+  const durableAccount = {};
+  let durableRecordsLoaded = false;
+  try {
+    const bindingLoaded = loadEnvFile(config.paths.accountBindingPath, durableBinding, {
+      allowedKeys: ACCOUNT_BINDING_KEYS,
+      rejectDuplicateKeys: true,
+      requiredKeys: ACCOUNT_BINDING_KEYS,
+      strict: true,
+    });
+    const accountLoaded = loadEnvFile(config.paths.accountEnvPath, durableAccount, {
+      allowedKeys: ACCOUNT_ENV_KEYS,
+      rejectDuplicateKeys: true,
+      requiredKeys: new Set(['CODEX_HOME']),
+      strict: true,
+    });
+    durableRecordsLoaded = bindingLoaded && accountLoaded;
+  } catch {
+    durableRecordsLoaded = false;
+  }
+  const matches = durableRecordsLoaded
+    && config.accountBindingLoaded
     && config.accountEnvLoaded
+    && durableBinding.DISCORD_INSTANCE === env.DISCORD_INSTANCE
+    && path.resolve(durableBinding.DISCORD_CONFIG_DIR) === path.resolve(env.DISCORD_CONFIG_DIR)
+    && path.resolve(durableAccount.CODEX_HOME) === path.resolve(env.CODEX_HOME)
     && path.resolve(config.codexHome) === path.resolve(env.CODEX_HOME)
     && config.paths.instance === env.DISCORD_INSTANCE
     && path.resolve(config.paths.stateDir) === path.resolve(env.DISCORD_CONFIG_DIR);
