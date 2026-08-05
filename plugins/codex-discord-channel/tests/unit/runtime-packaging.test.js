@@ -67,6 +67,60 @@ function requestMcp(command, args, options, requests) {
   });
 }
 
+function startMcpSession(command, args, options) {
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: options.env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const pending = new Map();
+  let nextId = 1;
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+  lines.on('line', (line) => {
+    const message = JSON.parse(line);
+    const waiter = pending.get(String(message.id));
+    if (!waiter) return;
+    pending.delete(String(message.id));
+    clearTimeout(waiter.timer);
+    waiter.resolve(message);
+  });
+  child.once('exit', (code, signal) => {
+    for (const waiter of pending.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`MCP exited ${code ?? signal}: ${stderr}`));
+    }
+    pending.clear();
+  });
+
+  return {
+    request(method, params = {}) {
+      const id = nextId;
+      nextId += 1;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(String(id));
+          reject(new Error(`Timed out waiting for MCP response: ${stderr}`));
+        }, 5000);
+        pending.set(String(id), { reject, resolve, timer });
+        child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      });
+    },
+    close() {
+      return new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once('exit', () => resolve());
+        child.kill('SIGTERM');
+      });
+    },
+  };
+}
+
 function runMcpExpectFailure(command, args, options) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -263,4 +317,61 @@ test('packaged MCP missing any selected identity exits before owner or Discord s
     assert.equal(result.stdout, '', attack.label);
     assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), false, attack.label);
   }
+});
+
+test('packaged MCP rejects a stale process reclaim after successor startup', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-owner-fence-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const codexHome = path.join(root, 'codex-home');
+  const stateDir = path.join(root, 'discord', 'packaging-test');
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexHome, 'discord-instance.env'),
+    `DISCORD_INSTANCE=packaging-test\nDISCORD_CONFIG_DIR=${stateDir}\n`,
+  );
+  fs.writeFileSync(path.join(stateDir, 'account.env'), `CODEX_HOME=${codexHome}\n`);
+
+  const baseEnv = {
+    HOME: root,
+    CODEX_HOME: codexHome,
+    DISCORD_INSTANCE: 'packaging-test',
+    DISCORD_CONFIG_DIR: stateDir,
+    DISCORD_CHANNEL_DISABLE_LOGIN: '1',
+    CODEX_DISCORD_DELIVERY_MODE: 'off',
+    NODE_PATH: '',
+  };
+  const first = startMcpSession(process.execPath, ['./runtime/mcp-server.cjs'], {
+    cwd: pluginRoot,
+    env: {
+      ...baseEnv,
+      CODEX_DISCORD_OWNER_ID: 'owner-a',
+      CODEX_THREAD_ID: 'thread-a',
+      CODEX_TURN_ID: 'turn-a',
+    },
+  });
+  t.after(() => first.close());
+  await first.request('initialize', { protocolVersion: '2025-11-25' });
+
+  const successor = startMcpSession(process.execPath, ['./runtime/mcp-server.cjs'], {
+    cwd: pluginRoot,
+    env: {
+      ...baseEnv,
+      CODEX_DISCORD_OWNER_ID: 'owner-b',
+      CODEX_THREAD_ID: 'thread-b',
+      CODEX_TURN_ID: 'turn-b',
+    },
+  });
+  t.after(() => successor.close());
+  await successor.request('initialize', { protocolVersion: '2025-11-25' });
+
+  const staleClaim = await first.request('tools/call', {
+    name: 'discord_channel_claim_owner',
+    arguments: {},
+  });
+  const owner = JSON.parse(fs.readFileSync(path.join(stateDir, 'owner.json'), 'utf8'));
+
+  assert.match(staleClaim.error?.message || '', /stale sender owner claim/i);
+  assert.equal(owner.ownerId, 'owner-b');
 });

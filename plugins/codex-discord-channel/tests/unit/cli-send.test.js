@@ -7,6 +7,12 @@ const path = require('node:path');
 const test = require('node:test');
 const { MessagePayload } = require('discord.js');
 const { sendViaRest } = require('../../bin/codex-discord-channel');
+const {
+  bindOwnerDelivery,
+  claimOwner,
+  createOwner,
+  readOwner,
+} = require('../../src/owner-state');
 const { beginReply } = require('../../src/reply-delivery');
 
 const ARGS = { channelId: 'c1', replyTo: 'm1', followup: false };
@@ -20,10 +26,19 @@ function fixture(overrides = {}) {
       tokenConfigured: true,
       botUserId: 'bot1',
       paths: {
+        instance: 'codex01',
         envFile: path.join(stateDir, '.env'),
+        ownerPath: path.join(stateDir, 'owner.json'),
         stateDir,
         replyReceiptDir: path.join(stateDir, 'reply-receipts'),
       },
+      ownerId: 'cli-owner',
+      pid: process.pid,
+      hostname: 'test-host',
+      cwd: '/workspace',
+      startedAt: '2026-08-04T00:00:00.000Z',
+      threadId: 'thread-cli',
+      turnId: 'turn-cli',
       ...overrides,
     },
   };
@@ -87,10 +102,29 @@ function restHarness(options = {}) {
   return { fetchImpl, messages, requests, postCount: () => postCount };
 }
 
-function runCli(config, fetchImpl, content = 'answer') {
+async function authorizeCli(config) {
+  if (config.senderCapability) return;
+  const capability = await claimOwner(
+    config.paths.ownerPath,
+    createOwner(config),
+    { expected: readOwner(config.paths.ownerPath) },
+  );
+  await bindOwnerDelivery(config, {
+    channelId: 'c1',
+    sourceMessageId: 'm1',
+    threadId: 'thread-cli',
+    turnId: 'turn-cli',
+  });
+  config.senderCapability = capability;
+}
+
+async function runCli(config, fetchImpl, content = 'answer') {
+  await authorizeCli(config);
   return sendViaRest(ARGS, {
     config,
     fetchImpl,
+    senderCapability: config.senderCapability,
+    onSenderCapability(capability) { config.senderCapability = capability; },
     configureNetwork() {},
     async readStdin() { return content; },
     writeOutput() {},
@@ -125,6 +159,28 @@ test('CLI reply POST matches the real discord.js MessagePayload contract', async
 
   assert.deepEqual(actual, expected);
   assert.equal(sent.messageId, 'out-1');
+});
+
+test('direct CLI send without an owning capability fails before network setup', async () => {
+  const { config } = fixture();
+  let configured = false;
+  let fetched = false;
+
+  await assert.rejects(
+    sendViaRest(ARGS, {
+      config,
+      configureNetwork() { configured = true; },
+      async fetchImpl() {
+        fetched = true;
+        throw new Error('network must not be reached');
+      },
+      async readStdin() { return 'answer'; },
+      writeOutput() {},
+    }),
+    (error) => error.code === 'sender_capability_required',
+  );
+  assert.equal(configured, false);
+  assert.equal(fetched, false);
 });
 
 test('CLI confirms exact stable GET identity when Discord omits the POST nonce', async () => {

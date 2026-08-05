@@ -372,7 +372,9 @@ function replyDispatch(args, config) {
   const channelId = typeof args.channelId === 'string' ? args.channelId.trim() : '';
   const replyTo = typeof args.replyTo === 'string' ? args.replyTo.trim() : '';
   if (args.followup === true) {
-    if (!channelId) throw new Error('channelId is required for an explicit Discord followup.');
+    if (!channelId || !replyTo) {
+      throw new Error('channelId and replyTo are required for an explicit Discord followup.');
+    }
     return {
       target: { channelId, replyTo, usedLastInbound: false },
       sourceMessageId: '',

@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createAppServerHost } = require('./app-server-host');
+const { bindOwnerDelivery } = require('./owner-state');
 const { isProcessAlive } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
@@ -842,6 +843,22 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       return unverified.result;
     }
 
+    const deliveredTurnId = response?.turn?.id || response?.turnId || target.activeTurnId || '';
+    try {
+      await bindOwnerDelivery(config, {
+        channelId: next.normalized.channelId,
+        sourceMessageId: next.normalized.messageId,
+        threadId: target.threadId,
+        turnId: deliveredTurnId,
+      }, deps);
+    } catch (error) {
+      logger('ERROR', 'Failed to bind Discord sender authority to the delivered turn', {
+        channelId: next.normalized.channelId,
+        messageId: next.normalized.messageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     try {
       const committed = await withDeliveryQueueLock(config, deps, () => {
         const queue = readDeliveryQueue(config, deps);
@@ -884,7 +901,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         reason: 'turn_accepted',
         deliveredCount: reconciledCount + 1,
         queueDepth: committed.queueDepth,
-        turnId: response?.turn?.id || response?.turnId || null,
+        turnId: deliveredTurnId || null,
       };
     } catch (error) {
       try {

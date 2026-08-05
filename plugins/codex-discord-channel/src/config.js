@@ -178,6 +178,12 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.CODEX_SESSION_ID ||
     env.CODEX_TARGET_THREAD_ID ||
     `${os.hostname()}:${process.pid}:${Date.now()}`;
+  const threadId = String(
+    env.CODEX_THREAD_ID || env.CODEX_TARGET_THREAD_ID || '',
+  ).trim();
+  const turnId = String(
+    env.CODEX_TURN_ID || env.CODEX_TARGET_TURN_ID || '',
+  ).trim();
   const requestedDeliveryMode = String(
     env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'app-server',
   ).toLowerCase();
@@ -220,6 +226,8 @@ function loadConfig(inputEnv = process.env, options = {}) {
     deliveryDrainMaxBackoffMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS, 30000),
     parentPid: process.ppid,
     ownerId,
+    threadId,
+    turnId,
     cwd,
     hostname: os.hostname(),
     pid: parseInteger(env.CODEX_DISCORD_OWNER_PID || env.CODEX_OWNER_PID, process.pid),

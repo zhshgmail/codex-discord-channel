@@ -37,9 +37,14 @@ The Discord gateway is identified by the configured instance state directory
 and one atomic PID-plus-generation authority record in `session-gateway.pid`.
 Pure current-version handoffs use JSON. A staged takeover from a legacy gateway
 leaves that gateway's PID and `.generation` files unchanged and stores the
-current receiver CAS in `session-gateway.pid.v2`. `owner.json` is status and
-handoff metadata; it is not a per-message receive gate and may change after
-`/clear` without replacing the gateway.
+current receiver CAS in `session-gateway.pid.v2`. `owner.json` remains outside
+the receive gate, but it is the outbound sender authority. Explicit
+compare-and-swap claims advance a monotonic generation and new capability
+lineage. Persisted inbound delivery rotates that capability and binds it to the
+exact source, target thread, and available turn id. Owner claims and admitted
+sends share one durable lock through network confirmation, and public status
+surfaces omit capability tokens. The direct CLI has no issued capability and
+remains fail-closed; production replies use the owning MCP.
 
 Access-approved Discord messages are atomically persisted to
 `pending-delivery.json`, cross-process locked, and deduplicated by Discord

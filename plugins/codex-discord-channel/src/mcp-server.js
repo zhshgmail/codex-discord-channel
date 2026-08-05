@@ -15,8 +15,14 @@ const {
   startDiscordClient,
 } = require('./discord-client');
 const { readDiscordHistory } = require('./history');
-const { claimOwner, createOwner, readOwner } = require('./owner-state');
+const {
+  claimOwner,
+  createOwner,
+  publicOwner,
+  readOwner,
+} = require('./owner-state');
 const { sendDiscordReplyOnce } = require('./reply-delivery');
+const { withSenderAdmission } = require('./sender-authority');
 
 const SERVER_NAME = 'Codex Discord Channel';
 const SERVER_VERSION = '0.3.0';
@@ -129,14 +135,7 @@ function toolList() {
             description: 'Explicitly allow an additional message after this source Discord message was already answered.',
           },
         },
-        required: ['channelId', 'content'],
-        anyOf: [
-          { required: ['replyTo'] },
-          {
-            required: ['followup'],
-            properties: { followup: { const: true } },
-          },
-        ],
+        required: ['channelId', 'content', 'replyTo'],
         additionalProperties: false,
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -159,15 +158,23 @@ function historyArgsWithDefaultChannel(args, config) {
   return { ...args, channelId };
 }
 
-function makeContext(config, discordState, delivery = null) {
-  return {
+function makeContext(config, discordState, delivery = null, senderCapability = null) {
+  const context = {
     config,
     discordState,
     delivery,
-    claim() {
-      return claimOwner(config.paths.ownerPath, createOwner(config));
+    senderCapability,
+    async claim() {
+      const claimed = await claimOwner(
+        config.paths.ownerPath,
+        createOwner(config),
+        { expected: context.senderCapability, allowLineage: true },
+      );
+      context.senderCapability = claimed;
+      return claimed;
     },
   };
+  return context;
 }
 
 async function callTool(context, name, args = {}) {
@@ -207,7 +214,7 @@ async function callTool(context, name, args = {}) {
       ...deliveryQueue,
       discordStarted: context.discordState.started,
       discordReason: context.discordState.reason || null,
-      currentOwner: owner,
+      currentOwner: publicOwner(owner),
       thisOwnerId: context.config.ownerId,
     };
     return textResult(JSON.stringify(payload, null, 2), payload);
@@ -215,40 +222,52 @@ async function callTool(context, name, args = {}) {
 
   if (name === 'discord_channel_read_owner') {
     const owner = readOwner(context.config.paths.ownerPath);
-    return textResult(JSON.stringify(owner, null, 2), { owner });
+    const safeOwner = publicOwner(owner);
+    return textResult(JSON.stringify(safeOwner, null, 2), { owner: safeOwner });
   }
 
   if (name === 'discord_channel_claim_owner') {
-    const owner = context.claim();
-    return textResult(`Claimed Discord channel owner for instance ${owner.instance}.`, { owner });
+    const owner = await context.claim();
+    return textResult(
+      `Claimed Discord channel owner for instance ${owner.instance}.`,
+      { owner: publicOwner(owner) },
+    );
   }
 
   if (name === 'discord_channel_send') {
-    const sent = await sendDiscordReplyOnce({
+    const sent = await withSenderAdmission({
       args,
+      capability: context.senderCapability,
       config: context.config,
-      content: args.content,
-      preflight: (target, identity) => prepareDiscordMessageSend(
-        context.discordState.client,
-        { ...args, ...target, ...identity },
-      ),
-      sender: (target, prepared, identity) => sendDiscordMessage(
-        context.discordState.client,
-        { ...args, ...target, ...identity },
-        prepared,
-      ),
-      confirmer: (target, prepared, sent, receipt) => confirmDiscordMessage(
-        context.discordState.client,
-        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true },
-        prepared,
-        sent,
-      ),
-      reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
-        context.discordState.client,
-        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true },
-        prepared,
-        receipt,
-      ),
+      onCapability(capability) {
+        context.senderCapability = capability;
+      },
+      operation: () => sendDiscordReplyOnce({
+        args,
+        config: context.config,
+        content: args.content,
+        preflight: (target, identity) => prepareDiscordMessageSend(
+          context.discordState.client,
+          { ...args, ...target, ...identity },
+        ),
+        sender: (target, prepared, identity) => sendDiscordMessage(
+          context.discordState.client,
+          { ...args, ...target, ...identity },
+          prepared,
+        ),
+        confirmer: (target, prepared, reply, receipt) => confirmDiscordMessage(
+          context.discordState.client,
+          { ...args, ...target, nonce: receipt.nonce, enforceNonce: true },
+          prepared,
+          reply,
+        ),
+        reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
+          context.discordState.client,
+          { ...args, ...target, nonce: receipt.nonce, enforceNonce: true },
+          prepared,
+          receipt,
+        ),
+      }),
     });
     const message = sent.duplicateSuppressed
       ? `Suppressed duplicate Discord reply for source message ${sent.sourceMessageId}.`
@@ -307,13 +326,18 @@ async function handleRequest(context, message) {
 async function main() {
   const logger = makeLogger();
   const config = loadMcpConfig();
-  claimOwner(config.paths.ownerPath, createOwner(config));
+  const expectedOwner = readOwner(config.paths.ownerPath);
+  const senderCapability = await claimOwner(
+    config.paths.ownerPath,
+    createOwner(config),
+    { expected: expectedOwner },
+  );
   const delivery = createDelivery(config, logger);
   const discordState = await startDiscordClient({ config, delivery, logger }).catch((error) => {
     logger('ERROR', 'Discord startup failed', { error: error instanceof Error ? error.message : String(error) });
     return { started: false, client: null, reason: 'startup_failed' };
   });
-  const context = makeContext(config, discordState, delivery);
+  const context = makeContext(config, discordState, delivery, senderCapability);
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   lines.on('line', (line) => {
@@ -333,6 +357,7 @@ module.exports = {
   callTool,
   handleRequest,
   main,
+  makeContext,
   toolList,
 };
 

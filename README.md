@@ -422,17 +422,22 @@ Check status before claiming live delivery. The minimum healthy evidence is:
 }
 ```
 
-The command-line sender reads message text from standard input:
+Outbound admission uses the versioned sender authority in `owner.json`. Each
+explicit owner transfer advances its monotonic generation, starts a new
+capability lineage, and invalidates every previous process. A confirmed inbound
+delivery advances that lineage again and binds it to the exact Discord source,
+Codex thread, and turn when the turn id is available. Owner transfer and the
+entire admitted send share one durable lock, so a transfer cannot interleave
+between admission and network send. Status and owner tools omit the capability
+tokens.
 
-```bash
-printf '%s' 'status update' |
-  DISCORD_INSTANCE=codex01 codex-discord-channel send \
-    --channel CHANNEL_ID --reply-to SOURCE_MESSAGE_ID
-```
-
-Guarded replies require the exact source `--channel` and `--reply-to` values.
-The sender never infers reply identity from mutable `last-inbound.json`. Use
-`--followup` with an exact channel only for a deliberate additional message.
+Guarded replies and explicit followups both require the exact source `channelId`
+and `replyTo`. The sender never infers either identity from mutable
+`last-inbound.json`. The standalone `codex-discord-channel send` command has no
+host-issued sender capability and therefore fails closed before network setup.
+Only the session-owned MCP path is activated for production outbound delivery;
+the internal CLI adapter accepts an injected capability for isolated tests and
+future trusted-host integration.
 
 Before the first network send for a source Discord message, the sender fsyncs an
 `in_flight` receipt under `reply-receipts/` while holding that source's

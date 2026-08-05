@@ -7,6 +7,12 @@ const path = require('node:path');
 const test = require('node:test');
 const { loadConfig } = require('../../src/config');
 const { callTool, handleRequest, toolList } = require('../../src/mcp-server');
+const {
+  bindOwnerDelivery,
+  claimOwner,
+  createOwner,
+  readOwner,
+} = require('../../src/owner-state');
 const { beginReply } = require('../../src/reply-delivery');
 
 const CHANNEL_ID = '100000000000000001';
@@ -84,6 +90,32 @@ async function captureHandleRequest(context, message) {
   return JSON.parse(output.trim());
 }
 
+async function authorizeContext(context, sourceMessageId = 'm1') {
+  context.config.threadId = 'thread-test';
+  context.config.turnId = 'turn-test';
+  const capability = await claimOwner(
+    context.config.paths.ownerPath,
+    createOwner(context.config),
+    { expected: readOwner(context.config.paths.ownerPath) },
+  );
+  await bindOwnerDelivery(context.config, {
+    channelId: 'c1',
+    sourceMessageId,
+    threadId: 'thread-test',
+    turnId: 'turn-test',
+  });
+  context.senderCapability = capability;
+  context.claim = async () => {
+    const claimed = await claimOwner(
+      context.config.paths.ownerPath,
+      createOwner(context.config),
+      { expected: context.senderCapability },
+    );
+    context.senderCapability = claimed;
+    return claimed;
+  };
+}
+
 test('history tool discovery exposes a strict bounded read-only schema', () => {
   const tool = toolList().find((item) => item.name === 'discord_channel_read_history');
 
@@ -117,17 +149,11 @@ test('history tool discovery exposes a strict bounded read-only schema', () => {
   });
 });
 
-test('send tool discovery requires an exact source or explicit followup', () => {
+test('send tool discovery requires an exact source for replies and followups', () => {
   const tool = toolList().find((item) => item.name === 'discord_channel_send');
 
-  assert.deepEqual(tool.inputSchema.required, ['channelId', 'content']);
-  assert.deepEqual(tool.inputSchema.anyOf, [
-    { required: ['replyTo'] },
-    {
-      required: ['followup'],
-      properties: { followup: { const: true } },
-    },
-  ]);
+  assert.deepEqual(tool.inputSchema.required, ['channelId', 'content', 'replyTo']);
+  assert.equal(Object.hasOwn(tool.inputSchema, 'anyOf'), false);
 });
 
 test('history tool returns structured authorized history for explicit arguments', async () => {
@@ -441,10 +467,11 @@ test('send tool rejects a guarded reply without exact source identity', async ()
       throw new Error('not used');
     },
   };
+  await authorizeContext(context);
 
   await assert.rejects(
     callTool(context, 'discord_channel_send', { content: 'hello back' }),
-    /channelId and replyTo are required/,
+    (error) => error.code === 'sender_context_ambiguous',
   );
 });
 
@@ -497,6 +524,7 @@ test('send tool suppresses a second reply to the same inbound message', async ()
       },
     },
   };
+  await authorizeContext(context);
 
   const first = await callTool(context, 'discord_channel_send', {
     channelId: 'c1',
@@ -564,6 +592,7 @@ test('send tool recovers a failed network send without consuming the exact sourc
     },
   };
   const args = { channelId: 'c1', replyTo: 'm1', content: 'answer' };
+  await authorizeContext(context);
 
   await assert.rejects(callTool(context, 'discord_channel_send', args), /fetch failed/);
   assert.equal(messages.size, 0);
@@ -608,6 +637,7 @@ test('send tool creates no message when exact source binding is missing or cross
         },
       },
     };
+    await authorizeContext(context);
 
     await assert.rejects(callTool(context, 'discord_channel_send', {
       channelId: 'c1', replyTo: 'm1', content: 'answer',
@@ -655,6 +685,7 @@ test('send tool releases a structured Discord 4xx claim for an exact retry', asy
     } },
   };
   const args = { channelId: 'c1', replyTo: 'm1', content: 'answer' };
+  await authorizeContext(context);
 
   await assert.rejects(callTool(context, 'discord_channel_send', args), /Invalid Form Body/);
   assert.deepEqual(fs.readdirSync(config.paths.replyReceiptDir), []);
@@ -678,6 +709,7 @@ test('send tool rejects a foreign receipt before Discord network access', async 
       channels: { async fetch() { networkCount += 1; throw new Error('must not fetch'); } },
     } },
   };
+  await authorizeContext(context);
 
   const result = await callTool(context, 'discord_channel_send', {
     channelId: 'c1', replyTo: 'm1', content: 'answer',
@@ -710,6 +742,7 @@ test('send tool cannot reconcile when the expected bot author is unavailable', a
       } },
     } },
   };
+  await authorizeContext(context);
 
   await assert.rejects(callTool(context, 'discord_channel_send', {
     channelId: 'c1', replyTo: 'm1', content: 'answer',

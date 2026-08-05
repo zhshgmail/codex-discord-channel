@@ -14,8 +14,9 @@ const {
 const { createDiscordRestClient } = require('../src/discord-rest-client');
 const { createDelivery } = require('../src/delivery');
 const { sendDiscordReplyOnce } = require('../src/reply-delivery');
+const { withSenderAdmission } = require('../src/sender-authority');
 const { startGatewayDrainLoop } = require('../src/gateway-drain-loop');
-const { claimOwner, createOwner } = require('../src/owner-state');
+const { claimOwner, createOwner, readOwner } = require('../src/owner-state');
 const { instanceDoctor, runAppServer } = require('../src/app-server-runtime');
 const { runTui } = require('../src/instance-launcher');
 
@@ -124,41 +125,52 @@ async function sendViaRest(args, deps = {}) {
   if (!content) throw new Error('stdin message content is required');
 
   const config = deps.config || loadConfig();
-  if (!config.tokenConfigured) {
-    throw new Error(`Discord token is not configured in ${config.paths.envFile}`);
-  }
-  (deps.configureNetwork || configureNetwork)(config, () => {});
-  const client = (deps.createDiscordRestClient || createDiscordRestClient)({
-    token: config.token,
-    botUserId: config.botUserId,
-    fetchImpl: deps.fetchImpl || globalThis.fetch,
-  });
-
-  const sent = await sendDiscordReplyOnce({
+  let senderCapability = deps.senderCapability || null;
+  const sent = await withSenderAdmission({
     args,
+    capability: senderCapability,
     config,
-    content,
-    preflight: (target, identity) => prepareDiscordMessageSend(
-      client,
-      { ...args, ...target, ...identity, content },
-    ),
-    sender: (target, prepared, identity) => sendDiscordMessage(
-      client,
-      { ...args, ...target, ...identity, content },
-      prepared,
-    ),
-    confirmer: (target, prepared, message, receipt) => confirmDiscordMessage(
-      client,
-      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
-      prepared,
-      message,
-    ),
-    reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
-      client,
-      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
-      prepared,
-      receipt,
-    ),
+    onCapability(capability) {
+      senderCapability = capability;
+      if (typeof deps.onSenderCapability === 'function') deps.onSenderCapability(capability);
+    },
+    operation: async () => {
+      if (!config.tokenConfigured) {
+        throw new Error(`Discord token is not configured in ${config.paths.envFile}`);
+      }
+      (deps.configureNetwork || configureNetwork)(config, () => {});
+      const client = (deps.createDiscordRestClient || createDiscordRestClient)({
+        token: config.token,
+        botUserId: config.botUserId,
+        fetchImpl: deps.fetchImpl || globalThis.fetch,
+      });
+      return sendDiscordReplyOnce({
+        args,
+        config,
+        content,
+        preflight: (target, identity) => prepareDiscordMessageSend(
+          client,
+          { ...args, ...target, ...identity, content },
+        ),
+        sender: (target, prepared, identity) => sendDiscordMessage(
+          client,
+          { ...args, ...target, ...identity, content },
+          prepared,
+        ),
+        confirmer: (target, prepared, message, receipt) => confirmDiscordMessage(
+          client,
+          { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+          prepared,
+          message,
+        ),
+        reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
+          client,
+          { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+          prepared,
+          receipt,
+        ),
+      });
+    },
   });
   (deps.writeOutput || ((text) => process.stdout.write(text)))(`${JSON.stringify(sent)}\n`);
   return sent;
@@ -197,7 +209,11 @@ async function runGateway(config = loadConfig()) {
   });
   if (enabled(config.env.CODEX_DISCORD_GATEWAY_CLAIM_OWNER)) {
     try {
-      claimOwner(config.paths.ownerPath, createOwner(config));
+      await claimOwner(
+        config.paths.ownerPath,
+        createOwner(config),
+        { expected: readOwner(config.paths.ownerPath) },
+      );
     } catch (error) {
       logger('ERROR', 'Failed to update optional Discord owner metadata', {
         error: error instanceof Error ? error.message : String(error),

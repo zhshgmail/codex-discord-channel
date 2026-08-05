@@ -126,7 +126,14 @@ stable nonce identity. A same-nonce retry is allowed only when no message id was
 returned and the bounded enforcement window is still open; nonce enforcement
 must deduplicate that replay. Otherwise uncertainty remains fail-closed.
 Confirmed replies suppress later automatic continuations. Use `followup: true`
-only when a second Discord message is intentionally required.
+only when a second Discord message is intentionally required, and retain the
+same exact `channelId` and `replyTo` source identity.
+
+The owning MCP also needs the current sender capability for this instance and
+state directory. Delivery binds that capability to the exact Codex thread and
+available turn id. A successor owner claim invalidates stale MCPs, and owner
+transfer cannot interleave with an admitted send. The standalone CLI has no
+host-issued capability and is not an active outbound path.
 
 Do not answer a Discord-origin request through a generic Discord MCP sender.
 That path does not share this plugin's reply receipt and bypasses the one-source

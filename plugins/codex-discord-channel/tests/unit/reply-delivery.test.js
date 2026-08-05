@@ -113,7 +113,7 @@ test('explicit followup bypasses the one-reply guard', async () => {
 
   await sendDiscordReplyOnce({ args: sourceArgs(), config, content: 'answer', sender });
   const followup = await sendDiscordReplyOnce({
-    args: { channelId: 'c1', followup: true },
+    args: { channelId: 'c1', replyTo: 'm1', followup: true },
     config,
     content: 'explicit followup',
     sender,
@@ -122,7 +122,7 @@ test('explicit followup bypasses the one-reply guard', async () => {
   assert.equal(followup.duplicateSuppressed, false);
   assert.equal(followup.sourceMessageId, null);
   assert.equal(sends.length, 2);
-  assert.equal(sends[1].replyTo, '');
+  assert.equal(sends[1].replyTo, 'm1');
 });
 
 test('a newer exact inbound source gets an independent reply receipt', async () => {
