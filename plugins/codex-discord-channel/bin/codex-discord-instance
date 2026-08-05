@@ -138,8 +138,19 @@ while ((SECONDS <= deadline)); do
     && [[ -S $socket ]]; then
     app_pid=$(systemctl --user show --property MainPID --value "$app_service")
     gateway_pid=$(systemctl --user show --property MainPID --value "$gateway_service")
-    "$node_bin" "$channel_bin" live-check "${runtime_args[@]}" \
-      --pid "$app_pid" --pid "$gateway_pid" >/dev/null
+    set +e
+    live_check_error=$("$node_bin" "$channel_bin" live-check "${runtime_args[@]}" \
+      --pid "$app_pid" --pid "$gateway_pid" 2>&1 >/dev/null)
+    live_check_status=$?
+    set -e
+    if ((live_check_status == 75)); then
+      sleep 0.1
+      continue
+    fi
+    if ((live_check_status != 0)); then
+      printf '%s\n' "$live_check_error" >&2
+      exit "$live_check_status"
+    fi
     clear_recovery_target
     codex_args=("$@")
     recovery_stamps=()

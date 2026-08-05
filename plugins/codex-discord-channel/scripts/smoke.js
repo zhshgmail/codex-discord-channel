@@ -58,6 +58,7 @@ const binPath = path.join(root, 'bin', 'codex-discord-channel');
 const mode = fs.statSync(binPath).mode;
 assert((mode & 0o111) !== 0, 'bin/codex-discord-channel must be executable');
 assert(fs.existsSync(path.join(root, 'runtime', 'mcp-server.cjs')), 'missing MCP runtime bundle');
+assert(fs.existsSync(path.join(root, 'runtime', 'channel.cjs')), 'missing service CLI runtime bundle');
 assert(fs.existsSync(path.join(root, 'THIRD_PARTY_NOTICES.txt')), 'missing bundled dependency notices');
 assert(!fs.existsSync(path.join(root, '.env')), 'plugin root must not contain .env');
 

@@ -142,10 +142,11 @@ codex plugin add codex-discord-channel@personal
 Use a new Codex thread after installation so the MCP server is loaded.
 
 Marketplace installation copies the plugin into the Codex cache but does not
-run `npm install` or package lifecycle hooks. The MCP entrypoint therefore uses
-the committed `runtime/mcp-server.cjs` bundle, which contains `discord.js`,
-`undici`, and `ws`. `npm ci` and `npm run build:runtime` are development steps
-for regenerating that bundle, not installation requirements.
+run `npm install` or package lifecycle hooks. The MCP and service entrypoints
+therefore use the committed `runtime/mcp-server.cjs` and `runtime/channel.cjs`
+bundles, which contain `discord.js`, `undici`, and `ws`. `npm ci` and
+`npm run build:runtime` are development steps for regenerating those bundles,
+not installation requirements.
 
 For a review branch or pinned deployment, replace `main` with the exact branch,
 tag, or commit approved for that deployment. Do not assume an open MCP
@@ -177,7 +178,7 @@ For example:
 CODEX_HOME=/home/USER/.codex-account-01
 CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
 NODE_BIN=/absolute/path/to/node
-CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
+CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/plugin/runtime/channel.cjs
 ```
 
 ```env
@@ -185,7 +186,7 @@ CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
 CODEX_HOME=/home/USER/.codex-account-02
 CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
 NODE_BIN=/absolute/path/to/node
-CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
+CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/plugin/runtime/channel.cjs
 ```
 
 Each instance still has its own `.env` containing a different

@@ -28,8 +28,12 @@ function verifyLiveProcess(config, pid, dependencies = {}) {
   let entries;
   try {
     entries = readFileSync(`/proc/${pid}/environ`).toString('utf8').split('\0').filter(Boolean);
-  } catch {
-    throw new Error(`Cannot read live service identity for PID ${pid}`);
+  } catch (cause) {
+    const error = new Error(`Cannot read live service identity for PID ${pid}`);
+    if (cause?.code === 'ENOENT' || cause?.code === 'ESRCH') {
+      error.code = 'live_service_process_unavailable';
+    }
+    throw error;
   }
   const env = Object.fromEntries(entries.map((entry) => {
     const separator = entry.indexOf('=');

@@ -147,6 +147,19 @@ test('live process identity requires the selected OpenAI account and Discord sta
   }));
 });
 
+test('missing proc identity is classified as a transient service lifecycle race', () => {
+  const config = instanceFixture();
+  assert.throws(
+    () => verifyLiveProcess(config, 12345, {
+      readFileSync() {
+        throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      },
+    }),
+    (error) => error.code === 'live_service_process_unavailable'
+      && /Cannot read live service identity/.test(error.message),
+  );
+});
+
 test('TUI argument separator keeps runtime selection separate from Codex arguments', () => {
   assert.deepEqual(parseTuiArgs([
     '--instance',

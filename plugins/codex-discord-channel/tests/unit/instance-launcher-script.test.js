@@ -19,6 +19,7 @@ function fixture() {
   const binDir = path.join(home, 'bin');
   const trace = path.join(home, 'trace.log');
   const loginMarker = path.join(home, 'login-complete');
+  const liveCheckCount = path.join(home, 'live-check-count');
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
   const fakeChannel = path.join(binDir, 'codex-discord-channel');
@@ -50,6 +51,16 @@ function fixture() {
     '  esac',
     'fi',
     'printf "node %s\\n" "$*" >>"$TRACE"',
+    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == live-check && ${LIVE_CHECK_FAIL_ONCE:-0} == 1 ]]; then',
+    '  count=0',
+    '  [[ -f $LIVE_CHECK_COUNT ]] && read -r count <"$LIVE_CHECK_COUNT"',
+    '  count=$((count + 1))',
+    '  printf "%s\\n" "$count" >"$LIVE_CHECK_COUNT"',
+    '  if ((count == 1)); then',
+    '    printf "Cannot read live service identity for transient PID\\n" >&2',
+    '    exit 75',
+    '  fi',
+    'fi',
     'if [[ ${LOGIN_REQUIRED:-0} == 1 && $2 == tui-login-state && ! -f $LOGIN_MARKER ]]; then exit 10; fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == login ]]; then',
     '  if [[ -n ${DISCORD_BOT_TOKEN+x} || -n ${DISCORD_BOT_USER_ID+x} ]]; then exit 91; fi',
@@ -105,6 +116,7 @@ function fixture() {
     fakeChannel,
     fakeCodex,
     home,
+    liveCheckCount,
     loginMarker,
     stateDir,
     trace,
@@ -122,6 +134,7 @@ function launchEnv(setup, overrides = {}) {
     FAKE_CODEX_BIN: setup.fakeCodex,
     HOME: setup.home,
     LOGIN_MARKER: setup.loginMarker,
+    LIVE_CHECK_COUNT: setup.liveCheckCount,
     PATH: `${setup.binDir}:${process.env.PATH}`,
     STATE_DIR: setup.stateDir,
     THREAD_ID: '019f3763-d308-7871-bedc-e6489b02190e',
@@ -148,6 +161,22 @@ test('shell launcher checks identity, starts both units, verifies each, then ent
     `node ${path.join(setup.binDir, 'codex-discord-channel')} live-check --instance codex02 --state-dir ${setup.stateDir} --pid 12345 --pid 12345`,
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`,
   ]);
+});
+
+test('shell launcher retries a service PID that exits before identity inspection', () => {
+  const setup = fixture();
+  const result = spawnSync(launcher, ['codex02', 'resume', 'thread-2'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      CODEX_DISCORD_START_TIMEOUT_SECONDS: '2',
+      LIVE_CHECK_FAIL_ONCE: '1',
+    }),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const trace = fs.readFileSync(setup.trace, 'utf8').trim().split('\n');
+  assert.equal(trace.filter((line) => line.includes(' live-check ')).length, 2);
+  assert.equal(trace.filter((line) => line.includes(`${setup.fakeCodex} --remote`)).length, 1);
+  assert.doesNotMatch(result.stderr, /Cannot read live service identity/);
 });
 
 test('first-run TTY login succeeds before services and the TUI start', () => {

@@ -185,6 +185,56 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
   assert.equal(fs.existsSync(path.join(home, '.codex')), false);
 });
 
+test('marketplace cache starts the service CLI without node_modules', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-cli-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const codexHome = path.join(root, 'codex-home');
+  const stateDir = path.join(root, 'discord', 'codex02');
+  const installedRoot = path.join(root, 'installed-plugin');
+  fs.cpSync(pluginRoot, installedRoot, {
+    recursive: true,
+    filter(source) {
+      return !['node_modules', '.env'].includes(path.basename(source));
+    },
+  });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(codexHome, 'discord-instance.env'),
+    `DISCORD_INSTANCE=codex02\nDISCORD_CONFIG_DIR=${stateDir}\n`,
+  );
+  fs.writeFileSync(path.join(stateDir, 'account.env'), `CODEX_HOME=${codexHome}\n`);
+
+  assert.deepEqual(findNamed(installedRoot, 'node_modules'), []);
+  const cliPath = path.join(installedRoot, 'runtime', 'channel.cjs');
+  assert.equal(fs.existsSync(cliPath), true, 'runtime/channel.cjs must be committed');
+  const bundle = fs.readFileSync(cliPath, 'utf8');
+  const imports = [...bundle.matchAll(/(?:require|__require)\(["']([^"']+)["']\)/g)]
+    .map((match) => match[1]);
+  assert.deepEqual(imports.filter((specifier) => !specifier.startsWith('node:')), []);
+
+  const result = await runMcpExpectFailure(
+    process.execPath,
+    ['./runtime/channel.cjs', 'gateway', '--instance', 'codex02', '--state-dir', stateDir],
+    {
+      cwd: installedRoot,
+      env: {
+        HOME: root,
+        CODEX_HOME: codexHome,
+        DISCORD_INSTANCE: 'codex02',
+        DISCORD_CONFIG_DIR: stateDir,
+        DISCORD_BOT_TOKEN: 'must-not-be-used',
+        DISCORD_CHANNEL_DISABLE_LOGIN: '1',
+        NODE_PATH: '',
+      },
+    },
+  );
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Discord gateway did not start: login_disabled/);
+  assert.doesNotMatch(result.stderr, /Cannot find module/);
+});
+
 test('packaged MCP missing any selected identity exits before owner or Discord state', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-identity-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

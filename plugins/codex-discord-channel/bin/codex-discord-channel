@@ -325,6 +325,6 @@ module.exports = {
 if (require.main === module) {
   main().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-    process.exit(1);
+    process.exit(error?.code === 'live_service_process_unavailable' ? 75 : 1);
   });
 }
