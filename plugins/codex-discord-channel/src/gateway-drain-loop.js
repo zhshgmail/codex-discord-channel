@@ -77,6 +77,10 @@ function startGatewayDrainLoop({
     const result = await delivery.flush({
       verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps),
     });
+    if (result?.reason === 'structured_ack_uncertain') {
+      retryDelayMs = baseDelayMs;
+      return baseDelayMs;
+    }
     if (result?.status === 'queued' || result?.status === 'failed') {
       return increaseBackoff();
     }

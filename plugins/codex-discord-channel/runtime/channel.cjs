@@ -3490,7 +3490,10 @@ var require_app_server_host = __commonJS({
         this.timeoutRecoveryTarget = null, this.onNotification = (notification) => {
           if (notification?.method === "item/started" || notification?.method === "item/completed") {
             let threadId = notification.params?.threadId, item = notification.params?.item;
-            typeof threadId == "string" && threadId !== "" && item?.type === "userMessage" && typeof item.clientId == "string" && item.clientId !== "" && this.wakeDeliveryWaiters(threadId, item.clientId);
+            if (typeof threadId == "string" && threadId !== "" && item?.type === "userMessage" && typeof item.clientId == "string" && item.clientId !== "") {
+              let proof = { threadId, clientUserMessageId: item.clientId };
+              this.wakeDeliveryWaiters(threadId, item.clientId), this.emit("deliveryProof", proof);
+            }
             return;
           }
           if (notification?.method === "thread/started") {
@@ -3974,6 +3977,9 @@ var require_app_server_host = __commonJS({
       }
       onThreadClosed(listener) {
         return this.on("threadClosed", listener), () => this.off("threadClosed", listener);
+      }
+      onDeliveryProof(listener) {
+        return this.on("deliveryProof", listener), () => this.off("deliveryProof", listener);
       }
       destroy() {
         this.destroyed = !0;
@@ -4579,7 +4585,15 @@ ${normalized.content}${attachmentText}
         ...details || {}
       }, writeDeliveryQueue(queue, config, deps);
     }
-    function completedQueue(queue, next) {
+    function readbackReceipt(threadId, clientUserMessageId, deps = {}) {
+      return {
+        version: 1,
+        threadId,
+        clientUserMessageId,
+        verifiedAt: new Date(currentTimeMs(deps)).toISOString()
+      };
+    }
+    function completedQueue(queue, next, threadId, clientUserMessageId, deps = {}) {
       return {
         version: DELIVERY_QUEUE_VERSION,
         activation: queue.activation,
@@ -4589,7 +4603,8 @@ ${normalized.content}${attachmentText}
           {
             channelId: next.normalized.channelId,
             messageId: next.normalized.messageId,
-            completedAt: (/* @__PURE__ */ new Date()).toISOString()
+            completedAt: new Date(currentTimeMs(deps)).toISOString(),
+            readbackReceipt: readbackReceipt(threadId, clientUserMessageId, deps)
           }
         ],
         archived: queue.archived,
@@ -4653,7 +4668,7 @@ ${normalized.content}${attachmentText}
               return { retry: !0 };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
             if (receiverRejected) return { receiverRejected, queue };
-            let updated = completedQueue(queue, next);
+            let updated = completedQueue(queue, next, threadId, clientUserMessageId, deps);
             return writeDeliveryQueue(updated, config, deps), { queueDepth: updated.items.length };
           });
           if (reconciled.retry) continue;
@@ -4835,7 +4850,13 @@ ${normalized.content}${attachmentText}
               }, config, deps), { uncertain: !0, queueDepth: queue.items.length };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
             if (receiverRejected) return { receiverRejected, queue };
-            let updated = completedQueue(queue, next);
+            let updated = completedQueue(
+              queue,
+              next,
+              target.threadId,
+              params.clientUserMessageId,
+              deps
+            );
             return writeDeliveryQueue(updated, config, deps), { queueDepth: updated.items.length };
           });
           return activeDeliveryAttempts.delete(attemptId), committed.receiverRejected ? receiverRejectedResult(committed.queue, committed.receiverRejected) : committed.uncertain ? {
@@ -4920,7 +4941,7 @@ ${normalized.content}${attachmentText}
     }
     function createDelivery2(config, logger = () => {
     }, deps = {}) {
-      let host = deps.structuredHost || createAppServerHost(config, logger, deps.appServer || {}), admissionOperations = Promise.resolve(), drainOperations = Promise.resolve(), destroyed = !1, unsubscribeIdle = null, unsubscribeActive = null, unsubscribeReconnect = null, unsubscribeThreadClosed = null, startupDrain = Promise.resolve(), receiverVerification = null, receiverActivated = !1, leaseWakeTimer = null, leaseWakeAt = 0, serializeAdmission = (operation) => {
+      let host = deps.structuredHost || createAppServerHost(config, logger, deps.appServer || {}), admissionOperations = Promise.resolve(), drainOperations = Promise.resolve(), destroyed = !1, unsubscribeIdle = null, unsubscribeActive = null, unsubscribeReconnect = null, unsubscribeThreadClosed = null, unsubscribeDeliveryProof = null, startupDrain = Promise.resolve(), receiverVerification = null, receiverActivated = !1, leaseWakeTimer = null, leaseWakeAt = 0, serializeAdmission = (operation) => {
         let result = admissionOperations.then(operation, operation);
         return admissionOperations = result.catch(() => {
         }), result;
@@ -4977,6 +4998,70 @@ ${normalized.content}${attachmentText}
             let result = await flushStructuredQueue(config, logger, deps, host, options);
             return updateLeaseWake(result[DELIVERY_LEASE_RETRY_AT]), result;
           });
+        },
+        async recordCompletedReadback({ channelId, messageId, threadId } = {}) {
+          let normalizedChannelId = String(channelId || "").trim(), normalizedMessageId = String(messageId || "").trim(), normalizedThreadId = String(threadId || "").trim();
+          if (!normalizedChannelId || !normalizedMessageId || !normalizedThreadId)
+            throw new Error("channelId, messageId, and threadId are required for completed readback.");
+          let clientUserMessageId = `discord:${structuredSafeText(normalizedChannelId)}:${structuredSafeText(normalizedMessageId)}`;
+          return typeof host.hasDelivered == "function" && await host.hasDelivered(
+            normalizedThreadId,
+            clientUserMessageId
+          ) ? serializeAdmission(() => withDeliveryQueueLock(config, deps, () => {
+            let queue = readDeliveryQueue(config, deps);
+            if (queue.items.some((item) => sameDiscordIdentity(item.normalized, {
+              channelId: normalizedChannelId,
+              messageId: normalizedMessageId
+            })))
+              return {
+                status: "failed",
+                reason: "structured_delivery_still_pending",
+                channelId: normalizedChannelId,
+                messageId: normalizedMessageId,
+                threadId: normalizedThreadId
+              };
+            let completedIndex = queue.completed.findIndex((item) => sameDiscordIdentity(item, {
+              channelId: normalizedChannelId,
+              messageId: normalizedMessageId
+            }));
+            if (completedIndex === -1)
+              return {
+                status: "failed",
+                reason: "completed_delivery_not_found",
+                channelId: normalizedChannelId,
+                messageId: normalizedMessageId,
+                threadId: normalizedThreadId
+              };
+            let existing = queue.completed[completedIndex].readbackReceipt;
+            if (existing) {
+              let matches = existing.threadId === normalizedThreadId && existing.clientUserMessageId === clientUserMessageId;
+              return {
+                status: matches ? "confirmed" : "failed",
+                reason: matches ? "readback_receipt_already_persisted" : "readback_receipt_conflict",
+                channelId: normalizedChannelId,
+                messageId: normalizedMessageId,
+                threadId: normalizedThreadId,
+                clientUserMessageId
+              };
+            }
+            return queue.completed[completedIndex] = {
+              ...queue.completed[completedIndex],
+              readbackReceipt: readbackReceipt(normalizedThreadId, clientUserMessageId, deps)
+            }, writeDeliveryQueue(queue, config, deps), {
+              status: "confirmed",
+              reason: "readback_receipt_persisted",
+              channelId: normalizedChannelId,
+              messageId: normalizedMessageId,
+              threadId: normalizedThreadId,
+              clientUserMessageId
+            };
+          })) : {
+            status: "failed",
+            reason: "structured_readback_missing",
+            channelId: normalizedChannelId,
+            messageId: normalizedMessageId,
+            threadId: normalizedThreadId
+          };
         },
         coordinateReceiverOwnership(operation) {
           let coordinate = async () => {
@@ -5075,7 +5160,7 @@ ${normalized.content}${attachmentText}
           return admission.status !== "accepted" ? admission : (await startupDrain, { ...await delivery.flush(receiverVerification ? { verifyReceiverOwnership: receiverVerification } : {}), envelope: admission.envelope });
         },
         destroy() {
-          destroyed = !0, receiverActivated = !1, receiverVerification = null, typeof unsubscribeIdle == "function" && unsubscribeIdle(), typeof unsubscribeActive == "function" && unsubscribeActive(), typeof unsubscribeReconnect == "function" && unsubscribeReconnect(), typeof unsubscribeThreadClosed == "function" && unsubscribeThreadClosed(), clearLeaseWake(), typeof host.destroy == "function" && host.destroy();
+          destroyed = !0, receiverActivated = !1, receiverVerification = null, typeof unsubscribeIdle == "function" && unsubscribeIdle(), typeof unsubscribeActive == "function" && unsubscribeActive(), typeof unsubscribeReconnect == "function" && unsubscribeReconnect(), typeof unsubscribeThreadClosed == "function" && unsubscribeThreadClosed(), typeof unsubscribeDeliveryProof == "function" && unsubscribeDeliveryProof(), clearLeaseWake(), typeof host.destroy == "function" && host.destroy();
         }
       }, drainAutonomously = (trigger, options = {}) => {
         if (destroyed) return Promise.resolve({ status: "idle", reason: "delivery_destroyed" });
@@ -5091,7 +5176,7 @@ ${normalized.content}${attachmentText}
           reason: "shared_app_server_unavailable"
         }));
       };
-      return unsubscribeIdle = typeof host.onThreadIdle == "function" ? host.onThreadIdle(() => drainAutonomously("thread_idle")) : null, unsubscribeActive = typeof host.onThreadActive == "function" ? host.onThreadActive(() => drainAutonomously("thread_active")) : null, unsubscribeReconnect = typeof host.onReconnect == "function" ? host.onReconnect(() => drainAutonomously("reconnect")) : null, unsubscribeThreadClosed = typeof host.onThreadClosed == "function" ? host.onThreadClosed(() => drainAutonomously("thread_closed")) : null, delivery;
+      return unsubscribeIdle = typeof host.onThreadIdle == "function" ? host.onThreadIdle(() => drainAutonomously("thread_idle")) : null, unsubscribeActive = typeof host.onThreadActive == "function" ? host.onThreadActive(() => drainAutonomously("thread_active")) : null, unsubscribeReconnect = typeof host.onReconnect == "function" ? host.onReconnect(() => drainAutonomously("reconnect")) : null, unsubscribeThreadClosed = typeof host.onThreadClosed == "function" ? host.onThreadClosed(() => drainAutonomously("thread_closed")) : null, unsubscribeDeliveryProof = typeof host.onDeliveryProof == "function" ? host.onDeliveryProof(() => drainAutonomously("delivery_proof")) : null, delivery;
     }
     module2.exports = {
       buildReplyCommand,
@@ -94216,7 +94301,7 @@ var require_gateway_drain_loop = __commonJS({
         let result = await delivery.flush({
           verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps)
         });
-        return result?.status === "queued" || result?.status === "failed" ? increaseBackoff() : (retryDelayMs = baseDelayMs, baseDelayMs);
+        return result?.reason === "structured_ack_uncertain" ? (retryDelayMs = baseDelayMs, baseDelayMs) : result?.status === "queued" || result?.status === "failed" ? increaseBackoff() : (retryDelayMs = baseDelayMs, baseDelayMs);
       }, runTick, schedule = (delayMs) => {
         if (stopped) return;
         let expectedGeneration = ++generation;

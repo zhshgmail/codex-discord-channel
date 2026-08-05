@@ -719,7 +719,9 @@ class AppServerHost extends EventEmitter {
           typeof item.clientId === 'string' &&
           item.clientId !== ''
         ) {
+          const proof = { threadId, clientUserMessageId: item.clientId };
           this.wakeDeliveryWaiters(threadId, item.clientId);
+          this.emit('deliveryProof', proof);
         }
         return;
       }
@@ -1621,6 +1623,11 @@ class AppServerHost extends EventEmitter {
   onThreadClosed(listener) {
     this.on('threadClosed', listener);
     return () => this.off('threadClosed', listener);
+  }
+
+  onDeliveryProof(listener) {
+    this.on('deliveryProof', listener);
+    return () => this.off('deliveryProof', listener);
   }
 
   destroy() {

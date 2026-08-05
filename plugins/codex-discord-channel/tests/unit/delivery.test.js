@@ -92,6 +92,7 @@ function structuredFixture(overrides = {}) {
   let target = { available: true, threadId: 'thread-current', status: 'idle' };
   let idleListener = null;
   let activeListener = null;
+  let deliveryProofListener = null;
   let ttyCalls = 0;
   const host = {
     async resolveTarget() {
@@ -133,6 +134,12 @@ function structuredFixture(overrides = {}) {
         if (activeListener === listener) activeListener = null;
       };
     },
+    onDeliveryProof(listener) {
+      deliveryProofListener = listener;
+      return () => {
+        if (deliveryProofListener === listener) deliveryProofListener = null;
+      };
+    },
     status() {
       if (typeof overrides.status === 'function') return overrides.status();
       return {
@@ -162,6 +169,10 @@ function structuredFixture(overrides = {}) {
     async emitActive() {
       assert.equal(typeof activeListener, 'function');
       return activeListener();
+    },
+    async emitDeliveryProof(threadId, clientUserMessageId) {
+      assert.equal(typeof deliveryProofListener, 'function');
+      return deliveryProofListener({ threadId, clientUserMessageId });
     },
   };
 }
@@ -1720,6 +1731,99 @@ test('unpersisted successful response reconciles later without replay', async ()
   assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-delayed']);
 });
 
+test('active-turn durable proof wakes exact readback commit without replay', async () => {
+  let persisted = false;
+  let starts = 0;
+  const fixture = structuredFixture({
+    onStartTurn() {
+      starts += 1;
+      return { turnId: 'turn-active' };
+    },
+    hasDelivered(threadId, clientUserMessageId) {
+      return persisted && threadId === 'thread-current' &&
+        clientUserMessageId === 'discord:c1:m-active-proof';
+    },
+  });
+  fixture.setTarget({
+    available: true,
+    threadId: 'thread-current',
+    status: 'active',
+    activeTurnId: 'turn-active',
+  });
+
+  const uncertain = await fixture.delivery.deliver(
+    discordMessage('m-active-proof', 'visible once'),
+  );
+  assert.equal(uncertain.reason, 'structured_ack_uncertain');
+  persisted = true;
+  await fixture.emitDeliveryProof('thread-current', 'discord:c1:m-active-proof');
+
+  const queue = readQueue(fixture.dir);
+  assert.equal(starts, 1);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.completed, [{
+    channelId: 'c1',
+    messageId: 'm-active-proof',
+    completedAt: queue.completed[0].completedAt,
+    readbackReceipt: {
+      version: 1,
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-active-proof',
+      verifiedAt: queue.completed[0].readbackReceipt.verifiedAt,
+    },
+  }]);
+});
+
+test('legacy completed identity gains one exact-thread receipt without rebuilding the queue', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-completed-readback-'));
+  writePendingQueue(dir, [], {
+    completed: [{
+      channelId: 'c1',
+      messageId: 'm-completed',
+      completedAt: '2026-08-05T00:00:00.000Z',
+    }],
+  });
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    now: () => Date.parse('2026-08-05T00:01:00.000Z'),
+    structuredHost: {
+      async hasDelivered(threadId, clientUserMessageId) {
+        return threadId === 'thread-current' &&
+          clientUserMessageId === 'discord:c1:m-completed';
+      },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  const first = await delivery.recordCompletedReadback({
+    channelId: 'c1',
+    messageId: 'm-completed',
+    threadId: 'thread-current',
+  });
+  const second = await delivery.recordCompletedReadback({
+    channelId: 'c1',
+    messageId: 'm-completed',
+    threadId: 'thread-current',
+  });
+
+  assert.equal(first.reason, 'readback_receipt_persisted');
+  assert.equal(second.reason, 'readback_receipt_already_persisted');
+  const queue = readQueue(dir);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.completed, [{
+    channelId: 'c1',
+    messageId: 'm-completed',
+    completedAt: '2026-08-05T00:00:00.000Z',
+    readbackReceipt: {
+      version: 1,
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-completed',
+      verifiedAt: '2026-08-05T00:01:00.000Z',
+    },
+  }]);
+  delivery.destroy();
+});
+
 test('uncertain acknowledgement reconciles by client id without replaying turn/start', async () => {
   let accepted = false;
   const fixture = structuredFixture({
@@ -1797,7 +1901,15 @@ test('post-accept uncertainty persists replay identity and reconciles after rest
   }]);
   assert.equal(replayStarts, 0);
   assert.deepEqual(readQueue(fixture.dir).items, []);
-  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-post-accept']);
+  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => ({
+    messageId: item.messageId,
+    threadId: item.readbackReceipt?.threadId,
+    clientUserMessageId: item.readbackReceipt?.clientUserMessageId,
+  })), [{
+    messageId: 'm-post-accept',
+    threadId: 'thread-current',
+    clientUserMessageId: 'discord:c1:m-post-accept',
+  }]);
   recovered.destroy();
 });
 

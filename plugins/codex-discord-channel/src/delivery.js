@@ -504,7 +504,16 @@ function setQueueBlock(queue, reason, details, config, deps) {
   writeDeliveryQueue(queue, config, deps);
 }
 
-function completedQueue(queue, next) {
+function readbackReceipt(threadId, clientUserMessageId, deps = {}) {
+  return {
+    version: 1,
+    threadId,
+    clientUserMessageId,
+    verifiedAt: new Date(currentTimeMs(deps)).toISOString(),
+  };
+}
+
+function completedQueue(queue, next, threadId, clientUserMessageId, deps = {}) {
   return {
     version: DELIVERY_QUEUE_VERSION,
     activation: queue.activation,
@@ -514,7 +523,8 @@ function completedQueue(queue, next) {
       {
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId,
-        completedAt: new Date().toISOString(),
+        completedAt: new Date(currentTimeMs(deps)).toISOString(),
+        readbackReceipt: readbackReceipt(threadId, clientUserMessageId, deps),
       },
     ],
     archived: queue.archived,
@@ -606,7 +616,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next);
+        const updated = completedQueue(queue, next, threadId, clientUserMessageId, deps);
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length };
       });
@@ -858,7 +868,13 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next);
+        const updated = completedQueue(
+          queue,
+          next,
+          target.threadId,
+          params.clientUserMessageId,
+          deps,
+        );
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length };
       });
@@ -968,6 +984,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let unsubscribeActive = null;
   let unsubscribeReconnect = null;
   let unsubscribeThreadClosed = null;
+  let unsubscribeDeliveryProof = null;
   let startupDrain = Promise.resolve();
   let receiverVerification = null;
   let receiverActivated = false;
@@ -1053,6 +1070,83 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         updateLeaseWake(result[DELIVERY_LEASE_RETRY_AT]);
         return result;
       });
+    },
+    async recordCompletedReadback({ channelId, messageId, threadId } = {}) {
+      const normalizedChannelId = String(channelId || '').trim();
+      const normalizedMessageId = String(messageId || '').trim();
+      const normalizedThreadId = String(threadId || '').trim();
+      if (!normalizedChannelId || !normalizedMessageId || !normalizedThreadId) {
+        throw new Error('channelId, messageId, and threadId are required for completed readback.');
+      }
+      const clientUserMessageId = `discord:${structuredSafeText(normalizedChannelId)}:${structuredSafeText(normalizedMessageId)}`;
+      const delivered = typeof host.hasDelivered === 'function' && await host.hasDelivered(
+        normalizedThreadId,
+        clientUserMessageId,
+      );
+      if (!delivered) {
+        return {
+          status: 'failed',
+          reason: 'structured_readback_missing',
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+          threadId: normalizedThreadId,
+        };
+      }
+      return serializeAdmission(() => withDeliveryQueueLock(config, deps, () => {
+        const queue = readDeliveryQueue(config, deps);
+        const pending = queue.items.some((item) => sameDiscordIdentity(item.normalized, {
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+        }));
+        if (pending) {
+          return {
+            status: 'failed',
+            reason: 'structured_delivery_still_pending',
+            channelId: normalizedChannelId,
+            messageId: normalizedMessageId,
+            threadId: normalizedThreadId,
+          };
+        }
+        const completedIndex = queue.completed.findIndex((item) => sameDiscordIdentity(item, {
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+        }));
+        if (completedIndex === -1) {
+          return {
+            status: 'failed',
+            reason: 'completed_delivery_not_found',
+            channelId: normalizedChannelId,
+            messageId: normalizedMessageId,
+            threadId: normalizedThreadId,
+          };
+        }
+        const existing = queue.completed[completedIndex].readbackReceipt;
+        if (existing) {
+          const matches = existing.threadId === normalizedThreadId &&
+            existing.clientUserMessageId === clientUserMessageId;
+          return {
+            status: matches ? 'confirmed' : 'failed',
+            reason: matches ? 'readback_receipt_already_persisted' : 'readback_receipt_conflict',
+            channelId: normalizedChannelId,
+            messageId: normalizedMessageId,
+            threadId: normalizedThreadId,
+            clientUserMessageId,
+          };
+        }
+        queue.completed[completedIndex] = {
+          ...queue.completed[completedIndex],
+          readbackReceipt: readbackReceipt(normalizedThreadId, clientUserMessageId, deps),
+        };
+        writeDeliveryQueue(queue, config, deps);
+        return {
+          status: 'confirmed',
+          reason: 'readback_receipt_persisted',
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+          threadId: normalizedThreadId,
+          clientUserMessageId,
+        };
+      }));
     },
     coordinateReceiverOwnership(operation) {
       const coordinate = async () => {
@@ -1193,6 +1287,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (typeof unsubscribeActive === 'function') unsubscribeActive();
       if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
       if (typeof unsubscribeThreadClosed === 'function') unsubscribeThreadClosed();
+      if (typeof unsubscribeDeliveryProof === 'function') unsubscribeDeliveryProof();
       clearLeaseWake();
       if (typeof host.destroy === 'function') host.destroy();
     },
@@ -1228,6 +1323,9 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     : null;
   unsubscribeThreadClosed = typeof host.onThreadClosed === 'function'
     ? host.onThreadClosed(() => drainAutonomously('thread_closed'))
+    : null;
+  unsubscribeDeliveryProof = typeof host.onDeliveryProof === 'function'
+    ? host.onDeliveryProof(() => drainAutonomously('delivery_proof'))
     : null;
   return delivery;
 }

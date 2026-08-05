@@ -2669,6 +2669,28 @@ test('signal before hasDelivered plus exact rollout proof completes without thre
   assert.deepEqual(client.requests, []);
 });
 
+test('user-item lifecycle signal is exposed as an exact delivery-proof wake', async (t) => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`delivery-proof wake must not request ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  t.after(() => host.destroy());
+  const wakes = [];
+  const unsubscribe = host.onDeliveryProof((proof) => wakes.push(proof));
+
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    'discord:c1:m-proof-wake',
+  ));
+  unsubscribe();
+
+  assert.deepEqual(wakes, [{
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-proof-wake',
+  }]);
+});
+
 test('lifecycle signal without durable rollout evidence does not prove delivery', async (t) => {
   const clientId = 'discord:c1:m-signal-only';
   const { codexHome } = createRolloutFixture(t, [sessionMeta()]);
