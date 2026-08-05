@@ -17,6 +17,8 @@ const THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190e';
 const CAPTURE_ID_A = 'capture-a';
 const CAPTURE_ID_B = 'capture-b';
 const CAPTURE_ID_C = 'capture-c';
+const RETAINED_GENERATIONS = 32;
+const RETAINED_GENERATION_FILES = RETAINED_GENERATIONS * 3;
 
 function fixture() {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-tui-target-'));
@@ -352,13 +354,180 @@ test('clear generation cannot delete a concurrently published capture C', () => 
   assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
 });
 
-test('integer launch threshold rejects a fractional same-millisecond prelaunch checkpoint', () => {
+test('reader fails closed when capture C publishes during target read', () => {
+  const { config } = fixture();
+  assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_A), true);
+  const files = targetPaths(config);
+  let injected = false;
+  const forcedFs = {
+    ...fs,
+    readFileSync(file, ...args) {
+      const content = fs.readFileSync(file, ...args);
+      if (!injected && path.dirname(file) === files.targets) {
+        injected = true;
+        assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_C), true);
+      }
+      return content;
+    },
+  };
+
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_A, { fs: forcedFs }), '');
+  assert.equal(injected, true);
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
+});
+
+test('generation ledger scan and retained files stay bounded after 3000 captures', (t) => {
+  const { config } = fixture();
+  const files = targetPaths(config);
+  const maxScanEntries = new Map();
+  const measuredFs = {
+    ...fs,
+    readdirSync(directory, ...args) {
+      const names = fs.readdirSync(directory, ...args);
+      if ([files.attempts, files.publications, files.targets].includes(directory)) {
+        maxScanEntries.set(
+          directory,
+          Math.max(maxScanEntries.get(directory) || 0, names.length),
+        );
+      }
+      return names;
+    },
+  };
+  const started = process.hrtime.bigint();
+  for (let sequence = 1; sequence <= 3000; sequence += 1) {
+    assert.equal(captureRecoveryTarget(config, 0, `scale-${sequence}`, { fs: measuredFs }), true);
+  }
+  const generationMs = Number(process.hrtime.bigint() - started) / 1e6;
+  const retained = [files.attempts, files.publications, files.targets]
+    .reduce((total, directory) => total + fs.readdirSync(directory).length, 0);
+
+  const readStarted = process.hrtime.bigint();
+  assert.equal(readRecoveryThread(config, 'scale-3000', { fs: measuredFs }), THREAD_ID);
+  const readMs = Number(process.hrtime.bigint() - readStarted) / 1e6;
+
+  assert.ok(retained <= RETAINED_GENERATION_FILES, `retained ${retained} generation files`);
+  assert.ok(maxScanEntries.get(files.attempts) <= RETAINED_GENERATIONS + 1);
+  assert.ok(maxScanEntries.get(files.publications) <= RETAINED_GENERATIONS);
+  assert.ok(maxScanEntries.get(files.targets) <= RETAINED_GENERATIONS);
+  t.diagnostic(`3000 captures ${generationMs.toFixed(1)}ms; latest read ${readMs.toFixed(3)}ms`);
+});
+
+test('compaction cannot reopen reclaimed A or B and ignores delayed stale files', () => {
+  const { config } = fixture();
+  for (let sequence = 1; sequence <= RETAINED_GENERATIONS + 2; sequence += 1) {
+    assert.equal(captureRecoveryTarget(config, 0, `capture-${sequence}`), true);
+  }
+  const files = targetPaths(config);
+  assert.equal(fs.existsSync(path.join(files.attempts, '1.attempt')), false);
+  assert.equal(fs.existsSync(path.join(files.publications, '1.json')), false);
+  assert.equal(fs.existsSync(path.join(files.targets, '1.json')), false);
+
+  fs.writeFileSync(path.join(files.publications, '1.json'), `${JSON.stringify({
+    version: 2,
+    sequence: 1,
+    status: 'published',
+    captureId: CAPTURE_ID_A,
+  })}\n`, { mode: 0o600 });
+  fs.writeFileSync(path.join(files.targets, '1.json'), `${JSON.stringify({
+    version: 1,
+    threadId: THREAD_ID,
+    status: 'active',
+    activeTurnId: 'stale-turn',
+    loadedThreadIds: [THREAD_ID],
+    captureId: CAPTURE_ID_A,
+  })}\n`, { mode: 0o600 });
+
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_A), '');
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
+  assert.equal(
+    readRecoveryThread(config, `capture-${RETAINED_GENERATIONS + 2}`),
+    THREAD_ID,
+  );
+  assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_C), true);
+  const retained = [files.attempts, files.publications, files.targets]
+    .reduce((total, directory) => total + fs.readdirSync(directory).length, 0);
+  assert.ok(retained <= RETAINED_GENERATION_FILES, `retained ${retained} generation files`);
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
+});
+
+test('compaction failure remains fail closed and a later generation recovers', () => {
+  const { config } = fixture();
+  for (let sequence = 1; sequence <= RETAINED_GENERATIONS; sequence += 1) {
+    assert.equal(captureRecoveryTarget(config, 0, `before-failure-${sequence}`), true);
+  }
+  const files = targetPaths(config);
+  let injected = false;
+  const forcedFs = {
+    ...fs,
+    unlinkSync(file) {
+      if (!injected && path.dirname(file) === files.attempts) {
+        injected = true;
+        const error = new Error('forced compaction unlink failure');
+        error.code = 'EIO';
+        throw error;
+      }
+      return fs.unlinkSync(file);
+    },
+  };
+
+  assert.throws(
+    () => captureRecoveryTarget(config, 0, CAPTURE_ID_B, { fs: forcedFs }),
+    (error) => error?.code === 'EIO',
+  );
+  assert.equal(injected, true);
+  assert.equal(readRecoveryThread(config, `before-failure-${RETAINED_GENERATIONS}`), '');
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
+  assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_C), true);
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
+});
+
+test('compaction owned by B cannot delete concurrently published C', () => {
+  const { config } = fixture();
+  for (let sequence = 1; sequence <= RETAINED_GENERATIONS; sequence += 1) {
+    assert.equal(captureRecoveryTarget(config, 0, `before-concurrency-${sequence}`), true);
+  }
+  const files = targetPaths(config);
+  let injected = false;
+  const forcedFs = {
+    ...fs,
+    unlinkSync(file) {
+      if (!injected && path.dirname(file) === files.attempts) {
+        injected = true;
+        assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_C), true);
+      }
+      try {
+        return fs.unlinkSync(file);
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        return undefined;
+      }
+    },
+  };
+
+  assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_B, { fs: forcedFs }), true);
+  assert.equal(injected, true);
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
+});
+
+test('integer launch threshold uses deterministic strict mtime ordering', () => {
   const { config, live } = fixture();
   assert.equal(captureRecoveryTarget(config, 0, CAPTURE_ID_A), true);
-  fs.utimesSync(live, 1.000499, 1.000499);
-  assert.ok(fs.statSync(live).mtimeMs > 1000);
-  assert.ok(fs.statSync(live).mtimeMs < 1001);
+  const controlledFs = {
+    ...fs,
+    statSync(file, ...args) {
+      const stat = fs.statSync(file, ...args);
+      return file === live ? { ...stat, mtimeMs: 1000.999 } : stat;
+    },
+  };
 
-  assert.equal(captureRecoveryTarget(config, 1000, CAPTURE_ID_B), false);
+  assert.equal(captureRecoveryTarget(config, 1000, CAPTURE_ID_B, { fs: controlledFs }), false);
   assert.equal(readRecoveryThread(config, CAPTURE_ID_B), '');
+
+  controlledFs.statSync = (file, ...args) => {
+    const stat = fs.statSync(file, ...args);
+    return file === live ? { ...stat, mtimeMs: 1001 } : stat;
+  };
+  assert.equal(captureRecoveryTarget(config, 1000, CAPTURE_ID_C, { fs: controlledFs }), true);
+  assert.equal(readRecoveryThread(config, CAPTURE_ID_C), THREAD_ID);
 });

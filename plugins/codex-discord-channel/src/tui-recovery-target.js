@@ -7,6 +7,8 @@ const TARGET_VERSION = 1;
 const PUBLICATION_VERSION = 2;
 const CAPTURE_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/;
 const ATTEMPT_FILE_PATTERN = /^([1-9][0-9]*)\.attempt$/;
+const GENERATION_FILE_PATTERN = /^([1-9][0-9]*)\.json(?:\.tmp-[1-9][0-9]*-[1-9][0-9]*)?$/;
+const RETAINED_GENERATIONS = 32;
 
 function targetPaths(config) {
   return {
@@ -107,6 +109,42 @@ function allocateAttempt(files, operationId, dependencies = {}) {
   throw new Error('recovery attempt ledger is exhausted');
 }
 
+function unlinkIfPresent(file, dependencies = {}) {
+  const fsImpl = dependencies.fs || fs;
+  try {
+    fsImpl.unlinkSync(file);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+function reclaimDirectory(directory, cutoff, pattern, dependencies = {}) {
+  const fsImpl = dependencies.fs || fs;
+  let names;
+  try {
+    names = fsImpl.readdirSync(directory);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw error;
+  }
+  for (const name of names) {
+    const match = pattern.exec(name);
+    if (!match) continue;
+    const sequence = Number(match[1]);
+    if (Number.isSafeInteger(sequence) && sequence <= cutoff) {
+      unlinkIfPresent(path.join(directory, name), dependencies);
+    }
+  }
+}
+
+function reclaimGenerations(files, ownerSequence, dependencies = {}) {
+  const cutoff = ownerSequence - RETAINED_GENERATIONS;
+  if (cutoff < 1) return;
+  reclaimDirectory(files.attempts, cutoff, ATTEMPT_FILE_PATTERN, dependencies);
+  reclaimDirectory(files.publications, cutoff, GENERATION_FILE_PATTERN, dependencies);
+  reclaimDirectory(files.targets, cutoff, GENERATION_FILE_PATTERN, dependencies);
+}
+
 function writeAtomic(file, content, sequence, dependencies = {}) {
   const fsImpl = dependencies.fs || fs;
   const temp = `${file}.tmp-${process.pid}-${sequence}`;
@@ -171,6 +209,7 @@ function captureRecoveryTarget(config, minimumMtimeMs = 0, captureIdentity, depe
   }
 
   const sequence = allocateAttempt(files, captureId, dependencies);
+  reclaimGenerations(files, sequence, dependencies);
   let liveMtimeMs;
   let record;
   try {
@@ -228,6 +267,7 @@ function clearRecoveryTarget(config, dependencies = {}) {
   const now = dependencies.now || Date.now;
   const operationId = `clear-${process.pid}-${now()}`;
   const sequence = allocateAttempt(files, operationId, dependencies);
+  reclaimGenerations(files, sequence, dependencies);
   publish(files, sequence, 'cleared', { operationId }, dependencies);
 }
 

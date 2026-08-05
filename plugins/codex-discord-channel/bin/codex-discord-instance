@@ -151,8 +151,13 @@ reconstruct_recovery_args() {
       resume_index=$arg_index
       break
     fi
+    if [[ $arg == --last || $arg == --*= ]]; then
+      return 1
+    fi
     if option_requires_value "$arg"; then
-      if ((arg_index + 1 >= args_count)) || [[ ${codex_args[$((arg_index + 1))]} == -* ]]; then
+      if ((arg_index + 1 >= args_count)) \
+        || [[ -z ${codex_args[$((arg_index + 1))]} ]] \
+        || [[ ${codex_args[$((arg_index + 1))]} == -* ]]; then
         return 1
       fi
       arg_index=$((arg_index + 2))
@@ -164,6 +169,7 @@ reconstruct_recovery_args() {
       while ((arg_index < args_count)); do
         candidate=${codex_args[$arg_index]}
         [[ $candidate == -- ]] && return 1
+        [[ -z $candidate ]] && return 1
         if [[ $candidate == resume && $image_value_count -gt 0 ]]; then
           resume_index=$arg_index
           break 2
@@ -189,21 +195,28 @@ reconstruct_recovery_args() {
 
   local -A positional_indices=()
   local -a image_starts=() image_ends=()
-  local -i definite_positionals=0 last_index=-1
+  local -i definite_positionals=0 last_index=-1 last_count=0 max_positionals=2
   local -i block_start block_end scan_index
   arg_index=$((resume_index + 1))
   while ((arg_index < args_count)); do
     arg=${codex_args[$arg_index]}
     if [[ $arg == --last ]]; then
+      last_count=$((last_count + 1))
+      ((last_count > 1)) && return 1
       last_index=$arg_index
       arg_index=$((arg_index + 1))
       continue
+    fi
+    if [[ $arg == resume || $arg == --*= ]]; then
+      return 1
     fi
     if [[ $arg == -- ]]; then
       return 1
     fi
     if option_requires_value "$arg"; then
-      if ((arg_index + 1 >= args_count)) || [[ ${codex_args[$((arg_index + 1))]} == -* ]]; then
+      if ((arg_index + 1 >= args_count)) \
+        || [[ -z ${codex_args[$((arg_index + 1))]} ]] \
+        || [[ ${codex_args[$((arg_index + 1))]} == -* ]]; then
         return 1
       fi
       arg_index=$((arg_index + 2))
@@ -213,6 +226,7 @@ reconstruct_recovery_args() {
       block_start=$((arg_index + 1))
       block_end=$block_start
       while ((block_end < args_count)) && [[ ${codex_args[$block_end]} != -* ]]; do
+        [[ -z ${codex_args[$block_end]} ]] && return 1
         block_end=$((block_end + 1))
       done
       if ((block_end == block_start)); then
@@ -232,13 +246,9 @@ reconstruct_recovery_args() {
     arg_index=$((arg_index + 1))
   done
 
-  if ((last_index >= 0)); then
-    recovered_args[$last_index]=$recovery_thread
-    return
-  fi
-
-  local -i remaining_positionals=$((2 - definite_positionals))
-  ((remaining_positionals < 0)) && remaining_positionals=0
+  ((last_index >= 0)) && max_positionals=1
+  ((definite_positionals > max_positionals)) && return 1
+  local -i remaining_positionals=$((max_positionals - definite_positionals))
   local -i block_index available take first_positional
   for ((block_index = ${#image_starts[@]} - 1; block_index >= 0 && remaining_positionals > 0; block_index -= 1)); do
     block_start=${image_starts[$block_index]}
@@ -253,6 +263,11 @@ reconstruct_recovery_args() {
     done
     remaining_positionals=$((remaining_positionals - take))
   done
+
+  if ((last_index >= 0)); then
+    recovered_args[$last_index]=$recovery_thread
+    return
+  fi
 
   for ((scan_index = resume_index + 1; scan_index < args_count; scan_index += 1)); do
     if [[ -n ${positional_indices[$scan_index]+x} ]]; then

@@ -103,6 +103,16 @@ function fixture() {
     'exit 0',
     '',
   ].join('\n'));
+  executable(path.join(binDir, 'date'), [
+    '#!/usr/bin/env bash',
+    'case ${1:-} in',
+    '  +%s%3N) printf "1000\\n" ;;',
+    '  +%s%N) printf "1000000000\\n" ;;',
+    '  +%s) printf "1\\n" ;;',
+    '  *) exec /bin/date "$@" ;;',
+    'esac',
+    '',
+  ].join('\n'));
   fs.writeFileSync(path.join(stateDir, 'account.env'), [
     `CODEX_HOME=${codexHome}`,
     `CODEX_BIN=${fakeCodex}`,
@@ -312,7 +322,7 @@ test('recovery appends exact resume while preserving flags from a non-resume lau
   ]);
 });
 
-test('recovery replaces only the resume operand and preserves all trailing arguments in order', () => {
+test('recovery replaces only the resume operand and preserves one prompt in order', () => {
   const setup = fixture();
   fs.writeFileSync(setup.transportFailMarker, '1\n');
   const result = spawnSync(
@@ -328,7 +338,6 @@ test('recovery replaces only the resume operand and preserves all trailing argum
       '--no-alt-screen',
       'old-thread-id',
       'continue the first prompt',
-      'then preserve the second prompt',
     ],
     {
       encoding: 'utf8',
@@ -340,8 +349,8 @@ test('recovery replaces only the resume operand and preserves all trailing argum
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen old-thread-id continue the first prompt then preserve the second prompt`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen 019f3763-d308-7871-bedc-e6489b02190e continue the first prompt then preserve the second prompt`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen old-thread-id continue the first prompt`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --profile after --sandbox read-only --no-alt-screen 019f3763-d308-7871-bedc-e6489b02190e continue the first prompt`,
   ]);
 });
 
@@ -535,6 +544,16 @@ test('recovery appends resume without consuming image values or option values as
 
 test('recovery fails closed without a second launch for malformed or terminated argv', () => {
   const cases = [
+    {
+      name: 'resume session plus prompt plus extra positional',
+      args: ['resume', 'old-thread', 'prompt', 'extra'],
+    },
+    { name: 'duplicate last selector', args: ['resume', '--last', '--last'] },
+    { name: 'duplicate resume subcommand', args: ['resume', 'resume'] },
+    { name: 'empty equals option value', args: ['resume', '--profile='] },
+    { name: 'empty separated option value', args: ['resume', '--profile', ''] },
+    { name: 'empty equals image value', args: ['resume', '--image='] },
+    { name: 'empty separated image value', args: ['resume', '--image', ''] },
     { name: 'image option without a value', args: ['resume', '--image'] },
     { name: 'fixed option without a value', args: ['resume', '--profile'] },
     { name: 'fixed option without a value before resume', args: ['--profile'] },
