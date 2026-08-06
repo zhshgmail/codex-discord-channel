@@ -616,6 +616,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
     if (snapshot.blocked?.reason === DELIVERY_ACK_UNCERTAIN) {
       const threadId = snapshot.blocked.threadId || '';
       const clientUserMessageId = snapshot.blocked.clientUserMessageId || '';
+      const turnId = snapshot.blocked.turnId || '';
       let alreadyAccepted = false;
       if (threadId && clientUserMessageId && typeof host.hasDelivered === 'function') {
         try {
@@ -630,7 +631,14 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next, threadId, clientUserMessageId, deps);
+        const updated = completedQueue(
+          queue,
+          next,
+          threadId,
+          clientUserMessageId,
+          deps,
+          turnId,
+        );
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length };
       });
@@ -679,6 +687,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: snapshot.blocked.threadId || '',
           clientUserMessageId: snapshot.blocked.clientUserMessageId || '',
+          turnId: snapshot.blocked.turnId || '',
           error: 'Previous structured delivery did not complete.',
         },
         verifyReceiverOwnership,
@@ -782,6 +791,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         phase: 'starting_turn',
         threadId: target.threadId,
         clientUserMessageId: params.clientUserMessageId,
+        turnId: target.status === 'active' ? target.activeTurnId : '',
       };
       writeDeliveryQueue(queue, config, deps);
       return { prepared: true };
@@ -813,6 +823,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId: target.status === 'active' ? target.activeTurnId : '',
           error: error instanceof Error ? error.message : String(error),
         }, config, deps);
         return blockedResult(queue, reason, uncertain ? 'failed' : 'queued');
@@ -848,6 +859,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId: response?.turn?.id || response?.turnId || (
+            target.status === 'active' ? target.activeTurnId : ''
+          ),
           error: 'Structured turn was acknowledged but its user item was not observed.',
         },
         verifyReceiverOwnership,
@@ -875,6 +889,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
               messageId: next.normalized.messageId,
               threadId: target.threadId,
               clientUserMessageId: params.clientUserMessageId,
+              turnId: response?.turn?.id || response?.turnId || (
+                target.status === 'active' ? target.activeTurnId : ''
+              ),
               error: 'Structured delivery checkpoint changed before commit.',
             }, config, deps);
           }
@@ -923,6 +940,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId: response?.turn?.id || response?.turnId || (
+            target.status === 'active' ? target.activeTurnId : ''
+          ),
           error: error instanceof Error ? error.message : String(error),
         }, verifyReceiverOwnership);
       } catch {}

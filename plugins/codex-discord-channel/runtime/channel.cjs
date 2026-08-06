@@ -5104,7 +5104,7 @@ ${normalized.content}${attachmentText}
           } : { status: "idle", reason: "queue_empty", deliveredCount: 0, queueDepth: 0 };
         let next = snapshot.items[0];
         if (snapshot.blocked?.reason === DELIVERY_ACK_UNCERTAIN) {
-          let threadId = snapshot.blocked.threadId || "", clientUserMessageId = snapshot.blocked.clientUserMessageId || "", alreadyAccepted = !1;
+          let threadId = snapshot.blocked.threadId || "", clientUserMessageId = snapshot.blocked.clientUserMessageId || "", turnId = snapshot.blocked.turnId || "", alreadyAccepted = !1;
           if (threadId && clientUserMessageId && typeof host.hasDelivered == "function")
             try {
               alreadyAccepted = await host.hasDelivered(threadId, clientUserMessageId);
@@ -5117,7 +5117,14 @@ ${normalized.content}${attachmentText}
               return { retry: !0 };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
             if (receiverRejected) return { receiverRejected, queue };
-            let updated = completedQueue(queue, next, threadId, clientUserMessageId, deps);
+            let updated = completedQueue(
+              queue,
+              next,
+              threadId,
+              clientUserMessageId,
+              deps,
+              turnId
+            );
             return writeDeliveryQueue(updated, config, deps), { queueDepth: updated.items.length };
           });
           if (reconciled.retry) continue;
@@ -5151,6 +5158,7 @@ ${normalized.content}${attachmentText}
               messageId: next.normalized.messageId,
               threadId: snapshot.blocked.threadId || "",
               clientUserMessageId: snapshot.blocked.clientUserMessageId || "",
+              turnId: snapshot.blocked.turnId || "",
               error: "Previous structured delivery did not complete."
             },
             verifyReceiverOwnership
@@ -5226,7 +5234,8 @@ ${normalized.content}${attachmentText}
             ...queue.blocked,
             phase: "starting_turn",
             threadId: target.threadId,
-            clientUserMessageId: params.clientUserMessageId
+            clientUserMessageId: params.clientUserMessageId,
+            turnId: target.status === "active" ? target.activeTurnId : ""
           }, writeDeliveryQueue(queue, config, deps), { prepared: !0 });
         });
         if (!prepared.prepared) {
@@ -5247,6 +5256,7 @@ ${normalized.content}${attachmentText}
               messageId: next.normalized.messageId,
               threadId: target.threadId,
               clientUserMessageId: params.clientUserMessageId,
+              turnId: target.status === "active" ? target.activeTurnId : "",
               error: error instanceof Error ? error.message : String(error)
             }, config, deps), blockedResult(queue, reason, uncertain ? "failed" : "queued"));
           });
@@ -5275,6 +5285,7 @@ ${normalized.content}${attachmentText}
               messageId: next.normalized.messageId,
               threadId: target.threadId,
               clientUserMessageId: params.clientUserMessageId,
+              turnId: response?.turn?.id || response?.turnId || (target.status === "active" ? target.activeTurnId : ""),
               error: "Structured turn was acknowledged but its user item was not observed."
             },
             verifyReceiverOwnership
@@ -5295,6 +5306,7 @@ ${normalized.content}${attachmentText}
                 messageId: next.normalized.messageId,
                 threadId: target.threadId,
                 clientUserMessageId: params.clientUserMessageId,
+                turnId: response?.turn?.id || response?.turnId || (target.status === "active" ? target.activeTurnId : ""),
                 error: "Structured delivery checkpoint changed before commit."
               }, config, deps), { uncertain: !0, queueDepth: queue.items.length };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
@@ -5331,6 +5343,7 @@ ${normalized.content}${attachmentText}
               messageId: next.normalized.messageId,
               threadId: target.threadId,
               clientUserMessageId: params.clientUserMessageId,
+              turnId: response?.turn?.id || response?.turnId || (target.status === "active" ? target.activeTurnId : ""),
               error: error instanceof Error ? error.message : String(error)
             }, verifyReceiverOwnership);
           } catch {

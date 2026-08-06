@@ -1869,6 +1869,13 @@ test('active-turn durable proof wakes exact readback commit without replay', asy
       clientUserMessageId: 'discord:c1:m-active-proof',
       verifiedAt: queue.completed[0].readbackReceipt.verifiedAt,
     },
+    outbound: {
+      version: 1,
+      threadId: 'thread-current',
+      turnId: 'turn-active',
+      status: 'waiting',
+      stableClientMessageId: replyNonce('c1', 'm-active-proof'),
+    },
   }]);
 });
 
@@ -1960,6 +1967,87 @@ test('uncertain final retry and gateway restart use one stable outbound identity
   assert.equal(confirmed.stableClientMessageId, stableClientMessageId);
   assert.equal(confirmed.status, 'confirmed');
   assert.equal(confirmed.outboundMessageId, 'discord-out-restart');
+  recovered.destroy();
+});
+
+test('ack-uncertain active-turn reconciliation preserves exact turn for restart-safe final reply', async () => {
+  let persisted = false;
+  const fixture = structuredFixture({
+    onStartTurn() { return { turnId: 'turn-active-reconciled' }; },
+    hasDelivered(threadId, clientUserMessageId) {
+      return persisted && threadId === 'thread-current' &&
+        clientUserMessageId === 'discord:c1:m-active-reconciled';
+    },
+  });
+  fixture.setTarget({
+    available: true,
+    threadId: 'thread-current',
+    status: 'active',
+    activeTurnId: 'turn-active-reconciled',
+  });
+
+  const uncertain = await fixture.delivery.deliver(
+    discordMessage('m-active-reconciled', 'reply after readback'),
+  );
+  assert.equal(uncertain.reason, 'structured_ack_uncertain');
+  assert.equal(readQueue(fixture.dir).blocked.turnId, 'turn-active-reconciled');
+  persisted = true;
+  await fixture.emitDeliveryProof(
+    'thread-current',
+    'discord:c1:m-active-reconciled',
+  );
+  assert.deepEqual(readQueue(fixture.dir).completed[0].outbound, {
+    version: 1,
+    threadId: 'thread-current',
+    turnId: 'turn-active-reconciled',
+    status: 'waiting',
+    stableClientMessageId: replyNonce('c1', 'm-active-reconciled'),
+  });
+
+  const networkByStableId = new Map();
+  let networkSends = 0;
+  const sender = async (reply) => {
+    if (!networkByStableId.has(reply.stableClientMessageId)) {
+      networkSends += 1;
+      networkByStableId.set(reply.stableClientMessageId, 'discord-out-reconciled');
+      throw new Error('reply acknowledgement lost');
+    }
+    return {
+      status: 'confirmed',
+      messageId: networkByStableId.get(reply.stableClientMessageId),
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: networkByStableId.get(reply.stableClientMessageId),
+      },
+    };
+  };
+  fixture.delivery.activateReplySender(sender);
+  await fixture.emitAssistantFinal(
+    'thread-current',
+    'turn-active-reconciled',
+    'final-item-active-reconciled',
+    'one reconciled answer',
+  );
+  assert.equal(readQueue(fixture.dir).completed[0].outbound.status, 'ready');
+  fixture.delivery.destroy();
+
+  const recovered = createDelivery(deliveryConfig(fixture.dir), () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await recovered.activateReplySender(sender);
+  await recovered.flushReplies();
+
+  const confirmed = readQueue(fixture.dir).completed[0].outbound;
+  assert.equal(networkSends, 1);
+  assert.equal(confirmed.status, 'confirmed');
+  assert.equal(confirmed.outboundMessageId, 'discord-out-reconciled');
+  assert.deepEqual(confirmed.readbackReceipt, {
+    channelId: 'c1',
+    messageId: 'discord-out-reconciled',
+  });
   recovered.destroy();
 });
 
