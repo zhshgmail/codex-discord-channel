@@ -2981,7 +2981,7 @@ var require_ws = __commonJS({
 var require_app_server_host = __commonJS({
   "src/app-server-host.js"(exports2, module2) {
     "use strict";
-    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 1, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_LIFECYCLE_PROOF_SIGNALS = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 1, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
     function parseTargetCheckpoint(raw) {
       let record;
       try {
@@ -3410,7 +3410,7 @@ var require_app_server_host = __commonJS({
     }, AppServerHost = class extends EventEmitter {
       constructor(config = {}, logger = () => {
       }, deps = {}) {
-        super(), this.logger = logger, this.fs = deps.fs || fs, this.targetCheckpointPath = config.paths?.appServerTargetPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "app-server-target.json") : ""), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
+        super(), this.logger = logger, this.fs = deps.fs || fs, this.targetCheckpointPath = config.paths?.appServerTargetPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "app-server-target.json") : ""), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.lifecycleProofSignals = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
           deps.lifecycleProofRetryDelaysMs
         );
         let fsPromises = deps.rolloutFsPromises || fs.promises, sessionsDir = rolloutSessionsDir(config, deps);
@@ -3427,6 +3427,9 @@ var require_app_server_host = __commonJS({
           if (notification?.method === "item/started" || notification?.method === "item/completed") {
             let threadId = notification.params?.threadId, item = notification.params?.item;
             if (typeof threadId == "string" && threadId !== "" && item?.type === "userMessage" && typeof item.clientId == "string" && item.clientId !== "") {
+              this.rememberLifecycleProofSignal(threadId, item.clientId);
+              let turnId = notification.params?.turnId;
+              notification.method === "item/started" && typeof turnId == "string" && turnId !== "" && threadId === this.currentThreadId && this.loadedInventoryProven && this.knownLoadedThreadIds.has(threadId) && this.activeTurnIds.get(threadId) !== turnId && (this.threadSelectionRevision += 1, this.threadStatuses.set(threadId, "active"), this.activeTurnIds.set(threadId, turnId), this.persistTargetCheckpoint());
               let proof = { threadId, clientUserMessageId: item.clientId };
               this.wakeDeliveryWaiters(threadId, item.clientId), this.emit("deliveryProof", proof);
             }
@@ -3479,8 +3482,13 @@ var require_app_server_host = __commonJS({
       }
       rememberVerifiedUserMessage(threadId, clientUserMessageId) {
         let key = deliveryProofKey(threadId, clientUserMessageId);
-        for (this.verifiedUserMessages.delete(key), this.verifiedUserMessages.set(key, !0); this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES; )
+        for (this.lifecycleProofSignals.delete(key), this.verifiedUserMessages.delete(key), this.verifiedUserMessages.set(key, !0); this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES; )
           this.verifiedUserMessages.delete(this.verifiedUserMessages.keys().next().value);
+      }
+      rememberLifecycleProofSignal(threadId, clientUserMessageId) {
+        let key = deliveryProofKey(threadId, clientUserMessageId);
+        for (this.lifecycleProofSignals.delete(key), this.lifecycleProofSignals.set(key, !0); this.lifecycleProofSignals.size > MAX_LIFECYCLE_PROOF_SIGNALS; )
+          this.lifecycleProofSignals.delete(this.lifecycleProofSignals.keys().next().value);
       }
       addDeliveryWaiter(key, waiter) {
         let waiters = this.deliveryWaiters.get(key);
@@ -3875,7 +3883,7 @@ var require_app_server_host = __commonJS({
           },
           close: resolveClosed
         };
-        this.addDeliveryWaiter(proofKey, waiter);
+        this.addDeliveryWaiter(proofKey, waiter), this.lifecycleProofSignals.has(proofKey) && requestSignalVerification();
         let AbortControllerClass = globalThis.AbortController, readAbort = AbortControllerClass ? new AbortControllerClass() : null;
         try {
           if (this.verifiedUserMessages.has(proofKey) || await requestVerification()) return !0;
@@ -3918,7 +3926,7 @@ var require_app_server_host = __commonJS({
         return this.on("deliveryProof", listener), () => this.off("deliveryProof", listener);
       }
       destroy() {
-        this.destroyed = !0;
+        this.destroyed = !0, this.lifecycleProofSignals.clear();
         for (let waiters of this.deliveryWaiters.values())
           for (let waiter of [...waiters]) waiter.close();
         this.deliveryWaiters.clear(), this.verifiedUserMessages.clear(), this.client.off("notification", this.onNotification), this.client.off("connectionChanged", this.onConnectionChanged), typeof this.client.destroy == "function" && this.client.destroy();
