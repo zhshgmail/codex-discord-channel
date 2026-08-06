@@ -88,6 +88,89 @@ function enteredRows(file) {
   });
 }
 
+function directBypassFixture(t) {
+  const setup = lockFixture(t);
+  const plugin = path.join(setup.root, 'plugin');
+  const scripts = path.join(plugin, 'scripts');
+  fs.mkdirSync(path.join(plugin, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(plugin, 'runtime'), { recursive: true });
+  fs.mkdirSync(path.join(plugin, 'src'), { recursive: true });
+  fs.mkdirSync(scripts, { recursive: true });
+  fs.copyFileSync(buildScript, path.join(scripts, 'build-runtime.js'));
+  fs.copyFileSync(wrapper, path.join(scripts, 'build-runtime-locked.sh'));
+  fs.chmodSync(path.join(scripts, 'build-runtime-locked.sh'), 0o700);
+  const driver = path.join(pluginRoot, 'scripts', 'build-runtime-driver.js');
+  if (fs.existsSync(driver)) fs.copyFileSync(driver, path.join(scripts, 'build-runtime-driver.js'));
+  fs.writeFileSync(path.join(plugin, 'bin', 'codex-discord-channel'), '// fixture\n');
+  fs.writeFileSync(path.join(plugin, 'src', 'mcp-server.js'), '// fixture\n');
+  const preload = path.join(setup.root, 'preload-fake-esbuild.js');
+  fs.writeFileSync(preload, [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    "const Module = require('node:module');",
+    'const originalLoad = Module._load;',
+    'Module._load = function patched(request, parent, isMain) {',
+    "  if (request !== 'esbuild') return originalLoad.call(this, request, parent, isMain);",
+    '  return {',
+    "    version: '0.28.1',",
+    '    async build(options) {',
+    '      if (Array.isArray(options.entryPoints)) {',
+    "        if (!options.metafile || options.treeShaking !== false || options.ignoreAnnotations !== true) throw new Error('invalid_audit_options');",
+    "        if (options.logOverride?.['unsupported-require-call'] !== 'error' || options.logOverride?.['unsupported-dynamic-import'] !== 'error' || options.logLevel !== 'silent') throw new Error('missing_audit_diagnostics');",
+    "        if (!Array.isArray(options.plugins) || options.plugins.length !== 1) throw new Error('missing_audit_plugin');",
+    '        const callbacks = [];',
+    '        options.plugins[0].setup({ onResolve(_filter, callback) { callbacks.push(callback); } });',
+    "        if (callbacks.length !== 1 || callbacks[0]({ kind: 'entry-point', path: options.entryPoints[0] }) !== null) throw new Error('invalid_entry_policy');",
+    "        const external = callbacks[0]({ kind: 'require-call', path: 'node:fs' });",
+    "        if (external?.external !== true || external?.path !== 'node:fs') throw new Error('invalid_external_policy');",
+    "        fs.mkdirSync(require('node:path').dirname(options.outfile), { recursive: true });",
+    "        fs.writeFileSync(options.outfile, '\\'use strict\\';\\nrequire(\"node:fs\");\\n');",
+    '        return { metafile: { outputs: {',
+    "          [options.outfile]: { entryPoint: options.entryPoints[0], imports: [{ external: true, kind: 'require-call', path: 'node:fs' }] },",
+    '        } } };',
+    '      }',
+    "      fs.appendFileSync(process.env.FAKE_ENTERED, `${process.pid}|${options.outdir}\\n`);",
+    "      if (process.env.FAKE_HOLD === '1') await new Promise(() => {});",
+    '      fs.mkdirSync(options.outdir, { recursive: true });',
+    '      const outputs = {};',
+    '      for (const name of Object.keys(options.entryPoints)) {',
+    "        fs.writeFileSync(require('node:path').join(options.outdir, `${name}.cjs`), '\\'use strict\\';\\nrequire(\"node:fs\");\\n');",
+    "        outputs[`runtime/${name}.cjs`] = { imports: [{ external: true, path: 'node:fs' }] };",
+    '      }',
+    '      return { metafile: { outputs } };',
+    '    },',
+    '    async stop() {},',
+    '  };',
+    '};',
+    '',
+  ].join('\n'));
+  return {
+    ...setup,
+    buildScript: path.join(scripts, 'build-runtime.js'),
+    driver: path.join(scripts, 'build-runtime-driver.js'),
+    env: {
+      ...setup.env,
+      CODEX_DISCORD_BUILD_WRAPPER_HELD: '1',
+      FAKE_HOLD: '1',
+      NODE_OPTIONS: `--require=${preload}`,
+    },
+    wrapper: path.join(scripts, 'build-runtime-locked.sh'),
+  };
+}
+
+async function waitForAdmissionOrExit(child, file) {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file) && fs.readFileSync(file, 'utf8').trim()) return { kind: 'admitted' };
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return { kind: 'exit', code: child.exitCode, signal: child.signalCode };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  child.kill('SIGKILL');
+  throw new Error('timed out waiting for driver admission or exit');
+}
+
 for (const signal of ['SIGTERM', 'SIGKILL']) {
   test(`nonblocking canonical lock rejects overlap and ${signal} releases without stale cleanup`, async (t) => {
     const setup = lockFixture(t);
@@ -313,4 +396,73 @@ test('plain Node CLI delegates to the wrapper so an overlapping wrapper cannot r
   const exited = await directExit;
   assert.equal(exited.code, 137);
   assert.equal(fs.existsSync(temporaryDirectory), false);
+});
+
+test('forged wrapper environment cannot let a direct CLI overlap the canonical wrapper', async (t) => {
+  const setup = directBypassFixture(t);
+  const direct = spawn(process.execPath, [setup.buildScript, '--check'], {
+    env: setup.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let admittedPid;
+  t.after(() => {
+    if (Number.isInteger(admittedPid) && processExists(admittedPid)) {
+      try { process.kill(admittedPid, 'SIGKILL'); } catch {}
+    }
+    if (direct.exitCode === null) direct.kill('SIGKILL');
+  });
+  await waitForFile(setup.entered);
+  admittedPid = enteredRows(setup.entered)[0].pid;
+
+  const rejected = spawnSync(setup.wrapper, ['--check'], {
+    encoding: 'utf8',
+    env: { ...setup.env, FAKE_HOLD: '' },
+    timeout: 2000,
+  });
+  assert.equal(rejected.status, 73, rejected.stderr);
+  assert.match(rejected.stderr, /^build_runtime_already_running\n$/);
+  assert.equal(enteredRows(setup.entered).length, 1);
+
+  const directExit = waitForExit(direct);
+  process.kill(admittedPid, 'SIGKILL');
+  await directExit;
+});
+
+test('direct internal driver cannot bypass the canonical wrapper lock', async (t) => {
+  const setup = directBypassFixture(t);
+  const direct = spawn(process.execPath, [setup.driver, '--check'], {
+    env: setup.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let admittedPid;
+  t.after(() => {
+    if (Number.isInteger(admittedPid) && processExists(admittedPid)) {
+      try { process.kill(admittedPid, 'SIGKILL'); } catch {}
+    }
+    if (direct.exitCode === null) direct.kill('SIGKILL');
+  });
+  const outcome = await waitForAdmissionOrExit(direct, setup.entered);
+  if (outcome.kind === 'admitted') {
+    admittedPid = enteredRows(setup.entered)[0].pid;
+    const overlap = spawnSync(setup.wrapper, ['--check'], {
+      encoding: 'utf8',
+      env: { ...setup.env, FAKE_HOLD: '' },
+      timeout: 2000,
+    });
+    assert.equal(overlap.status, 73, overlap.stderr);
+    return;
+  }
+
+  assert.equal(outcome.code, 72);
+  assert.equal(fs.existsSync(setup.entered), false);
+  const realNodePath = setup.env.PATH.split(path.delimiter)
+    .filter((entry) => entry !== path.join(setup.root, 'bin'))
+    .join(path.delimiter);
+  const admitted = spawnSync(setup.wrapper, [], {
+    encoding: 'utf8',
+    env: { ...setup.env, FAKE_HOLD: '', PATH: realNodePath },
+    timeout: 2000,
+  });
+  assert.equal(admitted.status, 0, admitted.stderr);
+  assert.equal(enteredRows(setup.entered).length, 1);
 });

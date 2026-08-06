@@ -103,6 +103,22 @@ diagnostic steps are recorded in
 
 ## Checks
 
+Runtime builds use two dependency audits. The first audit checks the original
+source graph. The second serially reparses each generated artifact with pinned
+esbuild 0.28.1, externalizes every retained runtime dependency edge recognized
+by that parser,
+rejects direct computed `require(expr)` and `import(expr)`, and permits only
+canonical exact `node:` builtins verified by Node itself. Both audits must pass
+before either runtime file is published.
+
+This is the bounded **Contract A** build-dependency guarantee. It is not a
+semantic proof that arbitrary JavaScript cannot acquire a loader. Loader
+aliases, optional/call/apply forms, `createRequire`, computed
+`require.resolve(expr)`, `import.meta.resolve`, `Module._load`,
+`process.mainModule`, compile-time dead-code loads, `eval`, and `Function`
+require a separate product/runtime design. Their absence from esbuild metadata
+is a documented non-goal, never PASS evidence for a stronger closure claim.
+
 ```bash
 npm install
 npm run check

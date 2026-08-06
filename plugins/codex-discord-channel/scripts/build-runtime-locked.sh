@@ -17,6 +17,8 @@ node_bin=$(command -v node) || {
   printf 'build_runtime_node_not_found\n' >&2
   exit 72
 }
+driver="$plugin_root/scripts/build-runtime-driver.js"
+[[ -f $driver && ! -L $driver ]] || exit 72
 
 lock_capture_directory=$(mktemp -d "$runtime_dir/.codex-discord-lock-capture-XXXXXX") || exit 72
 chmod 700 "$lock_capture_directory" || exit 72
@@ -77,8 +79,6 @@ if [[ $rc -ne 0 ]]; then
   exit "$rc"
 fi
 
-export CODEX_DISCORD_BUILD_WRAPPER_HELD=1
-
 # Only the lock owner may reap abandoned private build directories or recover
 # an interrupted two-file publish. A direct Node invocation never deletes a
 # peer's temporary output.
@@ -89,7 +89,7 @@ for stale_directory in "$runtime_dir/codex-discord-build-runtime-$root_digest-"?
 done
 shopt -u nullglob
 
-"$node_bin" "$plugin_root/scripts/build-runtime.js" --recover-publish || exit 72
+"$node_bin" "$driver" --recover-publish || exit 72
 
 temporary_directory=$(mktemp -d "$runtime_dir/codex-discord-build-runtime-$root_digest-XXXXXX") || exit 72
 chmod 700 "$temporary_directory" || exit 72
@@ -120,7 +120,7 @@ trap 'forward_signal HUP' HUP
 # The wrapper remains a small lock-owning supervisor. If the memory-heavy Node
 # child is terminated or selected by the OOM killer, wait returns and the
 # private output directory is removed before the kernel locks are released.
-"$node_bin" "$plugin_root/scripts/build-runtime.js" "$@" &
+"$node_bin" "$driver" "$@" &
 child_pid=$!
 set +e
 while true; do
@@ -130,7 +130,7 @@ while true; do
 done
 set -e
 recovery_rc=0
-"$node_bin" "$plugin_root/scripts/build-runtime.js" --recover-publish || recovery_rc=$?
+"$node_bin" "$driver" --recover-publish || recovery_rc=$?
 cleanup_rc=0
 cleanup_temporary_directory || cleanup_rc=$?
 if [[ $recovery_rc -ne 0 || $cleanup_rc -ne 0 ]]; then exit 72; fi

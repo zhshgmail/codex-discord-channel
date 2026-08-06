@@ -11,15 +11,19 @@ const DEFAULT_MAXIMUM_OUTPUT_BYTES = 8 * 1024 * 1024;
 const FILE_COMPARE_CHUNK_BYTES = 64 * 1024;
 const MAX_UNRESOLVED_SAMPLES = 8;
 const MAX_SPECIFIER_SAMPLE_BYTES = 120;
+const PINNED_ESBUILD_VERSION = '0.28.1';
 
-const builtins = new Set(moduleBuiltin.builtinModules.map((name) => name.replace(/^node:/, '')));
+function isVerifiedNodeBuiltin(specifier) {
+  if (!specifier.startsWith('node:')) return false;
+  return moduleBuiltin.isBuiltin(specifier);
+}
 
 const nodeExternals = {
   name: 'node-externals',
   setup(build) {
     build.onResolve({ filter: /^(?:node:)?[A-Za-z0-9_][A-Za-z0-9_./-]*$/ }, (args) => {
       const bare = args.path.replace(/^node:/, '');
-      if (builtins.has(bare)) return { external: true, path: `node:${bare}` };
+      if (moduleBuiltin.isBuiltin(args.path)) return { external: true, path: `node:${bare}` };
       return null;
     });
   },
@@ -160,20 +164,164 @@ function boundedSpecifier(specifier) {
   return `${Buffer.from(oneLine).subarray(0, MAX_SPECIFIER_SAMPLE_BYTES).toString()}...`;
 }
 
-function assertNoUnresolvedRuntimeImports(filePath, label) {
-  const text = fs.readFileSync(filePath, 'utf8');
-  const matcher = /(?:require|__require|import)\(\s*["']([^"']+)["']\s*\)/g;
+// Contract A is deliberately narrower than semantic loader non-reachability:
+// it covers only retained runtime dependency edges and direct computed loader
+// calls recognized by the pinned esbuild parser. Aliases, optional/call/apply
+// forms, createRequire, require.resolve, import.meta.resolve, Module._load,
+// process.mainModule, compile-time dead code, eval, and Function are
+// product-design scope, not evidence that this build gate passed a stronger
+// semantic contract.
+function artifactAuditExternals() {
+  return {
+    name: 'artifact-audit-externals',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        if (args.kind === 'entry-point') return null;
+        return { external: true, path: args.path };
+      });
+    },
+  };
+}
+
+function assertPinnedEsbuild(esbuildApi) {
+  if (!esbuildApi || esbuildApi.version !== PINNED_ESBUILD_VERSION) {
+    throw new Error(
+      `build runtime requires pinned esbuild ${PINNED_ESBUILD_VERSION}; `
+      + `loaded=${esbuildApi && typeof esbuildApi.version === 'string' ? esbuildApi.version : '<unknown>'}`,
+    );
+  }
+}
+
+function resolveMetafilePath(workingDirectory, filePath) {
+  return path.resolve(workingDirectory, filePath);
+}
+
+function assertArtifactAuditMetafile(
+  metafile,
+  expectedOutputPath,
+  expectedEntryPoint,
+  workingDirectory,
+  label,
+) {
+  if (!metafile || typeof metafile !== 'object' || !metafile.outputs || typeof metafile.outputs !== 'object') {
+    throw new Error(`${label} closure audit returned malformed or incomplete metadata`);
+  }
+  const entries = Object.entries(metafile.outputs);
+  if (entries.length !== 1) {
+    throw new Error(`${label} closure audit returned malformed or incomplete metadata`);
+  }
+  const [outputPath, output] = entries[0];
+  if (resolveMetafilePath(workingDirectory, outputPath) !== path.resolve(expectedOutputPath)
+    || !output || typeof output !== 'object'
+    || typeof output.entryPoint !== 'string'
+    || resolveMetafilePath(workingDirectory, output.entryPoint) !== path.resolve(expectedEntryPoint)
+    || !Array.isArray(output.imports)) {
+    throw new Error(`${label} closure audit returned malformed or incomplete metadata`);
+  }
+
   const samples = [];
   let count = 0;
-  for (let match = matcher.exec(text); match !== null; match = matcher.exec(text)) {
-    const specifier = match[1];
-    if (specifier.startsWith('node:')) continue;
+  for (const item of output.imports) {
+    if (!item || typeof item !== 'object' || typeof item.path !== 'string'
+      || typeof item.kind !== 'string' || item.external !== true) {
+      throw new Error(`${label} closure audit returned malformed or incomplete metadata`);
+    }
+    if (isVerifiedNodeBuiltin(item.path)) continue;
     count += 1;
-    if (samples.length < MAX_UNRESOLVED_SAMPLES) samples.push(boundedSpecifier(specifier));
+    if (samples.length < MAX_UNRESOLVED_SAMPLES) samples.push(boundedSpecifier(item.path));
+  }
+  if (count > 0) {
+    throw new Error(
+      `${label} closure audit rejected esbuild-recognized retained runtime dependency edges: `
+      + `count=${count} sample=${samples.join(',')}`,
+    );
+  }
+}
+
+async function auditGeneratedArtifactClosure(
+  artifact,
+  temporaryDirectory,
+  maximumOutputBytes,
+  esbuildApi,
+) {
+  boundedRegularFile(artifact.generatedPath, maximumOutputBytes, 'generated audit input');
+  const auditOutputPath = path.join(temporaryDirectory, `.closure-audit-${artifact.entryName}.cjs`);
+  let failure;
+  try {
+    const result = await esbuildApi.build({
+      absWorkingDir: temporaryDirectory,
+      bundle: true,
+      entryPoints: [artifact.generatedPath],
+      format: 'cjs',
+      ignoreAnnotations: true,
+      legalComments: 'none',
+      logOverride: {
+        'unsupported-dynamic-import': 'error',
+        'unsupported-require-call': 'error',
+      },
+      logLevel: 'silent',
+      metafile: true,
+      minify: false,
+      outfile: auditOutputPath,
+      platform: 'node',
+      plugins: [artifactAuditExternals()],
+      sourcemap: false,
+      target: ['node22'],
+      treeShaking: false,
+      write: true,
+    });
+    boundedRegularFile(auditOutputPath, maximumOutputBytes, 'closure audit output');
+    assertArtifactAuditMetafile(
+      result.metafile,
+      auditOutputPath,
+      artifact.generatedPath,
+      temporaryDirectory,
+      artifact.label,
+    );
+  } catch (error) {
+    failure = error;
+  } finally {
+    try {
+      fs.rmSync(auditOutputPath, { force: true });
+    } catch (error) {
+      if (!failure) failure = error;
+    }
+  }
+  if (failure) throw failure;
+}
+
+function assertMetafileHasNoExternalRuntimeImports(metafile, bundleDefinitions) {
+  if (!metafile || typeof metafile !== 'object' || !metafile.outputs || typeof metafile.outputs !== 'object') {
+    throw new Error('esbuild did not return bounded external-import metadata');
+  }
+  const outputEntries = Object.entries(metafile.outputs);
+  const expectedOutputs = new Set(bundleDefinitions.map((definition) => `${definition.entryName}.cjs`));
+  const coveredOutputs = new Set();
+  const samples = [];
+  let count = 0;
+  for (const [outputPath, output] of outputEntries) {
+    const outputName = path.basename(outputPath);
+    if (!expectedOutputs.has(outputName) || coveredOutputs.has(outputName)
+      || !output || typeof output !== 'object' || !Array.isArray(output.imports)) {
+      throw new Error('esbuild returned malformed or incomplete external-import metadata');
+    }
+    coveredOutputs.add(outputName);
+    for (const item of output.imports) {
+      if (!item || typeof item !== 'object' || typeof item.path !== 'string'
+        || typeof item.external !== 'boolean') {
+        throw new Error('esbuild returned malformed or incomplete external-import metadata');
+      }
+      if (!item.external || isVerifiedNodeBuiltin(item.path)) continue;
+      count += 1;
+      if (samples.length < MAX_UNRESOLVED_SAMPLES) samples.push(boundedSpecifier(item.path));
+    }
+  }
+  if (outputEntries.length !== expectedOutputs.size || coveredOutputs.size !== expectedOutputs.size) {
+    throw new Error('esbuild returned malformed or incomplete external-import metadata');
   }
   if (count === 0) return;
   throw new Error(
-    `${label} bundle contains unresolved non-node runtime imports: `
+    'esbuild metadata contains external non-node runtime imports: '
     + `count=${count} sample=${samples.join(',')}`,
   );
 }
@@ -229,7 +377,6 @@ function validateGeneratedArtifacts(bundleDefinitions, temporaryDirectory, maxim
   return bundleDefinitions.map((definition) => {
     const generatedPath = path.join(temporaryDirectory, `${definition.entryName}.cjs`);
     boundedRegularFile(generatedPath, maximumOutputBytes, 'generated output');
-    assertNoUnresolvedRuntimeImports(generatedPath, definition.label);
     return { ...definition, generatedPath };
   });
 }
@@ -386,8 +533,9 @@ async function runBuildRuntime(options = {}) {
   let temporaryDirectory;
 
   try {
+    assertPinnedEsbuild(esbuildApi);
     temporaryDirectory = resolveTemporaryDirectory(pluginRoot, options);
-    await esbuildApi.build({
+    const buildResult = await esbuildApi.build({
       absWorkingDir: pluginRoot,
       bundle: true,
       define: {
@@ -401,7 +549,7 @@ async function runBuildRuntime(options = {}) {
       },
       format: 'cjs',
       legalComments: 'none',
-      metafile: false,
+      metafile: true,
       minifySyntax: true,
       outExtension: { '.js': '.cjs' },
       outdir: temporaryDirectory,
@@ -412,11 +560,20 @@ async function runBuildRuntime(options = {}) {
       target: ['node22'],
       write: true,
     });
+    assertMetafileHasNoExternalRuntimeImports(buildResult.metafile, bundleDefinitions);
     const artifacts = validateGeneratedArtifacts(
       bundleDefinitions,
       temporaryDirectory,
       maximumOutputBytes,
     );
+    for (const artifact of artifacts) {
+      await auditGeneratedArtifactClosure(
+        artifact,
+        temporaryDirectory,
+        maximumOutputBytes,
+        esbuildApi,
+      );
+    }
     if (options.check) {
       for (const artifact of artifacts) {
         const relativeOutput = path.relative(pluginRoot, artifact.outputPath);
@@ -456,41 +613,33 @@ async function runBuildRuntime(options = {}) {
 }
 
 if (require.main === module) {
-  if (process.env.CODEX_DISCORD_BUILD_WRAPPER_HELD !== '1') {
-    const wrapper = path.join(__dirname, 'build-runtime-locked.sh');
-    const delegated = childProcess.spawnSync('bash', [wrapper, ...process.argv.slice(2)], {
-      env: process.env,
-      stdio: 'inherit',
-    });
-    if (delegated.error) {
-      process.stderr.write(`${delegated.error.stack || delegated.error.message}\n`);
-      process.exitCode = 72;
-    } else if (delegated.signal) {
-      process.kill(process.pid, delegated.signal);
-    } else {
-      process.exitCode = delegated.status ?? 72;
-    }
-  } else if (process.argv.includes('--recover-publish')) {
-    try {
-      const pluginRoot = path.resolve(__dirname, '..');
-      recoverPublishTransaction(definitions(pluginRoot));
-    } catch (error) {
-      process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-      process.exitCode = 1;
-    }
+  // This public CLI never trusts caller-controlled state as evidence that a
+  // lock is held. The wrapper invokes a distinct non-main driver after it has
+  // acquired the kernel locks; all direct CLI calls delegate unconditionally.
+  const wrapper = path.join(__dirname, 'build-runtime-locked.sh');
+  const delegated = childProcess.spawnSync('bash', [wrapper, ...process.argv.slice(2)], {
+    env: process.env,
+    stdio: 'inherit',
+  });
+  if (delegated.error) {
+    process.stderr.write(`${delegated.error.stack || delegated.error.message}\n`);
+    process.exitCode = 72;
+  } else if (delegated.signal) {
+    process.kill(process.pid, delegated.signal);
   } else {
-    runBuildRuntime({ check: process.argv.includes('--check') }).catch((error) => {
-      process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-      process.exitCode = 1;
-    });
+    process.exitCode = delegated.status ?? 72;
   }
 }
 
 module.exports = {
   DEFAULT_MAXIMUM_OUTPUT_BYTES,
+  PINNED_ESBUILD_VERSION,
+  assertArtifactAuditMetafile,
   assertCommittedBundleCurrent,
+  assertMetafileHasNoExternalRuntimeImports,
   compareFilesBounded,
   createPrivateTemporaryDirectory,
+  definitions,
   firstMismatchOffset,
   publishValidatedArtifacts,
   recoverPublishTransaction,
