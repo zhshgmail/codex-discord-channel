@@ -3056,6 +3056,35 @@ test('user-item lifecycle signal is exposed as an exact delivery-proof wake', as
   }]);
 });
 
+test('completed final assistant item is exposed for durable Discord egress', async (t) => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`assistant-final notification must not request ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  t.after(() => host.destroy());
+  const finals = [];
+  const unsubscribe = host.onAssistantFinal((event) => finals.push(event));
+
+  for (const item of [
+    { type: 'agentMessage', id: 'commentary-1', text: 'working', phase: 'commentary' },
+    { type: 'agentMessage', id: 'final-1', text: 'done', phase: 'final_answer' },
+    { type: 'agentMessage', id: 'final-empty', text: '', phase: 'final_answer' },
+  ]) {
+    client.emit('notification', {
+      method: 'item/completed',
+      params: { threadId: DELIVERY_THREAD_ID, turnId: 'turn-active', item },
+    });
+  }
+  unsubscribe();
+
+  assert.deepEqual(finals, [{
+    threadId: DELIVERY_THREAD_ID,
+    turnId: 'turn-active',
+    itemId: 'final-1',
+    text: 'done',
+  }]);
+});
+
 test('lifecycle signal without durable rollout evidence does not prove delivery', async (t) => {
   const clientId = 'discord:c1:m-signal-only';
   const { codexHome } = createRolloutFixture(t, [sessionMeta()]);

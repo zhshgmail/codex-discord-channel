@@ -16,6 +16,7 @@ const {
   resolveReplyTarget,
   structuredSafeText,
 } = require('../../src/delivery');
+const { replyNonce } = require('../../src/reply-delivery');
 const {
   commitReceiverOwnership,
   isCurrentReceiverOwnership,
@@ -93,6 +94,7 @@ function structuredFixture(overrides = {}) {
   let idleListener = null;
   let activeListener = null;
   let deliveryProofListener = null;
+  let assistantFinalListener = null;
   let ttyCalls = 0;
   const host = {
     async resolveTarget() {
@@ -140,6 +142,12 @@ function structuredFixture(overrides = {}) {
         if (deliveryProofListener === listener) deliveryProofListener = null;
       };
     },
+    onAssistantFinal(listener) {
+      assistantFinalListener = listener;
+      return () => {
+        if (assistantFinalListener === listener) assistantFinalListener = null;
+      };
+    },
     status() {
       if (typeof overrides.status === 'function') return overrides.status();
       return {
@@ -173,6 +181,10 @@ function structuredFixture(overrides = {}) {
     async emitDeliveryProof(threadId, clientUserMessageId) {
       assert.equal(typeof deliveryProofListener, 'function');
       return deliveryProofListener({ threadId, clientUserMessageId });
+    },
+    async emitAssistantFinal(threadId, turnId, itemId, text) {
+      assert.equal(typeof assistantFinalListener, 'function');
+      return assistantFinalListener({ threadId, turnId, itemId, text });
     },
   };
 }
@@ -1858,6 +1870,97 @@ test('active-turn durable proof wakes exact readback commit without replay', asy
       verifiedAt: queue.completed[0].readbackReceipt.verifiedAt,
     },
   }]);
+});
+
+test('active-turn final persists stable outbound acknowledgement and exact readback', async () => {
+  const fixture = structuredFixture({
+    onStartTurn() { return { turn: { id: 'turn-active-final' } }; },
+  });
+  fixture.setTarget({
+    available: true,
+    threadId: 'thread-current',
+    status: 'active',
+    activeTurnId: 'turn-active-final',
+  });
+  const sends = [];
+  fixture.delivery.activateReplySender(async (reply) => {
+    sends.push(reply);
+    return {
+      status: 'confirmed',
+      messageId: 'discord-out-1',
+      readbackReceipt: { channelId: reply.channelId, messageId: 'discord-out-1' },
+    };
+  });
+
+  await fixture.delivery.deliver(discordMessage('m-active-final', 'answer me'));
+  await fixture.emitAssistantFinal('thread-current', 'turn-active-final', 'final-item-1', 'answer');
+
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].sourceMessageId, 'm-active-final');
+  assert.equal(sends[0].stableClientMessageId, replyNonce('c1', 'm-active-final'));
+  assert.match(sends[0].stableClientMessageId, /^cdr-/);
+  const completed = readQueue(fixture.dir).completed[0];
+  assert.equal(completed.outbound.status, 'confirmed');
+  assert.equal(completed.outbound.outboundMessageId, 'discord-out-1');
+  assert.deepEqual(completed.outbound.readbackReceipt, {
+    channelId: 'c1',
+    messageId: 'discord-out-1',
+  });
+});
+
+test('uncertain final retry and gateway restart use one stable outbound identity', async () => {
+  const fixture = structuredFixture({
+    onStartTurn() { return { turn: { id: 'turn-restart-final' } }; },
+  });
+  await fixture.delivery.deliver(discordMessage('m-restart-final', 'answer once'));
+
+  const networkByStableId = new Map();
+  let networkSends = 0;
+  const sender = async (reply) => {
+    if (!networkByStableId.has(reply.stableClientMessageId)) {
+      networkSends += 1;
+      networkByStableId.set(reply.stableClientMessageId, 'discord-out-restart');
+      const error = new Error('confirmation response lost');
+      error.code = 'reply_ack_uncertain';
+      throw error;
+    }
+    return {
+      status: 'confirmed',
+      messageId: networkByStableId.get(reply.stableClientMessageId),
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: networkByStableId.get(reply.stableClientMessageId),
+      },
+    };
+  };
+  fixture.delivery.activateReplySender(sender);
+  await fixture.emitAssistantFinal(
+    'thread-current',
+    'turn-restart-final',
+    'final-item-restart',
+    'one answer',
+  );
+  const ready = readQueue(fixture.dir).completed[0].outbound;
+  assert.equal(ready.status, 'ready');
+  const stableClientMessageId = ready.stableClientMessageId;
+  fixture.delivery.destroy();
+
+  const recovered = createDelivery(deliveryConfig(fixture.dir), () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  recovered.activateReplySender(sender);
+  await recovered.flushReplies();
+  await recovered.flushReplies();
+
+  assert.equal(networkSends, 1);
+  const confirmed = readQueue(fixture.dir).completed[0].outbound;
+  assert.equal(confirmed.stableClientMessageId, stableClientMessageId);
+  assert.equal(confirmed.status, 'confirmed');
+  assert.equal(confirmed.outboundMessageId, 'discord-out-restart');
+  recovered.destroy();
 });
 
 test('legacy completed identity gains one exact-thread receipt without rebuilding the queue', async () => {

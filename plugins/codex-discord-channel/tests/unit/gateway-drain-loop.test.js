@@ -252,6 +252,32 @@ test('uncertain acknowledgement keeps a prompt readback retry without replay bac
   await loop.stop();
 });
 
+test('outbound final replies are retried even when the inbound queue is empty', async () => {
+  const timers = createManualTimers();
+  const calls = [];
+  const loop = startGatewayDrainLoop({
+    config: { deliveryDrainIntervalMs: 10, deliveryDrainMaxBackoffMs: 40 },
+    delivery: {
+      async flush() { calls.push('inbound'); return { status: 'idle' }; },
+      async flushReplies() { calls.push('outbound'); return { status: 'idle' }; },
+    },
+    receiverOwnership: { pid: process.pid },
+    deps: {
+      clearTimeout: timers.clearTimeout,
+      setTimeout: timers.setTimeout,
+      readDeliveryQueueStatus() {
+        return { deliveryQueueDepth: 0, deliveryBlockedReason: null };
+      },
+      isCurrentReceiverOwnership() { return { active: true, pid: process.pid }; },
+    },
+  });
+
+  await timers.runNext();
+
+  assert.deepEqual(calls, ['outbound']);
+  await loop.stop();
+});
+
 test('duplicate timer callback invocation cannot duplicate an in-flight structured turn', async () => {
   const fixture = await deliveryFixture({ available: true, holdTurn: true });
   await fixture.delivery.enqueue(discordMessage('message-once'));

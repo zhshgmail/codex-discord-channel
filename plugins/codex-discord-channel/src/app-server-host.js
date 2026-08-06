@@ -715,6 +715,27 @@ class AppServerHost extends EventEmitter {
         const threadId = notification.params?.threadId;
         const item = notification.params?.item;
         if (
+          notification.method === 'item/completed' &&
+          typeof threadId === 'string' &&
+          threadId !== '' &&
+          item?.type === 'agentMessage' &&
+          item.phase === 'final_answer' &&
+          typeof item.id === 'string' &&
+          item.id !== '' &&
+          typeof item.text === 'string' &&
+          item.text !== '' &&
+          typeof notification.params?.turnId === 'string' &&
+          notification.params.turnId !== ''
+        ) {
+          this.emit('assistantFinal', {
+            threadId,
+            turnId: notification.params.turnId,
+            itemId: item.id,
+            text: item.text,
+          });
+          return;
+        }
+        if (
           typeof threadId === 'string' &&
           threadId !== '' &&
           item?.type === 'userMessage' &&
@@ -1689,6 +1710,11 @@ class AppServerHost extends EventEmitter {
   onDeliveryProof(listener) {
     this.on('deliveryProof', listener);
     return () => this.off('deliveryProof', listener);
+  }
+
+  onAssistantFinal(listener) {
+    this.on('assistantFinal', listener);
+    return () => this.off('assistantFinal', listener);
   }
 
   destroy() {

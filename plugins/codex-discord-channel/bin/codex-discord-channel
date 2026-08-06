@@ -189,6 +189,48 @@ async function runGateway(config = loadConfig()) {
     delivery.destroy();
     throw new Error(`Discord gateway did not start: ${discordState.reason || 'unknown'}`);
   }
+  await delivery.activateReplySender(async (reply) => {
+    const args = { channelId: reply.channelId, replyTo: reply.sourceMessageId };
+    const content = reply.text;
+    const sent = await sendDiscordReplyOnce({
+      args,
+      config,
+      content,
+      preflight: (target, identity) => prepareDiscordMessageSend(
+        discordState.client,
+        { ...args, ...target, ...identity, content },
+      ),
+      sender: (target, prepared, identity) => sendDiscordMessage(
+        discordState.client,
+        { ...args, ...target, ...identity, content },
+        prepared,
+      ),
+      confirmer: (target, prepared, message, receipt) => confirmDiscordMessage(
+        discordState.client,
+        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+        prepared,
+        message,
+      ),
+      reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
+        discordState.client,
+        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+        prepared,
+        receipt,
+      ),
+    });
+    return {
+      ...sent,
+      status: sent.messageId && (
+        sent.duplicateSuppressed !== true || sent.receiptStatus === 'confirmed'
+      ) ? 'confirmed' : 'uncertain',
+      readbackReceipt: sent.messageId ? {
+        channelId: sent.channelId || reply.channelId,
+        messageId: sent.messageId,
+        sourceMessageId: sent.sourceMessageId,
+        stableClientMessageId: reply.stableClientMessageId,
+      } : null,
+    };
+  });
   const drainLoop = startGatewayDrainLoop({
     config,
     delivery,
