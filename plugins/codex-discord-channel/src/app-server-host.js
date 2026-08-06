@@ -1573,14 +1573,21 @@ class AppServerHost extends EventEmitter {
   }
 
   async readAssistantFinal(threadId, turnId) {
+    const finals = await this.readAssistantFinals(threadId, [turnId]);
+    return finals.length === 1 ? finals[0] : null;
+  }
+
+  async readAssistantFinals(threadId, turnIds) {
     if (
       typeof threadId !== 'string' ||
       threadId === '' ||
-      typeof turnId !== 'string' ||
-      turnId === ''
+      !Array.isArray(turnIds) ||
+      turnIds.some((turnId) => typeof turnId !== 'string' || turnId === '')
     ) {
-      return null;
+      return [];
     }
+    const requestedTurnIds = Array.from(new Set(turnIds));
+    if (requestedTurnIds.length === 0) return [];
     const params = { threadId, includeTurns: true };
     let threadSelectionRevision;
     let response;
@@ -1605,10 +1612,20 @@ class AppServerHost extends EventEmitter {
       );
     }
     const thread = response?.thread;
-    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
-    const turns = thread.turns.filter((turn) => turn?.id === turnId);
-    if (turns.length !== 1) return null;
-    return finalAssistantFromTurn(threadId, turns[0]);
+    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return [];
+    const requested = new Set(requestedTurnIds);
+    const turnsById = new Map(requestedTurnIds.map((turnId) => [turnId, []]));
+    for (const turn of thread.turns) {
+      if (requested.has(turn?.id)) turnsById.get(turn.id).push(turn);
+    }
+    const finals = [];
+    for (const turnId of requestedTurnIds) {
+      const turns = turnsById.get(turnId);
+      if (turns.length !== 1) continue;
+      const final = finalAssistantFromTurn(threadId, turns[0]);
+      if (final) finals.push(final);
+    }
+    return finals;
   }
 
   async hasDelivered(threadId, clientUserMessageId) {

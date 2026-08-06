@@ -14,6 +14,7 @@ const STALE_DELIVERY_ACTIVATION = 'stale_delivery_activation';
 const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
 const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
 const MAX_REPLY_RECOVERY_CANDIDATES = 32;
+const MAX_REPLY_EGRESS_CANDIDATES = 32;
 const activeDeliveryAttempts = new Set();
 
 function currentTimeMs(deps = {}) {
@@ -247,6 +248,8 @@ function emptyDeliveryQueue() {
     completed: [],
     archived: [],
     blocked: null,
+    replyRecoveryCursor: 0,
+    replyEgressCursor: 0,
   };
 }
 
@@ -273,6 +276,10 @@ function readDeliveryQueue(config = {}, deps = {}) {
     completed: Array.isArray(parsed.completed) ? parsed.completed : [],
     archived: Array.isArray(parsed.archived) ? parsed.archived : [],
     blocked: parsed.blocked && typeof parsed.blocked === 'object' ? parsed.blocked : null,
+    replyRecoveryCursor: Number.isSafeInteger(parsed.replyRecoveryCursor) &&
+      parsed.replyRecoveryCursor >= 0 ? parsed.replyRecoveryCursor : 0,
+    replyEgressCursor: Number.isSafeInteger(parsed.replyEgressCursor) &&
+      parsed.replyEgressCursor >= 0 ? parsed.replyEgressCursor : 0,
   };
 }
 
@@ -399,6 +406,8 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
       completed: queue.completed,
       archived,
       blocked: !activationMatches || headWasArchived ? null : queue.blocked,
+      replyRecoveryCursor: queue.replyRecoveryCursor,
+      replyEgressCursor: queue.replyEgressCursor,
     },
     changed: true,
     archivedCount: staleItems.length,
@@ -544,6 +553,8 @@ function completedQueue(queue, next, threadId, clientUserMessageId, deps = {}, t
     ],
     archived: queue.archived,
     blocked: null,
+    replyRecoveryCursor: queue.replyRecoveryCursor,
+    replyEgressCursor: queue.replyEgressCursor,
   };
 }
 
@@ -1146,13 +1157,20 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     recoverReplies() {
       return serializeAdmission(async () => {
         if (destroyed) return { status: 'idle', reason: 'delivery_destroyed' };
-        if (typeof host.readAssistantFinal !== 'function') {
+        if (typeof host.readAssistantFinals !== 'function') {
           return { status: 'idle', reason: 'reply_recovery_unsupported' };
         }
-        const snapshot = await withDeliveryQueueLock(config, deps, () => {
+        const candidates = await withDeliveryQueueLock(config, deps, () => {
           const queue = readDeliveryQueue(config, deps);
           const frozen = new Map();
-          for (const entry of queue.completed) {
+          const completedCount = queue.completed.length;
+          const start = completedCount === 0
+            ? 0
+            : queue.replyRecoveryCursor % completedCount;
+          let nextCursor = start;
+          for (let offset = 0; offset < completedCount; offset += 1) {
+            const index = (start + offset) % completedCount;
+            const entry = queue.completed[index];
             if (
               entry?.outbound?.status !== 'waiting' ||
               typeof entry.outbound.threadId !== 'string' ||
@@ -1168,51 +1186,58 @@ function createDelivery(config, logger = () => {}, deps = {}) {
                 threadId: entry.outbound.threadId,
                 turnId: entry.outbound.turnId,
               });
+              nextCursor = (index + 1) % completedCount;
+              if (frozen.size === MAX_REPLY_RECOVERY_CANDIDATES) break;
             }
           }
-          const candidates = Array.from(frozen.values());
-          return {
-            candidates,
-            limitExceeded: candidates.length > MAX_REPLY_RECOVERY_CANDIDATES,
-          };
+          if (frozen.size > 0) {
+            queue.replyRecoveryCursor = nextCursor;
+            writeDeliveryQueue(queue, config, deps);
+          }
+          return Array.from(frozen.values());
         });
-        const { candidates } = snapshot;
         if (candidates.length === 0) {
           return { status: 'idle', reason: 'reply_recovery_empty' };
         }
-        if (snapshot.limitExceeded) {
-          logger('ERROR', 'Refusing unbounded exact app-server final reply recovery', {
-            candidateCount: candidates.length,
-            candidateLimit: MAX_REPLY_RECOVERY_CANDIDATES,
-          });
-          return {
-            status: 'failed',
-            reason: 'reply_recovery_limit_exceeded',
-            candidateCount: candidates.length,
-            candidateLimit: MAX_REPLY_RECOVERY_CANDIDATES,
-          };
+        const grouped = new Map();
+        for (const candidate of candidates) {
+          if (!grouped.has(candidate.threadId)) grouped.set(candidate.threadId, []);
+          grouped.get(candidate.threadId).push(candidate.turnId);
         }
         let recoveredCount = 0;
         let failedCount = 0;
         let missingCount = 0;
-        for (const candidate of candidates) {
-          let event;
+        for (const [threadId, turnIds] of grouped) {
+          let events;
           try {
-            event = await host.readAssistantFinal(candidate.threadId, candidate.turnId);
+            events = await host.readAssistantFinals(threadId, turnIds);
           } catch (error) {
-            failedCount += 1;
-            logger('ERROR', 'Failed exact app-server final reply recovery', {
-              threadId: candidate.threadId,
-              turnId: candidate.turnId,
+            failedCount += turnIds.length;
+            logger('ERROR', 'Failed grouped exact app-server final reply recovery', {
+              threadId,
+              turnIds,
               error: error instanceof Error ? error.message : String(error),
             });
             continue;
           }
-          if (!event) {
-            missingCount += 1;
+          if (!Array.isArray(events)) {
+            failedCount += turnIds.length;
             continue;
           }
-          recoveredCount += await persistAssistantFinal(event);
+          const expected = new Set(turnIds);
+          const observed = new Set();
+          for (const event of events) {
+            if (
+              event?.threadId !== threadId ||
+              !expected.has(event?.turnId) ||
+              observed.has(event.turnId)
+            ) {
+              continue;
+            }
+            observed.add(event.turnId);
+            recoveredCount += await persistAssistantFinal(event);
+          }
+          missingCount += expected.size - observed.size;
         }
         if (recoveredCount > 0) {
           return {
@@ -1249,19 +1274,39 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         }
         const candidates = await withDeliveryQueueLock(config, deps, () => {
           const queue = readDeliveryQueue(config, deps);
-          return queue.completed.filter((entry) => (
-            entry?.outbound?.status === 'ready' &&
-            typeof entry.outbound.text === 'string' &&
-            entry.outbound.text !== ''
-          )).map((completed) => ({
-            channelId: completed.channelId,
-            sourceMessageId: completed.messageId,
-            stableClientMessageId: completed.outbound.stableClientMessageId,
-            threadId: completed.outbound.threadId,
-            turnId: completed.outbound.turnId,
-            itemId: completed.outbound.itemId,
-            text: completed.outbound.text,
-          }));
+          const frozen = [];
+          const completedCount = queue.completed.length;
+          const start = completedCount === 0
+            ? 0
+            : queue.replyEgressCursor % completedCount;
+          let nextCursor = start;
+          for (let offset = 0; offset < completedCount; offset += 1) {
+            const index = (start + offset) % completedCount;
+            const completed = queue.completed[index];
+            if (
+              completed?.outbound?.status !== 'ready' ||
+              typeof completed.outbound.text !== 'string' ||
+              completed.outbound.text === ''
+            ) {
+              continue;
+            }
+            frozen.push({
+              channelId: completed.channelId,
+              sourceMessageId: completed.messageId,
+              stableClientMessageId: completed.outbound.stableClientMessageId,
+              threadId: completed.outbound.threadId,
+              turnId: completed.outbound.turnId,
+              itemId: completed.outbound.itemId,
+              text: completed.outbound.text,
+            });
+            nextCursor = (index + 1) % completedCount;
+            if (frozen.length === MAX_REPLY_EGRESS_CANDIDATES) break;
+          }
+          if (frozen.length > 0) {
+            queue.replyEgressCursor = nextCursor;
+            writeDeliveryQueue(queue, config, deps);
+          }
+          return frozen;
         });
         if (candidates.length === 0) return { status: 'idle', reason: 'reply_queue_empty' };
         let confirmedCount = 0;
