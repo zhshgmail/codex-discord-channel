@@ -3165,6 +3165,19 @@ test('exact final readback fails closed on thread turn and final ambiguity', asy
         }],
       },
     },
+    {
+      name: 'valid plus malformed final answer',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [{
+          id: 'turn-exact-final',
+          items: [
+            { type: 'agentMessage', id: 'final-valid', text: 'A', phase: 'final_answer' },
+            { type: 'agentMessage', id: 'final-malformed', text: '', phase: 'final_answer' },
+          ],
+        }],
+      },
+    },
   ];
   for (const entry of cases) {
     await t.test(entry.name, async (subtest) => {

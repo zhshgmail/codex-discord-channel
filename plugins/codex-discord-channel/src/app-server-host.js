@@ -105,13 +105,17 @@ function finalAssistantFromTurn(threadId, turn) {
   }
   const finals = turn.items.filter((item) => (
     item?.type === 'agentMessage' &&
-    item.phase === 'final_answer' &&
-    typeof item.id === 'string' &&
-    item.id !== '' &&
-    typeof item.text === 'string' &&
-    item.text !== ''
+    item.phase === 'final_answer'
   ));
   if (finals.length !== 1) return null;
+  if (
+    typeof finals[0].id !== 'string' ||
+    finals[0].id === '' ||
+    typeof finals[0].text !== 'string' ||
+    finals[0].text === ''
+  ) {
+    return null;
+  }
   return {
     threadId,
     turnId: turn.id,

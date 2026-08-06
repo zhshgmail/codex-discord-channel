@@ -13,6 +13,7 @@ const DELIVERY_ACK_UNCERTAIN = 'structured_ack_uncertain';
 const STALE_DELIVERY_ACTIVATION = 'stale_delivery_activation';
 const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
 const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
+const MAX_REPLY_RECOVERY_CANDIDATES = 32;
 const activeDeliveryAttempts = new Set();
 
 function currentTimeMs(deps = {}) {
@@ -1068,27 +1069,24 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   };
   const persistAssistantFinal = (event) => withDeliveryQueueLock(config, deps, () => {
     const queue = readDeliveryQueue(config, deps);
-    const duplicate = queue.completed.some((entry) => (
-      entry?.outbound?.itemId === event.itemId &&
-      entry?.outbound?.threadId === event.threadId &&
-      entry?.outbound?.turnId === event.turnId
-    ));
-    if (duplicate) return false;
-    const completed = queue.completed.find((entry) => (
+    const completed = queue.completed.filter((entry) => (
       entry?.outbound?.status === 'waiting' &&
       entry.outbound.threadId === event.threadId &&
       entry.outbound.turnId === event.turnId
     ));
-    if (!completed) return false;
-    completed.outbound = {
-      ...completed.outbound,
-      status: 'ready',
-      itemId: event.itemId,
-      text: event.text,
-      readyAt: new Date(currentTimeMs(deps)).toISOString(),
-    };
+    if (completed.length === 0) return 0;
+    const readyAt = new Date(currentTimeMs(deps)).toISOString();
+    for (const entry of completed) {
+      entry.outbound = {
+        ...entry.outbound,
+        status: 'ready',
+        itemId: event.itemId,
+        text: event.text,
+        readyAt,
+      };
+    }
     writeDeliveryQueue(queue, config, deps);
-    return true;
+    return completed.length;
   });
 
   const delivery = {
@@ -1151,37 +1149,96 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         if (typeof host.readAssistantFinal !== 'function') {
           return { status: 'idle', reason: 'reply_recovery_unsupported' };
         }
-        const candidate = await withDeliveryQueueLock(config, deps, () => {
+        const snapshot = await withDeliveryQueueLock(config, deps, () => {
           const queue = readDeliveryQueue(config, deps);
-          const completed = queue.completed.find((entry) => (
-            entry?.outbound?.status === 'waiting' &&
-            typeof entry.outbound.threadId === 'string' &&
-            entry.outbound.threadId !== '' &&
-            typeof entry.outbound.turnId === 'string' &&
-            entry.outbound.turnId !== ''
-          ));
-          return completed ? {
-            threadId: completed.outbound.threadId,
-            turnId: completed.outbound.turnId,
-          } : null;
+          const frozen = new Map();
+          for (const entry of queue.completed) {
+            if (
+              entry?.outbound?.status !== 'waiting' ||
+              typeof entry.outbound.threadId !== 'string' ||
+              entry.outbound.threadId === '' ||
+              typeof entry.outbound.turnId !== 'string' ||
+              entry.outbound.turnId === ''
+            ) {
+              continue;
+            }
+            const key = JSON.stringify([entry.outbound.threadId, entry.outbound.turnId]);
+            if (!frozen.has(key)) {
+              frozen.set(key, {
+                threadId: entry.outbound.threadId,
+                turnId: entry.outbound.turnId,
+              });
+            }
+          }
+          const candidates = Array.from(frozen.values());
+          return {
+            candidates,
+            limitExceeded: candidates.length > MAX_REPLY_RECOVERY_CANDIDATES,
+          };
         });
-        if (!candidate) return { status: 'idle', reason: 'reply_recovery_empty' };
-        let event;
-        try {
-          event = await host.readAssistantFinal(candidate.threadId, candidate.turnId);
-        } catch (error) {
-          logger('ERROR', 'Failed exact app-server final reply recovery', {
-            threadId: candidate.threadId,
-            turnId: candidate.turnId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          return { status: 'failed', reason: 'reply_recovery_failed' };
+        const { candidates } = snapshot;
+        if (candidates.length === 0) {
+          return { status: 'idle', reason: 'reply_recovery_empty' };
         }
-        if (!event) return { status: 'idle', reason: 'reply_final_not_found' };
-        const stored = await persistAssistantFinal(event);
-        return stored
-          ? { status: 'recovered', reason: 'reply_final_recovered' }
-          : { status: 'idle', reason: 'reply_final_already_recorded' };
+        if (snapshot.limitExceeded) {
+          logger('ERROR', 'Refusing unbounded exact app-server final reply recovery', {
+            candidateCount: candidates.length,
+            candidateLimit: MAX_REPLY_RECOVERY_CANDIDATES,
+          });
+          return {
+            status: 'failed',
+            reason: 'reply_recovery_limit_exceeded',
+            candidateCount: candidates.length,
+            candidateLimit: MAX_REPLY_RECOVERY_CANDIDATES,
+          };
+        }
+        let recoveredCount = 0;
+        let failedCount = 0;
+        let missingCount = 0;
+        for (const candidate of candidates) {
+          let event;
+          try {
+            event = await host.readAssistantFinal(candidate.threadId, candidate.turnId);
+          } catch (error) {
+            failedCount += 1;
+            logger('ERROR', 'Failed exact app-server final reply recovery', {
+              threadId: candidate.threadId,
+              turnId: candidate.turnId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
+          }
+          if (!event) {
+            missingCount += 1;
+            continue;
+          }
+          recoveredCount += await persistAssistantFinal(event);
+        }
+        if (recoveredCount > 0) {
+          return {
+            status: 'recovered',
+            reason: 'reply_final_recovered',
+            recoveredCount,
+            failedCount,
+            missingCount,
+          };
+        }
+        if (failedCount > 0) {
+          return {
+            status: 'failed',
+            reason: 'reply_recovery_failed',
+            recoveredCount,
+            failedCount,
+            missingCount,
+          };
+        }
+        return {
+          status: 'idle',
+          reason: 'reply_final_not_found',
+          recoveredCount,
+          failedCount,
+          missingCount,
+        };
       });
     },
     flushReplies() {
@@ -1190,15 +1247,13 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         if (typeof replySender !== 'function') {
           return { status: 'idle', reason: 'reply_sender_inactive' };
         }
-        const candidate = await withDeliveryQueueLock(config, deps, () => {
+        const candidates = await withDeliveryQueueLock(config, deps, () => {
           const queue = readDeliveryQueue(config, deps);
-          const completed = queue.completed.find((entry) => (
+          return queue.completed.filter((entry) => (
             entry?.outbound?.status === 'ready' &&
             typeof entry.outbound.text === 'string' &&
             entry.outbound.text !== ''
-          ));
-          if (!completed) return null;
-          return {
+          )).map((completed) => ({
             channelId: completed.channelId,
             sourceMessageId: completed.messageId,
             stableClientMessageId: completed.outbound.stableClientMessageId,
@@ -1206,53 +1261,70 @@ function createDelivery(config, logger = () => {}, deps = {}) {
             turnId: completed.outbound.turnId,
             itemId: completed.outbound.itemId,
             text: completed.outbound.text,
-          };
+          }));
         });
-        if (!candidate) return { status: 'idle', reason: 'reply_queue_empty' };
-        let result;
-        try {
-          result = await replySender(candidate);
-        } catch (error) {
-          logger('ERROR', 'Discord final reply acknowledgement is uncertain', {
-            channelId: candidate.channelId,
-            sourceMessageId: candidate.sourceMessageId,
-            stableClientMessageId: candidate.stableClientMessageId,
-            error: error instanceof Error ? error.message : String(error),
+        if (candidates.length === 0) return { status: 'idle', reason: 'reply_queue_empty' };
+        let confirmedCount = 0;
+        let failedCount = 0;
+        let lastMessageId = null;
+        for (const candidate of candidates) {
+          let result;
+          try {
+            result = await replySender(candidate);
+          } catch (error) {
+            failedCount += 1;
+            logger('ERROR', 'Discord final reply acknowledgement is uncertain', {
+              channelId: candidate.channelId,
+              sourceMessageId: candidate.sourceMessageId,
+              stableClientMessageId: candidate.stableClientMessageId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
+          }
+          const outboundMessageId = String(result?.messageId || '').trim();
+          const confirmed = result?.status === 'confirmed' || (
+            outboundMessageId && (
+              result?.duplicateSuppressed !== true || result?.receiptStatus === 'confirmed'
+            )
+          );
+          if (!confirmed || !outboundMessageId) {
+            failedCount += 1;
+            continue;
+          }
+          await withDeliveryQueueLock(config, deps, () => {
+            const queue = readDeliveryQueue(config, deps);
+            const completed = queue.completed.find((entry) => (
+              entry?.channelId === candidate.channelId &&
+              entry?.messageId === candidate.sourceMessageId &&
+              entry?.outbound?.status === 'ready' &&
+              entry.outbound.stableClientMessageId === candidate.stableClientMessageId &&
+              entry.outbound.itemId === candidate.itemId
+            ));
+            if (!completed) return;
+            completed.outbound = {
+              ...completed.outbound,
+              status: 'confirmed',
+              outboundMessageId,
+              confirmedAt: new Date(currentTimeMs(deps)).toISOString(),
+              readbackReceipt: result.readbackReceipt || {
+                channelId: result.channelId || candidate.channelId,
+                messageId: outboundMessageId,
+              },
+            };
+            writeDeliveryQueue(queue, config, deps);
+            confirmedCount += 1;
+            lastMessageId = outboundMessageId;
           });
-          return { status: 'failed', reason: 'reply_ack_uncertain' };
         }
-        const outboundMessageId = String(result?.messageId || '').trim();
-        const confirmed = result?.status === 'confirmed' || (
-          outboundMessageId && (
-            result?.duplicateSuppressed !== true || result?.receiptStatus === 'confirmed'
-          )
-        );
-        if (!confirmed || !outboundMessageId) {
-          return { status: 'failed', reason: 'reply_ack_uncertain' };
-        }
-        await withDeliveryQueueLock(config, deps, () => {
-          const queue = readDeliveryQueue(config, deps);
-          const completed = queue.completed.find((entry) => (
-            entry?.channelId === candidate.channelId &&
-            entry?.messageId === candidate.sourceMessageId &&
-            entry?.outbound?.status === 'ready' &&
-            entry.outbound.stableClientMessageId === candidate.stableClientMessageId &&
-            entry.outbound.itemId === candidate.itemId
-          ));
-          if (!completed) return;
-          completed.outbound = {
-            ...completed.outbound,
+        if (confirmedCount > 0) {
+          return {
             status: 'confirmed',
-            outboundMessageId,
-            confirmedAt: new Date(currentTimeMs(deps)).toISOString(),
-            readbackReceipt: result.readbackReceipt || {
-              channelId: result.channelId || candidate.channelId,
-              messageId: outboundMessageId,
-            },
+            messageId: lastMessageId,
+            confirmedCount,
+            failedCount,
           };
-          writeDeliveryQueue(queue, config, deps);
-        });
-        return { status: 'confirmed', messageId: outboundMessageId };
+        }
+        return { status: 'failed', reason: 'reply_ack_uncertain', confirmedCount, failedCount };
       });
     },
     async recordCompletedReadback({ channelId, messageId, threadId } = {}) {

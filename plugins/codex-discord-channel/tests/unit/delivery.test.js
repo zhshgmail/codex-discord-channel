@@ -2130,6 +2130,194 @@ test('gateway startup recovers a missed production final by exact stored thread 
   delivery.destroy();
 });
 
+test('reply recovery drains a frozen mixed waiting batch once per exact turn across restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-final-batch-recovery-'));
+  const waiting = (messageId, turnId) => ({
+    channelId: 'c1',
+    messageId,
+    completedAt: '2026-08-06T17:12:30.000Z',
+    readbackReceipt: {
+      version: 1,
+      threadId: ROLLOUT_THREAD_ID,
+      clientUserMessageId: `discord:c1:${messageId}`,
+      verifiedAt: '2026-08-06T17:12:31.000Z',
+    },
+    outbound: {
+      version: 1,
+      threadId: ROLLOUT_THREAD_ID,
+      turnId,
+      status: 'waiting',
+      stableClientMessageId: replyNonce('c1', messageId),
+    },
+  });
+  writePendingQueue(dir, [], {
+    completed: [
+      waiting('m-final-failed', 'turn-final-failed'),
+      waiting('m-final-invalid', 'turn-final-invalid'),
+      waiting('m-final-valid-one', 'turn-final-valid'),
+      waiting('m-final-valid-two', 'turn-final-valid'),
+    ],
+  });
+
+  const createRecoveringHost = (requests, exactReads, outcomes) => {
+    const client = new EventEmitter();
+    client.status = () => ({ configured: true, available: true, reason: null });
+    client.request = async (method, params) => {
+      requests.push({ method, params });
+      assert.equal(method, 'thread/read');
+      assert.deepEqual(params, { threadId: ROLLOUT_THREAD_ID, includeTurns: true });
+      const turnId = outcomes[requests.length - 1];
+      if (turnId === 'turn-final-failed') throw new Error('exact read unavailable');
+      return {
+        thread: {
+          id: ROLLOUT_THREAD_ID,
+          turns: [{
+            id: turnId,
+            items: turnId === 'turn-final-valid' ? [{
+              type: 'agentMessage',
+              id: 'final-batch-item',
+              text: 'batch answer',
+              phase: 'final_answer',
+            }] : [],
+          }],
+        },
+      };
+    };
+    const host = createAppServerHost(
+      { appServerUrl: 'wss://remote.example.invalid/rpc' },
+      () => {},
+      { client },
+    );
+    const readAssistantFinal = host.readAssistantFinal.bind(host);
+    host.readAssistantFinal = async (threadId, turnId) => {
+      exactReads.push({ threadId, turnId });
+      return readAssistantFinal(threadId, turnId);
+    };
+    return host;
+  };
+
+  const firstRequests = [];
+  const firstExactReads = [];
+  const firstSends = [];
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: createRecoveringHost(firstRequests, firstExactReads, [
+      'turn-final-failed',
+      'turn-final-invalid',
+      'turn-final-valid',
+    ]),
+  });
+  await delivery.activateReplySender(async (reply) => {
+    firstSends.push(reply);
+    return {
+      status: 'confirmed',
+      channelId: reply.channelId,
+      messageId: `discord-out-${reply.sourceMessageId}`,
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: `discord-out-${reply.sourceMessageId}`,
+      },
+    };
+  });
+
+  assert.deepEqual(firstRequests.map(({ params }) => params.threadId), [
+    ROLLOUT_THREAD_ID,
+    ROLLOUT_THREAD_ID,
+    ROLLOUT_THREAD_ID,
+  ]);
+  assert.deepEqual(firstExactReads, [
+    { threadId: ROLLOUT_THREAD_ID, turnId: 'turn-final-failed' },
+    { threadId: ROLLOUT_THREAD_ID, turnId: 'turn-final-invalid' },
+    { threadId: ROLLOUT_THREAD_ID, turnId: 'turn-final-valid' },
+  ]);
+  assert.deepEqual(firstSends.map(({ sourceMessageId }) => sourceMessageId), [
+    'm-final-valid-one',
+    'm-final-valid-two',
+  ]);
+  const firstQueue = readQueue(dir).completed;
+  assert.equal(firstQueue[0].outbound.status, 'waiting');
+  assert.equal(firstQueue[1].outbound.status, 'waiting');
+  assert.equal(firstQueue[2].outbound.status, 'confirmed');
+  assert.equal(firstQueue[3].outbound.status, 'confirmed');
+  delivery.destroy();
+
+  const restartRequests = [];
+  const restartExactReads = [];
+  const restartSends = [];
+  const restarted = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: createRecoveringHost(restartRequests, restartExactReads, [
+      'turn-final-failed',
+      'turn-final-invalid',
+    ]),
+  });
+  await restarted.activateReplySender(async (reply) => {
+    restartSends.push(reply);
+    return {
+      status: 'confirmed',
+      messageId: `unexpected-${reply.sourceMessageId}`,
+    };
+  });
+
+  assert.equal(restartRequests.length, 2);
+  assert.deepEqual(restartExactReads, [
+    { threadId: ROLLOUT_THREAD_ID, turnId: 'turn-final-failed' },
+    { threadId: ROLLOUT_THREAD_ID, turnId: 'turn-final-invalid' },
+  ]);
+  assert.equal(restartSends.length, 0);
+  const restartedQueue = readQueue(dir).completed;
+  assert.equal(restartedQueue[0].outbound.status, 'waiting');
+  assert.equal(restartedQueue[1].outbound.status, 'waiting');
+  assert.equal(restartedQueue[2].outbound.status, 'confirmed');
+  assert.equal(restartedQueue[3].outbound.status, 'confirmed');
+  restarted.destroy();
+});
+
+test('reply recovery fails closed before reads when the frozen exact-turn batch exceeds its bound', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-final-batch-bound-'));
+  writePendingQueue(dir, [], {
+    completed: Array.from({ length: 33 }, (_, index) => ({
+      channelId: 'c1',
+      messageId: `m-final-bound-${index}`,
+      completedAt: '2026-08-06T17:12:30.000Z',
+      outbound: {
+        version: 1,
+        threadId: ROLLOUT_THREAD_ID,
+        turnId: `turn-final-bound-${index}`,
+        status: 'waiting',
+        stableClientMessageId: replyNonce('c1', `m-final-bound-${index}`),
+      },
+    })),
+  });
+  let reads = 0;
+  let sends = 0;
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async readAssistantFinal() {
+        reads += 1;
+        throw new Error('bounded recovery must fail before a read');
+      },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  const recovered = await delivery.recoverReplies();
+  await delivery.activateReplySender(async () => {
+    sends += 1;
+    throw new Error('bounded recovery must not send');
+  });
+
+  assert.deepEqual(recovered, {
+    status: 'failed',
+    reason: 'reply_recovery_limit_exceeded',
+    candidateCount: 33,
+    candidateLimit: 32,
+  });
+  assert.equal(reads, 0);
+  assert.equal(sends, 0);
+  assert.equal(readQueue(dir).completed.every((entry) => entry.outbound.status === 'waiting'), true);
+  delivery.destroy();
+});
+
 test('legacy completed identity gains one exact-thread receipt without rebuilding the queue', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-completed-readback-'));
   writePendingQueue(dir, [], {
