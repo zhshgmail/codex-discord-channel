@@ -22,9 +22,9 @@
   },
   "scripts": {
     "build": "npm run build:runtime",
-    "build:runtime": "node scripts/build-runtime.js",
-    "build:check": "node scripts/build-runtime.js --check",
-    "syntax": "bash -n bin/codex-discord-instance && node --check bin/codex-discord-channel && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js && node --check runtime/*.cjs",
+    "build:runtime": "bash scripts/build-runtime-locked.sh",
+    "build:check": "bash scripts/build-runtime-locked.sh --check",
+    "syntax": "bash -n bin/codex-discord-instance scripts/build-runtime-locked.sh && node --check bin/codex-discord-channel && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js && node --check runtime/*.cjs",
     "test": "node --test tests/unit/*.test.js",
     "smoke": "node scripts/smoke.js",
     "import:bridge": "node scripts/import-bridge-state.js",
@@ -47,6 +47,6 @@
     }
   },
   "devDependencies": {
-    "esbuild": "^0.28.1"
+    "esbuild": "0.28.1"
   }
 }
