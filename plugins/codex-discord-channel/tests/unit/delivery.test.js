@@ -16,6 +16,7 @@ const {
   resolveReplyTarget,
   structuredSafeText,
 } = require('../../src/delivery');
+const { replyNonce } = require('../../src/reply-delivery');
 const {
   commitReceiverOwnership,
   isCurrentReceiverOwnership,
@@ -92,6 +93,8 @@ function structuredFixture(overrides = {}) {
   let target = { available: true, threadId: 'thread-current', status: 'idle' };
   let idleListener = null;
   let activeListener = null;
+  let deliveryProofListener = null;
+  let assistantFinalListener = null;
   let ttyCalls = 0;
   const host = {
     async resolveTarget() {
@@ -133,6 +136,18 @@ function structuredFixture(overrides = {}) {
         if (activeListener === listener) activeListener = null;
       };
     },
+    onDeliveryProof(listener) {
+      deliveryProofListener = listener;
+      return () => {
+        if (deliveryProofListener === listener) deliveryProofListener = null;
+      };
+    },
+    onAssistantFinal(listener) {
+      assistantFinalListener = listener;
+      return () => {
+        if (assistantFinalListener === listener) assistantFinalListener = null;
+      };
+    },
     status() {
       if (typeof overrides.status === 'function') return overrides.status();
       return {
@@ -162,6 +177,14 @@ function structuredFixture(overrides = {}) {
     async emitActive() {
       assert.equal(typeof activeListener, 'function');
       return activeListener();
+    },
+    async emitDeliveryProof(threadId, clientUserMessageId) {
+      assert.equal(typeof deliveryProofListener, 'function');
+      return deliveryProofListener({ threadId, clientUserMessageId });
+    },
+    async emitAssistantFinal(threadId, turnId, itemId, text) {
+      assert.equal(typeof assistantFinalListener, 'function');
+      return assistantFinalListener({ threadId, turnId, itemId, text });
     },
   };
 }
@@ -872,6 +895,82 @@ test('matching lifecycle signal plus rollout evidence completes without a full t
   );
   assert.deepEqual(readQueue(dir).items, []);
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-item-ack']);
+});
+
+test('active-turn steer with an early lifecycle signal persists one exact ACK', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-early-proof-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { codexHome, rolloutPath } = createDeliveryRollout(t);
+  const client = new EventEmitter();
+  const requests = [];
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === 'thread/loaded/list') {
+      return { data: [ROLLOUT_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{ id: 'turn-active', status: 'inProgress', items: [] }],
+        },
+      };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-active');
+      client.emit('notification', {
+        method: 'item/started',
+        params: {
+          threadId: params.threadId,
+          turnId: 'turn-active',
+          item: { type: 'userMessage', clientId: params.clientUserMessageId },
+        },
+      });
+      setTimeout(() => {
+        fs.appendFileSync(rolloutPath, `${JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            client_id: params.clientUserMessageId,
+          },
+        })}\n`);
+      }, 10);
+      return { turnId: 'turn-active' };
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  const logs = [];
+  const host = createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+    env: { CODEX_HOME: codexHome, HOME: path.dirname(codexHome) },
+    paths: { stateDir: dir },
+  }, () => {}, { client, lifecycleProofRetryDelaysMs: [0, 25, 75] });
+  const delivery = createDelivery(deliveryConfig(dir), (level, message, meta) => {
+    logs.push({ level, message, meta });
+  }, { structuredHost: host });
+  t.after(() => delivery.destroy());
+  await delivery.activateReceiver(activeReceiver);
+
+  const delivered = await delivery.deliver(discordMessage('m-active-early', 'visible once'));
+  const duplicate = await delivery.deliver(discordMessage('m-active-early', 'visible once'));
+
+  assert.equal(delivered.status, 'delivered');
+  assert.equal(delivered.reason, 'turn_accepted');
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(requests.filter((request) => request.method === 'turn/steer').length, 1);
+  assert.equal(logs.some((entry) => entry.meta?.reason === 'structured_ack_uncertain'), false);
+  const queue = readQueue(dir);
+  assert.deepEqual(queue.items, []);
+  assert.equal(queue.completed.length, 1);
+  assert.deepEqual(queue.completed[0].readbackReceipt, {
+    version: 1,
+    threadId: ROLLOUT_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-active-early',
+    verifiedAt: queue.completed[0].readbackReceipt.verifiedAt,
+  });
 });
 
 test('busy target drains one FIFO item per idle transition and dynamically follows rotation', async () => {
@@ -1717,7 +1816,631 @@ test('unpersisted successful response reconciles later without replay', async ()
   assert.equal(reconciled.reason, 'turn_already_accepted');
   assert.equal(starts, 1);
   assert.deepEqual(readQueue(fixture.dir).items, []);
-  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-delayed']);
+  const queue = readQueue(fixture.dir);
+  assert.deepEqual(queue.completed.map((item) => item.messageId), ['m-delayed']);
+  assert.equal(queue.completed[0].readbackReceipt.threadId, 'thread-current');
+  assert.equal(
+    queue.completed[0].readbackReceipt.clientUserMessageId,
+    'discord:c1:m-delayed',
+  );
+  const duplicate = await fixture.delivery.deliver(discordMessage('m-delayed', 'once'));
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(starts, 1);
+  assert.equal(readQueue(fixture.dir).completed.length, 1);
+});
+
+test('active-turn durable proof wakes exact readback commit without replay', async () => {
+  let persisted = false;
+  let starts = 0;
+  const fixture = structuredFixture({
+    onStartTurn() {
+      starts += 1;
+      return { turnId: 'turn-active' };
+    },
+    hasDelivered(threadId, clientUserMessageId) {
+      return persisted && threadId === 'thread-current' &&
+        clientUserMessageId === 'discord:c1:m-active-proof';
+    },
+  });
+  fixture.setTarget({
+    available: true,
+    threadId: 'thread-current',
+    status: 'active',
+    activeTurnId: 'turn-active',
+  });
+
+  const uncertain = await fixture.delivery.deliver(
+    discordMessage('m-active-proof', 'visible once'),
+  );
+  assert.equal(uncertain.reason, 'structured_ack_uncertain');
+  persisted = true;
+  await fixture.emitDeliveryProof('thread-current', 'discord:c1:m-active-proof');
+
+  const queue = readQueue(fixture.dir);
+  assert.equal(starts, 1);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.completed, [{
+    channelId: 'c1',
+    messageId: 'm-active-proof',
+    completedAt: queue.completed[0].completedAt,
+    readbackReceipt: {
+      version: 1,
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-active-proof',
+      verifiedAt: queue.completed[0].readbackReceipt.verifiedAt,
+    },
+    outbound: {
+      version: 1,
+      threadId: 'thread-current',
+      turnId: 'turn-active',
+      status: 'waiting',
+      stableClientMessageId: replyNonce('c1', 'm-active-proof'),
+    },
+  }]);
+});
+
+test('active-turn final persists stable outbound acknowledgement and exact readback', async () => {
+  const fixture = structuredFixture({
+    onStartTurn() { return { turn: { id: 'turn-active-final' } }; },
+  });
+  fixture.setTarget({
+    available: true,
+    threadId: 'thread-current',
+    status: 'active',
+    activeTurnId: 'turn-active-final',
+  });
+  const sends = [];
+  await fixture.delivery.activateReplySender(async (reply) => {
+    sends.push(reply);
+    return {
+      status: 'confirmed',
+      messageId: 'discord-out-1',
+      readbackReceipt: { channelId: reply.channelId, messageId: 'discord-out-1' },
+    };
+  });
+
+  await fixture.delivery.deliver(discordMessage('m-active-final', 'answer me'));
+  await fixture.emitAssistantFinal('thread-current', 'turn-active-final', 'final-item-1', 'answer');
+
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].sourceMessageId, 'm-active-final');
+  assert.equal(sends[0].stableClientMessageId, replyNonce('c1', 'm-active-final'));
+  assert.match(sends[0].stableClientMessageId, /^cdr-/);
+  const completed = readQueue(fixture.dir).completed[0];
+  assert.equal(completed.outbound.status, 'confirmed');
+  assert.equal(completed.outbound.outboundMessageId, 'discord-out-1');
+  assert.deepEqual(completed.outbound.readbackReceipt, {
+    channelId: 'c1',
+    messageId: 'discord-out-1',
+  });
+});
+
+test('uncertain final retry and gateway restart use one stable outbound identity', async () => {
+  const fixture = structuredFixture({
+    onStartTurn() { return { turn: { id: 'turn-restart-final' } }; },
+  });
+  await fixture.delivery.deliver(discordMessage('m-restart-final', 'answer once'));
+
+  const networkByStableId = new Map();
+  let networkSends = 0;
+  const sender = async (reply) => {
+    if (!networkByStableId.has(reply.stableClientMessageId)) {
+      networkSends += 1;
+      networkByStableId.set(reply.stableClientMessageId, 'discord-out-restart');
+      const error = new Error('confirmation response lost');
+      error.code = 'reply_ack_uncertain';
+      throw error;
+    }
+    return {
+      status: 'confirmed',
+      messageId: networkByStableId.get(reply.stableClientMessageId),
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: networkByStableId.get(reply.stableClientMessageId),
+      },
+    };
+  };
+  await fixture.delivery.activateReplySender(sender);
+  await fixture.emitAssistantFinal(
+    'thread-current',
+    'turn-restart-final',
+    'final-item-restart',
+    'one answer',
+  );
+  const ready = readQueue(fixture.dir).completed[0].outbound;
+  assert.equal(ready.status, 'ready');
+  const stableClientMessageId = ready.stableClientMessageId;
+  fixture.delivery.destroy();
+
+  const recovered = createDelivery(deliveryConfig(fixture.dir), () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await recovered.activateReplySender(sender);
+  await recovered.flushReplies();
+  await recovered.flushReplies();
+
+  assert.equal(networkSends, 1);
+  const confirmed = readQueue(fixture.dir).completed[0].outbound;
+  assert.equal(confirmed.stableClientMessageId, stableClientMessageId);
+  assert.equal(confirmed.status, 'confirmed');
+  assert.equal(confirmed.outboundMessageId, 'discord-out-restart');
+  recovered.destroy();
+});
+
+test('ack-uncertain active-turn reconciliation preserves exact turn for restart-safe final reply', async () => {
+  let persisted = false;
+  const fixture = structuredFixture({
+    onStartTurn() { return { turnId: 'turn-active-reconciled' }; },
+    hasDelivered(threadId, clientUserMessageId) {
+      return persisted && threadId === 'thread-current' &&
+        clientUserMessageId === 'discord:c1:m-active-reconciled';
+    },
+  });
+  fixture.setTarget({
+    available: true,
+    threadId: 'thread-current',
+    status: 'active',
+    activeTurnId: 'turn-active-reconciled',
+  });
+
+  const uncertain = await fixture.delivery.deliver(
+    discordMessage('m-active-reconciled', 'reply after readback'),
+  );
+  assert.equal(uncertain.reason, 'structured_ack_uncertain');
+  assert.equal(readQueue(fixture.dir).blocked.turnId, 'turn-active-reconciled');
+  persisted = true;
+  await fixture.emitDeliveryProof(
+    'thread-current',
+    'discord:c1:m-active-reconciled',
+  );
+  assert.deepEqual(readQueue(fixture.dir).completed[0].outbound, {
+    version: 1,
+    threadId: 'thread-current',
+    turnId: 'turn-active-reconciled',
+    status: 'waiting',
+    stableClientMessageId: replyNonce('c1', 'm-active-reconciled'),
+  });
+
+  const networkByStableId = new Map();
+  let networkSends = 0;
+  const sender = async (reply) => {
+    if (!networkByStableId.has(reply.stableClientMessageId)) {
+      networkSends += 1;
+      networkByStableId.set(reply.stableClientMessageId, 'discord-out-reconciled');
+      throw new Error('reply acknowledgement lost');
+    }
+    return {
+      status: 'confirmed',
+      messageId: networkByStableId.get(reply.stableClientMessageId),
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: networkByStableId.get(reply.stableClientMessageId),
+      },
+    };
+  };
+  await fixture.delivery.activateReplySender(sender);
+  await fixture.emitAssistantFinal(
+    'thread-current',
+    'turn-active-reconciled',
+    'final-item-active-reconciled',
+    'one reconciled answer',
+  );
+  assert.equal(readQueue(fixture.dir).completed[0].outbound.status, 'ready');
+  fixture.delivery.destroy();
+
+  const recovered = createDelivery(deliveryConfig(fixture.dir), () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await recovered.activateReplySender(sender);
+  await recovered.flushReplies();
+
+  const confirmed = readQueue(fixture.dir).completed[0].outbound;
+  assert.equal(networkSends, 1);
+  assert.equal(confirmed.status, 'confirmed');
+  assert.equal(confirmed.outboundMessageId, 'discord-out-reconciled');
+  assert.deepEqual(confirmed.readbackReceipt, {
+    channelId: 'c1',
+    messageId: 'discord-out-reconciled',
+  });
+  recovered.destroy();
+});
+
+test('gateway startup recovers a missed production final by exact stored thread and turn', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-final-startup-recovery-'));
+  writePendingQueue(dir, [], {
+    completed: [{
+      channelId: 'c1',
+      messageId: 'm-final-startup-recovery',
+      completedAt: '2026-08-06T17:12:30.000Z',
+      readbackReceipt: {
+        version: 1,
+        threadId: ROLLOUT_THREAD_ID,
+        clientUserMessageId: 'discord:c1:m-final-startup-recovery',
+        verifiedAt: '2026-08-06T17:12:31.000Z',
+      },
+      outbound: {
+        version: 1,
+        threadId: ROLLOUT_THREAD_ID,
+        turnId: 'turn-live-final',
+        status: 'waiting',
+        stableClientMessageId: replyNonce('c1', 'm-final-startup-recovery'),
+      },
+    }],
+  });
+  const client = new EventEmitter();
+  const requests = [];
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    assert.equal(method, 'thread/read');
+    assert.deepEqual(params, { threadId: ROLLOUT_THREAD_ID, includeTurns: true });
+    return {
+      thread: {
+        id: ROLLOUT_THREAD_ID,
+        turns: [{
+          id: 'turn-live-final',
+          items: [{
+            type: 'agentMessage',
+            id: 'final-live-item',
+            text: 'ACK',
+            phase: 'final_answer',
+          }],
+        }],
+      },
+    };
+  };
+  const host = createAppServerHost(
+    { appServerUrl: 'wss://remote.example.invalid/rpc' },
+    () => {},
+    { client },
+  );
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, { structuredHost: host });
+  const sends = [];
+  await delivery.activateReplySender(async (reply) => {
+    sends.push(reply);
+    return {
+      status: 'confirmed',
+      channelId: reply.channelId,
+      messageId: 'discord-out-startup-recovery',
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: 'discord-out-startup-recovery',
+      },
+    };
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].sourceMessageId, 'm-final-startup-recovery');
+  assert.equal(sends[0].turnId, 'turn-live-final');
+  const outbound = readQueue(dir).completed[0].outbound;
+  assert.equal(outbound.status, 'confirmed');
+  assert.equal(outbound.itemId, 'final-live-item');
+  assert.equal(outbound.outboundMessageId, 'discord-out-startup-recovery');
+  assert.deepEqual(outbound.readbackReceipt, {
+    channelId: 'c1',
+    messageId: 'discord-out-startup-recovery',
+  });
+  delivery.destroy();
+});
+
+test('reply recovery drains a frozen mixed waiting batch once per exact turn across restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-final-batch-recovery-'));
+  const failedThreadId = '019f3763-d308-7871-bedc-e6489b02190f';
+  const waiting = (messageId, threadId, turnId) => ({
+    channelId: 'c1',
+    messageId,
+    completedAt: '2026-08-06T17:12:30.000Z',
+    readbackReceipt: {
+      version: 1,
+      threadId,
+      clientUserMessageId: `discord:c1:${messageId}`,
+      verifiedAt: '2026-08-06T17:12:31.000Z',
+    },
+    outbound: {
+      version: 1,
+      threadId,
+      turnId,
+      status: 'waiting',
+      stableClientMessageId: replyNonce('c1', messageId),
+    },
+  });
+  writePendingQueue(dir, [], {
+    completed: [
+      waiting('m-final-failed', failedThreadId, 'turn-final-failed'),
+      waiting('m-final-invalid', ROLLOUT_THREAD_ID, 'turn-final-invalid'),
+      waiting('m-final-valid-one', ROLLOUT_THREAD_ID, 'turn-final-valid'),
+      waiting('m-final-valid-two', ROLLOUT_THREAD_ID, 'turn-final-valid'),
+      waiting('m-final-valid-other', ROLLOUT_THREAD_ID, 'turn-final-valid-other'),
+    ],
+  });
+
+  const createRecoveringHost = (requests) => {
+    const client = new EventEmitter();
+    client.status = () => ({ configured: true, available: true, reason: null });
+    client.request = async (method, params) => {
+      requests.push({ method, params });
+      assert.equal(method, 'thread/read');
+      if (params.threadId === failedThreadId) throw new Error('exact read unavailable');
+      assert.deepEqual(params, { threadId: ROLLOUT_THREAD_ID, includeTurns: true });
+      return {
+        thread: {
+          id: ROLLOUT_THREAD_ID,
+          turns: [
+            { id: 'turn-final-invalid', items: [] },
+            { id: 'turn-final-valid', items: [{
+              type: 'agentMessage',
+              id: 'final-batch-item',
+              text: 'batch answer',
+              phase: 'final_answer',
+            }] },
+            { id: 'turn-final-valid-other', items: [{
+              type: 'agentMessage',
+              id: 'final-batch-other-item',
+              text: 'other batch answer',
+              phase: 'final_answer',
+            }] },
+          ],
+        },
+      };
+    };
+    return createAppServerHost(
+      { appServerUrl: 'wss://remote.example.invalid/rpc' },
+      () => {},
+      { client },
+    );
+  };
+
+  const firstRequests = [];
+  const firstSends = [];
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: createRecoveringHost(firstRequests),
+  });
+  await delivery.activateReplySender(async (reply) => {
+    firstSends.push(reply);
+    return {
+      status: 'confirmed',
+      channelId: reply.channelId,
+      messageId: `discord-out-${reply.sourceMessageId}`,
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: `discord-out-${reply.sourceMessageId}`,
+      },
+    };
+  });
+
+  assert.deepEqual(firstRequests.map(({ params }) => params.threadId), [
+    failedThreadId,
+    ROLLOUT_THREAD_ID,
+  ]);
+  assert.deepEqual(firstSends.map(({ sourceMessageId }) => sourceMessageId), [
+    'm-final-valid-one',
+    'm-final-valid-two',
+    'm-final-valid-other',
+  ]);
+  const firstQueue = readQueue(dir).completed;
+  assert.equal(firstQueue[0].outbound.status, 'waiting');
+  assert.equal(firstQueue[1].outbound.status, 'waiting');
+  assert.equal(firstQueue[2].outbound.status, 'confirmed');
+  assert.equal(firstQueue[3].outbound.status, 'confirmed');
+  assert.equal(firstQueue[4].outbound.status, 'confirmed');
+  delivery.destroy();
+
+  const restartRequests = [];
+  const restartSends = [];
+  const restarted = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: createRecoveringHost(restartRequests),
+  });
+  await restarted.activateReplySender(async (reply) => {
+    restartSends.push(reply);
+    return {
+      status: 'confirmed',
+      messageId: `unexpected-${reply.sourceMessageId}`,
+    };
+  });
+
+  assert.equal(restartRequests.length, 2);
+  assert.deepEqual(restartRequests.map(({ params }) => params.threadId), [
+    failedThreadId,
+    ROLLOUT_THREAD_ID,
+  ]);
+  assert.equal(restartSends.length, 0);
+  const restartedQueue = readQueue(dir).completed;
+  assert.equal(restartedQueue[0].outbound.status, 'waiting');
+  assert.equal(restartedQueue[1].outbound.status, 'waiting');
+  assert.equal(restartedQueue[2].outbound.status, 'confirmed');
+  assert.equal(restartedQueue[3].outbound.status, 'confirmed');
+  assert.equal(restartedQueue[4].outbound.status, 'confirmed');
+  restarted.destroy();
+});
+
+test('reply recovery and ready egress make bounded exactly-once progress across restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-final-batch-bound-'));
+  const turns = Array.from({ length: 35 }, (_, index) => ({
+    id: `turn-final-bound-${index}`,
+    items: [{
+      type: 'agentMessage',
+      id: `final-bound-item-${index}`,
+      text: `bounded answer ${index}`,
+      phase: 'final_answer',
+    }],
+  }));
+  writePendingQueue(dir, [], {
+    completed: turns.map((turn, index) => ({
+      channelId: 'c1',
+      messageId: `m-final-bound-${index}`,
+      completedAt: '2026-08-06T17:12:30.000Z',
+      outbound: {
+        version: 1,
+        threadId: ROLLOUT_THREAD_ID,
+        turnId: turn.id,
+        status: 'waiting',
+        stableClientMessageId: replyNonce('c1', `m-final-bound-${index}`),
+      },
+    })),
+  });
+  const client = new EventEmitter();
+  const requests = [];
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    assert.equal(method, 'thread/read');
+    assert.deepEqual(params, { threadId: ROLLOUT_THREAD_ID, includeTurns: true });
+    return { thread: { id: ROLLOUT_THREAD_ID, turns } };
+  };
+  const host = createAppServerHost(
+    { appServerUrl: 'wss://remote.example.invalid/rpc' },
+    () => {},
+    { client },
+  );
+  const sends = [];
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: host,
+  });
+  await delivery.activateReplySender(async (reply) => {
+    sends.push(reply);
+    return {
+      status: 'confirmed',
+      messageId: `discord-out-${reply.sourceMessageId}`,
+    };
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(sends.length, 32);
+  assert.equal(readQueue(dir).completed.filter((entry) => entry.outbound.status === 'waiting').length, 3);
+  await delivery.recoverReplies();
+  await delivery.flushReplies();
+  assert.equal(requests.length, 2);
+  assert.equal(sends.length, 35);
+  assert.equal(new Set(sends.map((reply) => reply.stableClientMessageId)).size, 35);
+  assert.equal(readQueue(dir).completed.every((entry) => entry.outbound.status === 'confirmed'), true);
+  delivery.destroy();
+
+  let restartReads = 0;
+  let restartSends = 0;
+  const restarted = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async readAssistantFinals() {
+        restartReads += 1;
+        throw new Error('confirmed backlog must not be read after restart');
+      },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await restarted.activateReplySender(async () => {
+    restartSends += 1;
+    throw new Error('confirmed backlog must not be sent after restart');
+  });
+  assert.equal(restartReads, 0);
+  assert.equal(restartSends, 0);
+  restarted.destroy();
+});
+
+test('ready reply backlog drains one bounded window per restart without duplicate sends', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-final-ready-bound-'));
+  writePendingQueue(dir, [], {
+    completed: Array.from({ length: 35 }, (_, index) => ({
+      channelId: 'c1',
+      messageId: `m-final-ready-${index}`,
+      completedAt: '2026-08-06T17:12:30.000Z',
+      outbound: {
+        version: 1,
+        threadId: ROLLOUT_THREAD_ID,
+        turnId: `turn-final-ready-${index}`,
+        status: 'ready',
+        stableClientMessageId: replyNonce('c1', `m-final-ready-${index}`),
+        itemId: `final-ready-item-${index}`,
+        text: `ready answer ${index}`,
+      },
+    })),
+  });
+  const sends = [];
+  const activate = async () => {
+    const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+      structuredHost: {
+        async readAssistantFinals() {
+          throw new Error('ready backlog must not perform recovery reads');
+        },
+        status() { return { configured: true, available: true, reason: null }; },
+        destroy() {},
+      },
+    });
+    await delivery.activateReplySender(async (reply) => {
+      sends.push(reply);
+      return {
+        status: 'confirmed',
+        messageId: `discord-out-${reply.sourceMessageId}`,
+      };
+    });
+    delivery.destroy();
+  };
+
+  await activate();
+  assert.equal(sends.length, 32);
+  assert.equal(readQueue(dir).completed.filter((entry) => entry.outbound.status === 'ready').length, 3);
+  await activate();
+  assert.equal(sends.length, 35);
+  assert.equal(new Set(sends.map((reply) => reply.stableClientMessageId)).size, 35);
+  assert.equal(readQueue(dir).completed.every((entry) => entry.outbound.status === 'confirmed'), true);
+  await activate();
+  assert.equal(sends.length, 35);
+});
+
+test('legacy completed identity gains one exact-thread receipt without rebuilding the queue', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-completed-readback-'));
+  writePendingQueue(dir, [], {
+    completed: [{
+      channelId: 'c1',
+      messageId: 'm-completed',
+      completedAt: '2026-08-05T00:00:00.000Z',
+    }],
+  });
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    now: () => Date.parse('2026-08-05T00:01:00.000Z'),
+    structuredHost: {
+      async hasDelivered(threadId, clientUserMessageId) {
+        return threadId === 'thread-current' &&
+          clientUserMessageId === 'discord:c1:m-completed';
+      },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  const first = await delivery.recordCompletedReadback({
+    channelId: 'c1',
+    messageId: 'm-completed',
+    threadId: 'thread-current',
+  });
+  const second = await delivery.recordCompletedReadback({
+    channelId: 'c1',
+    messageId: 'm-completed',
+    threadId: 'thread-current',
+  });
+
+  assert.equal(first.reason, 'readback_receipt_persisted');
+  assert.equal(second.reason, 'readback_receipt_already_persisted');
+  const queue = readQueue(dir);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.completed, [{
+    channelId: 'c1',
+    messageId: 'm-completed',
+    completedAt: '2026-08-05T00:00:00.000Z',
+    readbackReceipt: {
+      version: 1,
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-completed',
+      verifiedAt: '2026-08-05T00:01:00.000Z',
+    },
+  }]);
+  delivery.destroy();
 });
 
 test('uncertain acknowledgement reconciles by client id without replaying turn/start', async () => {
@@ -1797,7 +2520,19 @@ test('post-accept uncertainty persists replay identity and reconciles after rest
   }]);
   assert.equal(replayStarts, 0);
   assert.deepEqual(readQueue(fixture.dir).items, []);
-  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-post-accept']);
+  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => ({
+    messageId: item.messageId,
+    threadId: item.readbackReceipt?.threadId,
+    clientUserMessageId: item.readbackReceipt?.clientUserMessageId,
+  })), [{
+    messageId: 'm-post-accept',
+    threadId: 'thread-current',
+    clientUserMessageId: 'discord:c1:m-post-accept',
+  }]);
+  const duplicate = await recovered.deliver(discordMessage('m-post-accept', 'once'));
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(replayStarts, 0);
+  assert.equal(readQueue(fixture.dir).completed.length, 1);
   recovered.destroy();
 });
 

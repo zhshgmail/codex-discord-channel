@@ -38,7 +38,17 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.ignoredDeliveryMode, null);
   assert.equal(config.deliveryDrainIntervalMs, 1000);
   assert.equal(config.deliveryDrainMaxBackoffMs, 30000);
+  assert.equal(config.messageContentIntent, true);
   assert.equal(config.cwd, '/workspace');
+});
+
+test('loadConfig can disable the privileged Message Content gateway intent', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    DISCORD_MESSAGE_CONTENT_INTENT: 'false',
+  });
+
+  assert.equal(config.messageContentIntent, false);
 });
 
 test('loadConfig derives delivery activation from the installed plugin root', () => {

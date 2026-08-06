@@ -19,6 +19,10 @@ let releaseReference;
 let handling;
 
 const delivery = {
+  async activateReplySender() {
+    record('reply_sender_activated');
+    return { status: 'idle', reason: 'reply_queue_empty' };
+  },
   async enqueue() {
     record('enqueue_called');
     return { status: 'accepted', reason: 'discord_message_persisted' };

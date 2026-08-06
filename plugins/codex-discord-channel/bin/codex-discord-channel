@@ -2,11 +2,19 @@
 'use strict';
 
 const { loadConfig } = require('../src/config');
-const { configureNetwork, releaseDiscordReceiverOwnership } = require('../src/discord-client');
+const {
+  configureNetwork,
+  confirmDiscordMessage,
+  prepareDiscordMessageSend,
+  reconcileDiscordMessage,
+  releaseDiscordReceiverOwnership,
+  sendDiscordMessage,
+  startDiscordClient,
+} = require('../src/discord-client');
+const { createDiscordRestClient } = require('../src/discord-rest-client');
 const { createDelivery } = require('../src/delivery');
 const { sendDiscordReplyOnce } = require('../src/reply-delivery');
 const { startGatewayDrainLoop } = require('../src/gateway-drain-loop');
-const { startDiscordClient } = require('../src/discord-client');
 const { claimOwner, createOwner } = require('../src/owner-state');
 const { instanceDoctor, runAppServer } = require('../src/app-server-runtime');
 const { runTui } = require('../src/instance-launcher');
@@ -21,6 +29,7 @@ function usage() {
     '  codex-discord-channel tui-check [--instance ID --state-dir PATH]',
     '  codex-discord-channel live-check [--instance ID --state-dir PATH] --pid PID --pid PID',
     '  codex-discord-channel tui [--instance ID --state-dir PATH] [-- CODEX_ARGS...]',
+    '  codex-discord-channel tui-recovery-target ACTION [MIN_MTIME_MS] [--instance ID --state-dir PATH]',
     '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID] [--followup]',
     '',
     'The send command reads message text from stdin. A guarded reply requires exact --channel and --reply-to values.',
@@ -110,56 +119,49 @@ function readStdin() {
   });
 }
 
-async function sendViaRest(args) {
-  const content = (await readStdin()).trim();
+async function sendViaRest(args, deps = {}) {
+  const content = (await (deps.readStdin || readStdin)()).trim();
   if (!content) throw new Error('stdin message content is required');
 
-  const config = loadConfig();
+  const config = deps.config || loadConfig();
   if (!config.tokenConfigured) {
     throw new Error(`Discord token is not configured in ${config.paths.envFile}`);
   }
-  configureNetwork(config, () => {});
+  (deps.configureNetwork || configureNetwork)(config, () => {});
+  const client = (deps.createDiscordRestClient || createDiscordRestClient)({
+    token: config.token,
+    botUserId: config.botUserId,
+    fetchImpl: deps.fetchImpl || globalThis.fetch,
+  });
 
   const sent = await sendDiscordReplyOnce({
     args,
     config,
     content,
-    async sender(target) {
-      const payload = { content };
-      if (target.replyTo) {
-        payload.message_reference = {
-          message_id: target.replyTo,
-          channel_id: target.channelId,
-          fail_if_not_exists: false,
-        };
-      }
-
-      const response = await fetch(`https://discord.com/api/v10/channels/${target.channelId}/messages`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bot ${config.token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
-      const bodyText = await response.text();
-      let body;
-      try {
-        body = JSON.parse(bodyText);
-      } catch {
-        body = {};
-      }
-      if (!response.ok) {
-        const error = new Error(`Discord send failed ${response.status}: ${body.message || bodyText}`);
-        if (response.status >= 400 && response.status < 500) {
-          error.definitiveNoSend = true;
-        }
-        throw error;
-      }
-      return { channelId: body.channel_id, messageId: body.id };
-    },
+    preflight: (target, identity) => prepareDiscordMessageSend(
+      client,
+      { ...args, ...target, ...identity, content },
+    ),
+    sender: (target, prepared, identity) => sendDiscordMessage(
+      client,
+      { ...args, ...target, ...identity, content },
+      prepared,
+    ),
+    confirmer: (target, prepared, message, receipt) => confirmDiscordMessage(
+      client,
+      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+      prepared,
+      message,
+    ),
+    reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
+      client,
+      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+      prepared,
+      receipt,
+    ),
   });
-  process.stdout.write(`${JSON.stringify(sent)}\n`);
+  (deps.writeOutput || ((text) => process.stdout.write(text)))(`${JSON.stringify(sent)}\n`);
+  return sent;
 }
 
 function makeLogger() {
@@ -187,6 +189,48 @@ async function runGateway(config = loadConfig()) {
     delivery.destroy();
     throw new Error(`Discord gateway did not start: ${discordState.reason || 'unknown'}`);
   }
+  await delivery.activateReplySender(async (reply) => {
+    const args = { channelId: reply.channelId, replyTo: reply.sourceMessageId };
+    const content = reply.text;
+    const sent = await sendDiscordReplyOnce({
+      args,
+      config,
+      content,
+      preflight: (target, identity) => prepareDiscordMessageSend(
+        discordState.client,
+        { ...args, ...target, ...identity, content },
+      ),
+      sender: (target, prepared, identity) => sendDiscordMessage(
+        discordState.client,
+        { ...args, ...target, ...identity, content },
+        prepared,
+      ),
+      confirmer: (target, prepared, message, receipt) => confirmDiscordMessage(
+        discordState.client,
+        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+        prepared,
+        message,
+      ),
+      reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
+        discordState.client,
+        { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+        prepared,
+        receipt,
+      ),
+    });
+    return {
+      ...sent,
+      status: sent.messageId && (
+        sent.duplicateSuppressed !== true || sent.receiptStatus === 'confirmed'
+      ) ? 'confirmed' : 'uncertain',
+      readbackReceipt: sent.messageId ? {
+        channelId: sent.channelId || reply.channelId,
+        messageId: sent.messageId,
+        sourceMessageId: sent.sourceMessageId,
+        stableClientMessageId: reply.stableClientMessageId,
+      } : null,
+    };
+  });
   const drainLoop = startGatewayDrainLoop({
     config,
     delivery,
@@ -258,6 +302,15 @@ async function main() {
     require('../src/instance-launcher').requireInstanceReady(loadRuntimeConfig(rest));
     return;
   }
+  if (command === 'tui-login-state') {
+    try {
+      require('../src/instance-launcher').requireInstanceReady(loadRuntimeConfig(rest));
+    } catch (error) {
+      if (error?.code !== 'openai_account_login_missing') throw error;
+      process.exitCode = 10;
+    }
+    return;
+  }
   if (command === 'live-check') {
     const args = parseLiveCheckArgs(rest);
     const config = loadRuntimeConfig(args.runtimeArgs);
@@ -268,6 +321,30 @@ async function main() {
   if (command === 'tui') {
     const args = parseTuiArgs(rest);
     runTui(loadRuntimeConfig(args.runtimeArgs), args.codexArgs);
+    return;
+  }
+  if (command === 'tui-recovery-target') {
+    const [action, maybeMtime, ...runtimeTail] = rest;
+    const hasMtime = action === 'snapshot';
+    const runtimeArgs = hasMtime ? runtimeTail : rest.slice(1);
+    const minimumMtimeMs = hasMtime ? Number(maybeMtime) : 0;
+    if (!['snapshot', 'read', 'clear'].includes(action)) {
+      throw new Error('tui-recovery-target action must be snapshot, read, or clear');
+    }
+    if (hasMtime && (!/^\d+$/.test(maybeMtime || '') || !Number.isSafeInteger(minimumMtimeMs))) {
+      throw new Error('tui-recovery-target snapshot requires a non-negative millisecond timestamp');
+    }
+    const config = loadRuntimeConfig(runtimeArgs);
+    const target = require('../src/tui-recovery-target');
+    if (action === 'snapshot') {
+      if (!target.captureRecoveryTarget(config, minimumMtimeMs)) process.exitCode = 10;
+    } else if (action === 'read') {
+      const threadId = target.readRecoveryThread(config);
+      if (!threadId) process.exitCode = 10;
+      else process.stdout.write(`${threadId}\n`);
+    } else {
+      target.clearRecoveryTarget(config);
+    }
     return;
   }
   if (command === '-h' || command === '--help') {
@@ -290,6 +367,6 @@ module.exports = {
 if (require.main === module) {
   main().catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
-    process.exit(1);
+    process.exit(error?.code === 'live_service_process_unavailable' ? 75 : 1);
   });
 }

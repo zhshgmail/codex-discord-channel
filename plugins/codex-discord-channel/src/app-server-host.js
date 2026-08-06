@@ -10,6 +10,7 @@ const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
 const MAX_TARGET_RESOLUTION_RESTARTS = 4;
 const MAX_VERIFIED_USER_MESSAGES = 256;
+const MAX_LIFECYCLE_PROOF_SIGNALS = 256;
 const MAX_ROLLOUT_SEARCH_DEPTH = 4;
 const MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096;
 const MAX_ROLLOUT_SEARCH_ENTRIES = 65536;
@@ -90,6 +91,37 @@ function reconnectableError(error) {
 
 function deliveryProofKey(threadId, clientUserMessageId) {
   return JSON.stringify([threadId, clientUserMessageId]);
+}
+
+function finalAssistantFromTurn(threadId, turn) {
+  if (
+    typeof threadId !== 'string' ||
+    threadId === '' ||
+    typeof turn?.id !== 'string' ||
+    turn.id === '' ||
+    !Array.isArray(turn.items)
+  ) {
+    return null;
+  }
+  const finals = turn.items.filter((item) => (
+    item?.type === 'agentMessage' &&
+    item.phase === 'final_answer'
+  ));
+  if (finals.length !== 1) return null;
+  if (
+    typeof finals[0].id !== 'string' ||
+    finals[0].id === '' ||
+    typeof finals[0].text !== 'string' ||
+    finals[0].text === ''
+  ) {
+    return null;
+  }
+  return {
+    threadId,
+    turnId: turn.id,
+    itemId: finals[0].id,
+    text: finals[0].text,
+  };
 }
 
 function isLocalAppServer(endpoint) {
@@ -678,6 +710,7 @@ class AppServerHost extends EventEmitter {
     this.activeTurnIds = new Map();
     this.knownLoadedThreadIds = new Set();
     this.verifiedUserMessages = new Map();
+    this.lifecycleProofSignals = new Map();
     this.deliveryWaiters = new Map();
     this.destroyed = false;
     this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
@@ -713,13 +746,52 @@ class AppServerHost extends EventEmitter {
         const threadId = notification.params?.threadId;
         const item = notification.params?.item;
         if (
+          notification.method === 'item/completed' &&
+          typeof threadId === 'string' &&
+          threadId !== '' &&
+          item?.type === 'agentMessage' &&
+          item.phase === 'final_answer' &&
+          typeof item.id === 'string' &&
+          item.id !== '' &&
+          typeof item.text === 'string' &&
+          item.text !== '' &&
+          typeof notification.params?.turnId === 'string' &&
+          notification.params.turnId !== ''
+        ) {
+          this.emit('assistantFinal', {
+            threadId,
+            turnId: notification.params.turnId,
+            itemId: item.id,
+            text: item.text,
+          });
+          return;
+        }
+        if (
           typeof threadId === 'string' &&
           threadId !== '' &&
           item?.type === 'userMessage' &&
           typeof item.clientId === 'string' &&
           item.clientId !== ''
         ) {
+          this.rememberLifecycleProofSignal(threadId, item.clientId);
+          const turnId = notification.params?.turnId;
+          if (
+            notification.method === 'item/started' &&
+            typeof turnId === 'string' &&
+            turnId !== '' &&
+            threadId === this.currentThreadId &&
+            this.loadedInventoryProven &&
+            this.knownLoadedThreadIds.has(threadId) &&
+            this.activeTurnIds.get(threadId) !== turnId
+          ) {
+            this.threadSelectionRevision += 1;
+            this.threadStatuses.set(threadId, 'active');
+            this.activeTurnIds.set(threadId, turnId);
+            this.persistTargetCheckpoint();
+          }
+          const proof = { threadId, clientUserMessageId: item.clientId };
           this.wakeDeliveryWaiters(threadId, item.clientId);
+          this.emit('deliveryProof', proof);
         }
         return;
       }
@@ -753,8 +825,11 @@ class AppServerHost extends EventEmitter {
       }
       if (notification?.method === 'turn/completed') {
         const threadId = notification.params?.threadId;
-        const turnId = notification.params?.turn?.id;
+        const turn = notification.params?.turn;
+        const turnId = turn?.id;
         if (!threadId) return;
+        const assistantFinal = finalAssistantFromTurn(threadId, turn);
+        if (assistantFinal) this.emit('assistantFinal', assistantFinal);
         if (!turnId || this.activeTurnIds.get(threadId) === turnId) {
           this.activeTurnIds.delete(threadId);
         }
@@ -875,10 +950,20 @@ class AppServerHost extends EventEmitter {
 
   rememberVerifiedUserMessage(threadId, clientUserMessageId) {
     const key = deliveryProofKey(threadId, clientUserMessageId);
+    this.lifecycleProofSignals.delete(key);
     this.verifiedUserMessages.delete(key);
     this.verifiedUserMessages.set(key, true);
     while (this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES) {
       this.verifiedUserMessages.delete(this.verifiedUserMessages.keys().next().value);
+    }
+  }
+
+  rememberLifecycleProofSignal(threadId, clientUserMessageId) {
+    const key = deliveryProofKey(threadId, clientUserMessageId);
+    this.lifecycleProofSignals.delete(key);
+    this.lifecycleProofSignals.set(key, true);
+    while (this.lifecycleProofSignals.size > MAX_LIFECYCLE_PROOF_SIGNALS) {
+      this.lifecycleProofSignals.delete(this.lifecycleProofSignals.keys().next().value);
     }
   }
 
@@ -1343,6 +1428,36 @@ class AppServerHost extends EventEmitter {
         .map((turn) => turn.id);
       if (inProgressTurnIds.length === 1) {
         this.activeTurnIds.set(thread.id, inProgressTurnIds[0]);
+      } else if (inProgressTurnIds.length > 1) {
+        let latestTurns;
+        try {
+          latestTurns = await requestForTarget('thread/turns/list', {
+            threadId: thread.id,
+            limit: 1,
+            sortDirection: 'desc',
+            itemsView: 'summary',
+          });
+        } catch (error) {
+          const reason = error?.code || 'shared_app_server_thread_unreadable';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
+        if (this.threadSelectionRevision !== threadSelectionRevision) {
+          return retryAfterRevision();
+        }
+        const latestTurn = Array.isArray(latestTurns?.data) && latestTurns.data.length === 1
+          ? latestTurns.data[0]
+          : null;
+        if (
+          latestTurn?.status === 'inProgress' &&
+          typeof latestTurn.id === 'string' &&
+          latestTurn.id !== '' &&
+          inProgressTurnIds.includes(latestTurn.id)
+        ) {
+          this.activeTurnIds.set(thread.id, latestTurn.id);
+        } else {
+          this.activeTurnIds.delete(thread.id);
+        }
       } else {
         this.activeTurnIds.delete(thread.id);
       }
@@ -1457,6 +1572,62 @@ class AppServerHost extends EventEmitter {
     ));
   }
 
+  async readAssistantFinal(threadId, turnId) {
+    const finals = await this.readAssistantFinals(threadId, [turnId]);
+    return finals.length === 1 ? finals[0] : null;
+  }
+
+  async readAssistantFinals(threadId, turnIds) {
+    if (
+      typeof threadId !== 'string' ||
+      threadId === '' ||
+      !Array.isArray(turnIds) ||
+      turnIds.some((turnId) => typeof turnId !== 'string' || turnId === '')
+    ) {
+      return [];
+    }
+    const requestedTurnIds = Array.from(new Set(turnIds));
+    if (requestedTurnIds.length === 0) return [];
+    const params = { threadId, includeTurns: true };
+    let threadSelectionRevision;
+    let response;
+    if (typeof this.client.requestOnConnection === 'function') {
+      await this.client.ensureConnected();
+      threadSelectionRevision = this.threadSelectionRevision;
+      response = (await this.client.requestOnConnection(
+        'thread/read',
+        params,
+        this.client.connectionGeneration,
+        null,
+        false,
+      )).result;
+    } else {
+      threadSelectionRevision = this.threadSelectionRevision;
+      response = await this.client.request('thread/read', params);
+    }
+    if (this.threadSelectionRevision !== threadSelectionRevision) {
+      throw deliveryError(
+        'The current app-server thread changed during final reply reconciliation.',
+        'shared_app_server_thread_changed',
+      );
+    }
+    const thread = response?.thread;
+    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return [];
+    const requested = new Set(requestedTurnIds);
+    const turnsById = new Map(requestedTurnIds.map((turnId) => [turnId, []]));
+    for (const turn of thread.turns) {
+      if (requested.has(turn?.id)) turnsById.get(turn.id).push(turn);
+    }
+    const finals = [];
+    for (const turnId of requestedTurnIds) {
+      const turns = turnsById.get(turnId);
+      if (turns.length !== 1) continue;
+      const final = finalAssistantFromTurn(threadId, turns[0]);
+      if (final) finals.push(final);
+    }
+    return finals;
+  }
+
   async hasDelivered(threadId, clientUserMessageId) {
     if (
       typeof threadId !== 'string' ||
@@ -1563,6 +1734,9 @@ class AppServerHost extends EventEmitter {
       close: resolveClosed,
     };
     this.addDeliveryWaiter(proofKey, waiter);
+    if (this.lifecycleProofSignals.has(proofKey)) {
+      void requestSignalVerification();
+    }
     const AbortControllerClass = globalThis.AbortController;
     const readAbort = AbortControllerClass ? new AbortControllerClass() : null;
 
@@ -1623,8 +1797,19 @@ class AppServerHost extends EventEmitter {
     return () => this.off('threadClosed', listener);
   }
 
+  onDeliveryProof(listener) {
+    this.on('deliveryProof', listener);
+    return () => this.off('deliveryProof', listener);
+  }
+
+  onAssistantFinal(listener) {
+    this.on('assistantFinal', listener);
+    return () => this.off('assistantFinal', listener);
+  }
+
   destroy() {
     this.destroyed = true;
+    this.lifecycleProofSignals.clear();
     for (const waiters of this.deliveryWaiters.values()) {
       for (const waiter of [...waiters]) waiter.close();
     }

@@ -53,10 +53,6 @@ function startGatewayDrainLoop({
 
   const drainOnce = async () => {
     const status = queueStatus(config, deps);
-    if (status.deliveryQueueDepth === 0) {
-      retryDelayMs = baseDelayMs;
-      return baseDelayMs;
-    }
     if (!Number.isInteger(status.deliveryQueueDepth) || status.deliveryQueueDepth < 0) {
       log(logger, 'ERROR', 'Cannot inspect durable Discord delivery queue', {
         reason: status.deliveryBlockedReason || 'delivery_queue_unreadable',
@@ -74,9 +70,22 @@ function startGatewayDrainLoop({
       return increaseBackoff();
     }
 
+    if (typeof delivery.flushReplies === 'function') {
+      const replyResult = await delivery.flushReplies();
+      if (replyResult?.status === 'failed') return increaseBackoff();
+    }
+    if (status.deliveryQueueDepth === 0) {
+      retryDelayMs = baseDelayMs;
+      return baseDelayMs;
+    }
+
     const result = await delivery.flush({
       verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps),
     });
+    if (result?.reason === 'structured_ack_uncertain') {
+      retryDelayMs = baseDelayMs;
+      return baseDelayMs;
+    }
     if (result?.status === 'queued' || result?.status === 'failed') {
       return increaseBackoff();
     }

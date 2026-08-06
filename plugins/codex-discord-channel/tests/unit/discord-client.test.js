@@ -14,12 +14,230 @@ const {
   readReceiverAuthoritySnapshot,
 } = require('../../src/receiver-state');
 const {
+  confirmDiscordMessage,
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
+  prepareDiscordMessageSend,
+  reconcileDiscordMessage,
   releaseDiscordReceiverOwnership,
   resolveReferencedMessage,
+  sendDiscordMessage,
   startDiscordClient,
 } = require('../../src/discord-client');
+
+test('guarded Discord sends carry a stable enforced nonce and require exact readback', async () => {
+  const messages = new Map([['m1', { id: 'm1', channelId: 'c1' }]]);
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (typeof query === 'string') return messages.get(query) || null;
+        return new Map(messages.entries());
+      },
+    },
+    async send(payload) {
+      const response = {
+        id: 'out1',
+        channelId: 'c1',
+        content: payload.content,
+        nonce: payload.nonce,
+        reference: { messageId: payload.reply.messageReference },
+        author: { id: 'bot1' },
+      };
+      const durable = { ...response };
+      delete durable.nonce;
+      messages.set(durable.id, durable);
+      return response;
+    },
+  };
+  const client = {
+    user: { id: 'bot1' },
+    channels: { async fetch() { return channel; } },
+  };
+  const args = {
+    channelId: 'c1',
+    replyTo: 'm1',
+    content: 'answer',
+    nonce: 'cdr-stable',
+    enforceNonce: true,
+  };
+
+  const prepared = await prepareDiscordMessageSend(client, args);
+  assert.equal(prepared.payload.nonce, 'cdr-stable');
+  assert.equal(prepared.payload.enforceNonce, true);
+  assert.equal(prepared.payload.reply.failIfNotExists, true);
+  const sent = await sendDiscordMessage(client, args, prepared);
+  assert.deepEqual(sent, { channelId: 'c1', messageId: 'out1' });
+  assert.deepEqual(await confirmDiscordMessage(client, args, prepared, sent), {
+    channelId: 'c1', messageId: 'out1',
+  });
+});
+
+test('guarded Discord sends reject a conflicting nonce in the immediate POST response', async () => {
+  const prepared = {
+    channel: {
+      async send() {
+        return { id: 'out1', channelId: 'c1', nonce: 'foreign-nonce' };
+      },
+    },
+    payload: { content: 'answer', nonce: 'cdr-stable', enforceNonce: true },
+  };
+
+  await assert.rejects(sendDiscordMessage({}, {
+    channelId: 'c1', nonce: 'cdr-stable', enforceNonce: true,
+  }, prepared), (error) => {
+    assert.equal(error.code, 'reply_send_response_nonce_mismatch');
+    assert.deepEqual(error.replySendIdentity, { channelId: 'c1', messageId: 'out1' });
+    return true;
+  });
+});
+
+test('stable reply confirmation rejects foreign message identity fields without requiring GET nonce', async () => {
+  const args = {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'cdr-stable', enforceNonce: true,
+  };
+  const baseline = {
+    id: 'out1', channelId: 'c1', content: 'answer',
+    reference: { messageId: 'm1' }, author: { id: 'bot1' },
+  };
+  const attacks = [
+    ['message id', { id: 'foreign-id' }],
+    ['channel', { channelId: 'foreign-channel' }],
+    ['content', { content: 'foreign-content' }],
+    ['reply source', { reference: { messageId: 'foreign-source' } }],
+    ['bot author', { author: { id: 'foreign-bot' } }],
+  ];
+
+  for (const [label, mutation] of attacks) {
+    const channel = {
+      messages: { async fetch() { return { ...baseline, ...mutation }; } },
+    };
+    const client = {
+      user: { id: 'bot1' }, channels: { async fetch() { return channel; } },
+    };
+    await assert.rejects(
+      confirmDiscordMessage(client, args, { channel }, { channelId: 'c1', messageId: 'out1' }),
+      (error) => error.code === 'reply_confirmation_mismatch',
+      label,
+    );
+  }
+});
+
+test('reply reconciliation requires nonce source content channel and bot identity', async () => {
+  const messages = new Map([
+    ['wrong-source', {
+      id: 'wrong-source', channelId: 'c1', content: 'answer', nonce: 'cdr-stable',
+      reference: { messageId: 'other' }, author: { id: 'bot1' },
+    }],
+    ['right', {
+      id: 'right', channelId: 'c1', content: 'answer', nonce: 'cdr-stable',
+      reference: { messageId: 'm1' }, author: { id: 'bot1' },
+    }],
+  ]);
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (typeof query === 'string') return messages.get(query) || null;
+        return new Map(messages.entries());
+      },
+    },
+  };
+  const client = {
+    user: { id: 'bot1' },
+    channels: { async fetch() { return channel; } },
+  };
+  const args = {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'cdr-stable', enforceNonce: true,
+  };
+
+  assert.deepEqual(await reconcileDiscordMessage(client, args, { channel }, {}), {
+    found: true,
+    channelId: 'c1',
+    messageId: 'right',
+  });
+  messages.delete('right');
+  assert.deepEqual(await reconcileDiscordMessage(client, args, { channel }, {}), { found: false });
+});
+
+test('reply reconciliation with a durable message id never substitutes a different nonce match', async () => {
+  const exact = {
+    id: 'foreign-id', channelId: 'c1', content: 'answer', nonce: 'cdr-stable',
+    reference: { messageId: 'm1' }, author: { id: 'bot1' },
+  };
+  const substitute = {
+    ...exact, id: 'substitute-id',
+  };
+  const channel = {
+    messages: {
+      async fetch(query) {
+        if (typeof query === 'string') return exact;
+        return new Map([[substitute.id, substitute]]);
+      },
+    },
+  };
+  const client = {
+    user: { id: 'bot1' }, channels: { async fetch() { return channel; } },
+  };
+
+  assert.deepEqual(await reconcileDiscordMessage(client, {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'cdr-stable', enforceNonce: true,
+  }, { channel }, { outboundMessageId: 'out1' }), { found: false });
+});
+
+test('guarded Discord preflight fails closed for missing or cross-channel sources', async () => {
+  for (const source of [null, { id: 'm1', channelId: 'other-channel' }]) {
+    let sendCount = 0;
+    const channel = {
+      messages: { async fetch() { return source; } },
+      async send() { sendCount += 1; },
+    };
+    const client = {
+      user: { id: 'bot1' },
+      channels: { async fetch() { return channel; } },
+    };
+
+    await assert.rejects(prepareDiscordMessageSend(client, {
+      channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'stable', enforceNonce: true,
+    }), /Exact Discord reply source/);
+    assert.equal(sendCount, 0);
+  }
+});
+
+test('structured Discord 4xx errors release sends but response-loss errors stay uncertain', async () => {
+  const prepared = {
+    channel: {
+      async send() {
+        const error = new Error('Invalid Form Body');
+        error.status = 400;
+        error.code = 50035;
+        throw error;
+      },
+    },
+    payload: { content: 'answer' },
+  };
+  await assert.rejects(
+    sendDiscordMessage({}, { channelId: 'c1' }, prepared),
+    (error) => error.definitiveNoSend === true,
+  );
+
+  prepared.channel.send = async () => { throw new Error('fetch failed after write'); };
+  await assert.rejects(
+    sendDiscordMessage({}, { channelId: 'c1' }, prepared),
+    (error) => error.definitiveNoSend !== true,
+  );
+});
+
+test('reconciliation rejects an unavailable expected bot author before fetching', async () => {
+  let fetchCount = 0;
+  const channel = {
+    messages: { async fetch() { fetchCount += 1; return new Map(); } },
+  };
+  const client = { user: { id: '' }, channels: { async fetch() { return channel; } } };
+
+  await assert.rejects(reconcileDiscordMessage(client, {
+    channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'stable', enforceNonce: true,
+  }, { channel }, {}), (error) => error.code === 'reply_reconciliation_author_unavailable');
+  assert.equal(fetchCount, 0);
+});
 
 test('reference resolver fetches references for enabled guild channels', async () => {
   const referenced = { author: { id: 'peer' }, content: 'hello <@bot>' };
@@ -357,8 +575,9 @@ test('non-receiver MCP client logs in without claiming ownership or registering 
   const { EventEmitter } = require('node:events');
   let claims = 0;
   class FakeDiscordClient extends EventEmitter {
-    constructor() {
+    constructor(options) {
       super();
+      this.options = options;
       this.user = { id: 'bot', tag: 'bot#0001' };
       this.loginTokens = [];
     }
@@ -403,6 +622,51 @@ test('non-receiver MCP client logs in without claiming ownership or registering 
   assert.equal(result.started, true);
   assert.equal(claims, 0);
   assert.deepEqual(result.client.loginTokens, ['test-token']);
+  assert.deepEqual(result.client.options.intents, [1, 2, 4, 8]);
+  assert.equal(result.client.listenerCount('messageCreate'), 0);
+});
+
+test('explicit false omits only the privileged Message Content gateway intent', async () => {
+  const { EventEmitter } = require('node:events');
+  class FakeDiscordClient extends EventEmitter {
+    constructor(options) {
+      super();
+      this.options = options;
+      this.user = { id: 'bot', tag: 'bot#0001' };
+    }
+
+    async login() {}
+  }
+
+  const result = await startDiscordClient({
+    config: {
+      tokenConfigured: true,
+      loginDisabled: false,
+      messageContentIntent: false,
+      token: 'test-token',
+      botUserId: 'bot',
+      paths: { gatewayPidPath: '/missing/session-gateway.pid' },
+    },
+    delivery: {},
+    logger: () => {},
+    deps: {
+      discord: {
+        Client: FakeDiscordClient,
+        Events: { MessageCreate: 'messageCreate' },
+        GatewayIntentBits: {
+          DirectMessages: 1,
+          Guilds: 2,
+          GuildMessages: 4,
+          MessageContent: 8,
+        },
+        Partials: { Channel: 'channel' },
+      },
+      isActiveDiscordReceiver: () => ({ active: false, reason: 'another_gateway_active', pid: 1234 }),
+    },
+  });
+
+  assert.equal(result.started, true);
+  assert.deepEqual(result.client.options.intents, [1, 2, 4]);
   assert.equal(result.client.listenerCount('messageCreate'), 0);
 });
 

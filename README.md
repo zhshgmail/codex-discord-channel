@@ -141,6 +141,13 @@ codex plugin add codex-discord-channel@personal
 
 Use a new Codex thread after installation so the MCP server is loaded.
 
+Marketplace installation copies the plugin into the Codex cache but does not
+run `npm install` or package lifecycle hooks. The MCP and service entrypoints
+therefore use the committed `runtime/mcp-server.cjs` and `runtime/channel.cjs`
+bundles, which contain `discord.js`, `undici`, and `ws`. `npm ci` and
+`npm run build:runtime` are development steps for regenerating those bundles,
+not installation requirements.
+
 For a review branch or pinned deployment, replace `main` with the exact branch,
 tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
@@ -171,7 +178,7 @@ For example:
 CODEX_HOME=/home/USER/.codex-account-01
 CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
 NODE_BIN=/absolute/path/to/node
-CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
+CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/plugin/runtime/channel.cjs
 ```
 
 ```env
@@ -179,7 +186,7 @@ CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
 CODEX_HOME=/home/USER/.codex-account-02
 CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
 NODE_BIN=/absolute/path/to/node
-CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
+CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/plugin/runtime/channel.cjs
 ```
 
 Each instance still has its own `.env` containing a different
@@ -190,17 +197,24 @@ before `.env` and pins the selected Discord state directory before applying
 `CODEX_DISCORD_CHANNEL_BIN` are accepted. Put proxy and CA variables in the
 optional instance-local `app-server-network.env`; unknown keys fail closed.
 
-Bind MCP discovery to the same instance even when a launcher does not preserve
-Discord environment variables. Create `$CODEX_HOME/discord-instance.env`:
+Bind MCP discovery to the same instance by preserving all three identity
+variables from the selected Codex process. The plugin MCP manifest explicitly
+requests `CODEX_HOME`, `DISCORD_INSTANCE`, and `DISCORD_CONFIG_DIR`; if Codex
+does not pass any one of them, the MCP process exits before claiming an owner
+or starting Discord. Create `$CODEX_HOME/discord-instance.env` as the durable
+validation record:
 
 ```env
 DISCORD_INSTANCE=codex02
 DISCORD_CONFIG_DIR=/home/USER/.codex/channels/discord/codex02
 ```
 
-This file accepts only those two keys. Explicit command-line service selection
-must agree with it, so a stale or edited environment file cannot redirect one
-instance onto another instance's bot state.
+This file accepts only those two keys. The explicit MCP identity must agree
+with it, and the selected state's `account.env` must point back to the same
+`CODEX_HOME`, so a stale or edited environment file cannot redirect one
+instance onto another instance's bot state. This binding validates an explicit
+identity; it is not a fallback for identity variables filtered out by an MCP
+launcher.
 
 The account-isolated app-server entry point fails closed when `CODEX_HOME` is
 not explicit:
@@ -221,11 +235,29 @@ codex-discord-channel instance-doctor
 
 Use the instance launcher for the visible TUI. It validates the account login
 and bot configuration, enables and starts both systemd units, waits for the
-instance socket, and only then replaces itself with the matching Codex client:
+instance socket, and then supervises the matching Codex client:
 
 ```bash
 codex-discord-instance codex02
 ```
+
+The supervisor snapshots the one proven active top-level thread while the TUI
+is running. If the app-server process crashes and systemd replaces its Unix
+socket, the supervisor reconnects and resumes that exact thread. It does not
+recover an ordinary Codex command failure, an ambiguous target, a user exit,
+or more than five app-server replacements in one minute. Use the instance
+launcher for recovery; a direct `codex --remote ...` process has no supervising
+parent and exits when its WebSocket transport is reset.
+
+On the first interactive launch, if the Discord instance configuration is
+valid and only the isolated OpenAI account login is missing, the launcher runs
+the configured `NODE_BIN` and `CODEX_BIN` as `codex login` with that instance's
+`CODEX_HOME`. It retries readiness only after login exits successfully. This
+bootstrap requires both stdin and stdout to be TTYs; cancellation, login
+failure, or a noninteractive invocation exits before either systemd service or
+the Codex TUI starts. Gateway and systemd entry points never attempt account
+login and remain fail-closed. Discord credentials are not passed to the login
+process.
 
 An alias may select the instance, but it is not the isolation or startup
 boundary:
@@ -242,7 +274,7 @@ from `account.env`; this avoids relying on an interactive `nvm` PATH. Copy both
 templates to `$HOME/.config/systemd/user/` and enable the same instance name
 for both units. Keep `account.env` mode `0600`. The visible TUI must use the
 matching account and socket. Prefer the launcher above; the equivalent
-low-level command is:
+low-level command below deliberately has no automatic recovery:
 
 ```bash
 CODEX_HOME="$HOME/.codex-account-02" \
@@ -251,9 +283,33 @@ DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
 codex --remote "unix://$HOME/.codex/channels/discord/codex02/app-server.sock"
 ```
 
-The plugin MCP manifest intentionally does not hardcode `codex01`; it inherits
-the instance variables from the selected Codex process and falls back to that
-account's `discord-instance.env` binding.
+### Runtime Updates Without Dropping The TUI
+
+Install plugin revisions into versioned directories. After changing only
+`CODEX_DISCORD_CHANNEL_BIN` in `account.env`, restart the gateway service:
+
+```bash
+systemctl --user restart codex-discord-channel@codex02.service
+```
+
+Do not restart `codex-discord-app-server@codex02.service` from a TUI attached
+to that instance. The app-server is the TUI transport; restarting it terminates
+an unsupervised client immediately and invokes supervisor recovery for a client
+started by `codex-discord-instance`. The bundled app-server unit sets
+`RefuseManualStop=yes` so an accidental `stop` or `restart` fails closed.
+Systemd may still recover an app-server process that crashes on its own.
+
+A planned app-server replacement is a separate maintenance operation: first
+ensure the visible TUI was started by `codex-discord-instance`, preserve its
+exact thread checkpoint, and obtain explicit operator approval. Updating the
+Discord gateway or its dependencies does not require replacing the Codex
+app-server.
+
+The plugin MCP manifest intentionally does not hardcode `codex01`; it requests
+the complete account identity from the selected Codex process and checks it
+against that account's `discord-instance.env` plus instance-local
+`account.env`. Missing or conflicting identity fails closed before owner state
+or Discord state can be touched.
 
 Create `$HOME/.codex/channels/discord/codex01/.env` locally:
 
@@ -379,11 +435,24 @@ Guarded replies require the exact source `--channel` and `--reply-to` values.
 The sender never infers reply identity from mutable `last-inbound.json`. Use
 `--followup` with an exact channel only for a deliberate additional message.
 
-Before the first network send for a source Discord message, the sender fsyncs a
-durable claim under `reply-receipts/`. A later automatic continuation targeting
-that exact source is suppressed instead of posting another answer. Discord-
-origin replies must use this plugin's sender; a generic Discord MCP sender
-bypasses the receipt guard.
+Before the first network send for a source Discord message, the sender fsyncs an
+`in_flight` receipt under `reply-receipts/` while holding that source's
+cross-process lock. The Discord request carries a deterministic nonce with
+nonce enforcement. When the create-message response includes that nonce, it
+must match. Its returned message id is the durable anchor and becomes terminal
+only after an exact read-back proves the same message id, channel, source reply,
+content, and bot author; Discord may omit nonce from that later GET.
+If the response returns an id with a conflicting nonce, the receipt preserves
+that id as permanently uncertain and suppresses both reconciliation and replay.
+
+If a process or network acknowledgement is lost, a later process first
+reconciles the recorded message id or any available stable nonce identity. A
+request may be repeated with the same enforced nonce only when no message id was
+returned and the bounded replay window is still open; Discord nonce enforcement
+then returns the original message instead of creating another one. Otherwise it
+remains fail-closed. A confirmed receipt suppresses every later automatic
+continuation. Discord-origin replies must use this plugin's sender; a generic
+Discord MCP sender bypasses the receipt guard.
 
 `discord_channel_read_history` is bounded to 25 sanitized messages per call.
 Use its exclusive `before` cursor to page backward. Reading history does not

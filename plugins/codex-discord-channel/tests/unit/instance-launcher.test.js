@@ -76,7 +76,10 @@ test('TUI launcher replaces itself with matching Codex after the shell startup b
 test('launcher rejects an OpenAI account that is not logged in', () => {
   const config = instanceFixture();
   fs.unlinkSync(path.join(config.codexHome, 'auth.json'));
-  assert.throws(() => requireInstanceReady(config), /not logged in/);
+  assert.throws(
+    () => requireInstanceReady(config),
+    (error) => error.code === 'openai_account_login_missing' && /not logged in/.test(error.message),
+  );
 });
 
 test('launcher fails before systemd when Discord bot credentials are missing', () => {
@@ -142,6 +145,19 @@ test('live process identity requires the selected OpenAI account and Discord sta
       return target.endsWith('/cmdline') ? legacyCommand : legacyDefault;
     },
   }));
+});
+
+test('missing proc identity is classified as a transient service lifecycle race', () => {
+  const config = instanceFixture();
+  assert.throws(
+    () => verifyLiveProcess(config, 12345, {
+      readFileSync() {
+        throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      },
+    }),
+    (error) => error.code === 'live_service_process_unavailable'
+      && /Cannot read live service identity/.test(error.message),
+  );
 });
 
 test('TUI argument separator keeps runtime selection separate from Codex arguments', () => {

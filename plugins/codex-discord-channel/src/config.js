@@ -48,6 +48,7 @@ function parseInteger(value, fallback) {
 function loadEnvFile(file, env, options = {}) {
   if (!file || !fs.existsSync(file)) return false;
   const text = fs.readFileSync(file, 'utf8');
+  const seenKeys = new Set();
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
@@ -67,6 +68,12 @@ function loadEnvFile(file, env, options = {}) {
       error.code = 'environment_key_not_allowed';
       throw error;
     }
+    if (options.rejectDuplicateKeys && seenKeys.has(key)) {
+      const error = new Error(`Environment key ${key} is duplicated in ${file}`);
+      error.code = 'environment_key_duplicated';
+      throw error;
+    }
+    seenKeys.add(key);
     const value = stripQuotes(rawValue);
     if (
       options.rejectConflicts &&
@@ -80,6 +87,12 @@ function loadEnvFile(file, env, options = {}) {
     if (env[key] === undefined) {
       env[key] = value;
     }
+  }
+  const missing = [...(options.requiredKeys || [])].filter((key) => !seenKeys.has(key));
+  if (missing.length > 0) {
+    const error = new Error(`Environment file ${file} is missing: ${missing.join(', ')}`);
+    error.code = 'environment_required_key_missing';
+    throw error;
   }
   return true;
 }
@@ -193,6 +206,7 @@ function loadConfig(inputEnv = process.env, options = {}) {
     botUserId,
     proxyUrl,
     insecureTls: parseBool(env.DISCORD_INSECURE_TLS, env.NODE_TLS_REJECT_UNAUTHORIZED === '0'),
+    messageContentIntent: parseBool(env.DISCORD_MESSAGE_CONTENT_INTENT, true),
     loginDisabled: parseBool(env.DISCORD_CHANNEL_DISABLE_LOGIN, false),
     deliveryMode,
     deliveryActivationId,
@@ -214,6 +228,8 @@ function loadConfig(inputEnv = process.env, options = {}) {
 }
 
 module.exports = {
+  ACCOUNT_BINDING_KEYS,
+  ACCOUNT_ENV_KEYS,
   loadConfig,
   loadEnvFile,
   parseInteger,

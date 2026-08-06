@@ -1,5 +1,6 @@
 [Unit]
 Description=Codex Discord account-isolated app server (%i)
+RefuseManualStop=yes
 After=network-online.target
 Wants=network-online.target
 Before=codex-discord-channel@%i.service

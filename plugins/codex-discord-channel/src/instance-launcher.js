@@ -28,8 +28,12 @@ function verifyLiveProcess(config, pid, dependencies = {}) {
   let entries;
   try {
     entries = readFileSync(`/proc/${pid}/environ`).toString('utf8').split('\0').filter(Boolean);
-  } catch {
-    throw new Error(`Cannot read live service identity for PID ${pid}`);
+  } catch (cause) {
+    const error = new Error(`Cannot read live service identity for PID ${pid}`);
+    if (cause?.code === 'ENOENT' || cause?.code === 'ESRCH') {
+      error.code = 'live_service_process_unavailable';
+    }
+    throw error;
   }
   const env = Object.fromEntries(entries.map((entry) => {
     const separator = entry.indexOf('=');
@@ -57,9 +61,7 @@ function verifyLiveProcess(config, pid, dependencies = {}) {
   throw new Error(`Live service PID ${pid} does not match instance ${config.paths.instance}`);
 }
 
-function requireInstanceReady(config, dependencies = {}) {
-  const statSync = dependencies.statSync || fs.statSync;
-  const existsSync = dependencies.existsSync || fs.existsSync;
+function requireInstancePrerequisites(config) {
   if (config.accountHomeSource === 'default') {
     throw new Error(`CODEX_HOME is not pinned in ${config.paths.accountEnvPath}`);
   }
@@ -67,14 +69,25 @@ function requireInstanceReady(config, dependencies = {}) {
   if (!config.tokenConfigured || !config.botUserId) {
     throw new Error(`Discord bot credentials are incomplete in ${config.paths.envFile}`);
   }
-  const authPath = path.join(config.codexHome, 'auth.json');
-  if (!existsSync(authPath) || !statSync(authPath).isFile()) {
-    throw new Error(`OpenAI account is not logged in under ${config.codexHome}; run the account login command first`);
-  }
   const nodeBin = String(config.env.NODE_BIN || '').trim();
   const codexBin = String(config.env.CODEX_BIN || '').trim();
   if (!path.isAbsolute(nodeBin) || !path.isAbsolute(codexBin)) {
     throw new Error('NODE_BIN and CODEX_BIN must be absolute paths in account.env');
+  }
+  return { codexBin, nodeBin };
+}
+
+function requireInstanceReady(config, dependencies = {}) {
+  const statSync = dependencies.statSync || fs.statSync;
+  const existsSync = dependencies.existsSync || fs.existsSync;
+  const { codexBin, nodeBin } = requireInstancePrerequisites(config);
+  const authPath = path.join(config.codexHome, 'auth.json');
+  if (!existsSync(authPath) || !statSync(authPath).isFile()) {
+    const error = new Error(
+      `OpenAI account is not logged in under ${config.codexHome}; run the account login command first`,
+    );
+    error.code = 'openai_account_login_missing';
+    throw error;
   }
   return { authPath, codexBin, nodeBin };
 }

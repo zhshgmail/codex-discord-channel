@@ -271,6 +271,281 @@ test('fresh recovery selects the unique top-level root among loaded subagent thr
   );
 });
 
+test('gateway restart recovers the newest active turn when an older turn remains in progress', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-overlapping-turn-recovery-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: params.includeTurns
+            ? [
+              { id: 'turn-stale', status: 'inProgress', startedAt: 100, items: [] },
+              { id: 'turn-after-stale', status: 'completed', startedAt: 200, items: [] },
+              { id: 'turn-current', status: 'inProgress', startedAt: 300, items: [] },
+            ]
+            : [],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      assert.deepEqual(params, {
+        threadId: 'thread-root',
+        limit: 1,
+        sortDirection: 'desc',
+        itemsView: 'summary',
+      });
+      return {
+        data: [{
+          id: 'turn-current',
+          status: 'inProgress',
+          startedAt: 300,
+          items: [],
+        }],
+        nextCursor: 'older-turns',
+        backwardsCursor: 'current-turn',
+      };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-current');
+      return { turnId: 'turn-current' };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  }, () => {}, { client });
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.activeTurnId, 'turn-current');
+  await host.startTurn({
+    threadId: 'thread-root',
+    clientUserMessageId: 'discord:c1:m-overlapping-turns',
+    input: [{ type: 'text', text: 'recover exact current turn' }],
+  }, target);
+  assert.equal(
+    client.requests.some((request) => request.method === 'thread/turns/list'),
+    true,
+  );
+  const checkpoint = JSON.parse(fs.readFileSync(
+    path.join(stateDir, 'app-server-target.json'),
+    'utf8',
+  ));
+  assert.equal(checkpoint.activeTurnId, 'turn-current');
+});
+
+test('overlapping active turns stay fail closed when the newest turn is not in progress', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-overlapping-turn-closed-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: params.includeTurns
+            ? [
+              { id: 'turn-stale-a', status: 'inProgress', items: [] },
+              { id: 'turn-stale-b', status: 'inProgress', items: [] },
+            ]
+            : [],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      return {
+        data: [{ id: 'turn-newest-completed', status: 'completed', items: [] }],
+        nextCursor: 'older-turns',
+        backwardsCursor: 'newest-completed',
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  }, () => {}, { client });
+  t.after(() => host.destroy());
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-root',
+    status: 'active',
+  });
+  assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
+});
+
+test('overlapping active turns reject missing or malformed newest-turn data', async (t) => {
+  const cases = [
+    ['missing response', undefined],
+    ['missing data', {}],
+    ['non-array data', { data: { id: 'turn-current', status: 'inProgress' } }],
+    ['empty data', { data: [] }],
+    ['multiple latest turns', {
+      data: [
+        { id: 'turn-current', status: 'inProgress' },
+        { id: 'turn-stale', status: 'inProgress' },
+      ],
+    }],
+    ['missing latest id', { data: [{ status: 'inProgress' }] }],
+    ['missing latest status', { data: [{ id: 'turn-current' }] }],
+  ];
+
+  for (const [name, latestTurns] of cases) {
+    await t.test(name, async (t) => {
+      const client = new FakeRpcClient(async (method, params) => {
+        if (method === 'thread/loaded/list') {
+          return { data: ['thread-root'], nextCursor: null };
+        }
+        if (method === 'thread/read') {
+          return {
+            thread: {
+              id: params.threadId,
+              parentThreadId: null,
+              status: { type: 'active', activeFlags: [] },
+              turns: [
+                { id: 'turn-stale', status: 'inProgress', items: [] },
+                { id: 'turn-current', status: 'inProgress', items: [] },
+              ],
+            },
+          };
+        }
+        if (method === 'thread/turns/list') return latestTurns;
+        throw new Error(`unexpected method ${method}`);
+      });
+      const host = createAppServerHost(
+        { appServerUrl: 'ws://127.0.0.1:4500' },
+        () => {},
+        { client },
+      );
+      t.after(() => host.destroy());
+
+      assert.deepEqual(await host.resolveTarget(), {
+        available: true,
+        threadId: 'thread-root',
+        status: 'active',
+      });
+    });
+  }
+});
+
+test('overlapping active turns reject a newest turn outside the thread-read active set', async (t) => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: [
+            { id: 'turn-stale', status: 'inProgress', items: [] },
+            { id: 'turn-current', status: 'inProgress', items: [] },
+          ],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      return {
+        data: [{ id: 'turn-not-in-thread-read', status: 'inProgress', items: [] }],
+        nextCursor: 'older-turns',
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+  t.after(() => host.destroy());
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-root',
+    status: 'active',
+  });
+});
+
+test('newest-turn recovery discards an async result after the thread selection revision changes', async (t) => {
+  let releaseLatestTurn;
+  let markLatestTurnRequested;
+  const latestTurnRequested = new Promise((resolve) => { markLatestTurnRequested = resolve; });
+  const latestTurnReleased = new Promise((resolve) => { releaseLatestTurn = resolve; });
+  let latestTurnRequests = 0;
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: [
+            { id: 'turn-stale', status: 'inProgress', items: [] },
+            { id: 'turn-current-before-notification', status: 'inProgress', items: [] },
+          ],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      latestTurnRequests += 1;
+      markLatestTurnRequested();
+      await latestTurnReleased;
+      return {
+        data: [{
+          id: 'turn-current-before-notification',
+          status: 'inProgress',
+          items: [],
+        }],
+        nextCursor: 'older-turns',
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+  t.after(() => host.destroy());
+
+  const resolving = host.resolveTarget();
+  await latestTurnRequested;
+  client.emit('notification', {
+    method: 'turn/started',
+    params: {
+      threadId: 'thread-root',
+      turn: { id: 'turn-current-from-notification' },
+    },
+  });
+  releaseLatestTurn();
+
+  assert.deepEqual(await resolving, {
+    available: true,
+    threadId: 'thread-root',
+    status: 'active',
+    activeTurnId: 'turn-current-from-notification',
+  });
+  assert.equal(latestTurnRequests, 1);
+});
+
 test('system-error root remains the structured target while a subagent is active', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
@@ -2667,6 +2942,262 @@ test('signal before hasDelivered plus exact rollout proof completes without thre
 
   assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
   assert.deepEqual(client.requests, []);
+});
+
+test('signal before hasDelivered retains a bounded retry until exact proof becomes durable', async (t) => {
+  const clientId = 'discord:c1:m-signal-before-durable';
+  let proofDurable = false;
+  let verificationCalls = 0;
+  let firstVerificationFinished;
+  const firstVerification = new Promise((resolve) => {
+    firstVerificationFinished = resolve;
+  });
+  const client = new FakeRpcClient(async (method, params) => {
+    assert.equal(method, 'thread/read');
+    return { thread: { id: params.threadId, turns: [] } };
+  });
+  const host = createAppServerHost({}, () => {}, {
+    client,
+    lifecycleProofRetryDelaysMs: [20],
+    verifyRolloutDelivery: async () => {
+      verificationCalls += 1;
+      if (verificationCalls === 1) firstVerificationFinished();
+      return proofDurable;
+    },
+  });
+  t.after(() => host.destroy());
+
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+  const delivered = host.hasDelivered(DELIVERY_THREAD_ID, clientId);
+  await firstVerification;
+  proofDurable = true;
+
+  assert.equal(await delivered, true);
+  assert.equal(verificationCalls, 2);
+  assert.equal(client.requests.length, 1);
+});
+
+test('user-item start refreshes the exact active turn used by subsequent steer', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-item-turn-refresh-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{ id: 'turn-stale', status: 'inProgress', items: [] }],
+        },
+      };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-current');
+      return { turnId: params.expectedTurnId };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  }, () => {}, { client });
+  t.after(() => host.destroy());
+
+  const stale = await host.resolveTarget();
+  assert.equal(stale.activeTurnId, 'turn-stale');
+  const notification = userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    'discord:c1:m-current-turn',
+  );
+  notification.params.turnId = 'turn-current';
+  client.emit('notification', notification);
+
+  const current = await host.resolveTarget();
+  assert.equal(current.activeTurnId, 'turn-current');
+  await host.startTurn({
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-after-refresh',
+    input: [{ type: 'text', text: 'after refresh' }],
+  }, current);
+  const checkpoint = JSON.parse(fs.readFileSync(
+    path.join(stateDir, 'app-server-target.json'),
+    'utf8',
+  ));
+  assert.equal(checkpoint.activeTurnId, 'turn-current');
+});
+
+test('user-item lifecycle signal is exposed as an exact delivery-proof wake', async (t) => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`delivery-proof wake must not request ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  t.after(() => host.destroy());
+  const wakes = [];
+  const unsubscribe = host.onDeliveryProof((proof) => wakes.push(proof));
+
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    'discord:c1:m-proof-wake',
+  ));
+  unsubscribe();
+
+  assert.deepEqual(wakes, [{
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-proof-wake',
+  }]);
+});
+
+test('completed final assistant item is exposed for durable Discord egress', async (t) => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`assistant-final notification must not request ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  t.after(() => host.destroy());
+  const finals = [];
+  const unsubscribe = host.onAssistantFinal((event) => finals.push(event));
+
+  for (const item of [
+    { type: 'agentMessage', id: 'commentary-1', text: 'working', phase: 'commentary' },
+    { type: 'agentMessage', id: 'final-1', text: 'done', phase: 'final_answer' },
+    { type: 'agentMessage', id: 'final-empty', text: '', phase: 'final_answer' },
+  ]) {
+    client.emit('notification', {
+      method: 'item/completed',
+      params: { threadId: DELIVERY_THREAD_ID, turnId: 'turn-active', item },
+    });
+  }
+  unsubscribe();
+
+  assert.deepEqual(finals, [{
+    threadId: DELIVERY_THREAD_ID,
+    turnId: 'turn-active',
+    itemId: 'final-1',
+    text: 'done',
+  }]);
+});
+
+test('production turn/completed payload exposes its exact final assistant item', async (t) => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`turn/completed notification must not request ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  t.after(() => host.destroy());
+  const finals = [];
+  host.onAssistantFinal((event) => finals.push(event));
+
+  client.emit('notification', {
+    method: 'turn/completed',
+    params: {
+      threadId: DELIVERY_THREAD_ID,
+      turn: {
+        id: 'turn-production-completed',
+        items: [
+          { type: 'agentMessage', id: 'commentary-production', text: 'working', phase: 'commentary' },
+          { type: 'agentMessage', id: 'final-production', text: 'ACK', phase: 'final_answer' },
+        ],
+        itemsView: { type: 'full' },
+        status: 'completed',
+        error: null,
+        startedAt: 1,
+        completedAt: 2,
+        durationMs: 1000,
+      },
+    },
+  });
+
+  assert.deepEqual(finals, [{
+    threadId: DELIVERY_THREAD_ID,
+    turnId: 'turn-production-completed',
+    itemId: 'final-production',
+    text: 'ACK',
+  }]);
+});
+
+test('exact final readback fails closed on thread turn and final ambiguity', async (t) => {
+  const cases = [
+    {
+      name: 'wrong thread',
+      thread: { id: OTHER_DELIVERY_THREAD_ID, turns: [] },
+    },
+    {
+      name: 'missing turn',
+      thread: { id: DELIVERY_THREAD_ID, turns: [] },
+    },
+    {
+      name: 'duplicate exact turn',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [
+          { id: 'turn-exact-final', items: [] },
+          { id: 'turn-exact-final', items: [] },
+        ],
+      },
+    },
+    {
+      name: 'no final answer',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [{
+          id: 'turn-exact-final',
+          items: [{ type: 'agentMessage', id: 'commentary-only', text: 'working', phase: 'commentary' }],
+        }],
+      },
+    },
+    {
+      name: 'multiple final answers',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [{
+          id: 'turn-exact-final',
+          items: [
+            { type: 'agentMessage', id: 'final-a', text: 'A', phase: 'final_answer' },
+            { type: 'agentMessage', id: 'final-b', text: 'B', phase: 'final_answer' },
+          ],
+        }],
+      },
+    },
+    {
+      name: 'valid plus malformed final answer',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [{
+          id: 'turn-exact-final',
+          items: [
+            { type: 'agentMessage', id: 'final-valid', text: 'A', phase: 'final_answer' },
+            { type: 'agentMessage', id: 'final-malformed', text: '', phase: 'final_answer' },
+          ],
+        }],
+      },
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const client = new FakeRpcClient(async (method, params) => {
+        assert.equal(method, 'thread/read');
+        assert.deepEqual(params, { threadId: DELIVERY_THREAD_ID, includeTurns: true });
+        return { thread: entry.thread };
+      });
+      const host = createAppServerHost(
+        { appServerUrl: 'wss://remote.example.invalid/rpc' },
+        () => {},
+        { client },
+      );
+      subtest.after(() => host.destroy());
+      assert.equal(
+        await host.readAssistantFinal(DELIVERY_THREAD_ID, 'turn-exact-final'),
+        null,
+      );
+    });
+  }
 });
 
 test('lifecycle signal without durable rollout evidence does not prove delivery', async (t) => {

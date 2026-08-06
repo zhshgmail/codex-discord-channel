@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createAppServerHost } = require('./app-server-host');
+const { replyNonce } = require('./reply-delivery');
 const { isProcessAlive } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
@@ -12,6 +13,8 @@ const DELIVERY_ACK_UNCERTAIN = 'structured_ack_uncertain';
 const STALE_DELIVERY_ACTIVATION = 'stale_delivery_activation';
 const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
 const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
+const MAX_REPLY_RECOVERY_CANDIDATES = 32;
+const MAX_REPLY_EGRESS_CANDIDATES = 32;
 const activeDeliveryAttempts = new Set();
 
 function currentTimeMs(deps = {}) {
@@ -245,6 +248,8 @@ function emptyDeliveryQueue() {
     completed: [],
     archived: [],
     blocked: null,
+    replyRecoveryCursor: 0,
+    replyEgressCursor: 0,
   };
 }
 
@@ -271,6 +276,10 @@ function readDeliveryQueue(config = {}, deps = {}) {
     completed: Array.isArray(parsed.completed) ? parsed.completed : [],
     archived: Array.isArray(parsed.archived) ? parsed.archived : [],
     blocked: parsed.blocked && typeof parsed.blocked === 'object' ? parsed.blocked : null,
+    replyRecoveryCursor: Number.isSafeInteger(parsed.replyRecoveryCursor) &&
+      parsed.replyRecoveryCursor >= 0 ? parsed.replyRecoveryCursor : 0,
+    replyEgressCursor: Number.isSafeInteger(parsed.replyEgressCursor) &&
+      parsed.replyEgressCursor >= 0 ? parsed.replyEgressCursor : 0,
   };
 }
 
@@ -397,6 +406,8 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
       completed: queue.completed,
       archived,
       blocked: !activationMatches || headWasArchived ? null : queue.blocked,
+      replyRecoveryCursor: queue.replyRecoveryCursor,
+      replyEgressCursor: queue.replyEgressCursor,
     },
     changed: true,
     archivedCount: staleItems.length,
@@ -504,7 +515,17 @@ function setQueueBlock(queue, reason, details, config, deps) {
   writeDeliveryQueue(queue, config, deps);
 }
 
-function completedQueue(queue, next) {
+function readbackReceipt(threadId, clientUserMessageId, deps = {}) {
+  return {
+    version: 1,
+    threadId,
+    clientUserMessageId,
+    verifiedAt: new Date(currentTimeMs(deps)).toISOString(),
+  };
+}
+
+function completedQueue(queue, next, threadId, clientUserMessageId, deps = {}, turnId = '') {
+  const normalizedTurnId = String(turnId || '').trim();
   return {
     version: DELIVERY_QUEUE_VERSION,
     activation: queue.activation,
@@ -514,11 +535,26 @@ function completedQueue(queue, next) {
       {
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId,
-        completedAt: new Date().toISOString(),
+        completedAt: new Date(currentTimeMs(deps)).toISOString(),
+        readbackReceipt: readbackReceipt(threadId, clientUserMessageId, deps),
+        ...(normalizedTurnId ? {
+          outbound: {
+            version: 1,
+            threadId,
+            turnId: normalizedTurnId,
+            status: 'waiting',
+            stableClientMessageId: replyNonce(
+              next.normalized.channelId,
+              next.normalized.messageId,
+            ),
+          },
+        } : {}),
       },
     ],
     archived: queue.archived,
     blocked: null,
+    replyRecoveryCursor: queue.replyRecoveryCursor,
+    replyEgressCursor: queue.replyEgressCursor,
   };
 }
 
@@ -592,6 +628,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
     if (snapshot.blocked?.reason === DELIVERY_ACK_UNCERTAIN) {
       const threadId = snapshot.blocked.threadId || '';
       const clientUserMessageId = snapshot.blocked.clientUserMessageId || '';
+      const turnId = snapshot.blocked.turnId || '';
       let alreadyAccepted = false;
       if (threadId && clientUserMessageId && typeof host.hasDelivered === 'function') {
         try {
@@ -606,7 +643,14 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next);
+        const updated = completedQueue(
+          queue,
+          next,
+          threadId,
+          clientUserMessageId,
+          deps,
+          turnId,
+        );
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length };
       });
@@ -655,6 +699,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: snapshot.blocked.threadId || '',
           clientUserMessageId: snapshot.blocked.clientUserMessageId || '',
+          turnId: snapshot.blocked.turnId || '',
           error: 'Previous structured delivery did not complete.',
         },
         verifyReceiverOwnership,
@@ -758,6 +803,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         phase: 'starting_turn',
         threadId: target.threadId,
         clientUserMessageId: params.clientUserMessageId,
+        turnId: target.status === 'active' ? target.activeTurnId : '',
       };
       writeDeliveryQueue(queue, config, deps);
       return { prepared: true };
@@ -789,6 +835,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId: target.status === 'active' ? target.activeTurnId : '',
           error: error instanceof Error ? error.message : String(error),
         }, config, deps);
         return blockedResult(queue, reason, uncertain ? 'failed' : 'queued');
@@ -824,6 +871,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId: response?.turn?.id || response?.turnId || (
+            target.status === 'active' ? target.activeTurnId : ''
+          ),
           error: 'Structured turn was acknowledged but its user item was not observed.',
         },
         verifyReceiverOwnership,
@@ -851,6 +901,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
               messageId: next.normalized.messageId,
               threadId: target.threadId,
               clientUserMessageId: params.clientUserMessageId,
+              turnId: response?.turn?.id || response?.turnId || (
+                target.status === 'active' ? target.activeTurnId : ''
+              ),
               error: 'Structured delivery checkpoint changed before commit.',
             }, config, deps);
           }
@@ -858,7 +911,14 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next);
+        const updated = completedQueue(
+          queue,
+          next,
+          target.threadId,
+          params.clientUserMessageId,
+          deps,
+          response?.turn?.id || response?.turnId || '',
+        );
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length };
       });
@@ -892,6 +952,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId: response?.turn?.id || response?.turnId || (
+            target.status === 'active' ? target.activeTurnId : ''
+          ),
           error: error instanceof Error ? error.message : String(error),
         }, verifyReceiverOwnership);
       } catch {}
@@ -968,11 +1031,15 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let unsubscribeActive = null;
   let unsubscribeReconnect = null;
   let unsubscribeThreadClosed = null;
+  let unsubscribeDeliveryProof = null;
+  let unsubscribeAssistantFinal = null;
   let startupDrain = Promise.resolve();
   let receiverVerification = null;
   let receiverActivated = false;
   let leaseWakeTimer = null;
   let leaseWakeAt = 0;
+  let replySender = null;
+  let replyOperations = Promise.resolve();
   const serializeAdmission = (operation) => {
     const result = admissionOperations.then(operation, operation);
     admissionOperations = result.catch(() => {});
@@ -981,6 +1048,11 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   const serializeDrain = (operation) => {
     const result = drainOperations.then(operation, operation);
     drainOperations = result.catch(() => {});
+    return result;
+  };
+  const serializeReply = (operation) => {
+    const result = replyOperations.then(operation, operation);
+    replyOperations = result.catch(() => {});
     return result;
   };
   const clearLeaseWake = () => {
@@ -1006,6 +1078,27 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     }, delay);
     if (typeof leaseWakeTimer?.unref === 'function') leaseWakeTimer.unref();
   };
+  const persistAssistantFinal = (event) => withDeliveryQueueLock(config, deps, () => {
+    const queue = readDeliveryQueue(config, deps);
+    const completed = queue.completed.filter((entry) => (
+      entry?.outbound?.status === 'waiting' &&
+      entry.outbound.threadId === event.threadId &&
+      entry.outbound.turnId === event.turnId
+    ));
+    if (completed.length === 0) return 0;
+    const readyAt = new Date(currentTimeMs(deps)).toISOString();
+    for (const entry of completed) {
+      entry.outbound = {
+        ...entry.outbound,
+        status: 'ready',
+        itemId: event.itemId,
+        text: event.text,
+        readyAt,
+      };
+    }
+    writeDeliveryQueue(queue, config, deps);
+    return completed.length;
+  });
 
   const delivery = {
     status() {
@@ -1053,6 +1146,308 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         updateLeaseWake(result[DELIVERY_LEASE_RETRY_AT]);
         return result;
       });
+    },
+    activateReplySender(sender) {
+      if (typeof sender !== 'function') {
+        throw new Error('Discord reply sender must be a function.');
+      }
+      replySender = sender;
+      return delivery.recoverReplies().then(() => delivery.flushReplies());
+    },
+    recoverReplies() {
+      return serializeAdmission(async () => {
+        if (destroyed) return { status: 'idle', reason: 'delivery_destroyed' };
+        if (typeof host.readAssistantFinals !== 'function') {
+          return { status: 'idle', reason: 'reply_recovery_unsupported' };
+        }
+        const candidates = await withDeliveryQueueLock(config, deps, () => {
+          const queue = readDeliveryQueue(config, deps);
+          const frozen = new Map();
+          const completedCount = queue.completed.length;
+          const start = completedCount === 0
+            ? 0
+            : queue.replyRecoveryCursor % completedCount;
+          let nextCursor = start;
+          for (let offset = 0; offset < completedCount; offset += 1) {
+            const index = (start + offset) % completedCount;
+            const entry = queue.completed[index];
+            if (
+              entry?.outbound?.status !== 'waiting' ||
+              typeof entry.outbound.threadId !== 'string' ||
+              entry.outbound.threadId === '' ||
+              typeof entry.outbound.turnId !== 'string' ||
+              entry.outbound.turnId === ''
+            ) {
+              continue;
+            }
+            const key = JSON.stringify([entry.outbound.threadId, entry.outbound.turnId]);
+            if (!frozen.has(key)) {
+              frozen.set(key, {
+                threadId: entry.outbound.threadId,
+                turnId: entry.outbound.turnId,
+              });
+              nextCursor = (index + 1) % completedCount;
+              if (frozen.size === MAX_REPLY_RECOVERY_CANDIDATES) break;
+            }
+          }
+          if (frozen.size > 0) {
+            queue.replyRecoveryCursor = nextCursor;
+            writeDeliveryQueue(queue, config, deps);
+          }
+          return Array.from(frozen.values());
+        });
+        if (candidates.length === 0) {
+          return { status: 'idle', reason: 'reply_recovery_empty' };
+        }
+        const grouped = new Map();
+        for (const candidate of candidates) {
+          if (!grouped.has(candidate.threadId)) grouped.set(candidate.threadId, []);
+          grouped.get(candidate.threadId).push(candidate.turnId);
+        }
+        let recoveredCount = 0;
+        let failedCount = 0;
+        let missingCount = 0;
+        for (const [threadId, turnIds] of grouped) {
+          let events;
+          try {
+            events = await host.readAssistantFinals(threadId, turnIds);
+          } catch (error) {
+            failedCount += turnIds.length;
+            logger('ERROR', 'Failed grouped exact app-server final reply recovery', {
+              threadId,
+              turnIds,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
+          }
+          if (!Array.isArray(events)) {
+            failedCount += turnIds.length;
+            continue;
+          }
+          const expected = new Set(turnIds);
+          const observed = new Set();
+          for (const event of events) {
+            if (
+              event?.threadId !== threadId ||
+              !expected.has(event?.turnId) ||
+              observed.has(event.turnId)
+            ) {
+              continue;
+            }
+            observed.add(event.turnId);
+            recoveredCount += await persistAssistantFinal(event);
+          }
+          missingCount += expected.size - observed.size;
+        }
+        if (recoveredCount > 0) {
+          return {
+            status: 'recovered',
+            reason: 'reply_final_recovered',
+            recoveredCount,
+            failedCount,
+            missingCount,
+          };
+        }
+        if (failedCount > 0) {
+          return {
+            status: 'failed',
+            reason: 'reply_recovery_failed',
+            recoveredCount,
+            failedCount,
+            missingCount,
+          };
+        }
+        return {
+          status: 'idle',
+          reason: 'reply_final_not_found',
+          recoveredCount,
+          failedCount,
+          missingCount,
+        };
+      });
+    },
+    flushReplies() {
+      return serializeReply(async () => {
+        if (destroyed) return { status: 'idle', reason: 'delivery_destroyed' };
+        if (typeof replySender !== 'function') {
+          return { status: 'idle', reason: 'reply_sender_inactive' };
+        }
+        const candidates = await withDeliveryQueueLock(config, deps, () => {
+          const queue = readDeliveryQueue(config, deps);
+          const frozen = [];
+          const completedCount = queue.completed.length;
+          const start = completedCount === 0
+            ? 0
+            : queue.replyEgressCursor % completedCount;
+          let nextCursor = start;
+          for (let offset = 0; offset < completedCount; offset += 1) {
+            const index = (start + offset) % completedCount;
+            const completed = queue.completed[index];
+            if (
+              completed?.outbound?.status !== 'ready' ||
+              typeof completed.outbound.text !== 'string' ||
+              completed.outbound.text === ''
+            ) {
+              continue;
+            }
+            frozen.push({
+              channelId: completed.channelId,
+              sourceMessageId: completed.messageId,
+              stableClientMessageId: completed.outbound.stableClientMessageId,
+              threadId: completed.outbound.threadId,
+              turnId: completed.outbound.turnId,
+              itemId: completed.outbound.itemId,
+              text: completed.outbound.text,
+            });
+            nextCursor = (index + 1) % completedCount;
+            if (frozen.length === MAX_REPLY_EGRESS_CANDIDATES) break;
+          }
+          if (frozen.length > 0) {
+            queue.replyEgressCursor = nextCursor;
+            writeDeliveryQueue(queue, config, deps);
+          }
+          return frozen;
+        });
+        if (candidates.length === 0) return { status: 'idle', reason: 'reply_queue_empty' };
+        let confirmedCount = 0;
+        let failedCount = 0;
+        let lastMessageId = null;
+        for (const candidate of candidates) {
+          let result;
+          try {
+            result = await replySender(candidate);
+          } catch (error) {
+            failedCount += 1;
+            logger('ERROR', 'Discord final reply acknowledgement is uncertain', {
+              channelId: candidate.channelId,
+              sourceMessageId: candidate.sourceMessageId,
+              stableClientMessageId: candidate.stableClientMessageId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            continue;
+          }
+          const outboundMessageId = String(result?.messageId || '').trim();
+          const confirmed = result?.status === 'confirmed' || (
+            outboundMessageId && (
+              result?.duplicateSuppressed !== true || result?.receiptStatus === 'confirmed'
+            )
+          );
+          if (!confirmed || !outboundMessageId) {
+            failedCount += 1;
+            continue;
+          }
+          await withDeliveryQueueLock(config, deps, () => {
+            const queue = readDeliveryQueue(config, deps);
+            const completed = queue.completed.find((entry) => (
+              entry?.channelId === candidate.channelId &&
+              entry?.messageId === candidate.sourceMessageId &&
+              entry?.outbound?.status === 'ready' &&
+              entry.outbound.stableClientMessageId === candidate.stableClientMessageId &&
+              entry.outbound.itemId === candidate.itemId
+            ));
+            if (!completed) return;
+            completed.outbound = {
+              ...completed.outbound,
+              status: 'confirmed',
+              outboundMessageId,
+              confirmedAt: new Date(currentTimeMs(deps)).toISOString(),
+              readbackReceipt: result.readbackReceipt || {
+                channelId: result.channelId || candidate.channelId,
+                messageId: outboundMessageId,
+              },
+            };
+            writeDeliveryQueue(queue, config, deps);
+            confirmedCount += 1;
+            lastMessageId = outboundMessageId;
+          });
+        }
+        if (confirmedCount > 0) {
+          return {
+            status: 'confirmed',
+            messageId: lastMessageId,
+            confirmedCount,
+            failedCount,
+          };
+        }
+        return { status: 'failed', reason: 'reply_ack_uncertain', confirmedCount, failedCount };
+      });
+    },
+    async recordCompletedReadback({ channelId, messageId, threadId } = {}) {
+      const normalizedChannelId = String(channelId || '').trim();
+      const normalizedMessageId = String(messageId || '').trim();
+      const normalizedThreadId = String(threadId || '').trim();
+      if (!normalizedChannelId || !normalizedMessageId || !normalizedThreadId) {
+        throw new Error('channelId, messageId, and threadId are required for completed readback.');
+      }
+      const clientUserMessageId = `discord:${structuredSafeText(normalizedChannelId)}:${structuredSafeText(normalizedMessageId)}`;
+      const delivered = typeof host.hasDelivered === 'function' && await host.hasDelivered(
+        normalizedThreadId,
+        clientUserMessageId,
+      );
+      if (!delivered) {
+        return {
+          status: 'failed',
+          reason: 'structured_readback_missing',
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+          threadId: normalizedThreadId,
+        };
+      }
+      return serializeAdmission(() => withDeliveryQueueLock(config, deps, () => {
+        const queue = readDeliveryQueue(config, deps);
+        const pending = queue.items.some((item) => sameDiscordIdentity(item.normalized, {
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+        }));
+        if (pending) {
+          return {
+            status: 'failed',
+            reason: 'structured_delivery_still_pending',
+            channelId: normalizedChannelId,
+            messageId: normalizedMessageId,
+            threadId: normalizedThreadId,
+          };
+        }
+        const completedIndex = queue.completed.findIndex((item) => sameDiscordIdentity(item, {
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+        }));
+        if (completedIndex === -1) {
+          return {
+            status: 'failed',
+            reason: 'completed_delivery_not_found',
+            channelId: normalizedChannelId,
+            messageId: normalizedMessageId,
+            threadId: normalizedThreadId,
+          };
+        }
+        const existing = queue.completed[completedIndex].readbackReceipt;
+        if (existing) {
+          const matches = existing.threadId === normalizedThreadId &&
+            existing.clientUserMessageId === clientUserMessageId;
+          return {
+            status: matches ? 'confirmed' : 'failed',
+            reason: matches ? 'readback_receipt_already_persisted' : 'readback_receipt_conflict',
+            channelId: normalizedChannelId,
+            messageId: normalizedMessageId,
+            threadId: normalizedThreadId,
+            clientUserMessageId,
+          };
+        }
+        queue.completed[completedIndex] = {
+          ...queue.completed[completedIndex],
+          readbackReceipt: readbackReceipt(normalizedThreadId, clientUserMessageId, deps),
+        };
+        writeDeliveryQueue(queue, config, deps);
+        return {
+          status: 'confirmed',
+          reason: 'readback_receipt_persisted',
+          channelId: normalizedChannelId,
+          messageId: normalizedMessageId,
+          threadId: normalizedThreadId,
+          clientUserMessageId,
+        };
+      }));
     },
     coordinateReceiverOwnership(operation) {
       const coordinate = async () => {
@@ -1193,6 +1588,9 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (typeof unsubscribeActive === 'function') unsubscribeActive();
       if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
       if (typeof unsubscribeThreadClosed === 'function') unsubscribeThreadClosed();
+      if (typeof unsubscribeDeliveryProof === 'function') unsubscribeDeliveryProof();
+      if (typeof unsubscribeAssistantFinal === 'function') unsubscribeAssistantFinal();
+      replySender = null;
       clearLeaseWake();
       if (typeof host.destroy === 'function') host.destroy();
     },
@@ -1217,6 +1615,15 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       };
     });
   };
+  const recoverRepliesAutonomously = (trigger) => delivery.recoverReplies()
+    .then(() => delivery.flushReplies())
+    .catch((error) => {
+      logger('ERROR', 'Failed to recover Discord final reply automatically', {
+        trigger,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { status: 'failed', reason: 'reply_recovery_failed' };
+    });
   unsubscribeIdle = typeof host.onThreadIdle === 'function'
     ? host.onThreadIdle(() => drainAutonomously('thread_idle'))
     : null;
@@ -1224,10 +1631,32 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     ? host.onThreadActive(() => drainAutonomously('thread_active'))
     : null;
   unsubscribeReconnect = typeof host.onReconnect === 'function'
-    ? host.onReconnect(() => drainAutonomously('reconnect'))
+    ? host.onReconnect(() => Promise.all([
+      drainAutonomously('reconnect'),
+      recoverRepliesAutonomously('reconnect'),
+    ]))
     : null;
   unsubscribeThreadClosed = typeof host.onThreadClosed === 'function'
     ? host.onThreadClosed(() => drainAutonomously('thread_closed'))
+    : null;
+  unsubscribeDeliveryProof = typeof host.onDeliveryProof === 'function'
+    ? host.onDeliveryProof(() => drainAutonomously('delivery_proof'))
+    : null;
+  unsubscribeAssistantFinal = typeof host.onAssistantFinal === 'function'
+    ? host.onAssistantFinal((event) => serializeAdmission(async () => {
+      if (destroyed) return { status: 'idle', reason: 'delivery_destroyed' };
+      const stored = await persistAssistantFinal(event);
+      if (stored) return delivery.flushReplies();
+      return { status: 'idle', reason: 'assistant_final_unmatched' };
+    }).catch((error) => {
+      logger('ERROR', 'Failed to persist completed assistant final for Discord reply', {
+        threadId: event?.threadId,
+        turnId: event?.turnId,
+        itemId: event?.itemId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { status: 'failed', reason: 'reply_persistence_failed' };
+    }))
     : null;
   return delivery;
 }

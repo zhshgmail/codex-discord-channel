@@ -201,13 +201,17 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
     Partials,
   } = deps.discord || require('discord.js');
 
+  const intents = [
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+  ];
+  if (config.messageContentIntent !== false) {
+    intents.push(GatewayIntentBits.MessageContent);
+  }
+
   const client = new Client({
-    intents: [
-      GatewayIntentBits.DirectMessages,
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-    ],
+    intents,
     partials: [Partials.Channel],
   });
 
@@ -276,15 +280,80 @@ function validateDiscordMessageSend(client, args) {
   }
 }
 
+function replyProtocolError(code, message) {
+  const error = new Error(message || code);
+  error.code = code;
+  return error;
+}
+
+function expectedBotUserId(client) {
+  return String(client?.user?.id || '').trim();
+}
+
+function requireExpectedBotUserId(client, code) {
+  const botUserId = expectedBotUserId(client);
+  if (!botUserId) {
+    throw replyProtocolError(code, 'Expected Discord bot author identity is unavailable.');
+  }
+  return botUserId;
+}
+
+function isDefinitiveDiscordNoSendError(error) {
+  const status = Number(error?.status ?? error?.statusCode);
+  const code = error?.code ?? error?.rawError?.code;
+  return Number.isInteger(status)
+    && status >= 400
+    && status < 500
+    && (Number.isInteger(code) || /^\d+$/.test(String(code || '')));
+}
+
+async function fetchExactReplySource(channel, channelId, sourceMessageId) {
+  if (typeof channel?.messages?.fetch !== 'function') {
+    throw replyProtocolError(
+      'reply_source_binding_unavailable',
+      'Exact Discord reply source binding is unavailable.',
+    );
+  }
+  let source;
+  try {
+    source = await channel.messages.fetch(sourceMessageId);
+  } catch {
+    throw replyProtocolError(
+      'reply_source_binding_failed',
+      'Exact Discord reply source could not be fetched.',
+    );
+  }
+  if (
+    String(source?.id || '') !== sourceMessageId
+    || String(source?.channelId || '') !== channelId
+  ) {
+    throw replyProtocolError(
+      'reply_source_binding_mismatch',
+      'Exact Discord reply source does not belong to the target channel.',
+    );
+  }
+  return source;
+}
+
 async function prepareDiscordMessageSend(client, args) {
   validateDiscordMessageSend(client, args);
-  const channel = await client.channels.fetch(args.channelId.trim());
+  const channelId = args.channelId.trim();
+  const channel = await client.channels.fetch(channelId);
   if (!channel || typeof channel.send !== 'function') {
     throw new Error('Target channel cannot receive messages.');
   }
   const payload = { content: args.content };
+  if (typeof args.nonce === 'string' && args.nonce !== '') {
+    payload.nonce = args.nonce;
+    payload.enforceNonce = args.enforceNonce === true;
+  }
   if (typeof args.replyTo === 'string' && args.replyTo.trim() !== '') {
-    payload.reply = { messageReference: args.replyTo.trim(), failIfNotExists: false };
+    const sourceMessageId = args.replyTo.trim();
+    if (args.enforceNonce === true) {
+      requireExpectedBotUserId(client, 'reply_confirmation_author_unavailable');
+    }
+    await fetchExactReplySource(channel, channelId, sourceMessageId);
+    payload.reply = { messageReference: sourceMessageId, failIfNotExists: true };
   }
   return { channel, payload };
 }
@@ -292,18 +361,135 @@ async function prepareDiscordMessageSend(client, args) {
 async function sendDiscordMessage(client, args, prepared = null) {
   const dispatch = prepared || await prepareDiscordMessageSend(client, args);
   const { channel, payload } = dispatch;
-  const sent = await channel.send(payload);
+  let sent;
+  try {
+    sent = await channel.send(payload);
+  } catch (error) {
+    if (isDefinitiveDiscordNoSendError(error)) error.definitiveNoSend = true;
+    throw error;
+  }
+  if (
+    !sent?.id
+    || String(sent.channelId || '') !== String(args.channelId || '')
+  ) {
+    throw replyProtocolError(
+      'reply_send_response_invalid',
+      'Discord send response did not include the exact target message identity.',
+    );
+  }
+  const responseNonce = sent.nonce === null || sent.nonce === undefined
+    ? ''
+    : String(sent.nonce);
+  if (
+    args.enforceNonce === true
+    && responseNonce !== ''
+    && responseNonce !== String(args.nonce || '')
+  ) {
+    const error = replyProtocolError(
+      'reply_send_response_nonce_mismatch',
+      'Discord send response did not preserve the enforced nonce.',
+    );
+    error.replySendIdentity = {
+      channelId: String(sent.channelId),
+      messageId: String(sent.id),
+    };
+    throw error;
+  }
   return { channelId: sent.channelId, messageId: sent.id };
 }
 
+function messageReplySourceId(message) {
+  return String(message?.reference?.messageId || message?.messageReference?.messageId || '');
+}
+
+function messageMatchesStableReplyIdentity(client, message, args, expectedMessageId = '') {
+  if (!message) return false;
+  const botUserId = expectedBotUserId(client);
+  if (!botUserId) return false;
+  if (expectedMessageId && String(message.id || '') !== String(expectedMessageId)) return false;
+  if (String(message.channelId || '') !== String(args.channelId || '')) return false;
+  if (String(message.content || '') !== String(args.content || '')) return false;
+  if (messageReplySourceId(message) !== String(args.replyTo || '')) return false;
+  return String(message.author?.id || '') === botUserId;
+}
+
+function messageMatchesReplyNonce(client, message, args) {
+  const nonce = String(message?.nonce || '');
+  return nonce !== ''
+    && nonce === String(args.nonce || '')
+    && messageMatchesStableReplyIdentity(client, message, args);
+}
+
+function replyConfirmationError(code) {
+  return replyProtocolError(code);
+}
+
+async function fetchReplyMessage(channel, messageId) {
+  if (typeof channel?.messages?.fetch !== 'function') {
+    throw replyConfirmationError('reply_confirmation_unavailable');
+  }
+  try {
+    return await channel.messages.fetch(messageId);
+  } catch (error) {
+    if (error?.status === 404 || error?.statusCode === 404 || error?.code === 10008) return null;
+    throw replyConfirmationError('reply_confirmation_failed');
+  }
+}
+
+async function confirmDiscordMessage(client, args, prepared, sent) {
+  requireExpectedBotUserId(client, 'reply_confirmation_author_unavailable');
+  const channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId);
+  const message = await fetchReplyMessage(channel, sent.messageId);
+  if (!messageMatchesStableReplyIdentity(client, message, args, sent.messageId)) {
+    throw replyConfirmationError('reply_confirmation_mismatch');
+  }
+  return { channelId: String(message.channelId), messageId: String(message.id) };
+}
+
+function messageValues(collection) {
+  if (Array.isArray(collection)) return collection;
+  if (collection && typeof collection.values === 'function') return [...collection.values()];
+  return [];
+}
+
+async function reconcileDiscordMessage(client, args, prepared, receipt) {
+  requireExpectedBotUserId(client, 'reply_reconciliation_author_unavailable');
+  const channel = prepared?.channel || await client?.channels?.fetch?.(args.channelId);
+  if (!channel || typeof channel.messages?.fetch !== 'function') {
+    throw replyConfirmationError('reply_reconciliation_unavailable');
+  }
+  if (receipt?.outboundMessageId) {
+    const exact = await fetchReplyMessage(channel, receipt.outboundMessageId);
+    if (messageMatchesStableReplyIdentity(client, exact, args, receipt.outboundMessageId)) {
+      return { found: true, channelId: String(exact.channelId), messageId: String(exact.id) };
+    }
+    return { found: false };
+  }
+  let recent;
+  try {
+    recent = await channel.messages.fetch({ limit: 100 });
+  } catch {
+    throw replyConfirmationError('reply_reconciliation_failed');
+  }
+  const match = messageValues(recent).find((message) => (
+    messageMatchesReplyNonce(client, message, args)
+  ));
+  return match
+    ? { found: true, channelId: String(match.channelId), messageId: String(match.id) }
+    : { found: false };
+}
+
 module.exports = {
+  confirmDiscordMessage,
   configureNetwork,
   createDiscordMessageHandler,
   isCurrentDiscordReceiverOwnership,
   releaseDiscordReceiverOwnership,
   prepareDiscordMessageSend,
+  reconcileDiscordMessage,
   resolveReferencedMessage,
   sendDiscordMessage,
   startDiscordClient,
+  isDefinitiveDiscordNoSendError,
   validateDiscordMessageSend,
 };

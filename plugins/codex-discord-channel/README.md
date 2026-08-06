@@ -9,7 +9,27 @@ the repository [README](../../README.md).
 Multi-account deployments use one `account.env` per Discord instance. The
 repository README documents the independent `CODEX_HOME` and
 `DISCORD_CONFIG_DIR` boundaries, the fail-closed `app-server` command, and the
-bundled systemd templates.
+bundled systemd templates. The interactive `codex-discord-instance` launcher
+can bootstrap a missing isolated OpenAI login only when attached to a TTY;
+gateway and systemd paths never prompt and remain fail-closed.
+
+## Gateway Message Content Intent
+
+The gateway requests Discord's privileged Message Content intent by default,
+preserving existing instances such as `codex01`. For a bot whose Developer
+Portal configuration does not enable that intent, set this in the instance
+`.env`:
+
+```env
+DISCORD_MESSAGE_CONTENT_INTENT=false
+```
+
+This omits only `GatewayIntentBits.MessageContent`; Direct Messages, Guilds,
+and Guild Messages remain enabled. It does not relax sender, bot, channel,
+thread, or mention access checks. Use this mode for guild channel and thread
+policies with `requireMention: true`: Discord can expose mention-directed
+messages without the privileged intent, while unmentioned guild messages are
+still denied by the plugin and must not be expected to provide usable content.
 
 ## Runtime Contract
 
@@ -82,6 +102,22 @@ diagnostic steps are recorded in
 [Known Issues And Operational Boundaries](../../docs/known-issues.md).
 
 ## Checks
+
+Runtime builds use two dependency audits. The first audit checks the original
+source graph. The second serially reparses each generated artifact with pinned
+esbuild 0.28.1, externalizes every retained runtime dependency edge recognized
+by that parser,
+rejects direct computed `require(expr)` and `import(expr)`, and permits only
+canonical exact `node:` builtins verified by Node itself. Both audits must pass
+before either runtime file is published.
+
+This is the bounded **Contract A** build-dependency guarantee. It is not a
+semantic proof that arbitrary JavaScript cannot acquire a loader. Loader
+aliases, optional/call/apply forms, `createRequire`, computed
+`require.resolve(expr)`, `import.meta.resolve`, `Module._load`,
+`process.mainModule`, compile-time dead-code loads, `eval`, and `Function`
+require a separate product/runtime design. Their absence from esbuild metadata
+is a documented non-goal, never PASS evidence for a stronger closure claim.
 
 ```bash
 npm install
