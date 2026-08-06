@@ -1373,6 +1373,36 @@ class AppServerHost extends EventEmitter {
         .map((turn) => turn.id);
       if (inProgressTurnIds.length === 1) {
         this.activeTurnIds.set(thread.id, inProgressTurnIds[0]);
+      } else if (inProgressTurnIds.length > 1) {
+        let latestTurns;
+        try {
+          latestTurns = await requestForTarget('thread/turns/list', {
+            threadId: thread.id,
+            limit: 1,
+            sortDirection: 'desc',
+            itemsView: 'summary',
+          });
+        } catch (error) {
+          const reason = error?.code || 'shared_app_server_thread_unreadable';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
+        if (this.threadSelectionRevision !== threadSelectionRevision) {
+          return retryAfterRevision();
+        }
+        const latestTurn = Array.isArray(latestTurns?.data) && latestTurns.data.length === 1
+          ? latestTurns.data[0]
+          : null;
+        if (
+          latestTurn?.status === 'inProgress' &&
+          typeof latestTurn.id === 'string' &&
+          latestTurn.id !== '' &&
+          inProgressTurnIds.includes(latestTurn.id)
+        ) {
+          this.activeTurnIds.set(thread.id, latestTurn.id);
+        } else {
+          this.activeTurnIds.delete(thread.id);
+        }
       } else {
         this.activeTurnIds.delete(thread.id);
       }

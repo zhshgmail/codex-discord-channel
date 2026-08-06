@@ -271,6 +271,122 @@ test('fresh recovery selects the unique top-level root among loaded subagent thr
   );
 });
 
+test('gateway restart recovers the newest active turn when an older turn remains in progress', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-overlapping-turn-recovery-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: params.includeTurns
+            ? [
+              { id: 'turn-stale', status: 'inProgress', startedAt: 100, items: [] },
+              { id: 'turn-after-stale', status: 'completed', startedAt: 200, items: [] },
+              { id: 'turn-current', status: 'inProgress', startedAt: 300, items: [] },
+            ]
+            : [],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      assert.deepEqual(params, {
+        threadId: 'thread-root',
+        limit: 1,
+        sortDirection: 'desc',
+        itemsView: 'summary',
+      });
+      return {
+        data: [{
+          id: 'turn-current',
+          status: 'inProgress',
+          startedAt: 300,
+          items: [],
+        }],
+        nextCursor: 'older-turns',
+        backwardsCursor: 'current-turn',
+      };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-current');
+      return { turnId: 'turn-current' };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  }, () => {}, { client });
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.activeTurnId, 'turn-current');
+  await host.startTurn({
+    threadId: 'thread-root',
+    clientUserMessageId: 'discord:c1:m-overlapping-turns',
+    input: [{ type: 'text', text: 'recover exact current turn' }],
+  }, target);
+  assert.equal(
+    client.requests.some((request) => request.method === 'thread/turns/list'),
+    true,
+  );
+  const checkpoint = JSON.parse(fs.readFileSync(
+    path.join(stateDir, 'app-server-target.json'),
+    'utf8',
+  ));
+  assert.equal(checkpoint.activeTurnId, 'turn-current');
+});
+
+test('overlapping active turns stay fail closed when the newest turn is not in progress', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-overlapping-turn-closed-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: params.includeTurns
+            ? [
+              { id: 'turn-stale-a', status: 'inProgress', items: [] },
+              { id: 'turn-stale-b', status: 'inProgress', items: [] },
+            ]
+            : [],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      return {
+        data: [{ id: 'turn-newest-completed', status: 'completed', items: [] }],
+        nextCursor: 'older-turns',
+        backwardsCursor: 'newest-completed',
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  }, () => {}, { client });
+  t.after(() => host.destroy());
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-root',
+    status: 'active',
+  });
+  assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
+});
+
 test('system-error root remains the structured target while a subagent is active', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
