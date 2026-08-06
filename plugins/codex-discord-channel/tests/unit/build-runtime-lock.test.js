@@ -179,6 +179,35 @@ test('documented transient lock and package wrapper contend on the same identity
   assert.equal(enteredRows(setup.entered).length, 2);
 });
 
+test('symlinked compatibility lock is rejected without changing victim bytes, then ordinary lock succeeds', (t) => {
+  const setup = lockFixture(t);
+  const victim = path.join(setup.root, 'unrelated-victim');
+  const victimBytes = Buffer.from('must remain byte-for-byte intact\n');
+  const compatibilityLock = path.join(setup.root, 'runtime', 'codex02-discord-build-runtime.lock');
+  fs.writeFileSync(victim, victimBytes);
+  fs.symlinkSync(victim, compatibilityLock);
+
+  const rejected = spawnSync(wrapper, ['--check'], {
+    encoding: 'utf8',
+    env: setup.env,
+    timeout: 2000,
+  });
+  assert.equal(rejected.status, 72, rejected.stderr);
+  assert.match(rejected.stderr, /^build_runtime_unsafe_lock_path\n$/);
+  assert.deepEqual(fs.readFileSync(victim), victimBytes);
+  assert.equal(fs.existsSync(setup.entered), false, 'unsafe lock must fail before Node admission');
+
+  fs.unlinkSync(compatibilityLock);
+  const admitted = spawnSync(wrapper, ['--check'], {
+    encoding: 'utf8',
+    env: setup.env,
+    timeout: 2000,
+  });
+  assert.equal(admitted.status, 0, admitted.stderr);
+  assert.deepEqual(fs.readFileSync(victim), victimBytes);
+  assert.equal(enteredRows(setup.entered).length, 1);
+});
+
 test('supervisor-directed TERM waits for a slow child before cleanup and lock release', async (t) => {
   const setup = lockFixture(t);
   const holder = spawn(wrapper, ['--check'], {

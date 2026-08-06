@@ -18,25 +18,58 @@ node_bin=$(command -v node) || {
   exit 72
 }
 
-if [[ ! -e $lock_path && ! -e $compat_lock_path ]]; then
-  : >"$compat_lock_path" || exit 72
-  ln -- "$compat_lock_path" "$lock_path" 2>/dev/null || [[ -e $lock_path ]] || exit 72
-elif [[ ! -e $lock_path ]]; then
-  ln -- "$compat_lock_path" "$lock_path" 2>/dev/null || [[ -e $lock_path ]] || exit 72
-elif [[ ! -e $compat_lock_path ]]; then
-  ln -- "$lock_path" "$compat_lock_path" 2>/dev/null || [[ -e $compat_lock_path ]] || exit 72
-fi
+lock_capture_directory=$(mktemp -d "$runtime_dir/.codex-discord-lock-capture-XXXXXX") || exit 72
+chmod 700 "$lock_capture_directory" || exit 72
+lock_seed="$lock_capture_directory/seed"
+canonical_capture="$lock_capture_directory/canonical"
+compat_capture="$lock_capture_directory/compat"
+: >"$lock_seed" || exit 72
+chmod 600 "$lock_seed" || exit 72
 
-exec 8>"$compat_lock_path" || exit 72
-exec 9>"$lock_path" || exit 72
+cleanup_lock_capture() {
+  /usr/bin/find -P "$lock_capture_directory" -xdev -depth -delete
+}
+
+reject_unsafe_lock() {
+  printf 'build_runtime_unsafe_lock_path\n' >&2
+  cleanup_lock_capture >/dev/null 2>&1 || true
+  exit 72
+}
+
+capture_regular_lock() {
+  local source_path=$1
+  local capture_path=$2
+  # `ln -P` captures the directory entry itself. A symlink therefore remains
+  # a symlink inside our private directory and is rejected without opening or
+  # truncating its target. The captured regular-file inode cannot be swapped
+  # between validation and the append-only open below.
+  ln -P -- "$source_path" "$capture_path" 2>/dev/null || reject_unsafe_lock
+  [[ -f $capture_path && ! -L $capture_path ]] || reject_unsafe_lock
+}
+
+if [[ ! -e $lock_path && ! -L $lock_path ]]; then
+  ln -P -- "$lock_seed" "$lock_path" 2>/dev/null || true
+fi
+capture_regular_lock "$lock_path" "$canonical_capture"
+
+if [[ ! -e $compat_lock_path && ! -L $compat_lock_path ]]; then
+  ln -P -- "$canonical_capture" "$compat_lock_path" 2>/dev/null || true
+fi
+capture_regular_lock "$compat_lock_path" "$compat_capture"
+
+# Append mode is intentional: even after inode capture and type validation,
+# lock acquisition must never truncate shared lock bytes.
+exec 8>>"$compat_capture" || reject_unsafe_lock
+exec 9>>"$canonical_capture" || reject_unsafe_lock
 set +e
 /usr/bin/flock --nonblock --conflict-exit-code=73 8
 rc=$?
-if [[ $rc -eq 0 && $(stat -Lc '%d:%i' "$compat_lock_path") != $(stat -Lc '%d:%i' "$lock_path") ]]; then
+if [[ $rc -eq 0 && $(stat -Lc '%d:%i' "$compat_capture") != $(stat -Lc '%d:%i' "$canonical_capture") ]]; then
   /usr/bin/flock --nonblock --conflict-exit-code=73 9
   rc=$?
 fi
 set -e
+cleanup_lock_capture || exit 72
 if [[ $rc -ne 0 ]]; then
   if [[ $rc -eq 73 ]]; then
     printf 'build_runtime_already_running\n' >&2
