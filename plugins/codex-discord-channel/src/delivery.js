@@ -1066,6 +1066,30 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     }, delay);
     if (typeof leaseWakeTimer?.unref === 'function') leaseWakeTimer.unref();
   };
+  const persistAssistantFinal = (event) => withDeliveryQueueLock(config, deps, () => {
+    const queue = readDeliveryQueue(config, deps);
+    const duplicate = queue.completed.some((entry) => (
+      entry?.outbound?.itemId === event.itemId &&
+      entry?.outbound?.threadId === event.threadId &&
+      entry?.outbound?.turnId === event.turnId
+    ));
+    if (duplicate) return false;
+    const completed = queue.completed.find((entry) => (
+      entry?.outbound?.status === 'waiting' &&
+      entry.outbound.threadId === event.threadId &&
+      entry.outbound.turnId === event.turnId
+    ));
+    if (!completed) return false;
+    completed.outbound = {
+      ...completed.outbound,
+      status: 'ready',
+      itemId: event.itemId,
+      text: event.text,
+      readyAt: new Date(currentTimeMs(deps)).toISOString(),
+    };
+    writeDeliveryQueue(queue, config, deps);
+    return true;
+  });
 
   const delivery = {
     status() {
@@ -1119,7 +1143,46 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         throw new Error('Discord reply sender must be a function.');
       }
       replySender = sender;
-      return delivery.flushReplies();
+      return delivery.recoverReplies().then(() => delivery.flushReplies());
+    },
+    recoverReplies() {
+      return serializeAdmission(async () => {
+        if (destroyed) return { status: 'idle', reason: 'delivery_destroyed' };
+        if (typeof host.readAssistantFinal !== 'function') {
+          return { status: 'idle', reason: 'reply_recovery_unsupported' };
+        }
+        const candidate = await withDeliveryQueueLock(config, deps, () => {
+          const queue = readDeliveryQueue(config, deps);
+          const completed = queue.completed.find((entry) => (
+            entry?.outbound?.status === 'waiting' &&
+            typeof entry.outbound.threadId === 'string' &&
+            entry.outbound.threadId !== '' &&
+            typeof entry.outbound.turnId === 'string' &&
+            entry.outbound.turnId !== ''
+          ));
+          return completed ? {
+            threadId: completed.outbound.threadId,
+            turnId: completed.outbound.turnId,
+          } : null;
+        });
+        if (!candidate) return { status: 'idle', reason: 'reply_recovery_empty' };
+        let event;
+        try {
+          event = await host.readAssistantFinal(candidate.threadId, candidate.turnId);
+        } catch (error) {
+          logger('ERROR', 'Failed exact app-server final reply recovery', {
+            threadId: candidate.threadId,
+            turnId: candidate.turnId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return { status: 'failed', reason: 'reply_recovery_failed' };
+        }
+        if (!event) return { status: 'idle', reason: 'reply_final_not_found' };
+        const stored = await persistAssistantFinal(event);
+        return stored
+          ? { status: 'recovered', reason: 'reply_final_recovered' }
+          : { status: 'idle', reason: 'reply_final_already_recorded' };
+      });
     },
     flushReplies() {
       return serializeReply(async () => {
@@ -1435,6 +1498,15 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       };
     });
   };
+  const recoverRepliesAutonomously = (trigger) => delivery.recoverReplies()
+    .then(() => delivery.flushReplies())
+    .catch((error) => {
+      logger('ERROR', 'Failed to recover Discord final reply automatically', {
+        trigger,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { status: 'failed', reason: 'reply_recovery_failed' };
+    });
   unsubscribeIdle = typeof host.onThreadIdle === 'function'
     ? host.onThreadIdle(() => drainAutonomously('thread_idle'))
     : null;
@@ -1442,7 +1514,10 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     ? host.onThreadActive(() => drainAutonomously('thread_active'))
     : null;
   unsubscribeReconnect = typeof host.onReconnect === 'function'
-    ? host.onReconnect(() => drainAutonomously('reconnect'))
+    ? host.onReconnect(() => Promise.all([
+      drainAutonomously('reconnect'),
+      recoverRepliesAutonomously('reconnect'),
+    ]))
     : null;
   unsubscribeThreadClosed = typeof host.onThreadClosed === 'function'
     ? host.onThreadClosed(() => drainAutonomously('thread_closed'))
@@ -1453,30 +1528,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   unsubscribeAssistantFinal = typeof host.onAssistantFinal === 'function'
     ? host.onAssistantFinal((event) => serializeAdmission(async () => {
       if (destroyed) return { status: 'idle', reason: 'delivery_destroyed' };
-      const stored = await withDeliveryQueueLock(config, deps, () => {
-        const queue = readDeliveryQueue(config, deps);
-        const duplicate = queue.completed.some((entry) => (
-          entry?.outbound?.itemId === event.itemId &&
-          entry?.outbound?.threadId === event.threadId &&
-          entry?.outbound?.turnId === event.turnId
-        ));
-        if (duplicate) return false;
-        const completed = queue.completed.find((entry) => (
-          entry?.outbound?.status === 'waiting' &&
-          entry.outbound.threadId === event.threadId &&
-          entry.outbound.turnId === event.turnId
-        ));
-        if (!completed) return false;
-        completed.outbound = {
-          ...completed.outbound,
-          status: 'ready',
-          itemId: event.itemId,
-          text: event.text,
-          readyAt: new Date(currentTimeMs(deps)).toISOString(),
-        };
-        writeDeliveryQueue(queue, config, deps);
-        return true;
-      });
+      const stored = await persistAssistantFinal(event);
       if (stored) return delivery.flushReplies();
       return { status: 'idle', reason: 'assistant_final_unmatched' };
     }).catch((error) => {

@@ -3085,6 +3085,108 @@ test('completed final assistant item is exposed for durable Discord egress', asy
   }]);
 });
 
+test('production turn/completed payload exposes its exact final assistant item', async (t) => {
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`turn/completed notification must not request ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+  t.after(() => host.destroy());
+  const finals = [];
+  host.onAssistantFinal((event) => finals.push(event));
+
+  client.emit('notification', {
+    method: 'turn/completed',
+    params: {
+      threadId: DELIVERY_THREAD_ID,
+      turn: {
+        id: 'turn-production-completed',
+        items: [
+          { type: 'agentMessage', id: 'commentary-production', text: 'working', phase: 'commentary' },
+          { type: 'agentMessage', id: 'final-production', text: 'ACK', phase: 'final_answer' },
+        ],
+        itemsView: { type: 'full' },
+        status: 'completed',
+        error: null,
+        startedAt: 1,
+        completedAt: 2,
+        durationMs: 1000,
+      },
+    },
+  });
+
+  assert.deepEqual(finals, [{
+    threadId: DELIVERY_THREAD_ID,
+    turnId: 'turn-production-completed',
+    itemId: 'final-production',
+    text: 'ACK',
+  }]);
+});
+
+test('exact final readback fails closed on thread turn and final ambiguity', async (t) => {
+  const cases = [
+    {
+      name: 'wrong thread',
+      thread: { id: OTHER_DELIVERY_THREAD_ID, turns: [] },
+    },
+    {
+      name: 'missing turn',
+      thread: { id: DELIVERY_THREAD_ID, turns: [] },
+    },
+    {
+      name: 'duplicate exact turn',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [
+          { id: 'turn-exact-final', items: [] },
+          { id: 'turn-exact-final', items: [] },
+        ],
+      },
+    },
+    {
+      name: 'no final answer',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [{
+          id: 'turn-exact-final',
+          items: [{ type: 'agentMessage', id: 'commentary-only', text: 'working', phase: 'commentary' }],
+        }],
+      },
+    },
+    {
+      name: 'multiple final answers',
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        turns: [{
+          id: 'turn-exact-final',
+          items: [
+            { type: 'agentMessage', id: 'final-a', text: 'A', phase: 'final_answer' },
+            { type: 'agentMessage', id: 'final-b', text: 'B', phase: 'final_answer' },
+          ],
+        }],
+      },
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const client = new FakeRpcClient(async (method, params) => {
+        assert.equal(method, 'thread/read');
+        assert.deepEqual(params, { threadId: DELIVERY_THREAD_ID, includeTurns: true });
+        return { thread: entry.thread };
+      });
+      const host = createAppServerHost(
+        { appServerUrl: 'wss://remote.example.invalid/rpc' },
+        () => {},
+        { client },
+      );
+      subtest.after(() => host.destroy());
+      assert.equal(
+        await host.readAssistantFinal(DELIVERY_THREAD_ID, 'turn-exact-final'),
+        null,
+      );
+    });
+  }
+});
+
 test('lifecycle signal without durable rollout evidence does not prove delivery', async (t) => {
   const clientId = 'discord:c1:m-signal-only';
   const { codexHome } = createRolloutFixture(t, [sessionMeta()]);

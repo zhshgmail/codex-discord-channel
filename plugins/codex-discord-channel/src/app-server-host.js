@@ -93,6 +93,33 @@ function deliveryProofKey(threadId, clientUserMessageId) {
   return JSON.stringify([threadId, clientUserMessageId]);
 }
 
+function finalAssistantFromTurn(threadId, turn) {
+  if (
+    typeof threadId !== 'string' ||
+    threadId === '' ||
+    typeof turn?.id !== 'string' ||
+    turn.id === '' ||
+    !Array.isArray(turn.items)
+  ) {
+    return null;
+  }
+  const finals = turn.items.filter((item) => (
+    item?.type === 'agentMessage' &&
+    item.phase === 'final_answer' &&
+    typeof item.id === 'string' &&
+    item.id !== '' &&
+    typeof item.text === 'string' &&
+    item.text !== ''
+  ));
+  if (finals.length !== 1) return null;
+  return {
+    threadId,
+    turnId: turn.id,
+    itemId: finals[0].id,
+    text: finals[0].text,
+  };
+}
+
 function isLocalAppServer(endpoint) {
   const value = String(endpoint || '').trim();
   if (value.startsWith('unix://')) return true;
@@ -794,8 +821,11 @@ class AppServerHost extends EventEmitter {
       }
       if (notification?.method === 'turn/completed') {
         const threadId = notification.params?.threadId;
-        const turnId = notification.params?.turn?.id;
+        const turn = notification.params?.turn;
+        const turnId = turn?.id;
         if (!threadId) return;
+        const assistantFinal = finalAssistantFromTurn(threadId, turn);
+        if (assistantFinal) this.emit('assistantFinal', assistantFinal);
         if (!turnId || this.activeTurnIds.get(threadId) === turnId) {
           this.activeTurnIds.delete(threadId);
         }
@@ -1536,6 +1566,45 @@ class AppServerHost extends EventEmitter {
         item?.type === 'userMessage' && item.clientId === clientUserMessageId
       ))
     ));
+  }
+
+  async readAssistantFinal(threadId, turnId) {
+    if (
+      typeof threadId !== 'string' ||
+      threadId === '' ||
+      typeof turnId !== 'string' ||
+      turnId === ''
+    ) {
+      return null;
+    }
+    const params = { threadId, includeTurns: true };
+    let threadSelectionRevision;
+    let response;
+    if (typeof this.client.requestOnConnection === 'function') {
+      await this.client.ensureConnected();
+      threadSelectionRevision = this.threadSelectionRevision;
+      response = (await this.client.requestOnConnection(
+        'thread/read',
+        params,
+        this.client.connectionGeneration,
+        null,
+        false,
+      )).result;
+    } else {
+      threadSelectionRevision = this.threadSelectionRevision;
+      response = await this.client.request('thread/read', params);
+    }
+    if (this.threadSelectionRevision !== threadSelectionRevision) {
+      throw deliveryError(
+        'The current app-server thread changed during final reply reconciliation.',
+        'shared_app_server_thread_changed',
+      );
+    }
+    const thread = response?.thread;
+    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
+    const turns = thread.turns.filter((turn) => turn?.id === turnId);
+    if (turns.length !== 1) return null;
+    return finalAssistantFromTurn(threadId, turns[0]);
   }
 
   async hasDelivered(threadId, clientUserMessageId) {

@@ -1890,7 +1890,7 @@ test('active-turn final persists stable outbound acknowledgement and exact readb
     activeTurnId: 'turn-active-final',
   });
   const sends = [];
-  fixture.delivery.activateReplySender(async (reply) => {
+  await fixture.delivery.activateReplySender(async (reply) => {
     sends.push(reply);
     return {
       status: 'confirmed',
@@ -1940,7 +1940,7 @@ test('uncertain final retry and gateway restart use one stable outbound identity
       },
     };
   };
-  fixture.delivery.activateReplySender(sender);
+  await fixture.delivery.activateReplySender(sender);
   await fixture.emitAssistantFinal(
     'thread-current',
     'turn-restart-final',
@@ -1958,7 +1958,7 @@ test('uncertain final retry and gateway restart use one stable outbound identity
       destroy() {},
     },
   });
-  recovered.activateReplySender(sender);
+  await recovered.activateReplySender(sender);
   await recovered.flushReplies();
   await recovered.flushReplies();
 
@@ -2021,7 +2021,7 @@ test('ack-uncertain active-turn reconciliation preserves exact turn for restart-
       },
     };
   };
-  fixture.delivery.activateReplySender(sender);
+  await fixture.delivery.activateReplySender(sender);
   await fixture.emitAssistantFinal(
     'thread-current',
     'turn-active-reconciled',
@@ -2049,6 +2049,85 @@ test('ack-uncertain active-turn reconciliation preserves exact turn for restart-
     messageId: 'discord-out-reconciled',
   });
   recovered.destroy();
+});
+
+test('gateway startup recovers a missed production final by exact stored thread and turn', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-final-startup-recovery-'));
+  writePendingQueue(dir, [], {
+    completed: [{
+      channelId: 'c1',
+      messageId: 'm-final-startup-recovery',
+      completedAt: '2026-08-06T17:12:30.000Z',
+      readbackReceipt: {
+        version: 1,
+        threadId: ROLLOUT_THREAD_ID,
+        clientUserMessageId: 'discord:c1:m-final-startup-recovery',
+        verifiedAt: '2026-08-06T17:12:31.000Z',
+      },
+      outbound: {
+        version: 1,
+        threadId: ROLLOUT_THREAD_ID,
+        turnId: 'turn-live-final',
+        status: 'waiting',
+        stableClientMessageId: replyNonce('c1', 'm-final-startup-recovery'),
+      },
+    }],
+  });
+  const client = new EventEmitter();
+  const requests = [];
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    assert.equal(method, 'thread/read');
+    assert.deepEqual(params, { threadId: ROLLOUT_THREAD_ID, includeTurns: true });
+    return {
+      thread: {
+        id: ROLLOUT_THREAD_ID,
+        turns: [{
+          id: 'turn-live-final',
+          items: [{
+            type: 'agentMessage',
+            id: 'final-live-item',
+            text: 'ACK',
+            phase: 'final_answer',
+          }],
+        }],
+      },
+    };
+  };
+  const host = createAppServerHost(
+    { appServerUrl: 'wss://remote.example.invalid/rpc' },
+    () => {},
+    { client },
+  );
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, { structuredHost: host });
+  const sends = [];
+  await delivery.activateReplySender(async (reply) => {
+    sends.push(reply);
+    return {
+      status: 'confirmed',
+      channelId: reply.channelId,
+      messageId: 'discord-out-startup-recovery',
+      readbackReceipt: {
+        channelId: reply.channelId,
+        messageId: 'discord-out-startup-recovery',
+      },
+    };
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0].sourceMessageId, 'm-final-startup-recovery');
+  assert.equal(sends[0].turnId, 'turn-live-final');
+  const outbound = readQueue(dir).completed[0].outbound;
+  assert.equal(outbound.status, 'confirmed');
+  assert.equal(outbound.itemId, 'final-live-item');
+  assert.equal(outbound.outboundMessageId, 'discord-out-startup-recovery');
+  assert.deepEqual(outbound.readbackReceipt, {
+    channelId: 'c1',
+    messageId: 'discord-out-startup-recovery',
+  });
+  delivery.destroy();
 });
 
 test('legacy completed identity gains one exact-thread receipt without rebuilding the queue', async () => {

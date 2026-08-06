@@ -3090,6 +3090,17 @@ var require_app_server_host = __commonJS({
     function deliveryProofKey(threadId, clientUserMessageId) {
       return JSON.stringify([threadId, clientUserMessageId]);
     }
+    function finalAssistantFromTurn(threadId, turn) {
+      if (typeof threadId != "string" || threadId === "" || typeof turn?.id != "string" || turn.id === "" || !Array.isArray(turn.items))
+        return null;
+      let finals = turn.items.filter((item) => item?.type === "agentMessage" && item.phase === "final_answer" && typeof item.id == "string" && item.id !== "" && typeof item.text == "string" && item.text !== "");
+      return finals.length !== 1 ? null : {
+        threadId,
+        turnId: turn.id,
+        itemId: finals[0].id,
+        text: finals[0].text
+      };
+    }
     function isLocalAppServer(endpoint) {
       let value = String(endpoint || "").trim();
       if (value.startsWith("unix://")) return !0;
@@ -3520,9 +3531,10 @@ var require_app_server_host = __commonJS({
             return;
           }
           if (notification?.method === "turn/completed") {
-            let threadId = notification.params?.threadId, turnId = notification.params?.turn?.id;
+            let threadId = notification.params?.threadId, turn = notification.params?.turn, turnId = turn?.id;
             if (!threadId) return;
-            (!turnId || this.activeTurnIds.get(threadId) === turnId) && this.activeTurnIds.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (!turnId || this.timeoutRecoveryTarget.turnId === turnId) && (this.timeoutRecoveryTarget = null), threadId === this.currentThreadId && (this.threadSelectionRevision += 1, this.clearTargetCheckpoint(), this.restoredTargetCheckpoint = null);
+            let assistantFinal = finalAssistantFromTurn(threadId, turn);
+            assistantFinal && this.emit("assistantFinal", assistantFinal), (!turnId || this.activeTurnIds.get(threadId) === turnId) && this.activeTurnIds.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (!turnId || this.timeoutRecoveryTarget.turnId === turnId) && (this.timeoutRecoveryTarget = null), threadId === this.currentThreadId && (this.threadSelectionRevision += 1, this.clearTargetCheckpoint(), this.restoredTargetCheckpoint = null);
             return;
           }
           if (notification?.method === "thread/status/changed" && notification.params?.threadId) {
@@ -3917,6 +3929,26 @@ var require_app_server_host = __commonJS({
           );
         let thread = response?.thread;
         return thread?.id !== threadId || !Array.isArray(thread.turns) ? !1 : thread.turns.some((turn) => (Array.isArray(turn?.items) ? turn.items : []).some((item) => item?.type === "userMessage" && item.clientId === clientUserMessageId));
+      }
+      async readAssistantFinal(threadId, turnId) {
+        if (typeof threadId != "string" || threadId === "" || typeof turnId != "string" || turnId === "")
+          return null;
+        let params = { threadId, includeTurns: !0 }, threadSelectionRevision, response;
+        if (typeof this.client.requestOnConnection == "function" ? (await this.client.ensureConnected(), threadSelectionRevision = this.threadSelectionRevision, response = (await this.client.requestOnConnection(
+          "thread/read",
+          params,
+          this.client.connectionGeneration,
+          null,
+          !1
+        )).result) : (threadSelectionRevision = this.threadSelectionRevision, response = await this.client.request("thread/read", params)), this.threadSelectionRevision !== threadSelectionRevision)
+          throw deliveryError(
+            "The current app-server thread changed during final reply reconciliation.",
+            "shared_app_server_thread_changed"
+          );
+        let thread = response?.thread;
+        if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
+        let turns = thread.turns.filter((turn) => turn?.id === turnId);
+        return turns.length !== 1 ? null : finalAssistantFromTurn(threadId, turns[0]);
       }
       async hasDelivered(threadId, clientUserMessageId) {
         if (typeof threadId != "string" || threadId === "" || typeof clientUserMessageId != "string" || clientUserMessageId === "")
@@ -5427,7 +5459,18 @@ ${normalized.content}${attachmentText}
         clearLeaseWake();
         let delay = Math.max(1, Math.min(retryAt - currentTimeMs(deps), MAX_TIMER_DELAY_MS)), schedule = deps.setTimeout || setTimeout;
         leaseWakeAt = retryAt, leaseWakeTimer = schedule(() => (leaseWakeTimer = null, leaseWakeAt = 0, drainAutonomously("delivery_lease_expired")), delay), typeof leaseWakeTimer?.unref == "function" && leaseWakeTimer.unref();
-      }, delivery = {
+      }, persistAssistantFinal = (event) => withDeliveryQueueLock(config, deps, () => {
+        let queue = readDeliveryQueue(config, deps);
+        if (queue.completed.some((entry) => entry?.outbound?.itemId === event.itemId && entry?.outbound?.threadId === event.threadId && entry?.outbound?.turnId === event.turnId)) return !1;
+        let completed = queue.completed.find((entry) => entry?.outbound?.status === "waiting" && entry.outbound.threadId === event.threadId && entry.outbound.turnId === event.turnId);
+        return completed ? (completed.outbound = {
+          ...completed.outbound,
+          status: "ready",
+          itemId: event.itemId,
+          text: event.text,
+          readyAt: new Date(currentTimeMs(deps)).toISOString()
+        }, writeDeliveryQueue(queue, config, deps), !0) : !1;
+      }), delivery = {
         status() {
           return host.status();
         },
@@ -5469,7 +5512,33 @@ ${normalized.content}${attachmentText}
         activateReplySender(sender) {
           if (typeof sender != "function")
             throw new Error("Discord reply sender must be a function.");
-          return replySender = sender, delivery.flushReplies();
+          return replySender = sender, delivery.recoverReplies().then(() => delivery.flushReplies());
+        },
+        recoverReplies() {
+          return serializeAdmission(async () => {
+            if (destroyed) return { status: "idle", reason: "delivery_destroyed" };
+            if (typeof host.readAssistantFinal != "function")
+              return { status: "idle", reason: "reply_recovery_unsupported" };
+            let candidate = await withDeliveryQueueLock(config, deps, () => {
+              let completed = readDeliveryQueue(config, deps).completed.find((entry) => entry?.outbound?.status === "waiting" && typeof entry.outbound.threadId == "string" && entry.outbound.threadId !== "" && typeof entry.outbound.turnId == "string" && entry.outbound.turnId !== "");
+              return completed ? {
+                threadId: completed.outbound.threadId,
+                turnId: completed.outbound.turnId
+              } : null;
+            });
+            if (!candidate) return { status: "idle", reason: "reply_recovery_empty" };
+            let event;
+            try {
+              event = await host.readAssistantFinal(candidate.threadId, candidate.turnId);
+            } catch (error) {
+              return logger("ERROR", "Failed exact app-server final reply recovery", {
+                threadId: candidate.threadId,
+                turnId: candidate.turnId,
+                error: error instanceof Error ? error.message : String(error)
+              }), { status: "failed", reason: "reply_recovery_failed" };
+            }
+            return event ? await persistAssistantFinal(event) ? { status: "recovered", reason: "reply_final_recovered" } : { status: "idle", reason: "reply_final_already_recorded" } : { status: "idle", reason: "reply_final_not_found" };
+          });
         },
         flushReplies() {
           return serializeReply(async () => {
@@ -5692,19 +5761,14 @@ ${normalized.content}${attachmentText}
           status: "failed",
           reason: "shared_app_server_unavailable"
         }));
-      };
-      return unsubscribeIdle = typeof host.onThreadIdle == "function" ? host.onThreadIdle(() => drainAutonomously("thread_idle")) : null, unsubscribeActive = typeof host.onThreadActive == "function" ? host.onThreadActive(() => drainAutonomously("thread_active")) : null, unsubscribeReconnect = typeof host.onReconnect == "function" ? host.onReconnect(() => drainAutonomously("reconnect")) : null, unsubscribeThreadClosed = typeof host.onThreadClosed == "function" ? host.onThreadClosed(() => drainAutonomously("thread_closed")) : null, unsubscribeDeliveryProof = typeof host.onDeliveryProof == "function" ? host.onDeliveryProof(() => drainAutonomously("delivery_proof")) : null, unsubscribeAssistantFinal = typeof host.onAssistantFinal == "function" ? host.onAssistantFinal((event) => serializeAdmission(async () => destroyed ? { status: "idle", reason: "delivery_destroyed" } : await withDeliveryQueueLock(config, deps, () => {
-        let queue = readDeliveryQueue(config, deps);
-        if (queue.completed.some((entry) => entry?.outbound?.itemId === event.itemId && entry?.outbound?.threadId === event.threadId && entry?.outbound?.turnId === event.turnId)) return !1;
-        let completed = queue.completed.find((entry) => entry?.outbound?.status === "waiting" && entry.outbound.threadId === event.threadId && entry.outbound.turnId === event.turnId);
-        return completed ? (completed.outbound = {
-          ...completed.outbound,
-          status: "ready",
-          itemId: event.itemId,
-          text: event.text,
-          readyAt: new Date(currentTimeMs(deps)).toISOString()
-        }, writeDeliveryQueue(queue, config, deps), !0) : !1;
-      }) ? delivery.flushReplies() : { status: "idle", reason: "assistant_final_unmatched" }).catch((error) => (logger("ERROR", "Failed to persist completed assistant final for Discord reply", {
+      }, recoverRepliesAutonomously = (trigger) => delivery.recoverReplies().then(() => delivery.flushReplies()).catch((error) => (logger("ERROR", "Failed to recover Discord final reply automatically", {
+        trigger,
+        error: error instanceof Error ? error.message : String(error)
+      }), { status: "failed", reason: "reply_recovery_failed" }));
+      return unsubscribeIdle = typeof host.onThreadIdle == "function" ? host.onThreadIdle(() => drainAutonomously("thread_idle")) : null, unsubscribeActive = typeof host.onThreadActive == "function" ? host.onThreadActive(() => drainAutonomously("thread_active")) : null, unsubscribeReconnect = typeof host.onReconnect == "function" ? host.onReconnect(() => Promise.all([
+        drainAutonomously("reconnect"),
+        recoverRepliesAutonomously("reconnect")
+      ])) : null, unsubscribeThreadClosed = typeof host.onThreadClosed == "function" ? host.onThreadClosed(() => drainAutonomously("thread_closed")) : null, unsubscribeDeliveryProof = typeof host.onDeliveryProof == "function" ? host.onDeliveryProof(() => drainAutonomously("delivery_proof")) : null, unsubscribeAssistantFinal = typeof host.onAssistantFinal == "function" ? host.onAssistantFinal((event) => serializeAdmission(async () => destroyed ? { status: "idle", reason: "delivery_destroyed" } : await persistAssistantFinal(event) ? delivery.flushReplies() : { status: "idle", reason: "assistant_final_unmatched" }).catch((error) => (logger("ERROR", "Failed to persist completed assistant final for Discord reply", {
         threadId: event?.threadId,
         turnId: event?.turnId,
         itemId: event?.itemId,
