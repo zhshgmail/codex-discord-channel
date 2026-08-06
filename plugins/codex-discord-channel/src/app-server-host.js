@@ -10,6 +10,7 @@ const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
 const MAX_TARGET_RESOLUTION_RESTARTS = 4;
 const MAX_VERIFIED_USER_MESSAGES = 256;
+const MAX_LIFECYCLE_PROOF_SIGNALS = 256;
 const MAX_ROLLOUT_SEARCH_DEPTH = 4;
 const MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096;
 const MAX_ROLLOUT_SEARCH_ENTRIES = 65536;
@@ -678,6 +679,7 @@ class AppServerHost extends EventEmitter {
     this.activeTurnIds = new Map();
     this.knownLoadedThreadIds = new Set();
     this.verifiedUserMessages = new Map();
+    this.lifecycleProofSignals = new Map();
     this.deliveryWaiters = new Map();
     this.destroyed = false;
     this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
@@ -719,6 +721,22 @@ class AppServerHost extends EventEmitter {
           typeof item.clientId === 'string' &&
           item.clientId !== ''
         ) {
+          this.rememberLifecycleProofSignal(threadId, item.clientId);
+          const turnId = notification.params?.turnId;
+          if (
+            notification.method === 'item/started' &&
+            typeof turnId === 'string' &&
+            turnId !== '' &&
+            threadId === this.currentThreadId &&
+            this.loadedInventoryProven &&
+            this.knownLoadedThreadIds.has(threadId) &&
+            this.activeTurnIds.get(threadId) !== turnId
+          ) {
+            this.threadSelectionRevision += 1;
+            this.threadStatuses.set(threadId, 'active');
+            this.activeTurnIds.set(threadId, turnId);
+            this.persistTargetCheckpoint();
+          }
           const proof = { threadId, clientUserMessageId: item.clientId };
           this.wakeDeliveryWaiters(threadId, item.clientId);
           this.emit('deliveryProof', proof);
@@ -877,10 +895,20 @@ class AppServerHost extends EventEmitter {
 
   rememberVerifiedUserMessage(threadId, clientUserMessageId) {
     const key = deliveryProofKey(threadId, clientUserMessageId);
+    this.lifecycleProofSignals.delete(key);
     this.verifiedUserMessages.delete(key);
     this.verifiedUserMessages.set(key, true);
     while (this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES) {
       this.verifiedUserMessages.delete(this.verifiedUserMessages.keys().next().value);
+    }
+  }
+
+  rememberLifecycleProofSignal(threadId, clientUserMessageId) {
+    const key = deliveryProofKey(threadId, clientUserMessageId);
+    this.lifecycleProofSignals.delete(key);
+    this.lifecycleProofSignals.set(key, true);
+    while (this.lifecycleProofSignals.size > MAX_LIFECYCLE_PROOF_SIGNALS) {
+      this.lifecycleProofSignals.delete(this.lifecycleProofSignals.keys().next().value);
     }
   }
 
@@ -1565,6 +1593,9 @@ class AppServerHost extends EventEmitter {
       close: resolveClosed,
     };
     this.addDeliveryWaiter(proofKey, waiter);
+    if (this.lifecycleProofSignals.has(proofKey)) {
+      void requestSignalVerification();
+    }
     const AbortControllerClass = globalThis.AbortController;
     const readAbort = AbortControllerClass ? new AbortControllerClass() : null;
 
@@ -1632,6 +1663,7 @@ class AppServerHost extends EventEmitter {
 
   destroy() {
     this.destroyed = true;
+    this.lifecycleProofSignals.clear();
     for (const waiters of this.deliveryWaiters.values()) {
       for (const waiter of [...waiters]) waiter.close();
     }

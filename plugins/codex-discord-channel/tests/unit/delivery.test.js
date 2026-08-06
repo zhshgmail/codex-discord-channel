@@ -885,6 +885,82 @@ test('matching lifecycle signal plus rollout evidence completes without a full t
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-item-ack']);
 });
 
+test('active-turn steer with an early lifecycle signal persists one exact ACK', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-early-proof-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { codexHome, rolloutPath } = createDeliveryRollout(t);
+  const client = new EventEmitter();
+  const requests = [];
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === 'thread/loaded/list') {
+      return { data: [ROLLOUT_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{ id: 'turn-active', status: 'inProgress', items: [] }],
+        },
+      };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-active');
+      client.emit('notification', {
+        method: 'item/started',
+        params: {
+          threadId: params.threadId,
+          turnId: 'turn-active',
+          item: { type: 'userMessage', clientId: params.clientUserMessageId },
+        },
+      });
+      setTimeout(() => {
+        fs.appendFileSync(rolloutPath, `${JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            client_id: params.clientUserMessageId,
+          },
+        })}\n`);
+      }, 10);
+      return { turnId: 'turn-active' };
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  const logs = [];
+  const host = createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+    env: { CODEX_HOME: codexHome, HOME: path.dirname(codexHome) },
+    paths: { stateDir: dir },
+  }, () => {}, { client, lifecycleProofRetryDelaysMs: [0, 25, 75] });
+  const delivery = createDelivery(deliveryConfig(dir), (level, message, meta) => {
+    logs.push({ level, message, meta });
+  }, { structuredHost: host });
+  t.after(() => delivery.destroy());
+  await delivery.activateReceiver(activeReceiver);
+
+  const delivered = await delivery.deliver(discordMessage('m-active-early', 'visible once'));
+  const duplicate = await delivery.deliver(discordMessage('m-active-early', 'visible once'));
+
+  assert.equal(delivered.status, 'delivered');
+  assert.equal(delivered.reason, 'turn_accepted');
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(requests.filter((request) => request.method === 'turn/steer').length, 1);
+  assert.equal(logs.some((entry) => entry.meta?.reason === 'structured_ack_uncertain'), false);
+  const queue = readQueue(dir);
+  assert.deepEqual(queue.items, []);
+  assert.equal(queue.completed.length, 1);
+  assert.deepEqual(queue.completed[0].readbackReceipt, {
+    version: 1,
+    threadId: ROLLOUT_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-active-early',
+    verifiedAt: queue.completed[0].readbackReceipt.verifiedAt,
+  });
+});
+
 test('busy target drains one FIFO item per idle transition and dynamically follows rotation', async () => {
   const fixture = structuredFixture({
     onStartTurn(_params, controls) {
@@ -1728,7 +1804,17 @@ test('unpersisted successful response reconciles later without replay', async ()
   assert.equal(reconciled.reason, 'turn_already_accepted');
   assert.equal(starts, 1);
   assert.deepEqual(readQueue(fixture.dir).items, []);
-  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-delayed']);
+  const queue = readQueue(fixture.dir);
+  assert.deepEqual(queue.completed.map((item) => item.messageId), ['m-delayed']);
+  assert.equal(queue.completed[0].readbackReceipt.threadId, 'thread-current');
+  assert.equal(
+    queue.completed[0].readbackReceipt.clientUserMessageId,
+    'discord:c1:m-delayed',
+  );
+  const duplicate = await fixture.delivery.deliver(discordMessage('m-delayed', 'once'));
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(starts, 1);
+  assert.equal(readQueue(fixture.dir).completed.length, 1);
 });
 
 test('active-turn durable proof wakes exact readback commit without replay', async () => {
@@ -1910,6 +1996,10 @@ test('post-accept uncertainty persists replay identity and reconciles after rest
     threadId: 'thread-current',
     clientUserMessageId: 'discord:c1:m-post-accept',
   }]);
+  const duplicate = await recovered.deliver(discordMessage('m-post-accept', 'once'));
+  assert.equal(duplicate.status, 'duplicate');
+  assert.equal(replayStarts, 0);
+  assert.equal(readQueue(fixture.dir).completed.length, 1);
   recovered.destroy();
 });
 

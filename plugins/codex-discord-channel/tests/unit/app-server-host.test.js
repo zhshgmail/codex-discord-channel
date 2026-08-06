@@ -2669,6 +2669,96 @@ test('signal before hasDelivered plus exact rollout proof completes without thre
   assert.deepEqual(client.requests, []);
 });
 
+test('signal before hasDelivered retains a bounded retry until exact proof becomes durable', async (t) => {
+  const clientId = 'discord:c1:m-signal-before-durable';
+  let proofDurable = false;
+  let verificationCalls = 0;
+  let firstVerificationFinished;
+  const firstVerification = new Promise((resolve) => {
+    firstVerificationFinished = resolve;
+  });
+  const client = new FakeRpcClient(async (method, params) => {
+    assert.equal(method, 'thread/read');
+    return { thread: { id: params.threadId, turns: [] } };
+  });
+  const host = createAppServerHost({}, () => {}, {
+    client,
+    lifecycleProofRetryDelaysMs: [20],
+    verifyRolloutDelivery: async () => {
+      verificationCalls += 1;
+      if (verificationCalls === 1) firstVerificationFinished();
+      return proofDurable;
+    },
+  });
+  t.after(() => host.destroy());
+
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+  const delivered = host.hasDelivered(DELIVERY_THREAD_ID, clientId);
+  await firstVerification;
+  proofDurable = true;
+
+  assert.equal(await delivered, true);
+  assert.equal(verificationCalls, 2);
+  assert.equal(client.requests.length, 1);
+});
+
+test('user-item start refreshes the exact active turn used by subsequent steer', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-item-turn-refresh-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{ id: 'turn-stale', status: 'inProgress', items: [] }],
+        },
+      };
+    }
+    if (method === 'turn/steer') {
+      assert.equal(params.expectedTurnId, 'turn-current');
+      return { turnId: params.expectedTurnId };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  }, () => {}, { client });
+  t.after(() => host.destroy());
+
+  const stale = await host.resolveTarget();
+  assert.equal(stale.activeTurnId, 'turn-stale');
+  const notification = userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    'discord:c1:m-current-turn',
+  );
+  notification.params.turnId = 'turn-current';
+  client.emit('notification', notification);
+
+  const current = await host.resolveTarget();
+  assert.equal(current.activeTurnId, 'turn-current');
+  await host.startTurn({
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-after-refresh',
+    input: [{ type: 'text', text: 'after refresh' }],
+  }, current);
+  const checkpoint = JSON.parse(fs.readFileSync(
+    path.join(stateDir, 'app-server-target.json'),
+    'utf8',
+  ));
+  assert.equal(checkpoint.activeTurnId, 'turn-current');
+});
+
 test('user-item lifecycle signal is exposed as an exact delivery-proof wake', async (t) => {
   const client = new FakeRpcClient(async (method) => {
     throw new Error(`delivery-proof wake must not request ${method}`);
