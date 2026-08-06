@@ -3771,7 +3771,27 @@ var require_app_server_host = __commonJS({
         }
         if (this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, status), status === "active") {
           let inProgressTurnIds = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id);
-          inProgressTurnIds.length === 1 ? this.activeTurnIds.set(thread.id, inProgressTurnIds[0]) : this.activeTurnIds.delete(thread.id);
+          if (inProgressTurnIds.length === 1)
+            this.activeTurnIds.set(thread.id, inProgressTurnIds[0]);
+          else if (inProgressTurnIds.length > 1) {
+            let latestTurns;
+            try {
+              latestTurns = await requestForTarget("thread/turns/list", {
+                threadId: thread.id,
+                limit: 1,
+                sortDirection: "desc",
+                itemsView: "summary"
+              });
+            } catch (error) {
+              let reason = error?.code || "shared_app_server_thread_unreadable";
+              return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+            }
+            if (this.threadSelectionRevision !== threadSelectionRevision)
+              return retryAfterRevision();
+            let latestTurn = Array.isArray(latestTurns?.data) && latestTurns.data.length === 1 ? latestTurns.data[0] : null;
+            latestTurn?.status === "inProgress" && typeof latestTurn.id == "string" && latestTurn.id !== "" && inProgressTurnIds.includes(latestTurn.id) ? this.activeTurnIds.set(thread.id, latestTurn.id) : this.activeTurnIds.delete(thread.id);
+          } else
+            this.activeTurnIds.delete(thread.id);
         } else
           this.activeTurnIds.delete(thread.id);
         this.lastStatus = { configured: !0, available: !0, reason: null };
