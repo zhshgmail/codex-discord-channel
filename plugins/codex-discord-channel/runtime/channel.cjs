@@ -3093,8 +3093,8 @@ var require_app_server_host = __commonJS({
     function finalAssistantFromTurn(threadId, turn) {
       if (typeof threadId != "string" || threadId === "" || typeof turn?.id != "string" || turn.id === "" || !Array.isArray(turn.items))
         return null;
-      let finals = turn.items.filter((item) => item?.type === "agentMessage" && item.phase === "final_answer" && typeof item.id == "string" && item.id !== "" && typeof item.text == "string" && item.text !== "");
-      return finals.length !== 1 ? null : {
+      let finals = turn.items.filter((item) => item?.type === "agentMessage" && item.phase === "final_answer");
+      return finals.length !== 1 || typeof finals[0].id != "string" || finals[0].id === "" || typeof finals[0].text != "string" || finals[0].text === "" ? null : {
         threadId,
         turnId: turn.id,
         itemId: finals[0].id,
@@ -3931,8 +3931,14 @@ var require_app_server_host = __commonJS({
         return thread?.id !== threadId || !Array.isArray(thread.turns) ? !1 : thread.turns.some((turn) => (Array.isArray(turn?.items) ? turn.items : []).some((item) => item?.type === "userMessage" && item.clientId === clientUserMessageId));
       }
       async readAssistantFinal(threadId, turnId) {
-        if (typeof threadId != "string" || threadId === "" || typeof turnId != "string" || turnId === "")
-          return null;
+        let finals = await this.readAssistantFinals(threadId, [turnId]);
+        return finals.length === 1 ? finals[0] : null;
+      }
+      async readAssistantFinals(threadId, turnIds) {
+        if (typeof threadId != "string" || threadId === "" || !Array.isArray(turnIds) || turnIds.some((turnId) => typeof turnId != "string" || turnId === ""))
+          return [];
+        let requestedTurnIds = Array.from(new Set(turnIds));
+        if (requestedTurnIds.length === 0) return [];
         let params = { threadId, includeTurns: !0 }, threadSelectionRevision, response;
         if (typeof this.client.requestOnConnection == "function" ? (await this.client.ensureConnected(), threadSelectionRevision = this.threadSelectionRevision, response = (await this.client.requestOnConnection(
           "thread/read",
@@ -3946,9 +3952,18 @@ var require_app_server_host = __commonJS({
             "shared_app_server_thread_changed"
           );
         let thread = response?.thread;
-        if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
-        let turns = thread.turns.filter((turn) => turn?.id === turnId);
-        return turns.length !== 1 ? null : finalAssistantFromTurn(threadId, turns[0]);
+        if (thread?.id !== threadId || !Array.isArray(thread.turns)) return [];
+        let requested = new Set(requestedTurnIds), turnsById = new Map(requestedTurnIds.map((turnId) => [turnId, []]));
+        for (let turn of thread.turns)
+          requested.has(turn?.id) && turnsById.get(turn.id).push(turn);
+        let finals = [];
+        for (let turnId of requestedTurnIds) {
+          let turns = turnsById.get(turnId);
+          if (turns.length !== 1) continue;
+          let final = finalAssistantFromTurn(threadId, turns[0]);
+          final && finals.push(final);
+        }
+        return finals;
       }
       async hasDelivered(threadId, clientUserMessageId) {
         if (typeof threadId != "string" || threadId === "" || typeof clientUserMessageId != "string" || clientUserMessageId === "")
@@ -4704,7 +4719,7 @@ var require_receiver_state = __commonJS({
 var require_delivery = __commonJS({
   "src/delivery.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), { createAppServerHost } = require_app_server_host(), { replyNonce } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 2, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", STALE_DELIVERY_ACTIVATION = "stale_delivery_activation", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, activeDeliveryAttempts = /* @__PURE__ */ new Set();
+    var fs = require("node:fs"), path = require("node:path"), { createAppServerHost } = require_app_server_host(), { replyNonce } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 2, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", STALE_DELIVERY_ACTIVATION = "stale_delivery_activation", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, MAX_REPLY_RECOVERY_CANDIDATES = 32, MAX_REPLY_EGRESS_CANDIDATES = 32, activeDeliveryAttempts = /* @__PURE__ */ new Set();
     function currentTimeMs(deps = {}) {
       let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
       return Number.isFinite(value) ? value : Date.now();
@@ -4867,7 +4882,9 @@ ${normalized.content}${attachmentText}
         items: [],
         completed: [],
         archived: [],
-        blocked: null
+        blocked: null,
+        replyRecoveryCursor: 0,
+        replyEgressCursor: 0
       };
     }
     function readDeliveryQueue(config = {}, deps = {}) {
@@ -4889,7 +4906,9 @@ ${normalized.content}${attachmentText}
         items: parsed.items,
         completed: Array.isArray(parsed.completed) ? parsed.completed : [],
         archived: Array.isArray(parsed.archived) ? parsed.archived : [],
-        blocked: parsed.blocked && typeof parsed.blocked == "object" ? parsed.blocked : null
+        blocked: parsed.blocked && typeof parsed.blocked == "object" ? parsed.blocked : null,
+        replyRecoveryCursor: Number.isSafeInteger(parsed.replyRecoveryCursor) && parsed.replyRecoveryCursor >= 0 ? parsed.replyRecoveryCursor : 0,
+        replyEgressCursor: Number.isSafeInteger(parsed.replyEgressCursor) && parsed.replyEgressCursor >= 0 ? parsed.replyEgressCursor : 0
       };
     }
     function readDeliveryQueueStatus(config = {}, deps = {}) {
@@ -4978,7 +4997,9 @@ ${normalized.content}${attachmentText}
           items: eligibleItems,
           completed: queue.completed,
           archived,
-          blocked: !activationMatches || headWasArchived ? null : queue.blocked
+          blocked: !activationMatches || headWasArchived ? null : queue.blocked,
+          replyRecoveryCursor: queue.replyRecoveryCursor,
+          replyEgressCursor: queue.replyEgressCursor
         },
         changed: !0,
         archivedCount: staleItems.length
@@ -5089,7 +5110,9 @@ ${normalized.content}${attachmentText}
           }
         ],
         archived: queue.archived,
-        blocked: null
+        blocked: null,
+        replyRecoveryCursor: queue.replyRecoveryCursor,
+        replyEgressCursor: queue.replyEgressCursor
       };
     }
     function turnStartParams(next, threadId) {
@@ -5460,16 +5483,18 @@ ${normalized.content}${attachmentText}
         let delay = Math.max(1, Math.min(retryAt - currentTimeMs(deps), MAX_TIMER_DELAY_MS)), schedule = deps.setTimeout || setTimeout;
         leaseWakeAt = retryAt, leaseWakeTimer = schedule(() => (leaseWakeTimer = null, leaseWakeAt = 0, drainAutonomously("delivery_lease_expired")), delay), typeof leaseWakeTimer?.unref == "function" && leaseWakeTimer.unref();
       }, persistAssistantFinal = (event) => withDeliveryQueueLock(config, deps, () => {
-        let queue = readDeliveryQueue(config, deps);
-        if (queue.completed.some((entry) => entry?.outbound?.itemId === event.itemId && entry?.outbound?.threadId === event.threadId && entry?.outbound?.turnId === event.turnId)) return !1;
-        let completed = queue.completed.find((entry) => entry?.outbound?.status === "waiting" && entry.outbound.threadId === event.threadId && entry.outbound.turnId === event.turnId);
-        return completed ? (completed.outbound = {
-          ...completed.outbound,
-          status: "ready",
-          itemId: event.itemId,
-          text: event.text,
-          readyAt: new Date(currentTimeMs(deps)).toISOString()
-        }, writeDeliveryQueue(queue, config, deps), !0) : !1;
+        let queue = readDeliveryQueue(config, deps), completed = queue.completed.filter((entry) => entry?.outbound?.status === "waiting" && entry.outbound.threadId === event.threadId && entry.outbound.turnId === event.turnId);
+        if (completed.length === 0) return 0;
+        let readyAt = new Date(currentTimeMs(deps)).toISOString();
+        for (let entry of completed)
+          entry.outbound = {
+            ...entry.outbound,
+            status: "ready",
+            itemId: event.itemId,
+            text: event.text,
+            readyAt
+          };
+        return writeDeliveryQueue(queue, config, deps), completed.length;
       }), delivery = {
         status() {
           return host.status();
@@ -5517,27 +5542,69 @@ ${normalized.content}${attachmentText}
         recoverReplies() {
           return serializeAdmission(async () => {
             if (destroyed) return { status: "idle", reason: "delivery_destroyed" };
-            if (typeof host.readAssistantFinal != "function")
+            if (typeof host.readAssistantFinals != "function")
               return { status: "idle", reason: "reply_recovery_unsupported" };
-            let candidate = await withDeliveryQueueLock(config, deps, () => {
-              let completed = readDeliveryQueue(config, deps).completed.find((entry) => entry?.outbound?.status === "waiting" && typeof entry.outbound.threadId == "string" && entry.outbound.threadId !== "" && typeof entry.outbound.turnId == "string" && entry.outbound.turnId !== "");
-              return completed ? {
-                threadId: completed.outbound.threadId,
-                turnId: completed.outbound.turnId
-              } : null;
+            let candidates = await withDeliveryQueueLock(config, deps, () => {
+              let queue = readDeliveryQueue(config, deps), frozen = /* @__PURE__ */ new Map(), completedCount = queue.completed.length, start = completedCount === 0 ? 0 : queue.replyRecoveryCursor % completedCount, nextCursor = start;
+              for (let offset = 0; offset < completedCount; offset += 1) {
+                let index = (start + offset) % completedCount, entry = queue.completed[index];
+                if (entry?.outbound?.status !== "waiting" || typeof entry.outbound.threadId != "string" || entry.outbound.threadId === "" || typeof entry.outbound.turnId != "string" || entry.outbound.turnId === "")
+                  continue;
+                let key = JSON.stringify([entry.outbound.threadId, entry.outbound.turnId]);
+                if (!frozen.has(key) && (frozen.set(key, {
+                  threadId: entry.outbound.threadId,
+                  turnId: entry.outbound.turnId
+                }), nextCursor = (index + 1) % completedCount, frozen.size === MAX_REPLY_RECOVERY_CANDIDATES))
+                  break;
+              }
+              return frozen.size > 0 && (queue.replyRecoveryCursor = nextCursor, writeDeliveryQueue(queue, config, deps)), Array.from(frozen.values());
             });
-            if (!candidate) return { status: "idle", reason: "reply_recovery_empty" };
-            let event;
-            try {
-              event = await host.readAssistantFinal(candidate.threadId, candidate.turnId);
-            } catch (error) {
-              return logger("ERROR", "Failed exact app-server final reply recovery", {
-                threadId: candidate.threadId,
-                turnId: candidate.turnId,
-                error: error instanceof Error ? error.message : String(error)
-              }), { status: "failed", reason: "reply_recovery_failed" };
+            if (candidates.length === 0)
+              return { status: "idle", reason: "reply_recovery_empty" };
+            let grouped = /* @__PURE__ */ new Map();
+            for (let candidate of candidates)
+              grouped.has(candidate.threadId) || grouped.set(candidate.threadId, []), grouped.get(candidate.threadId).push(candidate.turnId);
+            let recoveredCount = 0, failedCount = 0, missingCount = 0;
+            for (let [threadId, turnIds] of grouped) {
+              let events;
+              try {
+                events = await host.readAssistantFinals(threadId, turnIds);
+              } catch (error) {
+                failedCount += turnIds.length, logger("ERROR", "Failed grouped exact app-server final reply recovery", {
+                  threadId,
+                  turnIds,
+                  error: error instanceof Error ? error.message : String(error)
+                });
+                continue;
+              }
+              if (!Array.isArray(events)) {
+                failedCount += turnIds.length;
+                continue;
+              }
+              let expected = new Set(turnIds), observed = /* @__PURE__ */ new Set();
+              for (let event of events)
+                event?.threadId !== threadId || !expected.has(event?.turnId) || observed.has(event.turnId) || (observed.add(event.turnId), recoveredCount += await persistAssistantFinal(event));
+              missingCount += expected.size - observed.size;
             }
-            return event ? await persistAssistantFinal(event) ? { status: "recovered", reason: "reply_final_recovered" } : { status: "idle", reason: "reply_final_already_recorded" } : { status: "idle", reason: "reply_final_not_found" };
+            return recoveredCount > 0 ? {
+              status: "recovered",
+              reason: "reply_final_recovered",
+              recoveredCount,
+              failedCount,
+              missingCount
+            } : failedCount > 0 ? {
+              status: "failed",
+              reason: "reply_recovery_failed",
+              recoveredCount,
+              failedCount,
+              missingCount
+            } : {
+              status: "idle",
+              reason: "reply_final_not_found",
+              recoveredCount,
+              failedCount,
+              missingCount
+            };
           });
         },
         flushReplies() {
@@ -5545,44 +5612,63 @@ ${normalized.content}${attachmentText}
             if (destroyed) return { status: "idle", reason: "delivery_destroyed" };
             if (typeof replySender != "function")
               return { status: "idle", reason: "reply_sender_inactive" };
-            let candidate = await withDeliveryQueueLock(config, deps, () => {
-              let completed = readDeliveryQueue(config, deps).completed.find((entry) => entry?.outbound?.status === "ready" && typeof entry.outbound.text == "string" && entry.outbound.text !== "");
-              return completed ? {
-                channelId: completed.channelId,
-                sourceMessageId: completed.messageId,
-                stableClientMessageId: completed.outbound.stableClientMessageId,
-                threadId: completed.outbound.threadId,
-                turnId: completed.outbound.turnId,
-                itemId: completed.outbound.itemId,
-                text: completed.outbound.text
-              } : null;
+            let candidates = await withDeliveryQueueLock(config, deps, () => {
+              let queue = readDeliveryQueue(config, deps), frozen = [], completedCount = queue.completed.length, start = completedCount === 0 ? 0 : queue.replyEgressCursor % completedCount, nextCursor = start;
+              for (let offset = 0; offset < completedCount; offset += 1) {
+                let index = (start + offset) % completedCount, completed = queue.completed[index];
+                if (!(completed?.outbound?.status !== "ready" || typeof completed.outbound.text != "string" || completed.outbound.text === "") && (frozen.push({
+                  channelId: completed.channelId,
+                  sourceMessageId: completed.messageId,
+                  stableClientMessageId: completed.outbound.stableClientMessageId,
+                  threadId: completed.outbound.threadId,
+                  turnId: completed.outbound.turnId,
+                  itemId: completed.outbound.itemId,
+                  text: completed.outbound.text
+                }), nextCursor = (index + 1) % completedCount, frozen.length === MAX_REPLY_EGRESS_CANDIDATES))
+                  break;
+              }
+              return frozen.length > 0 && (queue.replyEgressCursor = nextCursor, writeDeliveryQueue(queue, config, deps)), frozen;
             });
-            if (!candidate) return { status: "idle", reason: "reply_queue_empty" };
-            let result;
-            try {
-              result = await replySender(candidate);
-            } catch (error) {
-              return logger("ERROR", "Discord final reply acknowledgement is uncertain", {
-                channelId: candidate.channelId,
-                sourceMessageId: candidate.sourceMessageId,
-                stableClientMessageId: candidate.stableClientMessageId,
-                error: error instanceof Error ? error.message : String(error)
-              }), { status: "failed", reason: "reply_ack_uncertain" };
+            if (candidates.length === 0) return { status: "idle", reason: "reply_queue_empty" };
+            let confirmedCount = 0, failedCount = 0, lastMessageId = null;
+            for (let candidate of candidates) {
+              let result;
+              try {
+                result = await replySender(candidate);
+              } catch (error) {
+                failedCount += 1, logger("ERROR", "Discord final reply acknowledgement is uncertain", {
+                  channelId: candidate.channelId,
+                  sourceMessageId: candidate.sourceMessageId,
+                  stableClientMessageId: candidate.stableClientMessageId,
+                  error: error instanceof Error ? error.message : String(error)
+                });
+                continue;
+              }
+              let outboundMessageId = String(result?.messageId || "").trim();
+              if (!(result?.status === "confirmed" || outboundMessageId && (result?.duplicateSuppressed !== !0 || result?.receiptStatus === "confirmed")) || !outboundMessageId) {
+                failedCount += 1;
+                continue;
+              }
+              await withDeliveryQueueLock(config, deps, () => {
+                let queue = readDeliveryQueue(config, deps), completed = queue.completed.find((entry) => entry?.channelId === candidate.channelId && entry?.messageId === candidate.sourceMessageId && entry?.outbound?.status === "ready" && entry.outbound.stableClientMessageId === candidate.stableClientMessageId && entry.outbound.itemId === candidate.itemId);
+                completed && (completed.outbound = {
+                  ...completed.outbound,
+                  status: "confirmed",
+                  outboundMessageId,
+                  confirmedAt: new Date(currentTimeMs(deps)).toISOString(),
+                  readbackReceipt: result.readbackReceipt || {
+                    channelId: result.channelId || candidate.channelId,
+                    messageId: outboundMessageId
+                  }
+                }, writeDeliveryQueue(queue, config, deps), confirmedCount += 1, lastMessageId = outboundMessageId);
+              });
             }
-            let outboundMessageId = String(result?.messageId || "").trim();
-            return !(result?.status === "confirmed" || outboundMessageId && (result?.duplicateSuppressed !== !0 || result?.receiptStatus === "confirmed")) || !outboundMessageId ? { status: "failed", reason: "reply_ack_uncertain" } : (await withDeliveryQueueLock(config, deps, () => {
-              let queue = readDeliveryQueue(config, deps), completed = queue.completed.find((entry) => entry?.channelId === candidate.channelId && entry?.messageId === candidate.sourceMessageId && entry?.outbound?.status === "ready" && entry.outbound.stableClientMessageId === candidate.stableClientMessageId && entry.outbound.itemId === candidate.itemId);
-              completed && (completed.outbound = {
-                ...completed.outbound,
-                status: "confirmed",
-                outboundMessageId,
-                confirmedAt: new Date(currentTimeMs(deps)).toISOString(),
-                readbackReceipt: result.readbackReceipt || {
-                  channelId: result.channelId || candidate.channelId,
-                  messageId: outboundMessageId
-                }
-              }, writeDeliveryQueue(queue, config, deps));
-            }), { status: "confirmed", messageId: outboundMessageId });
+            return confirmedCount > 0 ? {
+              status: "confirmed",
+              messageId: lastMessageId,
+              confirmedCount,
+              failedCount
+            } : { status: "failed", reason: "reply_ack_uncertain", confirmedCount, failedCount };
           });
         },
         async recordCompletedReadback({ channelId, messageId, threadId } = {}) {
