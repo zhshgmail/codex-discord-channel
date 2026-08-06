@@ -387,6 +387,165 @@ test('overlapping active turns stay fail closed when the newest turn is not in p
   assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
 });
 
+test('overlapping active turns reject missing or malformed newest-turn data', async (t) => {
+  const cases = [
+    ['missing response', undefined],
+    ['missing data', {}],
+    ['non-array data', { data: { id: 'turn-current', status: 'inProgress' } }],
+    ['empty data', { data: [] }],
+    ['multiple latest turns', {
+      data: [
+        { id: 'turn-current', status: 'inProgress' },
+        { id: 'turn-stale', status: 'inProgress' },
+      ],
+    }],
+    ['missing latest id', { data: [{ status: 'inProgress' }] }],
+    ['missing latest status', { data: [{ id: 'turn-current' }] }],
+  ];
+
+  for (const [name, latestTurns] of cases) {
+    await t.test(name, async (t) => {
+      const client = new FakeRpcClient(async (method, params) => {
+        if (method === 'thread/loaded/list') {
+          return { data: ['thread-root'], nextCursor: null };
+        }
+        if (method === 'thread/read') {
+          return {
+            thread: {
+              id: params.threadId,
+              parentThreadId: null,
+              status: { type: 'active', activeFlags: [] },
+              turns: [
+                { id: 'turn-stale', status: 'inProgress', items: [] },
+                { id: 'turn-current', status: 'inProgress', items: [] },
+              ],
+            },
+          };
+        }
+        if (method === 'thread/turns/list') return latestTurns;
+        throw new Error(`unexpected method ${method}`);
+      });
+      const host = createAppServerHost(
+        { appServerUrl: 'ws://127.0.0.1:4500' },
+        () => {},
+        { client },
+      );
+      t.after(() => host.destroy());
+
+      assert.deepEqual(await host.resolveTarget(), {
+        available: true,
+        threadId: 'thread-root',
+        status: 'active',
+      });
+    });
+  }
+});
+
+test('overlapping active turns reject a newest turn outside the thread-read active set', async (t) => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: [
+            { id: 'turn-stale', status: 'inProgress', items: [] },
+            { id: 'turn-current', status: 'inProgress', items: [] },
+          ],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      return {
+        data: [{ id: 'turn-not-in-thread-read', status: 'inProgress', items: [] }],
+        nextCursor: 'older-turns',
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+  t.after(() => host.destroy());
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-root',
+    status: 'active',
+  });
+});
+
+test('newest-turn recovery discards an async result after the thread selection revision changes', async (t) => {
+  let releaseLatestTurn;
+  let markLatestTurnRequested;
+  const latestTurnRequested = new Promise((resolve) => { markLatestTurnRequested = resolve; });
+  const latestTurnReleased = new Promise((resolve) => { releaseLatestTurn = resolve; });
+  let latestTurnRequests = 0;
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-root'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: [
+            { id: 'turn-stale', status: 'inProgress', items: [] },
+            { id: 'turn-current-before-notification', status: 'inProgress', items: [] },
+          ],
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      latestTurnRequests += 1;
+      markLatestTurnRequested();
+      await latestTurnReleased;
+      return {
+        data: [{
+          id: 'turn-current-before-notification',
+          status: 'inProgress',
+          items: [],
+        }],
+        nextCursor: 'older-turns',
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+  t.after(() => host.destroy());
+
+  const resolving = host.resolveTarget();
+  await latestTurnRequested;
+  client.emit('notification', {
+    method: 'turn/started',
+    params: {
+      threadId: 'thread-root',
+      turn: { id: 'turn-current-from-notification' },
+    },
+  });
+  releaseLatestTurn();
+
+  assert.deepEqual(await resolving, {
+    available: true,
+    threadId: 'thread-root',
+    status: 'active',
+    activeTurnId: 'turn-current-from-notification',
+  });
+  assert.equal(latestTurnRequests, 1);
+});
+
 test('system-error root remains the structured target while a subagent is active', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
