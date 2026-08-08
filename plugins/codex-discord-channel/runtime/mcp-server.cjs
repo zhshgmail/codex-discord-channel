@@ -235,6 +235,11 @@ var require_config = __commonJS({
           env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
           18e4
         ),
+        requireTuiLease: !0,
+        tuiLeaseStaleMs: Math.max(
+          1e3,
+          parseInteger(env.CODEX_DISCORD_TUI_LEASE_STALE_MS, 3e3)
+        ),
         parentPid: process.ppid,
         ownerId,
         cwd,
@@ -249,6 +254,290 @@ var require_config = __commonJS({
       parseInteger,
       parseBool,
       stripQuotes
+    };
+  }
+});
+
+// src/tui-recovery-target.js
+var require_tui_recovery_target = __commonJS({
+  "src/tui-recovery-target.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs"), path = require("node:path"), { randomUUID } = require("node:crypto"), TARGET_VERSION = 2, TUI_LEASE_VERSION = 3, LEASE_ID = /^[0-9a-z][0-9a-z._-]{15,127}$/i, LOCK_WAIT_MS = 5e3, LOCK_ORPHAN_GRACE_MS = 3e4;
+    function targetPaths(config) {
+      return {
+        live: path.join(config.paths.stateDir, "app-server-target.json"),
+        invalidated: path.join(config.paths.stateDir, "app-server-target.invalidated.json"),
+        recovery: path.join(config.paths.stateDir, "tui-recovery-target.json")
+      };
+    }
+    function parseRecoveryTarget(raw) {
+      let record;
+      try {
+        record = JSON.parse(raw);
+      } catch {
+        return null;
+      }
+      let legacyActive = record?.version === 1 && record.status === "active" && typeof record.activeTurnId == "string" && record.activeTurnId !== "";
+      return ![1, TARGET_VERSION, TUI_LEASE_VERSION].includes(record?.version) || record.version === 1 && !legacyActive || typeof record.threadId != "string" || !/^[0-9a-f-]{20,}$/i.test(record.threadId) || !Array.isArray(record.loadedThreadIds) || record.loadedThreadIds.length === 0 || new Set(record.loadedThreadIds).size !== record.loadedThreadIds.length || !record.loadedThreadIds.includes(record.threadId) || record.version === TUI_LEASE_VERSION && !LEASE_ID.test(record.leaseId || "") ? null : {
+        version: record.version === TUI_LEASE_VERSION ? TUI_LEASE_VERSION : TARGET_VERSION,
+        threadId: record.threadId,
+        loadedThreadIds: [...record.loadedThreadIds],
+        ...record.version === TUI_LEASE_VERSION ? { leaseId: record.leaseId } : {}
+      };
+    }
+    function parseTuiLease(raw) {
+      let record;
+      try {
+        record = JSON.parse(raw);
+      } catch {
+        return null;
+      }
+      if (record?.version !== TUI_LEASE_VERSION || !LEASE_ID.test(record.leaseId || "") || !Number.isSafeInteger(record.supervisorPid) || record.supervisorPid <= 1 || typeof record.supervisorStartTicks != "string" || !/^\d+$/.test(record.supervisorStartTicks) || !Number.isSafeInteger(record.startedAtMs) || record.startedAtMs < 0 || !["launching", "active"].includes(record.phase))
+        return null;
+      let base = {
+        version: TUI_LEASE_VERSION,
+        leaseId: record.leaseId,
+        supervisorPid: record.supervisorPid,
+        supervisorStartTicks: record.supervisorStartTicks,
+        startedAtMs: record.startedAtMs,
+        phase: record.phase
+      };
+      if (record.phase === "launching") return base;
+      let target = parseRecoveryTarget(JSON.stringify({
+        version: TARGET_VERSION,
+        threadId: record.threadId,
+        loadedThreadIds: record.loadedThreadIds
+      }));
+      return target ? { ...base, ...target, version: TUI_LEASE_VERSION } : null;
+    }
+    function writeAtomic(file, content, dependencies = {}) {
+      let fsImpl = dependencies.fs || fs, now = dependencies.now || Date.now, temp = `${file}.tmp-${process.pid}-${now()}`;
+      fsImpl.mkdirSync(path.dirname(file), { recursive: !0, mode: 448 });
+      try {
+        fsImpl.writeFileSync(temp, content, { mode: 384 }), fsImpl.renameSync(temp, file), fsImpl.chmodSync(file, 384);
+      } catch (error) {
+        try {
+          fsImpl.unlinkSync(temp);
+        } catch {
+        }
+        throw error;
+      }
+    }
+    function processStartTicks(pid, fsImpl) {
+      try {
+        let raw = fsImpl.readFileSync(`/proc/${pid}/stat`, "utf8"), close = raw.lastIndexOf(")");
+        if (close < 0) return "";
+        let startTicks = raw.slice(close + 1).trim().split(/\s+/)[19];
+        return /^\d+$/.test(startTicks || "") ? startTicks : "";
+      } catch {
+        return "";
+      }
+    }
+    function sleepSync(milliseconds) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+    }
+    function removeOrphanedLock(lockFile, fsImpl, now) {
+      let owner = null, observedStat;
+      try {
+        owner = JSON.parse(fsImpl.readFileSync(lockFile, "utf8"));
+      } catch {
+      }
+      try {
+        observedStat = fsImpl.statSync(lockFile);
+      } catch (error) {
+        if (error?.code === "ENOENT") return !0;
+        throw error;
+      }
+      if (Number.isSafeInteger(owner?.pid) && owner.pid > 1 && /^\d+$/.test(owner?.startTicks || "")) {
+        if (processStartTicks(owner.pid, fsImpl) === owner.startTicks) return !1;
+      } else if (now() - observedStat.mtimeMs < LOCK_ORPHAN_GRACE_MS) return !1;
+      let tombstone = `${lockFile}.stale-${process.pid}-${randomUUID()}`;
+      try {
+        fsImpl.renameSync(lockFile, tombstone);
+      } catch (error) {
+        if (error?.code === "ENOENT") return !0;
+        throw error;
+      }
+      let movedOwner = null, movedStat = null;
+      try {
+        movedOwner = JSON.parse(fsImpl.readFileSync(tombstone, "utf8"));
+      } catch {
+      }
+      try {
+        movedStat = fsImpl.statSync(tombstone);
+      } catch {
+      }
+      if (!(movedStat && movedStat.dev === observedStat.dev && movedStat.ino === observedStat.ino) || owner?.token && movedOwner?.token !== owner.token)
+        try {
+          fsImpl.linkSync(tombstone, lockFile);
+        } catch (error) {
+          if (error?.code !== "EEXIST") throw error;
+        }
+      try {
+        fsImpl.unlinkSync(tombstone);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+      return !0;
+    }
+    function releaseRecoveryLock(lockFile, ownerToken, fsImpl) {
+      let owner;
+      try {
+        owner = JSON.parse(fsImpl.readFileSync(lockFile, "utf8"));
+      } catch (error) {
+        if (error?.code === "ENOENT") return;
+        throw error;
+      }
+      if (owner?.token === ownerToken)
+        try {
+          fsImpl.unlinkSync(lockFile);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+    }
+    function withRecoveryLock(config, dependencies, callback) {
+      let fsImpl = dependencies.fs || fs, now = dependencies.lockNow || Date.now, recovery = targetPaths(config).recovery, lockFile = `${recovery}.lock`, ownerToken = randomUUID(), deadline = now() + LOCK_WAIT_MS;
+      for (fsImpl.mkdirSync(path.dirname(recovery), { recursive: !0, mode: 448 }); ; ) {
+        let descriptor, created = !1;
+        try {
+          descriptor = fsImpl.openSync(lockFile, "wx", 384), created = !0, fsImpl.writeFileSync(descriptor, `${JSON.stringify({
+            token: ownerToken,
+            pid: process.pid,
+            startTicks: processStartTicks(process.pid, fsImpl)
+          })}
+`), fsImpl.closeSync(descriptor), descriptor = void 0;
+          let installedOwner = null;
+          try {
+            installedOwner = JSON.parse(fsImpl.readFileSync(lockFile, "utf8"));
+          } catch {
+          }
+          if (installedOwner?.token !== ownerToken) continue;
+          break;
+        } catch (error) {
+          if (descriptor !== void 0)
+            try {
+              fsImpl.closeSync(descriptor);
+            } catch {
+            }
+          if (error?.code !== "EEXIST") {
+            if (created)
+              try {
+                fsImpl.unlinkSync(lockFile);
+              } catch {
+              }
+            throw error;
+          }
+          if (removeOrphanedLock(lockFile, fsImpl, now)) continue;
+          if (now() >= deadline) throw new Error("Timed out waiting for supervised TUI lease lock");
+          sleepSync(10);
+        }
+      }
+      try {
+        return callback();
+      } finally {
+        releaseRecoveryLock(lockFile, ownerToken, fsImpl);
+      }
+    }
+    function beginTuiLease(config, lease, dependencies = {}) {
+      let record = parseTuiLease(JSON.stringify({
+        version: TUI_LEASE_VERSION,
+        leaseId: lease?.leaseId,
+        supervisorPid: lease?.supervisorPid,
+        supervisorStartTicks: String(lease?.supervisorStartTicks || ""),
+        startedAtMs: lease?.startedAtMs,
+        phase: "launching"
+      }));
+      if (!record) throw new Error("Invalid supervised TUI lease identity");
+      return withRecoveryLock(config, dependencies, () => writeAtomic(
+        targetPaths(config).recovery,
+        `${JSON.stringify(record, null, 2)}
+`,
+        dependencies
+      )), record;
+    }
+    function captureRecoveryTarget(config, minimumMtimeMs = 0, dependencies = {}) {
+      return withRecoveryLock(config, dependencies, () => {
+        let fsImpl = dependencies.fs || fs, files = targetPaths(config), lease;
+        try {
+          lease = parseTuiLease(fsImpl.readFileSync(files.recovery, "utf8"));
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+          return !1;
+        }
+        if (!lease || lease.leaseId !== dependencies.leaseId) return !1;
+        let launching = {
+          version: TUI_LEASE_VERSION,
+          leaseId: lease.leaseId,
+          supervisorPid: lease.supervisorPid,
+          supervisorStartTicks: lease.supervisorStartTicks,
+          startedAtMs: lease.startedAtMs,
+          phase: "launching"
+        }, record;
+        try {
+          return fsImpl.statSync(files.invalidated), writeAtomic(files.recovery, `${JSON.stringify(launching, null, 2)}
+`, dependencies), !1;
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+        try {
+          if (minimumMtimeMs && fsImpl.statSync(files.live).mtimeMs < minimumMtimeMs)
+            return writeAtomic(files.recovery, `${JSON.stringify(lease, null, 2)}
+`, dependencies), !1;
+          record = parseRecoveryTarget(fsImpl.readFileSync(files.live, "utf8"));
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+          return writeAtomic(files.recovery, `${JSON.stringify(lease, null, 2)}
+`, dependencies), !1;
+        }
+        return record ? record.version === TUI_LEASE_VERSION && record.leaseId !== lease.leaseId ? (writeAtomic(files.recovery, `${JSON.stringify(lease, null, 2)}
+`, dependencies), !1) : (writeAtomic(files.recovery, `${JSON.stringify({
+          ...launching,
+          phase: "active",
+          threadId: record.threadId,
+          loadedThreadIds: record.loadedThreadIds
+        }, null, 2)}
+`, dependencies), !0) : (writeAtomic(files.recovery, `${JSON.stringify(launching, null, 2)}
+`, dependencies), !1);
+      });
+    }
+    function readRecoveryThread(config, dependencies = {}) {
+      let fsImpl = dependencies.fs || fs, record;
+      try {
+        record = parseTuiLease(fsImpl.readFileSync(targetPaths(config).recovery, "utf8"));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        return "";
+      }
+      return record?.phase === "active" ? record.threadId : "";
+    }
+    function clearRecoveryTarget(config, dependencies = {}) {
+      return withRecoveryLock(config, dependencies, () => {
+        let fsImpl = dependencies.fs || fs, expectedLeaseId = dependencies.leaseId || "";
+        if (expectedLeaseId) {
+          let current;
+          try {
+            current = parseTuiLease(fsImpl.readFileSync(targetPaths(config).recovery, "utf8"));
+          } catch (error) {
+            if (error?.code === "ENOENT") return;
+            throw error;
+          }
+          if (!current || current.leaseId !== expectedLeaseId) return;
+        }
+        try {
+          fsImpl.unlinkSync(targetPaths(config).recovery);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      });
+    }
+    module2.exports = {
+      beginTuiLease,
+      captureRecoveryTarget,
+      clearRecoveryTarget,
+      parseRecoveryTarget,
+      parseTuiLease,
+      readRecoveryThread,
+      targetPaths
     };
   }
 });
@@ -2925,7 +3214,7 @@ var require_ws = __commonJS({
 var require_app_server_host = __commonJS({
   "src/app-server-host.js"(exports2, module2) {
     "use strict";
-    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 2, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
     function parseTargetCheckpoint(raw) {
       let record;
       try {
@@ -2934,14 +3223,21 @@ var require_app_server_host = __commonJS({
         return null;
       }
       let legacyActive = record?.version === 1 && record.status === "active" && typeof record.activeTurnId == "string" && record.activeTurnId !== "";
-      if (![1, TARGET_CHECKPOINT_VERSION].includes(record?.version) || record.version === 1 && !legacyActive || typeof record.threadId != "string" || record.threadId === "" || !Array.isArray(record.loadedThreadIds) || record.loadedThreadIds.length === 0 || record.loadedThreadIds.some((threadId) => typeof threadId != "string" || threadId === ""))
+      if (![1, 2, TARGET_CHECKPOINT_VERSION].includes(record?.version) || record.version === 1 && !legacyActive || record.version === TARGET_CHECKPOINT_VERSION && (typeof record.leaseId != "string" || record.leaseId === "") || typeof record.threadId != "string" || record.threadId === "" || !Array.isArray(record.loadedThreadIds) || record.loadedThreadIds.length === 0 || record.loadedThreadIds.some((threadId) => typeof threadId != "string" || threadId === ""))
         return null;
       let loadedThreadIds = [...new Set(record.loadedThreadIds)].sort();
       return loadedThreadIds.length !== record.loadedThreadIds.length || !loadedThreadIds.includes(record.threadId) ? null : {
         version: TARGET_CHECKPOINT_VERSION,
         threadId: record.threadId,
-        loadedThreadIds
+        loadedThreadIds,
+        leaseId: record.version === TARGET_CHECKPOINT_VERSION ? record.leaseId : ""
       };
+    }
+    function parseProcessStartTicks(raw) {
+      let text = String(raw || ""), commandEnd = text.lastIndexOf(")");
+      if (commandEnd < 0) return "";
+      let startTicks = text.slice(commandEnd + 1).trim().split(/\s+/)[19];
+      return /^\d+$/.test(startTicks || "") ? startTicks : "";
     }
     function endpointToWebSocket(endpoint) {
       let value = String(endpoint || "").trim();
@@ -3353,7 +3649,31 @@ var require_app_server_host = __commonJS({
     }, AppServerHost = class extends EventEmitter {
       constructor(config = {}, logger = () => {
       }, deps = {}) {
-        super(), this.logger = logger, this.fs = deps.fs || fs, this.targetCheckpointPath = config.paths?.appServerTargetPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "app-server-target.json") : ""), this.targetInvalidationPath = config.paths?.appServerTargetInvalidationPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "app-server-target.invalidated.json") : ""), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
+        super(), this.logger = logger, this.fs = deps.fs || fs, this.targetCheckpointPath = config.paths?.appServerTargetPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "app-server-target.json") : ""), this.targetInvalidationPath = config.paths?.appServerTargetInvalidationPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "app-server-target.invalidated.json") : ""), this.requireTuiLease = config.requireTuiLease === !0, this.tuiLeasePath = config.paths?.stateDir ? path.join(config.paths.stateDir, "tui-recovery-target.json") : "", this.tuiLeaseStaleMs = Math.max(1e3, Number(config.tuiLeaseStaleMs) || 3e3), this.now = deps.now || Date.now, this.readProcessStartTicks = deps.readProcessStartTicks || ((pid) => {
+          try {
+            return parseProcessStartTicks(this.fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+          } catch {
+            return "";
+          }
+        }), this.hasRemoteTuiChild = deps.hasRemoteTuiChild || ((pid) => {
+          let children;
+          try {
+            children = this.fs.readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8");
+          } catch {
+            return !1;
+          }
+          for (let childPid of children.trim().split(/\s+/).filter(Boolean)) {
+            let argv;
+            try {
+              argv = this.fs.readFileSync(`/proc/${childPid}/cmdline`).toString("utf8").split("\0").filter(Boolean);
+            } catch {
+              continue;
+            }
+            let remoteIndex = argv.indexOf("--remote");
+            if (remoteIndex >= 0 && argv[remoteIndex + 1] === config.appServerUrl) return !0;
+          }
+          return !1;
+        }), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
           deps.lifecycleProofRetryDelaysMs
         );
         let fsPromises = deps.rolloutFsPromises || fs.promises, sessionsDir = rolloutSessionsDir(config, deps);
@@ -3362,7 +3682,11 @@ var require_app_server_host = __commonJS({
           threadId,
           clientUserMessageId,
           fsPromises
-        ) : async () => !1, this.loadedInventoryProven = !1, this.restoredTargetCheckpoint = this.loadTargetCheckpoint(), this.restoredTargetCheckpoint) {
+        ) : async () => !1, this.loadedInventoryProven = !1, this.restoredTargetCheckpoint = this.loadTargetCheckpoint(), this.observedTuiLeaseTarget = null, this.requireTuiLease && this.restoredTargetCheckpoint) {
+          let checkpoint = this.restoredTargetCheckpoint, lease = this.readTuiLease(checkpoint.threadId);
+          (!lease.available || lease.record.leaseId !== checkpoint.leaseId) && (this.restoredTargetCheckpoint = null);
+        }
+        if (this.restoredTargetCheckpoint) {
           let checkpoint = this.restoredTargetCheckpoint;
           this.currentThreadId = checkpoint.threadId, this.knownLoadedThreadIds = new Set(checkpoint.loadedThreadIds);
         }
@@ -3374,7 +3698,10 @@ var require_app_server_host = __commonJS({
           }
           if (notification?.method === "thread/started") {
             let thread = notification.params?.thread;
-            thread?.id && (this.threadSelectionRevision += 1), thread?.id && !thread.parentThreadId && (this.loadedInventoryProven = !1, this.invalidateTargetCheckpoint("top_level_thread_started"), this.restoredTargetCheckpoint = null, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, thread.status?.type || "unavailable"), thread.status?.type === "idle" && this.emit("idle", { threadId: thread.id }));
+            if (thread?.id && (this.threadSelectionRevision += 1), thread?.id && !thread.parentThreadId) {
+              let lease = this.readTuiLease();
+              this.observedTuiLeaseTarget = lease.available && lease.record ? { leaseId: lease.record.leaseId, threadId: thread.id } : null, this.loadedInventoryProven = !1, this.invalidateTargetCheckpoint("top_level_thread_started"), this.restoredTargetCheckpoint = null, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, thread.status?.type || "unavailable"), thread.status?.type === "idle" && this.emit("idle", { threadId: thread.id });
+            }
             return;
           }
           if (notification?.method === "turn/started") {
@@ -3397,7 +3724,7 @@ var require_app_server_host = __commonJS({
           if (notification?.method === "thread/closed") {
             let threadId = notification.params?.threadId;
             if (!threadId) return;
-            this.threadSelectionRevision += 1, this.loadedInventoryProven && this.knownLoadedThreadIds.delete(threadId), this.threadStatuses.delete(threadId), this.activeTurnIds.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), this.currentThreadId === threadId && (this.loadedInventoryProven = !1, this.currentThreadId = "", this.invalidateTargetCheckpoint("current_thread_closed"), this.restoredTargetCheckpoint = null), this.wakeThreadDeliveryWaiters(threadId), this.emit("threadClosed", { threadId });
+            this.threadSelectionRevision += 1, this.loadedInventoryProven && this.knownLoadedThreadIds.delete(threadId), this.threadStatuses.delete(threadId), this.activeTurnIds.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), this.currentThreadId === threadId && (this.observedTuiLeaseTarget?.threadId === threadId && (this.observedTuiLeaseTarget = null), this.loadedInventoryProven = !1, this.currentThreadId = "", this.invalidateTargetCheckpoint("current_thread_closed"), this.restoredTargetCheckpoint = null), this.wakeThreadDeliveryWaiters(threadId), this.emit("threadClosed", { threadId });
           }
         }, this.onConnectionChanged = (event) => {
           if (this.threadSelectionRevision += 1, this.loadedInventoryProven = !1, this.lastStatus = this.client.status(), !this.lastStatus.available && this.lastStatus.reason === "shared_app_server_request_timeout") {
@@ -3501,11 +3828,15 @@ var require_app_server_host = __commonJS({
         let threadId = this.currentThreadId;
         if (!threadId || !this.loadedInventoryProven || !this.knownLoadedThreadIds.has(threadId))
           return;
+        let lease = this.readTuiLease(threadId);
+        if (!lease.available) return;
         let record = {
-          version: TARGET_CHECKPOINT_VERSION,
+          version: this.requireTuiLease ? TARGET_CHECKPOINT_VERSION : 2,
           threadId,
           loadedThreadIds: [...this.knownLoadedThreadIds].sort()
-        }, directory = path.dirname(this.targetCheckpointPath), tempPath = `${this.targetCheckpointPath}.tmp-${process.pid}-${Date.now()}`;
+        };
+        this.requireTuiLease && (record.leaseId = lease.record.leaseId);
+        let directory = path.dirname(this.targetCheckpointPath), tempPath = `${this.targetCheckpointPath}.tmp-${process.pid}-${Date.now()}`;
         try {
           this.fs.mkdirSync(directory, { recursive: !0, mode: 448 }), this.fs.writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}
 `, { mode: 384 }), this.fs.renameSync(tempPath, this.targetCheckpointPath), this.fs.chmodSync(this.targetCheckpointPath, 384), this.clearTargetInvalidation();
@@ -3520,7 +3851,55 @@ var require_app_server_host = __commonJS({
         }
       }
       status() {
-        return { ...this.lastStatus };
+        let status = { ...this.lastStatus };
+        if (!status.available) return status;
+        if (this.requireTuiLease && !this.currentThreadId)
+          return {
+            configured: !0,
+            available: !1,
+            reason: "shared_app_server_tui_lease_unbound"
+          };
+        let lease = this.readTuiLease(this.currentThreadId);
+        return lease.available ? status : { configured: !0, available: !1, reason: lease.reason };
+      }
+      readTuiLease(expectedThreadId = "") {
+        if (!this.requireTuiLease) return { available: !0, record: null };
+        if (!this.tuiLeasePath)
+          return { available: !1, reason: "shared_app_server_tui_lease_missing" };
+        let descriptor;
+        try {
+          descriptor = this.fs.openSync(this.tuiLeasePath, "r");
+          let stat = this.fs.fstatSync(descriptor), record = parseTuiLease(this.fs.readFileSync(descriptor, "utf8"));
+          if (!record)
+            return { available: !1, reason: "shared_app_server_tui_lease_invalid" };
+          let ageMs = this.now() - stat.mtimeMs;
+          if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > this.tuiLeaseStaleMs)
+            return { available: !1, reason: "shared_app_server_tui_lease_stale" };
+          let actualStartTicks = this.readProcessStartTicks(record.supervisorPid);
+          if (!actualStartTicks)
+            return { available: !1, reason: "shared_app_server_tui_supervisor_missing" };
+          if (actualStartTicks !== record.supervisorStartTicks)
+            return { available: !1, reason: "shared_app_server_tui_supervisor_reused" };
+          if (!this.hasRemoteTuiChild(record.supervisorPid))
+            return { available: !1, reason: "shared_app_server_tui_process_missing" };
+          if (expectedThreadId) {
+            let activeMatch = record.phase === "active" && record.threadId === expectedThreadId, observedMatch = this.observedTuiLeaseTarget?.leaseId === record.leaseId && this.observedTuiLeaseTarget.threadId === expectedThreadId;
+            if (!activeMatch && !observedMatch)
+              return { available: !1, reason: record.phase === "active" ? "shared_app_server_tui_lease_mismatch" : "shared_app_server_tui_lease_unbound" };
+          }
+          return { available: !0, record };
+        } catch (error) {
+          return {
+            available: !1,
+            reason: error?.code === "ENOENT" ? "shared_app_server_tui_lease_missing" : "shared_app_server_tui_lease_unreadable"
+          };
+        } finally {
+          if (descriptor !== void 0)
+            try {
+              this.fs.closeSync(descriptor);
+            } catch {
+            }
+        }
       }
       rememberAcceptedTurn(threadId, result, connectionGeneration = null) {
         let turnId = result?.turn?.id || result?.turnId;
@@ -3530,6 +3909,11 @@ var require_app_server_host = __commonJS({
         return this.resolveTargetAttempt({ revisionRestarts: 0 });
       }
       async resolveTargetAttempt(resolutionBudget) {
+        let initialLease = this.readTuiLease();
+        if (!initialLease.available) {
+          let { reason } = initialLease;
+          return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+        }
         this.loadedInventoryProven = !1;
         let threadSelectionRevision = this.threadSelectionRevision, restoredTargetCheckpoint = this.restoredTargetCheckpoint, provenLoadedThreadIds = new Set(this.knownLoadedThreadIds), threadIds = [], seenThreadIds = /* @__PURE__ */ new Set(), cursor = "", connectionGeneration = null, seenCursors = /* @__PURE__ */ new Set(), loadedPageCount = 0, retryAfterRevision = () => {
           if (resolutionBudget.revisionRestarts += 1, resolutionBudget.revisionRestarts > MAX_TARGET_RESOLUTION_RESTARTS) {
@@ -3718,6 +4102,11 @@ var require_app_server_host = __commonJS({
           let reason = "shared_app_server_thread_unavailable";
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
+        let matchingLease = this.readTuiLease(thread.id);
+        if (!matchingLease.available) {
+          let { reason } = matchingLease;
+          return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+        }
         if (this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, status), status === "active") {
           let inProgressTurnIds = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id);
           inProgressTurnIds.length === 1 ? this.activeTurnIds.set(thread.id, inProgressTurnIds[0]) : this.activeTurnIds.delete(thread.id);
@@ -3731,6 +4120,12 @@ var require_app_server_host = __commonJS({
       }
       async startTurn(params, target) {
         let generation = target?.[TARGET_GENERATION], validateTarget = () => {
+          let lease = this.readTuiLease(params.threadId);
+          if (!lease.available)
+            throw deliveryError(
+              "The supervised TUI lease is no longer fresh for structured delivery.",
+              lease.reason
+            );
           let statusChanged = target?.status === "active" ? !target.activeTurnId || this.activeTurnIds.get(params.threadId) !== target.activeTurnId : this.threadStatuses.get(params.threadId) !== target?.status;
           if (!generation || generation.threadSelectionRevision !== this.threadSelectionRevision || target.threadId !== params.threadId || this.currentThreadId !== params.threadId || statusChanged)
             throw deliveryError(

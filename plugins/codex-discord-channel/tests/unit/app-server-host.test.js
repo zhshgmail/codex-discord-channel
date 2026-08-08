@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -175,6 +176,204 @@ function createManualTimers() {
     },
   };
 }
+
+test('host requires a fresh matching supervised TUI lease before selecting a loaded thread', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-tui-lease-'));
+  const leasePath = path.join(stateDir, 'tui-recovery-target.json');
+  const client = new FakeRpcClient((method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.threadId === DELIVERY_THREAD_ID) {
+      return {
+        thread: {
+          id: DELIVERY_THREAD_ID,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${method}`);
+  });
+  const now = Date.now();
+  let processStartTicks = '12345';
+  let remoteTuiPresent = true;
+  const host = createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+    paths: { stateDir },
+    requireTuiLease: true,
+    tuiLeaseStaleMs: 3000,
+  }, () => {}, {
+    client,
+    hasRemoteTuiChild: () => remoteTuiPresent,
+    now: () => now,
+    readProcessStartTicks: () => processStartTicks,
+  });
+  t.after(() => {
+    host.destroy();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const missing = await host.resolveTarget();
+  assert.equal(missing.available, false);
+  assert.equal(missing.reason, 'shared_app_server_tui_lease_missing');
+  assert.equal(client.requests.length, 0);
+
+  fs.writeFileSync(leasePath, `${JSON.stringify({
+    version: 3,
+    leaseId: 'lease-0000000000000001',
+    supervisorPid: 4242,
+    supervisorStartTicks: '12345',
+    startedAtMs: now - 100,
+    phase: 'active',
+    threadId: DELIVERY_THREAD_ID,
+    loadedThreadIds: [DELIVERY_THREAD_ID],
+  })}\n`, { mode: 0o600 });
+  fs.utimesSync(leasePath, new Date(now), new Date(now));
+  const live = await host.resolveTarget();
+  assert.equal(live.available, true);
+  assert.equal(live.threadId, DELIVERY_THREAD_ID);
+
+  fs.utimesSync(leasePath, new Date(now - 4000), new Date(now - 4000));
+  const stale = await host.resolveTarget();
+  assert.equal(stale.available, false);
+  assert.equal(stale.reason, 'shared_app_server_tui_lease_stale');
+
+  fs.writeFileSync(leasePath, `${JSON.stringify({
+    version: 3,
+    leaseId: 'lease-0000000000000001',
+    supervisorPid: 4242,
+    supervisorStartTicks: '12345',
+    startedAtMs: now - 100,
+    phase: 'active',
+    threadId: OTHER_DELIVERY_THREAD_ID,
+    loadedThreadIds: [OTHER_DELIVERY_THREAD_ID],
+  })}\n`, { mode: 0o600 });
+  fs.utimesSync(leasePath, new Date(now), new Date(now));
+  const mismatched = await host.resolveTarget();
+  assert.equal(mismatched.available, false);
+  assert.equal(mismatched.reason, 'shared_app_server_tui_lease_mismatch');
+
+  fs.writeFileSync(leasePath, `${JSON.stringify({
+    version: 3,
+    leaseId: 'lease-0000000000000001',
+    supervisorPid: 4242,
+    supervisorStartTicks: '12345',
+    startedAtMs: now - 100,
+    phase: 'active',
+    threadId: DELIVERY_THREAD_ID,
+    loadedThreadIds: [DELIVERY_THREAD_ID],
+  })}\n`, { mode: 0o600 });
+  fs.utimesSync(leasePath, new Date(now), new Date(now));
+  processStartTicks = '';
+  const deadSupervisor = await host.resolveTarget();
+  assert.equal(deadSupervisor.available, false);
+  assert.equal(deadSupervisor.reason, 'shared_app_server_tui_supervisor_missing');
+
+  processStartTicks = '99999';
+  const reusedSupervisor = await host.resolveTarget();
+  assert.equal(reusedSupervisor.available, false);
+  assert.equal(reusedSupervisor.reason, 'shared_app_server_tui_supervisor_reused');
+
+  processStartTicks = '12345';
+  remoteTuiPresent = false;
+  const missingTui = await host.resolveTarget();
+  assert.equal(missingTui.available, false);
+  assert.equal(missingTui.reason, 'shared_app_server_tui_process_missing');
+
+  remoteTuiPresent = true;
+  fs.writeFileSync(leasePath, `${JSON.stringify({
+    version: 3,
+    leaseId: 'lease-0000000000000002',
+    supervisorPid: 4242,
+    supervisorStartTicks: '12345',
+    startedAtMs: now,
+    phase: 'launching',
+  })}\n`, { mode: 0o600 });
+  fs.utimesSync(leasePath, new Date(now), new Date(now));
+  const unbound = await host.resolveTarget();
+  assert.equal(unbound.available, false);
+  assert.equal(unbound.reason, 'shared_app_server_tui_lease_unbound');
+
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  const observed = await host.resolveTarget();
+  assert.equal(observed.available, true);
+  assert.equal(observed.threadId, DELIVERY_THREAD_ID);
+
+  fs.unlinkSync(leasePath);
+  await assert.rejects(
+    host.startTurn({ threadId: DELIVERY_THREAD_ID, input: [] }, observed),
+    (error) => error.code === 'shared_app_server_tui_lease_missing',
+  );
+  assert.equal(client.requests.some((request) => request.method === 'turn/start'), false);
+});
+
+test('host verifies the real supervised remote TUI child in procfs', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-real-tui-lease-'));
+  const endpoint = 'unix:///tmp/cdc-real-tui-lease.sock';
+  const procStat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8');
+  const startTicks = procStat.slice(procStat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
+  const tui = spawn(
+    process.execPath,
+    ['-e', 'setInterval(() => {}, 1000)', '--', '--remote', endpoint],
+    { stdio: 'ignore' },
+  );
+  const client = new FakeRpcClient((method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.threadId === DELIVERY_THREAD_ID) {
+      return {
+        thread: {
+          id: DELIVERY_THREAD_ID,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${method}`);
+  });
+  t.after(() => {
+    if (tui.exitCode === null) tui.kill('SIGKILL');
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  fs.writeFileSync(path.join(stateDir, 'tui-recovery-target.json'), `${JSON.stringify({
+    version: 3,
+    leaseId: 'lease-real-proc-proof-0001',
+    supervisorPid: process.pid,
+    supervisorStartTicks: startTicks,
+    startedAtMs: Date.now(),
+    phase: 'active',
+    threadId: DELIVERY_THREAD_ID,
+    loadedThreadIds: [DELIVERY_THREAD_ID],
+  })}\n`);
+  const host = createAppServerHost({
+    appServerUrl: endpoint,
+    paths: { stateDir },
+    requireTuiLease: true,
+    tuiLeaseStaleMs: 3000,
+  }, () => {}, { client });
+  t.after(() => host.destroy());
+
+  assert.equal((await host.resolveTarget()).available, true);
+  tui.kill('SIGTERM');
+  await new Promise((resolve) => tui.once('exit', resolve));
+  const exited = await host.resolveTarget();
+  assert.equal(exited.available, false);
+  assert.equal(exited.reason, 'shared_app_server_tui_process_missing');
+});
 
 test('endpointToWebSocket maps the shared Unix endpoint to the app-server RPC route', () => {
   assert.deepEqual(endpointToWebSocket('unix:///tmp/codex01/app-server.sock'), {

@@ -4,6 +4,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { parseTuiLease } = require('./tui-recovery-target');
 
 const TARGET_GENERATION = Symbol('appServerTargetGeneration');
 const MAX_FRESH_THREAD_READS = 32;
@@ -20,7 +21,7 @@ const MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2;
 const MAX_LIFECYCLE_PROOF_ATTEMPTS = 4;
 const MAX_LIFECYCLE_PROOF_DELAY_MS = 250;
 const DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]);
-const TARGET_CHECKPOINT_VERSION = 2;
+const TARGET_CHECKPOINT_VERSION = 3;
 const CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function parseTargetCheckpoint(raw) {
@@ -33,8 +34,11 @@ function parseTargetCheckpoint(raw) {
   const legacyActive = record?.version === 1 && record.status === 'active' &&
     typeof record.activeTurnId === 'string' && record.activeTurnId !== '';
   if (
-    ![1, TARGET_CHECKPOINT_VERSION].includes(record?.version) ||
+    ![1, 2, TARGET_CHECKPOINT_VERSION].includes(record?.version) ||
     (record.version === 1 && !legacyActive) ||
+    (record.version === TARGET_CHECKPOINT_VERSION && (
+      typeof record.leaseId !== 'string' || record.leaseId === ''
+    )) ||
     typeof record.threadId !== 'string' ||
     record.threadId === '' ||
     !Array.isArray(record.loadedThreadIds) ||
@@ -54,7 +58,17 @@ function parseTargetCheckpoint(raw) {
     version: TARGET_CHECKPOINT_VERSION,
     threadId: record.threadId,
     loadedThreadIds,
+    leaseId: record.version === TARGET_CHECKPOINT_VERSION ? record.leaseId : '',
   };
+}
+
+function parseProcessStartTicks(raw) {
+  const text = String(raw || '');
+  const commandEnd = text.lastIndexOf(')');
+  if (commandEnd < 0) return '';
+  const fields = text.slice(commandEnd + 1).trim().split(/\s+/);
+  const startTicks = fields[19];
+  return /^\d+$/.test(startTicks || '') ? startTicks : '';
 }
 
 function endpointToWebSocket(endpoint) {
@@ -671,6 +685,41 @@ class AppServerHost extends EventEmitter {
         ? path.join(config.paths.stateDir, 'app-server-target.invalidated.json')
         : ''
     );
+    this.requireTuiLease = config.requireTuiLease === true;
+    this.tuiLeasePath = config.paths?.stateDir
+      ? path.join(config.paths.stateDir, 'tui-recovery-target.json')
+      : '';
+    this.tuiLeaseStaleMs = Math.max(1000, Number(config.tuiLeaseStaleMs) || 3000);
+    this.now = deps.now || Date.now;
+    this.readProcessStartTicks = deps.readProcessStartTicks || ((pid) => {
+      try {
+        return parseProcessStartTicks(this.fs.readFileSync(`/proc/${pid}/stat`, 'utf8'));
+      } catch {
+        return '';
+      }
+    });
+    this.hasRemoteTuiChild = deps.hasRemoteTuiChild || ((pid) => {
+      let children;
+      try {
+        children = this.fs.readFileSync(`/proc/${pid}/task/${pid}/children`, 'utf8');
+      } catch {
+        return false;
+      }
+      for (const childPid of children.trim().split(/\s+/).filter(Boolean)) {
+        let argv;
+        try {
+          argv = this.fs.readFileSync(`/proc/${childPid}/cmdline`)
+            .toString('utf8')
+            .split('\0')
+            .filter(Boolean);
+        } catch {
+          continue;
+        }
+        const remoteIndex = argv.indexOf('--remote');
+        if (remoteIndex >= 0 && argv[remoteIndex + 1] === config.appServerUrl) return true;
+      }
+      return false;
+    });
     this.client = deps.client || new AppServerRpcClient(config, logger, deps);
     this.lastStatus = this.client.status();
     this.hasConnected = Boolean(this.lastStatus.available);
@@ -700,6 +749,14 @@ class AppServerHost extends EventEmitter {
         : async () => false);
     this.loadedInventoryProven = false;
     this.restoredTargetCheckpoint = this.loadTargetCheckpoint();
+    this.observedTuiLeaseTarget = null;
+    if (this.requireTuiLease && this.restoredTargetCheckpoint) {
+      const checkpoint = this.restoredTargetCheckpoint;
+      const lease = this.readTuiLease(checkpoint.threadId);
+      if (!lease.available || lease.record.leaseId !== checkpoint.leaseId) {
+        this.restoredTargetCheckpoint = null;
+      }
+    }
     if (this.restoredTargetCheckpoint) {
       const checkpoint = this.restoredTargetCheckpoint;
       this.currentThreadId = checkpoint.threadId;
@@ -730,6 +787,10 @@ class AppServerHost extends EventEmitter {
           this.threadSelectionRevision += 1;
         }
         if (thread?.id && !thread.parentThreadId) {
+          const lease = this.readTuiLease();
+          this.observedTuiLeaseTarget = lease.available && lease.record
+            ? { leaseId: lease.record.leaseId, threadId: thread.id }
+            : null;
           this.loadedInventoryProven = false;
           this.invalidateTargetCheckpoint('top_level_thread_started');
           this.restoredTargetCheckpoint = null;
@@ -806,6 +867,9 @@ class AppServerHost extends EventEmitter {
           this.timeoutRecoveryTarget = null;
         }
         if (this.currentThreadId === threadId) {
+          if (this.observedTuiLeaseTarget?.threadId === threadId) {
+            this.observedTuiLeaseTarget = null;
+          }
           this.loadedInventoryProven = false;
           this.currentThreadId = '';
           this.invalidateTargetCheckpoint('current_thread_closed');
@@ -989,11 +1053,14 @@ class AppServerHost extends EventEmitter {
     ) {
       return;
     }
+    const lease = this.readTuiLease(threadId);
+    if (!lease.available) return;
     const record = {
-      version: TARGET_CHECKPOINT_VERSION,
+      version: this.requireTuiLease ? TARGET_CHECKPOINT_VERSION : 2,
       threadId,
       loadedThreadIds: [...this.knownLoadedThreadIds].sort(),
     };
+    if (this.requireTuiLease) record.leaseId = lease.record.leaseId;
     const directory = path.dirname(this.targetCheckpointPath);
     const tempPath = `${this.targetCheckpointPath}.tmp-${process.pid}-${Date.now()}`;
     try {
@@ -1013,7 +1080,76 @@ class AppServerHost extends EventEmitter {
   }
 
   status() {
-    return { ...this.lastStatus };
+    const status = { ...this.lastStatus };
+    if (!status.available) return status;
+    if (this.requireTuiLease && !this.currentThreadId) {
+      return {
+        configured: true,
+        available: false,
+        reason: 'shared_app_server_tui_lease_unbound',
+      };
+    }
+    const lease = this.readTuiLease(this.currentThreadId);
+    if (!lease.available) {
+      return { configured: true, available: false, reason: lease.reason };
+    }
+    return status;
+  }
+
+  readTuiLease(expectedThreadId = '') {
+    if (!this.requireTuiLease) return { available: true, record: null };
+    if (!this.tuiLeasePath) {
+      return { available: false, reason: 'shared_app_server_tui_lease_missing' };
+    }
+
+    let descriptor;
+    try {
+      descriptor = this.fs.openSync(this.tuiLeasePath, 'r');
+      const stat = this.fs.fstatSync(descriptor);
+      const record = parseTuiLease(this.fs.readFileSync(descriptor, 'utf8'));
+      if (!record) {
+        return { available: false, reason: 'shared_app_server_tui_lease_invalid' };
+      }
+      const ageMs = this.now() - stat.mtimeMs;
+      if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > this.tuiLeaseStaleMs) {
+        return { available: false, reason: 'shared_app_server_tui_lease_stale' };
+      }
+      const actualStartTicks = this.readProcessStartTicks(record.supervisorPid);
+      if (!actualStartTicks) {
+        return { available: false, reason: 'shared_app_server_tui_supervisor_missing' };
+      }
+      if (actualStartTicks !== record.supervisorStartTicks) {
+        return { available: false, reason: 'shared_app_server_tui_supervisor_reused' };
+      }
+      if (!this.hasRemoteTuiChild(record.supervisorPid)) {
+        return { available: false, reason: 'shared_app_server_tui_process_missing' };
+      }
+      if (expectedThreadId) {
+        const activeMatch = record.phase === 'active' && record.threadId === expectedThreadId;
+        const observedMatch = this.observedTuiLeaseTarget?.leaseId === record.leaseId
+          && this.observedTuiLeaseTarget.threadId === expectedThreadId;
+        if (!activeMatch && !observedMatch) {
+          const reason = record.phase === 'active'
+            ? 'shared_app_server_tui_lease_mismatch'
+            : 'shared_app_server_tui_lease_unbound';
+          return { available: false, reason };
+        }
+      }
+      return { available: true, record };
+    } catch (error) {
+      return {
+        available: false,
+        reason: error?.code === 'ENOENT'
+          ? 'shared_app_server_tui_lease_missing'
+          : 'shared_app_server_tui_lease_unreadable',
+      };
+    } finally {
+      if (descriptor !== undefined) {
+        try {
+          this.fs.closeSync(descriptor);
+        } catch {}
+      }
+    }
   }
 
   rememberAcceptedTurn(threadId, result, connectionGeneration = null) {
@@ -1038,6 +1174,12 @@ class AppServerHost extends EventEmitter {
   }
 
   async resolveTargetAttempt(resolutionBudget) {
+    const initialLease = this.readTuiLease();
+    if (!initialLease.available) {
+      const { reason } = initialLease;
+      this.lastStatus = { configured: true, available: false, reason };
+      return { available: false, reason, status: 'unavailable' };
+    }
     this.loadedInventoryProven = false;
     const threadSelectionRevision = this.threadSelectionRevision;
     const restoredTargetCheckpoint = this.restoredTargetCheckpoint;
@@ -1354,6 +1496,12 @@ class AppServerHost extends EventEmitter {
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
     }
+    const matchingLease = this.readTuiLease(thread.id);
+    if (!matchingLease.available) {
+      const { reason } = matchingLease;
+      this.lastStatus = { configured: true, available: false, reason };
+      return { available: false, reason, status: 'unavailable' };
+    }
     this.knownLoadedThreadIds = new Set(threadIds);
     this.loadedInventoryProven = true;
     this.currentThreadId = thread.id;
@@ -1384,6 +1532,13 @@ class AppServerHost extends EventEmitter {
   async startTurn(params, target) {
     const generation = target?.[TARGET_GENERATION];
     const validateTarget = () => {
+      const lease = this.readTuiLease(params.threadId);
+      if (!lease.available) {
+        throw deliveryError(
+          'The supervised TUI lease is no longer fresh for structured delivery.',
+          lease.reason,
+        );
+      }
       const statusChanged = target?.status === 'active'
         ? !target.activeTurnId || this.activeTurnIds.get(params.threadId) !== target.activeTurnId
         : this.threadStatuses.get(params.threadId) !== target?.status;

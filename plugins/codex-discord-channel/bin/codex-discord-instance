@@ -101,13 +101,18 @@ socket_generation() {
   stat -Lc '%d:%i:%z' "$socket"
 }
 
-clear_recovery_target() {
-  "$node_bin" "$channel_bin" tui-recovery-target clear "${runtime_args[@]}" >/dev/null
+begin_tui_lease() {
+  local lease_id=$1
+  local started_at_ms=$2
+  "$node_bin" "$channel_bin" tui-recovery-target begin \
+    "$launcher_pid" "$launcher_start_ticks" "$lease_id" "$started_at_ms" \
+    "${runtime_args[@]}" >/dev/null
 }
 
 snapshot_recovery_target() {
   local minimum_mtime_ms=$1
-  "$node_bin" "$channel_bin" tui-recovery-target snapshot "$minimum_mtime_ms" \
+  local lease_id=$2
+  "$node_bin" "$channel_bin" tui-recovery-target snapshot "$minimum_mtime_ms" "$lease_id" \
     "${runtime_args[@]}" >/dev/null
 }
 
@@ -117,6 +122,9 @@ read_recovery_target() {
 
 watcher_pid=''
 watcher_stop=''
+launcher_pid=$$
+launcher_start_ticks=$(awk '{print $22}' "/proc/$launcher_pid/stat")
+current_lease_id=''
 stop_watcher() {
   if [[ -n $watcher_stop ]]; then
     : >"$watcher_stop"
@@ -130,7 +138,17 @@ stop_watcher() {
   watcher_pid=''
   watcher_stop=''
 }
-trap stop_watcher EXIT
+cleanup_launcher() {
+  local status=$?
+  trap - EXIT
+  stop_watcher
+  if [[ -n $current_lease_id ]]; then
+    "$node_bin" "$channel_bin" tui-recovery-target clear-owned "$current_lease_id" \
+      "${runtime_args[@]}" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup_launcher EXIT
 
 deadline=$((SECONDS + timeout_seconds))
 while ((SECONDS <= deadline)); do
@@ -141,17 +159,18 @@ while ((SECONDS <= deadline)); do
     gateway_pid=$(systemctl --user show --property MainPID --value "$gateway_service")
     "$node_bin" "$channel_bin" live-check "${runtime_args[@]}" \
       --pid "$app_pid" --pid "$gateway_pid" >/dev/null
-    clear_recovery_target
     codex_args=("$@")
     recovery_stamps=()
     while true; do
       launch_generation=$(socket_generation)
       launch_mtime_ms=$(date +%s%3N)
+      current_lease_id=$(tr -d '\n' </proc/sys/kernel/random/uuid)
+      begin_tui_lease "$current_lease_id" "$launch_mtime_ms"
       watcher_stop=$(mktemp "$state_dir/.tui-recovery-stop.XXXXXX")
       rm -f "$watcher_stop"
       (
-        while [[ ! -e $watcher_stop ]]; do
-          snapshot_recovery_target "$launch_mtime_ms" 2>/dev/null || true
+        while [[ ! -e $watcher_stop ]] && kill -0 "$launcher_pid" 2>/dev/null; do
+          snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
           sleep 0.2
         done
       ) &
@@ -171,10 +190,11 @@ while ((SECONDS <= deadline)); do
       tui_status=$?
       set -e
       stop_watcher
-      snapshot_recovery_target "$launch_mtime_ms" 2>/dev/null || true
+      snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
 
       if ((tui_status == 0 || tui_status == 130 || tui_status == 143)); then
-        clear_recovery_target
+        "$node_bin" "$channel_bin" tui-recovery-target clear-owned "$current_lease_id" \
+          "${runtime_args[@]}" >/dev/null
         exit "$tui_status"
       fi
 

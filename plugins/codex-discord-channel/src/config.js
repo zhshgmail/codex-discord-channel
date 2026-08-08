@@ -216,6 +216,11 @@ function loadConfig(inputEnv = process.env, options = {}) {
       env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
       180000,
     ),
+    requireTuiLease: true,
+    tuiLeaseStaleMs: Math.max(
+      1000,
+      parseInteger(env.CODEX_DISCORD_TUI_LEASE_STALE_MS, 3000),
+    ),
     parentPid: process.ppid,
     ownerId,
     cwd,

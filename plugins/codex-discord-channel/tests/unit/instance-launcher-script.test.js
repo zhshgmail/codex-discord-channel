@@ -33,10 +33,22 @@ function fixture() {
     '#!/usr/bin/env bash',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
+    '    begin)',
+    '      printf "{\\"version\\":3,\\"leaseId\\":\\"%s\\",\\"supervisorPid\\":%s,\\"supervisorStartTicks\\":\\"%s\\",\\"startedAtMs\\":%s,\\"phase\\":\\"launching\\"}\\n" "$6" "$4" "$5" "$7" >"$STATE_DIR/tui-recovery-target.json"',
+    '      exit 0',
+    '      ;;',
     '    clear) rm -f "$STATE_DIR/tui-recovery-target.json"; exit 0 ;;',
+    '    clear-owned) rm -f "$STATE_DIR/tui-recovery-target.json"; exit 0 ;;',
     '    snapshot)',
     '      if [[ -f $STATE_DIR/app-server-target.json ]]; then',
-    '        cp "$STATE_DIR/app-server-target.json" "$STATE_DIR/tui-recovery-target.json"',
+    '        python3 - "$STATE_DIR/tui-recovery-target.json" "$STATE_DIR/app-server-target.json" <<\'PY\'',
+    'import json, sys',
+    'lease_path, target_path = sys.argv[1:]',
+    'lease = json.load(open(lease_path))',
+    'target = json.load(open(target_path))',
+    'lease.update(phase="active", threadId=target["threadId"], loadedThreadIds=target["loadedThreadIds"])',
+    'json.dump(lease, open(lease_path, "w"))',
+    'PY',
     '        exit 0',
     '      fi',
     '      exit 10',
@@ -77,6 +89,11 @@ function fixture() {
     'PY',
     '    exit 71',
     '  fi',
+    'fi',
+    'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${EXIT_WITH_TARGET:-0} == 1 ]]; then',
+    '  printf "{\\"version\\":1,\\"threadId\\":\\"%s\\",\\"status\\":\\"active\\",\\"activeTurnId\\":\\"turn-1\\",\\"loadedThreadIds\\":[\\"%s\\"]}\\n" "$THREAD_ID" "$THREAD_ID" >"$STATE_DIR/app-server-target.json"',
+    '  sleep 0.4',
+    '  exit 72',
     'fi',
     'exit 0',
     '',
@@ -244,6 +261,18 @@ test('shell launcher resumes the exact captured thread after app-server replacem
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
+});
+
+test('shell launcher clears the supervised TUI lease on every launcher exit', () => {
+  const setup = fixture();
+  const result = spawnSync(launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, { EXIT_WITH_TARGET: '1' }),
+    timeout: 5000,
+  });
+
+  assert.equal(result.status, 72, result.stderr);
+  assert.equal(fs.existsSync(path.join(setup.stateDir, 'tui-recovery-target.json')), false);
 });
 
 test('Codex child receives only the explicit Discord instance allowlist', () => {

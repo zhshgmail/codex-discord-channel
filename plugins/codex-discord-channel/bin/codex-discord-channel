@@ -31,7 +31,7 @@ function usage() {
     '  codex-discord-channel tui-check [--instance ID --state-dir PATH]',
     '  codex-discord-channel live-check [--instance ID --state-dir PATH] --pid PID --pid PID',
     '  codex-discord-channel tui [--instance ID --state-dir PATH] [-- CODEX_ARGS...]',
-    '  codex-discord-channel tui-recovery-target ACTION [MIN_MTIME_MS] [--instance ID --state-dir PATH]',
+    '  codex-discord-channel tui-recovery-target ACTION [ACTION_ARGS...] [--instance ID --state-dir PATH]',
     '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID] [--followup]',
     '',
     'The send command reads message text from stdin. A guarded reply requires exact --channel and --reply-to values.',
@@ -306,24 +306,54 @@ async function main() {
     return;
   }
   if (command === 'tui-recovery-target') {
-    const [action, maybeMtime, ...runtimeTail] = rest;
-    const hasMtime = action === 'snapshot';
-    const runtimeArgs = hasMtime ? runtimeTail : rest.slice(1);
-    const minimumMtimeMs = hasMtime ? Number(maybeMtime) : 0;
-    if (!['snapshot', 'read', 'clear'].includes(action)) {
-      throw new Error('tui-recovery-target action must be snapshot, read, or clear');
+    const [action, ...tail] = rest;
+    if (!['begin', 'snapshot', 'read', 'clear', 'clear-owned'].includes(action)) {
+      throw new Error('tui-recovery-target action must be begin, snapshot, read, clear, or clear-owned');
     }
-    if (hasMtime && (!/^\d+$/.test(maybeMtime || '') || !Number.isSafeInteger(minimumMtimeMs))) {
-      throw new Error('tui-recovery-target snapshot requires a non-negative millisecond timestamp');
-    }
+    let actionArgs = [];
+    if (action === 'begin') actionArgs = tail.splice(0, 4);
+    if (action === 'snapshot') actionArgs = tail.splice(0, 2);
+    if (action === 'clear-owned') actionArgs = tail.splice(0, 1);
+    const runtimeArgs = tail;
     const config = loadRuntimeConfig(runtimeArgs);
     const target = require('../src/tui-recovery-target');
-    if (action === 'snapshot') {
-      if (!target.captureRecoveryTarget(config, minimumMtimeMs)) process.exitCode = 10;
+    if (action === 'begin') {
+      const [pidText, startTicks, leaseId, startedAtText] = actionArgs;
+      const supervisorPid = Number(pidText);
+      const startedAtMs = Number(startedAtText);
+      if (
+        !/^\d+$/.test(pidText || '')
+        || !Number.isSafeInteger(supervisorPid)
+        || !/^\d+$/.test(startTicks || '')
+        || !leaseId
+        || !/^\d+$/.test(startedAtText || '')
+        || !Number.isSafeInteger(startedAtMs)
+      ) {
+        throw new Error('tui-recovery-target begin requires PID START_TICKS LEASE_ID STARTED_AT_MS');
+      }
+      target.beginTuiLease(config, {
+        leaseId,
+        supervisorPid,
+        supervisorStartTicks: startTicks,
+        startedAtMs,
+      });
+    } else if (action === 'snapshot') {
+      const [mtimeText, leaseId] = actionArgs;
+      const minimumMtimeMs = Number(mtimeText);
+      if (!/^\d+$/.test(mtimeText || '') || !Number.isSafeInteger(minimumMtimeMs) || !leaseId) {
+        throw new Error('tui-recovery-target snapshot requires MIN_MTIME_MS LEASE_ID');
+      }
+      if (!target.captureRecoveryTarget(config, minimumMtimeMs, { leaseId })) {
+        process.exitCode = 10;
+      }
     } else if (action === 'read') {
       const threadId = target.readRecoveryThread(config);
       if (!threadId) process.exitCode = 10;
       else process.stdout.write(`${threadId}\n`);
+    } else if (action === 'clear-owned') {
+      const [leaseId] = actionArgs;
+      if (!leaseId) throw new Error('tui-recovery-target clear-owned requires LEASE_ID');
+      target.clearRecoveryTarget(config, { leaseId });
     } else {
       target.clearRecoveryTarget(config);
     }

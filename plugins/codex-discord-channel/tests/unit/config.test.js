@@ -49,6 +49,8 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.deliveryUncertainRetryBaseMs, 5000);
   assert.equal(config.deliveryUncertainRetryMaxMs, 300000);
   assert.equal(config.gatewayHealthStaleMs, 180000);
+  assert.equal(config.requireTuiLease, true);
+  assert.equal(config.tuiLeaseStaleMs, 3000);
   assert.equal(config.messageContentIntent, true);
   assert.equal(config.cwd, '/workspace');
 });
