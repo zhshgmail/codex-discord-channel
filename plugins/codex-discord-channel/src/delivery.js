@@ -683,6 +683,10 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           return { completed: true, queueDepth: queue.items.length + queue.uncertain.length };
         }
         const retryAt = timestampMs(uncertain.delivery?.retryAt);
+        if (queue.uncertain.length > 1) {
+          queue.uncertain.push(queue.uncertain.shift());
+          writeDeliveryQueue(queue, config, deps);
+        }
         return { waiting: true, retryAt, queue };
       });
       if (reconciled.retry) continue;
@@ -1206,6 +1210,12 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         throw error;
       }
       return target;
+    },
+    refreshTargetCheckpoint() {
+      if (config.deliveryMode === 'off') {
+        return Promise.resolve({ status: 'unsupported', reason: 'delivery_disabled' });
+      }
+      return serializeDrain(() => delivery.ensureReady());
     },
     flush(options = {}) {
       if (config.deliveryMode === 'off') {

@@ -13,6 +13,10 @@ bundled systemd templates. The interactive `codex-discord-instance` launcher
 can bootstrap a missing isolated OpenAI login only when attached to a TTY;
 gateway and systemd paths never prompt and remain fail-closed.
 
+The generic `CODEX_APP_SERVER_URL` is ignored for instance routing. Only the
+plugin-specific endpoint or the socket under that instance state directory may
+select the Discord delivery target.
+
 ## Gateway Message Content Intent
 
 The gateway requests Discord's privileged Message Content intent by default,

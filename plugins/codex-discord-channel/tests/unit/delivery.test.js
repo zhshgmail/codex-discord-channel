@@ -1838,6 +1838,63 @@ test('expired uncertain delivery remains fail closed and never replays turn/star
   delivery.destroy();
 });
 
+test('uncertain reconciliation rotates fairly without replaying later items', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-uncertain-fair-'));
+  const uncertain = ['m-unproven', 'm-proven'].map((messageId, index) => ({
+    version: 3,
+    activationId: TEST_ACTIVATION_ID,
+    queuedAt: `2026-07-20T00:00:0${index + 1}.000Z`,
+    normalized: discordMessage(messageId, messageId),
+    delivery: {
+      state: 'structured_ack_uncertain',
+      attempts: 1,
+      retryAt: '2026-07-20T00:01:00.000Z',
+      threadId: 'thread-current',
+      clientUserMessageId: `discord:c1:${messageId}`,
+    },
+  }));
+  fs.writeFileSync(path.join(dir, 'pending-delivery.json'), `${JSON.stringify({
+    version: 3,
+    activation: { id: TEST_ACTIVATION_ID, activatedAt: '2026-07-20T00:00:00.000Z' },
+    items: [],
+    uncertain,
+    completed: [],
+    archived: [],
+    blocked: null,
+  }, null, 2)}\n`);
+  let starts = 0;
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn() {
+        starts += 1;
+        return { turn: { id: 'must-not-replay' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return clientUserMessageId === 'discord:c1:m-proven';
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await delivery.flush();
+  await delivery.flush();
+
+  assert.equal(starts, 0);
+  assert.deepEqual(readQueue(dir).uncertain.map((item) => item.normalized.messageId), [
+    'm-unproven',
+  ]);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-proven']);
+  delivery.destroy();
+});
+
 test('legacy global acknowledgement block migrates to retry lane without blocking later FIFO', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-uncertain-v2-'));
   const first = discordMessage('m-legacy-uncertain', 'first');

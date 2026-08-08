@@ -96,11 +96,13 @@ test('app-server launch strips Discord and stale target controls from its child 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-app-server-secrets-'));
   const config = createInstance(root, 'codex02', '.codex-account-02', '22222222222222222');
   config.env.CODEX_TARGET_THREAD_ID = 'stale-thread';
+  config.env.CODEX_APP_SERVER_URL = 'unix:///tmp/foreign-codex01.sock';
   const launch = buildAppServerLaunch(config);
 
   assert.equal(Object.hasOwn(launch.env, 'DISCORD_BOT_TOKEN'), false);
   assert.equal(Object.hasOwn(launch.env, 'DISCORD_BOT_USER_ID'), false);
   assert.equal(Object.hasOwn(launch.env, 'CODEX_TARGET_THREAD_ID'), false);
+  assert.equal(Object.hasOwn(launch.env, 'CODEX_APP_SERVER_URL'), false);
   assert.equal(launch.env.DISCORD_INSTANCE, 'codex02');
   assert.equal(launch.env.DISCORD_CONFIG_DIR, config.paths.stateDir);
 });
@@ -134,6 +136,11 @@ test('systemd templates load absolute runtime paths from each instance account f
     assert.match(unit, /ExecStart=\/usr\/bin\/env \$\{NODE_BIN\} \$\{CODEX_DISCORD_CHANNEL_BIN\}/);
     assert.match(unit, /--instance %i --state-dir %h\/\.codex\/channels\/discord\/%i/);
     assert.doesNotMatch(unit, /nvm\/versions\/node/);
+    assert.match(
+      unit,
+      /^UnsetEnvironment=CODEX_APP_SERVER_URL CODEX_DISCORD_APP_SERVER_URL$/m,
+    );
+    assert.doesNotMatch(unit, /^Environment=CODEX_(?:DISCORD_)?APP_SERVER_URL=$/m);
   }
   const appServerUnit = fs.readFileSync(
     path.join(systemdDir, 'codex-discord-app-server@.service'),

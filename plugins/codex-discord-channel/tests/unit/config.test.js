@@ -306,6 +306,19 @@ test('loadConfig accepts an explicit shared app-server endpoint and timeouts', (
   assert.equal(config.deliveryDrainMaxBackoffMs, 400);
 });
 
+test('generic Codex app-server endpoint cannot redirect a Discord instance', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-generic-endpoint-'));
+  const stateDir = path.join(root, 'discord', 'codex02');
+  const config = loadConfig({
+    HOME: root,
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: stateDir,
+    CODEX_APP_SERVER_URL: 'unix:///tmp/foreign-codex01.sock',
+  });
+
+  assert.equal(config.appServerUrl, `unix://${path.join(stateDir, 'app-server.sock')}`);
+});
+
 test('loadConfig uses Codex thread id as stable owner id', () => {
   const config = loadConfig({
     HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),

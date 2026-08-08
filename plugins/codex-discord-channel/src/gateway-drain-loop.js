@@ -30,6 +30,9 @@ function startGatewayDrainLoop({
   if (typeof delivery?.flush !== 'function') {
     throw new Error('Discord gateway delivery does not provide structured queue draining.');
   }
+  if (typeof delivery?.refreshTargetCheckpoint !== 'function') {
+    throw new Error('Discord gateway delivery cannot refresh the TUI recovery target.');
+  }
 
   const baseDelayMs = positiveDelay(config?.deliveryDrainIntervalMs, DEFAULT_DRAIN_INTERVAL_MS);
   const maxBackoffMs = Math.max(
@@ -77,7 +80,7 @@ function startGatewayDrainLoop({
     const status = queueStatus(config, deps);
     if (status.deliveryQueueDepth === 0) {
       try {
-        await delivery.ensureReady();
+        await delivery.refreshTargetCheckpoint();
       } catch (error) {
         const reason = error?.code || 'shared_app_server_unavailable';
         log(logger, 'ERROR', 'Cannot refresh the Discord TUI recovery target', {

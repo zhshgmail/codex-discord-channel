@@ -468,7 +468,7 @@ test('gateway loop clamps configured delays to the Node timer maximum', async ()
       deliveryDrainIntervalMs: 3_000_000_000,
       deliveryDrainMaxBackoffMs: 4_000_000_000,
     },
-    delivery: { async flush() {} },
+    delivery: { async flush() {}, async refreshTargetCheckpoint() {} },
     receiverOwnership: {},
     deps: {
       clearTimeout: timers.clearTimeout,

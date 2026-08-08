@@ -171,7 +171,6 @@ function loadConfig(inputEnv = process.env, options = {}) {
   const deliveryMode = requestedDeliveryMode === 'off' ? 'off' : 'app-server';
   const appServerUrl = String(
     env.CODEX_DISCORD_APP_SERVER_URL ||
-    env.CODEX_APP_SERVER_URL ||
     `unix://${paths.stateDir}/app-server.sock`,
   ).trim();
   const deliveryActivationId = String(

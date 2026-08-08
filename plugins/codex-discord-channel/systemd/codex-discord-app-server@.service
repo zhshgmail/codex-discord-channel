@@ -12,6 +12,7 @@ UMask=0077
 Environment=DISCORD_INSTANCE=%i
 Environment=DISCORD_CONFIG_DIR=%h/.codex/channels/discord/%i
 EnvironmentFile=%h/.codex/channels/discord/%i/account.env
+UnsetEnvironment=CODEX_APP_SERVER_URL CODEX_DISCORD_APP_SERVER_URL
 ExecStart=/usr/bin/env ${NODE_BIN} ${CODEX_DISCORD_CHANNEL_BIN} app-server --instance %i --state-dir %h/.codex/channels/discord/%i
 Restart=always
 RestartSec=5

@@ -231,6 +231,12 @@ DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
 codex-discord-channel app-server
 ```
 
+Instance routing ignores the generic `CODEX_APP_SERVER_URL`; an inherited
+endpoint from another Codex process must not redirect this bot. Only
+`CODEX_DISCORD_APP_SERVER_URL` or the instance-local socket default selects the
+Discord delivery endpoint. The systemd templates explicitly clear both values
+before loading instance state.
+
 Inspect the non-secret effective identity before startup:
 
 ```bash

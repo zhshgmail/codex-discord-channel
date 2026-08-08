@@ -194,7 +194,7 @@ var require_config = __commonJS({
       let token = env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || "", botUserId = env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || "", proxyUrl = env.DISCORD_PROXY_URL || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || "", cwd = env.CODEX_CWD || options.cwd || process.cwd(), ownerId = env.CODEX_DISCORD_OWNER_ID || env.CODEX_THREAD_ID || env.CODEX_SESSION_ID || env.CODEX_TARGET_THREAD_ID || `${os.hostname()}:${process.pid}:${Date.now()}`, requestedDeliveryMode = String(
         env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || "app-server"
       ).toLowerCase(), deliveryMode = requestedDeliveryMode === "off" ? "off" : "app-server", appServerUrl = String(
-        env.CODEX_DISCORD_APP_SERVER_URL || env.CODEX_APP_SERVER_URL || `unix://${paths.stateDir}/app-server.sock`
+        env.CODEX_DISCORD_APP_SERVER_URL || `unix://${paths.stateDir}/app-server.sock`
       ).trim(), deliveryActivationId = String(
         env.CODEX_DISCORD_DELIVERY_ACTIVATION_ID || ""
       ).trim() || fs.realpathSync(path.resolve(__dirname, ".."));
@@ -4590,11 +4590,15 @@ ${normalized.content}${attachmentText}
             if (!sameDiscordIdentity(queue.uncertain[0]?.normalized, uncertain.normalized))
               return { retry: !0 };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-            return receiverRejected ? { receiverRejected, queue } : alreadyAccepted ? (queue.uncertain.shift(), queue.completed.push({
-              channelId: uncertain.normalized.channelId,
-              messageId: uncertain.normalized.messageId,
-              completedAt: new Date(currentTimeMs(deps)).toISOString()
-            }), writeDeliveryQueue(queue, config, deps), { completed: !0, queueDepth: queue.items.length + queue.uncertain.length }) : { waiting: !0, retryAt: timestampMs(uncertain.delivery?.retryAt), queue };
+            if (receiverRejected) return { receiverRejected, queue };
+            if (alreadyAccepted)
+              return queue.uncertain.shift(), queue.completed.push({
+                channelId: uncertain.normalized.channelId,
+                messageId: uncertain.normalized.messageId,
+                completedAt: new Date(currentTimeMs(deps)).toISOString()
+              }), writeDeliveryQueue(queue, config, deps), { completed: !0, queueDepth: queue.items.length + queue.uncertain.length };
+            let retryAt = timestampMs(uncertain.delivery?.retryAt);
+            return queue.uncertain.length > 1 && (queue.uncertain.push(queue.uncertain.shift()), writeDeliveryQueue(queue, config, deps)), { waiting: !0, retryAt, queue };
           });
           if (reconciled.retry) continue;
           if (reconciled.receiverRejected)
@@ -4976,6 +4980,9 @@ ${normalized.content}${attachmentText}
             throw error.code = target?.reason || "shared_app_server_unavailable", error;
           }
           return target;
+        },
+        refreshTargetCheckpoint() {
+          return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : serializeDrain(() => delivery.ensureReady());
         },
         flush(options = {}) {
           return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : serializeDrain(async () => {

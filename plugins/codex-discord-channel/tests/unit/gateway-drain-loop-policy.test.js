@@ -156,6 +156,13 @@ test('empty durable queue refreshes the recovery target without flushing', async
   const timers = createManualTimers();
   const originalFlush = fixture.delivery.flush.bind(fixture.delivery);
   let flushes = 0;
+  let refreshes = 0;
+  assert.equal(typeof fixture.delivery.refreshTargetCheckpoint, 'function');
+  const originalRefresh = fixture.delivery.refreshTargetCheckpoint.bind(fixture.delivery);
+  fixture.delivery.refreshTargetCheckpoint = (...args) => {
+    refreshes += 1;
+    return originalRefresh(...args);
+  };
   fixture.delivery.flush = (...args) => {
     flushes += 1;
     return originalFlush(...args);
@@ -165,6 +172,7 @@ test('empty durable queue refreshes the recovery target without flushing', async
   assert.deepEqual(timers.delays, [10]);
   assert.equal(await timers.runNext(), true);
   assert.equal(flushes, 0);
+  assert.equal(refreshes, 1);
   assert.equal(fixture.targetAttempts(), 1);
   assert.deepEqual(fixture.requests, []);
   assert.deepEqual(timers.delays, [10, 10]);

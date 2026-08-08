@@ -37,6 +37,7 @@ function sanitizedAppServerEnv(config) {
     if (
       key === 'CODEX_THREAD_ID' ||
       key === 'CODEX_SESSION_ID' ||
+      key === 'CODEX_APP_SERVER_URL' ||
       key === 'CODEX_APP_SERVER_SOCKET' ||
       key === 'CODEX_CWD' ||
       key.startsWith('CODEX_TARGET_') ||
