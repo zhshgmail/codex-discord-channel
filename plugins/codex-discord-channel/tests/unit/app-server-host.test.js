@@ -2920,6 +2920,47 @@ test('active goal turn recovered from thread/read accepts input with an exact tu
   }]);
 });
 
+test('active turn recovery ignores an older ghost in-progress turn', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-after-crash'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active', activeFlags: [] },
+          turns: [
+            { id: 'ghost-turn', status: 'inProgress', items: [] },
+            { id: 'interrupted-turn', status: 'interrupted', items: [] },
+            { id: 'current-turn', status: 'inProgress', items: [] },
+          ],
+        },
+      };
+    }
+    assert.equal(method, 'turn/steer');
+    assert.equal(params.expectedTurnId, 'current-turn');
+    return { turnId: params.expectedTurnId };
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+
+  const target = await host.resolveTarget();
+  assert.equal(target.status, 'active');
+  assert.equal(target.activeTurnId, 'current-turn');
+
+  const params = {
+    threadId: 'thread-after-crash',
+    clientUserMessageId: 'discord:c1:m-after-crash',
+    input: [{ type: 'text', text: 'continue from Discord' }],
+  };
+  assert.deepEqual(await host.startTurn(params, target), { turnId: 'current-turn' });
+});
+
 test('startTurn rejects a resolved target after a newer thread generation is selected', async () => {
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {

@@ -4108,8 +4108,8 @@ var require_app_server_host = __commonJS({
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
         if (this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, status), status === "active") {
-          let inProgressTurnIds = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id);
-          inProgressTurnIds.length === 1 ? this.activeTurnIds.set(thread.id, inProgressTurnIds[0]) : this.activeTurnIds.delete(thread.id);
+          let latestInProgressTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1);
+          latestInProgressTurnId ? this.activeTurnIds.set(thread.id, latestInProgressTurnId) : this.activeTurnIds.delete(thread.id);
         } else
           this.activeTurnIds.delete(thread.id);
         this.lastStatus = { configured: !0, available: !0, reason: null };

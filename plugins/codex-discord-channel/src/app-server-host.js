@@ -1507,11 +1507,12 @@ class AppServerHost extends EventEmitter {
     this.currentThreadId = thread.id;
     this.threadStatuses.set(thread.id, status);
     if (status === 'active') {
-      const inProgressTurnIds = (Array.isArray(thread.turns) ? thread.turns : [])
+      const latestInProgressTurnId = (Array.isArray(thread.turns) ? thread.turns : [])
         .filter((turn) => turn?.status === 'inProgress' && typeof turn.id === 'string' && turn.id)
-        .map((turn) => turn.id);
-      if (inProgressTurnIds.length === 1) {
-        this.activeTurnIds.set(thread.id, inProgressTurnIds[0]);
+        .map((turn) => turn.id)
+        .at(-1);
+      if (latestInProgressTurnId) {
+        this.activeTurnIds.set(thread.id, latestInProgressTurnId);
       } else {
         this.activeTurnIds.delete(thread.id);
       }
