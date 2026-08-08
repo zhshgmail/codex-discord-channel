@@ -1491,6 +1491,53 @@ test('concurrent receivers persist and submit a Discord identity only once', asy
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-once']);
 });
 
+test('target refresh serializes against a concurrent structured queue flush', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-refresh-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const calls = [];
+  const requests = [];
+  let releaseRefresh;
+  let markRefreshStarted;
+  const refreshReleased = new Promise((resolve) => { releaseRefresh = resolve; });
+  const refreshStarted = new Promise((resolve) => { markRefreshStarted = resolve; });
+  const host = {
+    async resolveTarget() {
+      calls.push(calls.length === 0 ? 'refresh' : 'flush');
+      if (calls.length === 1) {
+        markRefreshStarted();
+        await refreshReleased;
+      }
+      return { available: true, threadId: 'thread-current', status: 'idle' };
+    },
+    async startTurn(params) {
+      requests.push(params);
+      return { turn: { id: 'turn-refresh-serialized' } };
+    },
+    async hasDelivered(_threadId, clientUserMessageId) {
+      return requestWasPersisted(requests, clientUserMessageId);
+    },
+    onThreadIdle() { return () => {}; },
+    status() { return { configured: true, available: true, reason: null }; },
+    destroy() {},
+  };
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, { structuredHost: host });
+  await delivery.enqueue(discordMessage('m-refresh-serialized', 'once'));
+
+  const refresh = delivery.refreshTargetCheckpoint();
+  await refreshStarted;
+  const flush = delivery.flush();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(calls, ['refresh']);
+  releaseRefresh();
+  await Promise.all([refresh, flush]);
+  assert.deepEqual(calls, ['refresh', 'flush']);
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), [
+    'discord:c1:m-refresh-serialized',
+  ]);
+  delivery.destroy();
+});
+
 test('receiver handoff waits for the incumbent delivery lease before committing authority', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-authority-handoff-'));
   const config = deliveryConfig(dir, {
