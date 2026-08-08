@@ -6,12 +6,14 @@ const { createAppServerHost } = require('./app-server-host');
 const { isProcessAlive } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
-const DELIVERY_QUEUE_VERSION = 2;
+const DELIVERY_QUEUE_VERSION = 3;
 const DELIVERY_IN_PROGRESS = 'structured_delivery_in_progress';
 const DELIVERY_ACK_UNCERTAIN = 'structured_ack_uncertain';
 const STALE_DELIVERY_ACTIVATION = 'stale_delivery_activation';
 const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
 const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
+const DEFAULT_UNCERTAIN_RETRY_BASE_MS = 5000;
+const DEFAULT_UNCERTAIN_RETRY_MAX_MS = 5 * 60 * 1000;
 const activeDeliveryAttempts = new Set();
 
 function currentTimeMs(deps = {}) {
@@ -242,6 +244,7 @@ function emptyDeliveryQueue() {
     version: DELIVERY_QUEUE_VERSION,
     activation: null,
     items: [],
+    uncertain: [],
     completed: [],
     archived: [],
     blocked: null,
@@ -259,7 +262,7 @@ function readDeliveryQueue(config = {}, deps = {}) {
   } catch {
     throw new Error(DELIVERY_QUEUE_ERROR_MESSAGE);
   }
-  if (![1, DELIVERY_QUEUE_VERSION].includes(parsed?.version) || !Array.isArray(parsed.items)) {
+  if (![1, 2, DELIVERY_QUEUE_VERSION].includes(parsed?.version) || !Array.isArray(parsed.items)) {
     throw new Error(`Invalid Discord delivery queue: ${file}`);
   }
   return {
@@ -268,6 +271,7 @@ function readDeliveryQueue(config = {}, deps = {}) {
       ? parsed.activation
       : null,
     items: parsed.items,
+    uncertain: Array.isArray(parsed.uncertain) ? parsed.uncertain : [],
     completed: Array.isArray(parsed.completed) ? parsed.completed : [],
     archived: Array.isArray(parsed.archived) ? parsed.archived : [],
     blocked: parsed.blocked && typeof parsed.blocked === 'object' ? parsed.blocked : null,
@@ -278,9 +282,24 @@ function readDeliveryQueueStatus(config = {}, deps = {}) {
   const queuePath = getDeliveryQueuePath(config);
   try {
     const queue = readDeliveryQueue(config, deps);
+    const oldestUncertain = queue.uncertain[0] || null;
+    const degradedReason = queue.blocked?.reason || (
+      oldestUncertain ? DELIVERY_ACK_UNCERTAIN : null
+    );
     return {
       deliveryQueuePath: queuePath,
-      deliveryQueueDepth: queue.items.length,
+      deliveryQueueDepth: queue.items.length + queue.uncertain.length,
+      deliveryReadyCount: queue.items.length,
+      deliveryUncertainCount: queue.uncertain.length,
+      deliveryState: queue.blocked
+        ? 'blocked'
+        : (oldestUncertain ? 'degraded' : (queue.items.length > 0 ? 'queued' : 'idle')),
+      deliveryDegradedReason: degradedReason,
+      deliveryOldestUncertainMessageId: oldestUncertain?.normalized?.messageId || null,
+      deliveryOldestUncertainRetryAt: oldestUncertain?.delivery?.retryAt || null,
+      deliveryOldestUncertainAttempts: oldestUncertain
+        ? Math.max(0, Number(oldestUncertain.delivery?.attempts) || 0)
+        : null,
       deliveryArchivedCount: queue.archived.length,
       deliveryActivatedAt: queue.activation?.activatedAt || null,
       deliveryBlockedReason: queue.blocked?.reason || null,
@@ -291,6 +310,13 @@ function readDeliveryQueueStatus(config = {}, deps = {}) {
     return {
       deliveryQueuePath: queuePath,
       deliveryQueueDepth: null,
+      deliveryReadyCount: null,
+      deliveryUncertainCount: null,
+      deliveryState: 'unreadable',
+      deliveryDegradedReason: 'delivery_queue_unreadable',
+      deliveryOldestUncertainMessageId: null,
+      deliveryOldestUncertainRetryAt: null,
+      deliveryOldestUncertainAttempts: null,
       deliveryArchivedCount: null,
       deliveryActivatedAt: null,
       deliveryBlockedReason: 'delivery_queue_unreadable',
@@ -370,9 +396,15 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
   const eligibleItems = activationMatches
     ? queue.items.filter((item) => itemIsEligible(item))
     : [];
+  const staleUncertain = activationMatches
+    ? queue.uncertain.filter((item) => !itemIsEligible(item))
+    : queue.uncertain;
+  const eligibleUncertain = activationMatches
+    ? queue.uncertain.filter((item) => itemIsEligible(item))
+    : [];
   const archived = [...queue.archived];
   const archivedAt = new Date(currentTimeMs(deps)).toISOString();
-  for (const item of staleItems) {
+  for (const item of [...staleItems, ...staleUncertain]) {
     archiveIdentity(
       archived,
       queue.completed,
@@ -385,7 +417,8 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
   const headWasArchived = headIdentity && staleIdentities.has(
     `${headIdentity.channelId || ''}\0${headIdentity.messageId || ''}`,
   );
-  const changed = queue.version !== DELIVERY_QUEUE_VERSION || !activationMatches || staleItems.length > 0;
+  const changed = queue.version !== DELIVERY_QUEUE_VERSION || !activationMatches ||
+    staleItems.length > 0 || staleUncertain.length > 0;
   if (!changed) return { queue, changed: false, archivedCount: 0 };
   return {
     queue: {
@@ -394,12 +427,13 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
         ? queue.activation
         : { id: activationId, activatedAt: archivedAt },
       items: eligibleItems,
+      uncertain: eligibleUncertain,
       completed: queue.completed,
       archived,
       blocked: !activationMatches || headWasArchived ? null : queue.blocked,
     },
     changed: true,
-    archivedCount: staleItems.length,
+    archivedCount: staleItems.length + staleUncertain.length,
   };
 }
 
@@ -421,9 +455,10 @@ function queueDelivery(normalized, config = {}, deps = {}) {
     return { queue, enqueued: false, duplicate: 'archived' };
   }
   const pendingDuplicate = queue.items.some((item) => sameDiscordIdentity(item.normalized, identity));
+  const uncertainDuplicate = queue.uncertain.some((item) => sameDiscordIdentity(item.normalized, identity));
   const completedDuplicate = queue.completed.some((item) => sameDiscordIdentity(item, identity));
   const archivedDuplicate = queue.archived.some((item) => sameDiscordIdentity(item, identity));
-  if (!pendingDuplicate && !completedDuplicate && !archivedDuplicate) {
+  if (!pendingDuplicate && !uncertainDuplicate && !completedDuplicate && !archivedDuplicate) {
     queue.items.push({
       version: DELIVERY_QUEUE_VERSION,
       activationId,
@@ -436,10 +471,10 @@ function queueDelivery(normalized, config = {}, deps = {}) {
   }
   return {
     queue,
-    enqueued: !pendingDuplicate && !completedDuplicate && !archivedDuplicate,
+    enqueued: !pendingDuplicate && !uncertainDuplicate && !completedDuplicate && !archivedDuplicate,
     duplicate: completedDuplicate
       ? 'completed'
-      : (archivedDuplicate ? 'archived' : (pendingDuplicate ? 'pending' : null)),
+      : (archivedDuplicate ? 'archived' : ((pendingDuplicate || uncertainDuplicate) ? 'pending' : null)),
   };
 }
 
@@ -468,8 +503,12 @@ function blockedResult(queue, reason, status = 'queued') {
     status,
     reason,
     deliveredCount: 0,
-    queueDepth: queue.items.length,
+    queueDepth: queue.items.length + queue.uncertain.length,
   };
+}
+
+function pendingQueueDepth(queue) {
+  return queue.items.length + queue.uncertain.length;
 }
 
 function receiverRejectedResult(queue, receiver = {}) {
@@ -509,6 +548,7 @@ function completedQueue(queue, next) {
     version: DELIVERY_QUEUE_VERSION,
     activation: queue.activation,
     items: queue.items.slice(1),
+    uncertain: queue.uncertain,
     completed: [
       ...queue.completed,
       {
@@ -520,6 +560,63 @@ function completedQueue(queue, next) {
     archived: queue.archived,
     blocked: null,
   };
+}
+
+function uncertainRetryDelayMs(config, attemptCount) {
+  const base = Math.max(
+    1,
+    Number(config.deliveryUncertainRetryBaseMs) || DEFAULT_UNCERTAIN_RETRY_BASE_MS,
+  );
+  const maximum = Math.max(
+    base,
+    Number(config.deliveryUncertainRetryMaxMs) || DEFAULT_UNCERTAIN_RETRY_MAX_MS,
+  );
+  const exponent = Math.max(0, Math.min(16, Number(attemptCount) - 1));
+  return Math.min(maximum, base * (2 ** exponent));
+}
+
+function moveQueueHeadToUncertain(queue, config, deps, details = {}) {
+  const item = queue.items.shift();
+  const attempts = Math.max(0, Number(item.delivery?.attempts) || 0) + 1;
+  const deferredAtMs = currentTimeMs(deps);
+  item.delivery = {
+    state: DELIVERY_ACK_UNCERTAIN,
+    attempts,
+    firstDeferredAt: item.delivery?.firstDeferredAt || new Date(deferredAtMs).toISOString(),
+    lastDeferredAt: new Date(deferredAtMs).toISOString(),
+    retryAt: new Date(
+      deferredAtMs + uncertainRetryDelayMs(config, attempts),
+    ).toISOString(),
+    messageId: item.normalized.messageId,
+    threadId: details.threadId || item.delivery?.threadId || '',
+    clientUserMessageId: details.clientUserMessageId ||
+      item.delivery?.clientUserMessageId || '',
+    error: details.error || item.delivery?.error || '',
+  };
+  queue.uncertain.push(item);
+  queue.blocked = null;
+  return item;
+}
+
+async function deferCurrentHead(
+  config,
+  deps,
+  expected,
+  details = {},
+  verifyReceiverOwnership = null,
+) {
+  return withDeliveryQueueLock(config, deps, () => {
+    const queue = readDeliveryQueue(config, deps);
+    if (!queueHeadMatches(queue, expected)) return { retry: true };
+    const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+    if (receiverRejected) return { receiverRejected, queue };
+    moveQueueHeadToUncertain(queue, config, deps, details);
+    writeDeliveryQueue(queue, config, deps);
+    return {
+      result: blockedResult(queue, DELIVERY_ACK_UNCERTAIN, 'failed'),
+      queue,
+    };
+  });
 }
 
 function turnStartParams(next, threadId) {
@@ -540,24 +637,6 @@ function unavailableTarget(error) {
   };
 }
 
-async function blockCurrentHead(
-  config,
-  deps,
-  expected,
-  reason,
-  details = {},
-  verifyReceiverOwnership = null,
-) {
-  return withDeliveryQueueLock(config, deps, () => {
-    const queue = readDeliveryQueue(config, deps);
-    if (!queueHeadMatches(queue, expected)) return { retry: true };
-    const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-    if (receiverRejected) return { receiverRejected, queue };
-    setQueueBlock(queue, reason, details, config, deps);
-    return { result: blockedResult(queue, reason, reason === DELIVERY_ACK_UNCERTAIN ? 'failed' : 'queued') };
-  });
-}
-
 async function flushStructuredQueue(config, logger, deps, host, options = {}) {
   const verifyReceiverOwnership = options.verifyReceiverOwnership;
   let reconciledCount = 0;
@@ -575,6 +654,55 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
     const snapshot = inspection.queue;
     if (inspection.receiverRejected) {
       return receiverRejectedResult(snapshot, inspection.receiverRejected);
+    }
+    const uncertain = snapshot.uncertain[0];
+    if (uncertain) {
+      const threadId = uncertain.delivery?.threadId || '';
+      const clientUserMessageId = uncertain.delivery?.clientUserMessageId || '';
+      let alreadyAccepted = false;
+      if (threadId && clientUserMessageId && typeof host.hasDelivered === 'function') {
+        try {
+          alreadyAccepted = await host.hasDelivered(threadId, clientUserMessageId);
+        } catch {}
+      }
+      const reconciled = await withDeliveryQueueLock(config, deps, () => {
+        const queue = readDeliveryQueue(config, deps);
+        if (!sameDiscordIdentity(queue.uncertain[0]?.normalized, uncertain.normalized)) {
+          return { retry: true };
+        }
+        const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+        if (receiverRejected) return { receiverRejected, queue };
+        if (alreadyAccepted) {
+          queue.uncertain.shift();
+          queue.completed.push({
+            channelId: uncertain.normalized.channelId,
+            messageId: uncertain.normalized.messageId,
+            completedAt: new Date(currentTimeMs(deps)).toISOString(),
+          });
+          writeDeliveryQueue(queue, config, deps);
+          return { completed: true, queueDepth: queue.items.length + queue.uncertain.length };
+        }
+        const retryAt = timestampMs(uncertain.delivery?.retryAt);
+        return { waiting: true, retryAt, queue };
+      });
+      if (reconciled.retry) continue;
+      if (reconciled.receiverRejected) {
+        return receiverRejectedResult(reconciled.queue, reconciled.receiverRejected);
+      }
+      if (reconciled.completed) {
+        reconciledCount += 1;
+        continue;
+      }
+      if (snapshot.items.length === 0) {
+        const result = blockedResult(snapshot, DELIVERY_ACK_UNCERTAIN);
+        if (
+          Number.isFinite(reconciled.retryAt) &&
+          reconciled.retryAt > currentTimeMs(deps)
+        ) {
+          Object.defineProperty(result, DELIVERY_LEASE_RETRY_AT, { value: reconciled.retryAt });
+        }
+        return result;
+      }
     }
     if (snapshot.items.length === 0) {
       if (reconciledCount > 0) {
@@ -598,7 +726,20 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           alreadyAccepted = await host.hasDelivered(threadId, clientUserMessageId);
         } catch {}
       }
-      if (!alreadyAccepted) return blockedResult(snapshot, DELIVERY_ACK_UNCERTAIN, 'failed');
+      if (!alreadyAccepted) {
+        const deferred = await deferCurrentHead(
+          config,
+          deps,
+          next,
+          snapshot.blocked,
+          verifyReceiverOwnership,
+        );
+        if (deferred.retry) continue;
+        if (deferred.receiverRejected) {
+          return receiverRejectedResult(deferred.queue, deferred.receiverRejected);
+        }
+        return deferred.result;
+      }
       const reconciled = await withDeliveryQueueLock(config, deps, () => {
         const queue = readDeliveryQueue(config, deps);
         if (!queueHeadMatches(queue, next) || queue.blocked?.reason !== DELIVERY_ACK_UNCERTAIN) {
@@ -608,7 +749,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         if (receiverRejected) return { receiverRejected, queue };
         const updated = completedQueue(queue, next);
         writeDeliveryQueue(updated, config, deps);
-        return { queueDepth: updated.items.length };
+        return { queueDepth: pendingQueueDepth(updated) };
       });
       if (reconciled.retry) continue;
       if (reconciled.receiverRejected) {
@@ -646,11 +787,10 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         continue;
       }
-      const stale = await blockCurrentHead(
+      const stale = await deferCurrentHead(
         config,
         deps,
         next,
-        DELIVERY_ACK_UNCERTAIN,
         {
           messageId: next.normalized.messageId,
           threadId: snapshot.blocked.threadId || '',
@@ -696,7 +836,10 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         activeDeliveryAttempts.delete(attemptId);
         throw error;
       }
-      return { next: queue.items[0], queueDepth: queue.items.length };
+      return {
+        next: queue.items[0],
+        queueDepth: queue.items.length + queue.uncertain.length,
+      };
     });
     if (claim.retry) continue;
     if (claim.receiverRejected) {
@@ -778,21 +921,38 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       const reason = uncertain
         ? DELIVERY_ACK_UNCERTAIN
         : (error?.code === 'thread_busy' ? 'thread_busy' : (error?.code || 'shared_app_server_unavailable'));
-      const blocked = await withDeliveryQueueLock(config, deps, () => {
-        const queue = readDeliveryQueue(config, deps);
-        if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
-          return blockedResult(queue, DELIVERY_ACK_UNCERTAIN, 'failed');
+      const details = {
+        messageId: next.normalized.messageId,
+        threadId: target.threadId,
+        clientUserMessageId: params.clientUserMessageId,
+        error: error instanceof Error ? error.message : String(error),
+      };
+      let blocked;
+      if (uncertain) {
+        const deferred = await deferCurrentHead(
+          config,
+          deps,
+          next,
+          details,
+          verifyReceiverOwnership,
+        );
+        if (deferred.retry) continue;
+        if (deferred.receiverRejected) {
+          return receiverRejectedResult(deferred.queue, deferred.receiverRejected);
         }
-        const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-        if (receiverRejected) return receiverRejectedResult(queue, receiverRejected);
-        setQueueBlock(queue, reason, {
-          messageId: next.normalized.messageId,
-          threadId: target.threadId,
-          clientUserMessageId: params.clientUserMessageId,
-          error: error instanceof Error ? error.message : String(error),
-        }, config, deps);
-        return blockedResult(queue, reason, uncertain ? 'failed' : 'queued');
-      });
+        blocked = deferred.result;
+      } else {
+        blocked = await withDeliveryQueueLock(config, deps, () => {
+          const queue = readDeliveryQueue(config, deps);
+          if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
+            return blockedResult(queue, DELIVERY_ACK_UNCERTAIN, 'failed');
+          }
+          const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+          if (receiverRejected) return receiverRejectedResult(queue, receiverRejected);
+          setQueueBlock(queue, reason, details, config, deps);
+          return blockedResult(queue, reason);
+        });
+      }
       activeDeliveryAttempts.delete(attemptId);
       logger('ERROR', uncertain
         ? 'Structured Discord delivery acknowledgement is uncertain'
@@ -815,11 +975,10 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       }
     } catch {}
     if (!persistedUserItem) {
-      const unverified = await blockCurrentHead(
+      const unverified = await deferCurrentHead(
         config,
         deps,
         next,
-        DELIVERY_ACK_UNCERTAIN,
         {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
@@ -847,20 +1006,24 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         const queue = readDeliveryQueue(config, deps);
         if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
           if (queueHeadMatches(queue, next)) {
-            setQueueBlock(queue, DELIVERY_ACK_UNCERTAIN, {
+            moveQueueHeadToUncertain(queue, config, deps, {
               messageId: next.normalized.messageId,
               threadId: target.threadId,
               clientUserMessageId: params.clientUserMessageId,
               error: 'Structured delivery checkpoint changed before commit.',
-            }, config, deps);
+            });
+            writeDeliveryQueue(queue, config, deps);
           }
-          return { uncertain: true, queueDepth: queue.items.length };
+          return {
+            uncertain: true,
+            queueDepth: queue.items.length + queue.uncertain.length,
+          };
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
         const updated = completedQueue(queue, next);
         writeDeliveryQueue(updated, config, deps);
-        return { queueDepth: updated.items.length };
+        return { queueDepth: updated.items.length + updated.uncertain.length };
       });
       activeDeliveryAttempts.delete(attemptId);
       if (committed.receiverRejected) {
@@ -888,7 +1051,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       };
     } catch (error) {
       try {
-        await blockCurrentHead(config, deps, next, DELIVERY_ACK_UNCERTAIN, {
+        await deferCurrentHead(config, deps, next, {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
@@ -1155,7 +1318,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         return {
           status: 'duplicate',
           reason: 'discord_message_already_completed',
-          queueDepth: admission.queueResult.queue.items.length,
+          queueDepth: pendingQueueDepth(admission.queueResult.queue),
           envelope,
         };
       }
@@ -1163,7 +1326,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         return {
           status: 'duplicate',
           reason: 'discord_message_archived_at_activation',
-          queueDepth: admission.queueResult.queue.items.length,
+          queueDepth: pendingQueueDepth(admission.queueResult.queue),
           envelope,
         };
       }
@@ -1172,7 +1335,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         reason: admission.queueResult.enqueued
           ? 'discord_message_persisted'
           : 'discord_message_already_pending',
-        queueDepth: admission.queueResult.queue.items.length,
+        queueDepth: pendingQueueDepth(admission.queueResult.queue),
         envelope,
       };
     },

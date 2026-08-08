@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const moduleBuiltin = require('node:module');
+const os = require('node:os');
 const path = require('node:path');
 const esbuild = require('esbuild');
 
@@ -44,46 +45,51 @@ function externalImports(metafile) {
 }
 
 async function buildBundle() {
-  const result = await esbuild.build({
-    absWorkingDir: root,
-    bundle: true,
-    define: {
-      'process.env.WS_NO_BUFFER_UTIL': '"1"',
-      'process.env.WS_NO_UTF_8_VALIDATE': '"1"',
-    },
-    entryPoints: ['src/mcp-server.js'],
-    format: 'cjs',
-    legalComments: 'none',
-    metafile: true,
-    minifySyntax: true,
-    outfile: path.relative(root, outputPath),
-    packages: 'bundle',
-    platform: 'node',
-    plugins: [optionalNativeFallbacks, nodeExternals],
-    sourcemap: false,
-    target: ['node22'],
-    write: false,
-  });
-  const external = externalImports(result.metafile);
-  assert.deepEqual(
-    external.filter((specifier) => !specifier.startsWith('node:')),
-    [],
-    'MCP bundle contains external non-node dependencies',
-  );
-  const output = result.outputFiles.find((file) => file.path === outputPath);
-  assert(output, 'esbuild did not produce the MCP runtime bundle');
-  const unresolved = [...output.text.matchAll(/(?:require|__require)\(["']([^"']+)["']\)/g)]
-    .map((match) => match[1])
-    .filter((specifier) => !specifier.startsWith('node:'));
-  assert.deepEqual(unresolved, [], 'MCP bundle contains unresolved runtime imports');
-  return output.contents;
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-discord-runtime-'));
+  const temporaryOutput = path.join(temporaryDirectory, 'mcp-server.cjs');
+  try {
+    const result = await esbuild.build({
+      absWorkingDir: root,
+      bundle: true,
+      define: {
+        'process.env.WS_NO_BUFFER_UTIL': '"1"',
+        'process.env.WS_NO_UTF_8_VALIDATE': '"1"',
+      },
+      entryPoints: ['src/mcp-server.js'],
+      format: 'cjs',
+      legalComments: 'none',
+      metafile: true,
+      minifySyntax: true,
+      outfile: temporaryOutput,
+      packages: 'bundle',
+      platform: 'node',
+      plugins: [optionalNativeFallbacks, nodeExternals],
+      sourcemap: false,
+      target: ['node22'],
+      write: true,
+    });
+    const external = externalImports(result.metafile);
+    assert.deepEqual(
+      external.filter((specifier) => !specifier.startsWith('node:')),
+      [],
+      'MCP bundle contains external non-node dependencies',
+    );
+    const output = fs.readFileSync(temporaryOutput);
+    const unresolved = [...output.toString('utf8').matchAll(/(?:require|__require)\(["']([^"']+)["']\)/g)]
+      .map((match) => match[1])
+      .filter((specifier) => !specifier.startsWith('node:'));
+    assert.deepEqual(unresolved, [], 'MCP bundle contains unresolved runtime imports');
+    return output;
+  } finally {
+    fs.rmSync(temporaryDirectory, { force: true, recursive: true });
+  }
 }
 
 async function main() {
   const bundle = await buildBundle();
   if (check) {
     assert(fs.existsSync(outputPath), 'runtime/mcp-server.cjs is not committed');
-    assert.deepEqual(fs.readFileSync(outputPath), Buffer.from(bundle), 'runtime/mcp-server.cjs is stale');
+    assert(fs.readFileSync(outputPath).equals(bundle), 'runtime/mcp-server.cjs is stale');
     return;
   }
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });

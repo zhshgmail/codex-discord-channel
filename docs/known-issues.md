@@ -55,10 +55,13 @@ or a missed notification performs the same local verification before using the
 existing structured `thread/read` recovery path. Only a durable rollout record
 or exact readback can move the Discord identity into `completed`.
 
-If the user item is not observable, the queue head remains durable and status
-reports `structured_ack_uncertain`. Periodic reconciliation checks for the
-stable client id and completes without a second `turn/start` or `turn/steer`
-request once the item appears.
+If the user item is not observable, the item remains durable and status reports
+`deliveryState=degraded`, `structured_ack_uncertain`, its stable message id,
+attempt count, and retry time. Periodic reconciliation checks for the stable
+client id and completes without a second request once the item appears. If it
+does not appear, the item remains fail-closed while later FIFO items continue;
+timeout never authorizes a second request, and one uncertain item no longer
+freezes all inbound delivery.
 
 ### Diagnosis
 
@@ -113,7 +116,9 @@ remote app-servers, unavailable or ambiguous files, malformed identity, and
 records older than the bounded tail. The returned thread id and structured item
 shape must match exactly. A timeout, unsupported request, malformed response,
 wrong thread, or missing client id remains `structured_ack_uncertain`; none is
-converted into delivered.
+converted into delivered. It is visible in the reconciliation lane instead of
+becoming a permanent global queue block, and timeout never authorizes another
+`turn/start` call.
 
 This behavior is repository source behavior until the parent-owned deployment,
 restart, Discord send, and exact read-back checks have completed. The 120-second

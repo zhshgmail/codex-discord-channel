@@ -50,6 +50,12 @@ if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin
 fi
 
 runtime_args=(--instance "$instance" --state-dir "$state_dir")
+child_env_unsets=()
+while IFS= read -r name; do
+  case $name in
+    DISCORD_*|CODEX_DISCORD_*|CODEX_APP_SERVER_URL) child_env_unsets+=(-u "$name") ;;
+  esac
+done < <(compgen -e)
 set +e
 "$node_bin" "$channel_bin" tui-login-state "${runtime_args[@]}" >/dev/null
 login_state=$?
@@ -60,12 +66,7 @@ if ((login_state == 10)); then
     exit 1
   fi
   env \
-    -u DISCORD_BOT_TOKEN \
-    -u DISCORD_TOKEN \
-    -u DISCORD_BOT_USER_ID \
-    -u DISCORD_BOT_ID \
-    -u DISCORD_INSTANCE \
-    -u DISCORD_CONFIG_DIR \
+    "${child_env_unsets[@]}" \
     -u CODEX_DISCORD_OWNER_ID \
     -u CODEX_THREAD_ID \
     -u CODEX_SESSION_ID \
@@ -158,10 +159,7 @@ while ((SECONDS <= deadline)); do
 
       set +e
       env \
-        -u DISCORD_BOT_TOKEN \
-        -u DISCORD_TOKEN \
-        -u DISCORD_BOT_USER_ID \
-        -u DISCORD_BOT_ID \
+        "${child_env_unsets[@]}" \
         -u CODEX_THREAD_ID \
         -u CODEX_SESSION_ID \
         -u CODEX_TARGET_THREAD_ID \
@@ -221,18 +219,46 @@ while ((SECONDS <= deadline)); do
       recovery_stamps+=("$now_seconds")
 
       recovered_args=()
-      found_resume=0
-      for arg in "${codex_args[@]}"; do
-        if [[ $arg == resume ]]; then
-          recovered_args+=(resume "$recovery_thread")
-          found_resume=1
+      option_index=0
+      while ((option_index < ${#codex_args[@]})); do
+        arg=${codex_args[$option_index]}
+        if [[ $arg == -- ]] || [[ $arg != -* ]]; then
           break
         fi
-        recovered_args+=("$arg")
+        case $arg in
+          --oss|--full-auto|--dangerously-bypass-approvals-and-sandbox|--search|--no-alt-screen)
+            recovered_args+=("$arg")
+            option_index=$((option_index + 1))
+            ;;
+          --image=*)
+            option_index=$((option_index + 1))
+            ;;
+          --config=*|--enable=*|--disable=*|--model=*|--local-provider=*|--profile=*|--sandbox=*|--ask-for-approval=*|--cd=*|--add-dir=*)
+            recovered_args+=("$arg")
+            option_index=$((option_index + 1))
+            ;;
+          -i|--image)
+            if ((option_index + 1 >= ${#codex_args[@]})); then
+              echo "App-server recovery cannot discard $arg without its value" >&2
+              exit "$tui_status"
+            fi
+            option_index=$((option_index + 2))
+            ;;
+          -c|--config|--enable|--disable|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir)
+            if ((option_index + 1 >= ${#codex_args[@]})); then
+              echo "App-server recovery cannot preserve $arg without its value" >&2
+              exit "$tui_status"
+            fi
+            recovered_args+=("$arg" "${codex_args[$((option_index + 1))]}")
+            option_index=$((option_index + 2))
+            ;;
+          *)
+            echo "App-server recovery refuses unknown global option $arg" >&2
+            exit "$tui_status"
+            ;;
+        esac
       done
-      if ((found_resume == 0)); then
-        recovered_args=(resume "$recovery_thread")
-      fi
+      recovered_args+=(resume "$recovery_thread")
       codex_args=("${recovered_args[@]}")
       echo "App-server generation changed; resuming thread $recovery_thread." >&2
     done

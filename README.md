@@ -13,7 +13,8 @@ marketplace at `.agents/plugins/marketplace.json`.
   the current receiver CAS lives in `session-gateway.pid.v2`.
 - Keeps `owner.json` for status and handoff metadata only; thread or session ids
   never gate individual Discord messages.
-- Persists accepted messages in a cross-process locked, deduplicated FIFO.
+- Persists accepted messages in a cross-process locked, deduplicated ready FIFO
+  plus a visible fail-closed reconciliation lane for uncertain acknowledgements.
 - Sends one queued message at a time through `turn/start` when idle or
   `turn/steer` when an exact active turn is known on the shared Codex app-server
   used by the visible TUI.
@@ -65,8 +66,10 @@ sandbox, cwd, and approval overrides.
 
 Queue completion is committed only after structured acceptance **and** a
 read-back of the stable client message id from the exact target thread. A
-positive RPC response without that persisted user item is not success: replay
-is blocked and the FIFO head remains available for reconciliation. See the
+positive RPC response without that persisted user item is not success. The item
+moves to the uncertain reconciliation lane, where only exact durable proof can
+complete it and automatic `turn/start` replay is forbidden; later ready items
+continue. See the
 [Structured Delivery Contract](docs/structured-delivery.md) and
 [Known Issues And Operational Boundaries](docs/known-issues.md).
 
@@ -88,6 +91,17 @@ directory; `owner.json` and thread/session ids are not receive gates. The
 interval bounds may be changed with
 `CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS` and
 `CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS`.
+Uncertain proof rechecks use `CODEX_DISCORD_UNCERTAIN_RETRY_BASE_MS` and
+`CODEX_DISCORD_UNCERTAIN_RETRY_MAX_MS`. These legacy-named settings never
+authorize replaying `turn/start`.
+Gateway heartbeat expiry uses `CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS` and
+defaults to 3 minutes.
+
+The unique gateway writes `gateway-health.json` atomically. MCP status verifies
+that record against receiver PID/generation authority and reports MCP-local
+Discord login separately. Queue state is explicit as `idle`, `queued`,
+`blocked`, `degraded`, or `unreadable`; a degraded queue exposes the oldest
+uncertain message id, attempts, and retry time without message content.
 
 ## Required Live Migration
 
@@ -407,11 +421,18 @@ Check status before claiming live delivery. The minimum healthy evidence is:
 {
   "deliveryMode": "app-server",
   "deliverySafety": "structured_only",
+  "runtimeStatusSource": "gateway_health",
+  "gatewayLive": true,
   "structuredDeliveryState": "available",
   "sharedAppServerAvailable": true,
   "discordStarted": true
 }
 ```
+
+The top-level `discordStarted` and shared app-server fields always describe the
+durable gateway receiver. An MCP process may log in independently for tools;
+its diagnostics are reported only as `mcpDiscordClientStarted` and
+`mcpDiscordClientReason` and never substitute for missing gateway health.
 
 The command-line sender reads message text from standard input:
 
@@ -463,8 +484,9 @@ Expected fail-closed status before the shared endpoint exists:
 }
 ```
 
-Status also reports queue depth and the current blocked reason without exposing
-queued message content, tokens, or proxy values.
+Status also reports queue state, ready and uncertain counts, the current
+blocked or degraded reason, and the oldest uncertain retry metadata without
+exposing queued message content, tokens, or proxy values.
 
 ## Guild Reply Audience
 
@@ -490,6 +512,7 @@ $HOME/.codex/channels/discord/codex01/.env
 $HOME/.codex/channels/discord/codex01/access.json
 $HOME/.codex/channels/discord/codex01/owner.json
 $HOME/.codex/channels/discord/codex01/session-gateway.pid
+$HOME/.codex/channels/discord/codex01/gateway-health.json
 $HOME/.codex/channels/discord/codex01/pending-delivery.json
 $HOME/.codex/channels/discord/codex01/reply-receipts/
 $HOME/.codex/channels/discord/codex01/app-server.sock
@@ -504,8 +527,9 @@ Useful non-secret checks:
 ```bash
 systemctl --user status codex-discord-channel@codex01.service --no-pager -l
 journalctl --user -u codex-discord-channel@codex01.service -n 200 --no-pager
-jq '{blocked,itemCount:(.items|length),completed:(.completed|length)}' \
+jq '{blocked,ready:(.items|length),uncertain:(.uncertain|length),completed:(.completed|length)}' \
   "$HOME/.codex/channels/discord/codex01/pending-delivery.json"
+cat "$HOME/.codex/channels/discord/codex01/gateway-health.json"
 cat "$HOME/.codex/channels/discord/codex01/session-gateway.pid"
 ```
 
@@ -521,11 +545,16 @@ file both reach the fallback; inspect the command exit code separately.
 | Peer bot messages are absent | Group `allowFrom`, `allowBots`, current group id, and mention pattern | Allowlist the peer bot and set `allowBots: true` only for the intended group. |
 | Gateway says connected but the visible TUI receives nothing | Confirm both processes use the same `app-server.sock` | Relaunch the TUI with `codex --remote`. A direct TUI has a private embedded server. |
 | Queue is stuck at `thread_busy` | Exact current thread and active turn identity | Let the current turn advance; do not start a second receiver or inject terminal input. |
-| Queue is stuck at `structured_ack_uncertain` | Exact target thread read-back by stable client id | Preserve the queue. The gateway reconciles without replay when the user item appears. See the known issue below. |
+| Queue is degraded by `structured_ack_uncertain` | `deliveryOldestUncertainMessageId`, proof-check time, and exact target read-back | Preserve the item. The gateway completes it only from exact durable proof, never from timeout or automatic `turn/start` replay, while continuing later ready items. |
 | One Discord question receives repeated answers | Reply receipt for the exact source channel and message id | Use `discord_channel_send` with exact `channelId` and `replyTo`; automatic repeats are suppressed. Use `followup` only deliberately and do not bypass the guard with a generic Discord sender. |
 | Messages reappear after deployment | Runtime path and delivery activation id | Use versioned install paths. Do not reuse an old activation id across incompatible releases. |
 | Discord login or send fails behind a corporate network | Status booleans for proxy/TLS and service environment | Configure `DISCORD_PROXY_URL`; use `DISCORD_INSECURE_TLS` only where the local trust boundary explicitly requires it. Never log the values. |
 | `/clear` is followed by delivery to an old thread | Current runtime version and target checkpoint | Upgrade and verify thread rotation in the exact visible TUI. `owner.json` must not be used as the message receive gate. |
+
+The app-server unit uses `OOMPolicy=continue`, so an OOM-killed MCP or tool
+child does not automatically stop the surviving app-server and disconnect the
+visible TUI. Normal service shutdown retains systemd's control-group cleanup;
+do not preserve stale tool subprocesses across an app-server replacement.
 
 The reproduced false-completion incident and its fixed boundary are documented
 in [Known Issues And Operational Boundaries](docs/known-issues.md).

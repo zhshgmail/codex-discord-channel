@@ -24,6 +24,7 @@ function startGatewayDrainLoop({
   delivery,
   receiverOwnership,
   logger = () => {},
+  reportHealth = () => {},
   deps = {},
 }) {
   if (typeof delivery?.flush !== 'function') {
@@ -40,6 +41,17 @@ function startGatewayDrainLoop({
   const queueStatus = deps.readDeliveryQueueStatus || readDeliveryQueueStatus;
   const checkOwnership = deps.isCurrentReceiverOwnership || isCurrentReceiverOwnership;
 
+  const report = async (result) => {
+    try {
+      await reportHealth(result);
+    } catch (error) {
+      log(logger, 'ERROR', 'Failed to persist Discord gateway health', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    return result;
+  };
+
   let stopped = false;
   let timer = null;
   let generation = 0;
@@ -52,24 +64,52 @@ function startGatewayDrainLoop({
   };
 
   const drainOnce = async () => {
+    const receiver = checkOwnership(config, receiverOwnership, deps);
+    if (!receiver?.active) {
+      stopped = true;
+      generation += 1;
+      log(logger, 'INFO', 'Stopping Discord queue drain after receiver ownership changed', {
+        reason: receiver?.reason || 'gateway_generation_changed',
+        activePid: receiver?.pid,
+      });
+      return baseDelayMs;
+    }
     const status = queueStatus(config, deps);
     if (status.deliveryQueueDepth === 0) {
+      try {
+        await delivery.ensureReady();
+      } catch (error) {
+        const reason = error?.code || 'shared_app_server_unavailable';
+        log(logger, 'ERROR', 'Cannot refresh the Discord TUI recovery target', {
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        await report({
+          status: 'failed',
+          reason,
+          deliveredCount: 0,
+          queueDepth: 0,
+        });
+        return increaseBackoff();
+      }
+      if (!checkOwnership(config, receiverOwnership, deps)?.active) {
+        stopped = true;
+        generation += 1;
+        return baseDelayMs;
+      }
       retryDelayMs = baseDelayMs;
+      await report({ status: 'idle', reason: 'queue_empty', deliveredCount: 0, queueDepth: 0 });
       return baseDelayMs;
     }
     if (!Number.isInteger(status.deliveryQueueDepth) || status.deliveryQueueDepth < 0) {
       log(logger, 'ERROR', 'Cannot inspect durable Discord delivery queue', {
         reason: status.deliveryBlockedReason || 'delivery_queue_unreadable',
       });
-      return increaseBackoff();
-    }
-
-    const receiver = checkOwnership(config, receiverOwnership, deps);
-    if (!receiver?.active) {
-      log(logger, 'INFO', 'Deferring Discord queue drain because receiver ownership changed', {
-        reason: receiver?.reason || 'gateway_generation_changed',
-        activePid: receiver?.pid,
-        queueDepth: status.deliveryQueueDepth,
+      await report({
+        status: 'failed',
+        reason: status.deliveryBlockedReason || 'delivery_queue_unreadable',
+        deliveredCount: 0,
+        queueDepth: null,
       });
       return increaseBackoff();
     }
@@ -77,6 +117,20 @@ function startGatewayDrainLoop({
     const result = await delivery.flush({
       verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps),
     });
+    if (
+      result?.status === 'queued' &&
+      ['gateway_generation_changed', 'gateway_receiver_missing'].includes(result?.reason)
+    ) {
+      stopped = true;
+      generation += 1;
+      return baseDelayMs;
+    }
+    if (!checkOwnership(config, receiverOwnership, deps)?.active) {
+      stopped = true;
+      generation += 1;
+      return baseDelayMs;
+    }
+    await report(result);
     if (result?.status === 'queued' || result?.status === 'failed') {
       return increaseBackoff();
     }
@@ -104,6 +158,12 @@ function startGatewayDrainLoop({
       nextDelayMs = increaseBackoff();
       log(logger, 'ERROR', 'Periodic Discord queue drain failed', {
         error: error instanceof Error ? error.message : String(error),
+      });
+      await report({
+        status: 'failed',
+        reason: 'gateway_drain_failed',
+        deliveredCount: 0,
+        queueDepth: null,
       });
     } finally {
       if (activeTick === operation) activeTick = null;

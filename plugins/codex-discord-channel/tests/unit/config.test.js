@@ -30,6 +30,14 @@ test('loadConfig resolves default instance state path', () => {
     'codex-01',
     'pending-delivery.json',
   ));
+  assert.equal(config.paths.gatewayHealthPath, path.join(
+    home,
+    '.codex',
+    'channels',
+    'discord',
+    'codex-01',
+    'gateway-health.json',
+  ));
   assert.equal(config.deliveryMode, 'app-server');
   assert.equal(
     config.appServerUrl,
@@ -38,6 +46,9 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.ignoredDeliveryMode, null);
   assert.equal(config.deliveryDrainIntervalMs, 1000);
   assert.equal(config.deliveryDrainMaxBackoffMs, 30000);
+  assert.equal(config.deliveryUncertainRetryBaseMs, 5000);
+  assert.equal(config.deliveryUncertainRetryMaxMs, 300000);
+  assert.equal(config.gatewayHealthStaleMs, 180000);
   assert.equal(config.messageContentIntent, true);
   assert.equal(config.cwd, '/workspace');
 });

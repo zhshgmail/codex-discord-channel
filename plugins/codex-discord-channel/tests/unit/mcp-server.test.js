@@ -8,6 +8,7 @@ const test = require('node:test');
 const { loadConfig } = require('../../src/config');
 const { callTool, handleRequest, toolList } = require('../../src/mcp-server');
 const { beginReply } = require('../../src/reply-delivery');
+const { writeGatewayHealth } = require('../../src/gateway-health');
 
 const CHANNEL_ID = '100000000000000001';
 const GUILD_ID = '200000000000000001';
@@ -318,12 +319,14 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   assert.equal(result.structuredContent.proxyConfigured, true);
   assert.equal(result.structuredContent.insecureTls, true);
   assert.equal(result.structuredContent.discordStarted, false);
-  assert.equal(result.structuredContent.discordReason, 'startup_failed');
+  assert.equal(result.structuredContent.discordReason, 'gateway_health_missing');
+  assert.equal(result.structuredContent.runtimeStatusSource, 'gateway_health');
   assert.equal(result.structuredContent.deliverySafety, 'structured_only');
   assert.equal(result.structuredContent.structuredDeliveryState, 'unavailable');
-  assert.equal(result.structuredContent.sharedAppServerConfigured, true);
+  assert.equal(result.structuredContent.sharedAppServerConfigured, false);
   assert.equal(result.structuredContent.sharedAppServerAvailable, false);
-  assert.equal(result.structuredContent.sharedAppServerReason, 'shared_app_server_socket_missing');
+  assert.equal(result.structuredContent.sharedAppServerReason, 'gateway_health_missing');
+  assert.equal(result.structuredContent.mcpDiscordClientReason, 'startup_failed');
   assert.equal(Object.hasOwn(result.structuredContent, 'ttyAutoSubmitCompat'), false);
   assert.equal(result.structuredContent.deliveryQueueDepth, 1);
   assert.equal(result.structuredContent.deliveryBlockedReason, 'shared_app_server_socket_missing');
@@ -332,6 +335,84 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   assert.equal(result.content[0].text.includes('secret-token'), false);
   assert.equal(result.content[0].text.includes('127.0.0.1:8080'), false);
   assert.equal(result.content[0].text.includes('queued-secret-content'), false);
+});
+
+test('status uses the durable live gateway instead of the MCP-local Discord client', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  fs.mkdirSync(config.paths.stateDir, { recursive: true });
+  const receiverOwnership = {
+    version: 2,
+    pid: process.pid,
+    generation: 'gateway-generation',
+    claimedAt: '2026-08-08T00:00:00.000Z',
+    fallback: null,
+  };
+  fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(receiverOwnership)}\n`);
+  writeGatewayHealth(config, {
+    receiverOwnership,
+    discordStarted: true,
+    structured: { configured: true, available: true, reason: null },
+    queue: {
+      deliveryQueueDepth: 0,
+      deliveryReadyCount: 0,
+      deliveryUncertainCount: 0,
+      deliveryBlockedReason: null,
+    },
+    lastDrain: {
+      status: 'idle',
+      reason: 'queue_empty',
+      at: '2026-08-08T00:00:01.000Z',
+    },
+  });
+  const context = {
+    config,
+    discordState: { started: false, client: null, reason: 'mcp_login_failed' },
+    delivery: {
+      status() {
+        return { configured: true, available: false, reason: 'mcp_local_socket_missing' };
+      },
+    },
+    claim() { throw new Error('not used'); },
+  };
+
+  const result = await callTool(context, 'discord_channel_status');
+
+  assert.equal(result.structuredContent.runtimeStatusSource, 'gateway_health');
+  assert.equal(result.structuredContent.discordStarted, true);
+  assert.equal(result.structuredContent.discordReason, null);
+  assert.equal(result.structuredContent.mcpDiscordClientStarted, false);
+  assert.equal(result.structuredContent.mcpDiscordClientReason, 'mcp_login_failed');
+  assert.equal(result.structuredContent.structuredDeliveryState, 'available');
+  assert.equal(result.structuredContent.sharedAppServerAvailable, true);
+  assert.equal(result.structuredContent.sharedAppServerReason, null);
+  assert.equal(result.structuredContent.gatewayLastDrainReason, 'queue_empty');
+});
+
+test('status never substitutes MCP-local login when the durable gateway is missing', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const config = loadConfig({ HOME: home, DISCORD_INSTANCE: 'codex01' }, { cwd: '/workspace' });
+  const context = {
+    config,
+    discordState: { started: true, client: {}, reason: null },
+    delivery: {
+      status() {
+        return { configured: true, available: true, reason: null };
+      },
+    },
+    claim() { throw new Error('not used'); },
+  };
+
+  const result = await callTool(context, 'discord_channel_status');
+
+  assert.equal(result.structuredContent.runtimeStatusSource, 'gateway_health');
+  assert.equal(result.structuredContent.gatewayHealthReason, 'gateway_health_missing');
+  assert.equal(result.structuredContent.gatewayLive, false);
+  assert.equal(result.structuredContent.discordStarted, false);
+  assert.equal(result.structuredContent.discordReason, 'gateway_health_missing');
+  assert.equal(result.structuredContent.sharedAppServerAvailable, false);
+  assert.equal(result.structuredContent.sharedAppServerReason, 'gateway_health_missing');
+  assert.equal(result.structuredContent.mcpDiscordClientStarted, true);
 });
 
 test('status sanitizes malformed delivery queue errors', async () => {

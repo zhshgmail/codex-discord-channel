@@ -28,6 +28,7 @@ $HOME/.codex/channels/discord/<instance>/.env
 $HOME/.codex/channels/discord/<instance>/access.json
 $HOME/.codex/channels/discord/<instance>/owner.json
 $HOME/.codex/channels/discord/<instance>/session-gateway.pid
+$HOME/.codex/channels/discord/<instance>/gateway-health.json
 $HOME/.codex/channels/discord/<instance>/pending-delivery.json
 $HOME/.codex/channels/discord/<instance>/reply-receipts/
 $HOME/.codex/channels/discord/<instance>/app-server.sock
@@ -58,10 +59,14 @@ Healthy structured delivery requires:
 }
 ```
 
-Inspect `deliveryQueueDepth`, `deliveryBlockedReason`, and
+Inspect `runtimeStatusSource`, `gatewayLive`, `deliveryState`,
+`deliveryQueueDepth`, `deliveryUncertainCount`, `deliveryDegradedReason`, and
 `sharedAppServerReason` before making delivery claims. Stable unavailable
 reasons include a missing endpoint/socket, no loaded thread, an ambiguous
 thread, a busy thread, and uncertain structured acknowledgement.
+Top-level receiver and structured-delivery status comes only from the durable
+gateway health record. MCP-local Discord login is a separate diagnostic and is
+never receiver-health evidence.
 
 ## Shared Endpoint Boundary
 
@@ -86,7 +91,7 @@ must expose one provable top-level loaded thread. The latest top-level
 `thread/started` notification replaces it after thread rotation. Subagents are
 never targets.
 
-Each drain accepts at most one FIFO head. Idle targets and proven top-level
+Each drain accepts at most one ready FIFO head. Idle targets and proven top-level
 `systemError` targets use `turn/start`; active targets use `turn/steer` only with
 an exact turn id observed from app-server notifications or recovered from
 `thread/read` during startup and reconnect.
@@ -95,10 +100,16 @@ Unknown or ambiguous active-turn identity remains `thread_busy`, while a new
 reasoning effort, service tier, personality, cwd, sandbox, permissions,
 collaboration mode, and approval overrides.
 
-Every positive acknowledgement is read back from the exact target thread.
-Automatic replay stops unless reconciliation proves that the echoed stable
-client user message id exists there. A positive RPC response without that user
-item remains `structured_ack_uncertain` and must not be described as delivered.
+Every positive acknowledgement is read back from the exact target thread. A
+positive RPC response without that user item moves into the visible uncertain
+reconciliation lane and must not be described as delivered. Later ready items
+continue, but expiry only schedules another proof check; it never authorizes a
+second `turn/start` call.
+
+The exact top-level thread binding is durable across idle and active gateway
+restarts, but active turn ids are never persisted. Restart recovery rereads the
+bound thread before choosing start versus steer. `gateway-health.json` is the
+receiver truth; MCP-local login state is diagnostic only.
 
 ## History Reads
 

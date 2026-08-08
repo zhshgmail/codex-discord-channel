@@ -151,7 +151,7 @@ function startLoop(fixture, timers) {
   });
 }
 
-test('empty durable queue polls at the base interval without resolving a thread or flushing', async () => {
+test('empty durable queue refreshes the recovery target without flushing', async () => {
   const fixture = createFixture({ available: true });
   const timers = createManualTimers();
   const originalFlush = fixture.delivery.flush.bind(fixture.delivery);
@@ -165,7 +165,8 @@ test('empty durable queue polls at the base interval without resolving a thread 
   assert.deepEqual(timers.delays, [10]);
   assert.equal(await timers.runNext(), true);
   assert.equal(flushes, 0);
-  assert.equal(fixture.targetAttempts(), 0);
+  assert.equal(fixture.targetAttempts(), 1);
+  assert.deepEqual(fixture.requests, []);
   assert.deepEqual(timers.delays, [10, 10]);
 
   await loop.stop();

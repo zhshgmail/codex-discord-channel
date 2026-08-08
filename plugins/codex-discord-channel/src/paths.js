@@ -62,6 +62,10 @@ function resolvePaths(env = process.env) {
     accessPath: expandPath(firstNonEmpty(env.DISCORD_ACCESS_FILE, path.join(stateDir, 'access.json')), env),
     ownerPath: expandPath(firstNonEmpty(env.DISCORD_OWNER_FILE, path.join(stateDir, 'owner.json')), env),
     gatewayPidPath: expandPath(firstNonEmpty(env.DISCORD_GATEWAY_PID_FILE, path.join(stateDir, 'session-gateway.pid')), env),
+    gatewayHealthPath: expandPath(firstNonEmpty(
+      env.DISCORD_GATEWAY_HEALTH_FILE,
+      path.join(stateDir, 'gateway-health.json'),
+    ), env),
     lastInboundPath: expandPath(firstNonEmpty(env.DISCORD_LAST_INBOUND_FILE, path.join(stateDir, 'last-inbound.json')), env),
     deliveryQueuePath: expandPath(firstNonEmpty(env.DISCORD_DELIVERY_QUEUE_FILE, path.join(stateDir, 'pending-delivery.json')), env),
     replyReceiptDir: expandPath(firstNonEmpty(env.DISCORD_REPLY_RECEIPT_DIR, path.join(stateDir, 'reply-receipts')), env),

@@ -18,6 +18,7 @@ function fixture() {
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
   const binDir = path.join(home, 'bin');
   const trace = path.join(home, 'trace.log');
+  const childEnvTrace = path.join(home, 'child-env.log');
   const loginMarker = path.join(home, 'login-complete');
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
@@ -50,6 +51,9 @@ function fixture() {
     '  esac',
     'fi',
     'printf "node %s\\n" "$*" >>"$TRACE"',
+    'if [[ $1 == "$FAKE_CODEX_BIN" ]]; then',
+    '  env | LC_ALL=C sort | grep -E "^(DISCORD_|CODEX_DISCORD_|CODEX_APP_SERVER_URL=)" >>"$CHILD_ENV_TRACE" || true',
+    'fi',
     'if [[ ${LOGIN_REQUIRED:-0} == 1 && $2 == tui-login-state && ! -f $LOGIN_MARKER ]]; then exit 10; fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == login ]]; then',
     '  if [[ -n ${DISCORD_BOT_TOKEN+x} || -n ${DISCORD_BOT_USER_ID+x} ]]; then exit 91; fi',
@@ -101,6 +105,7 @@ function fixture() {
   ].join('\n'));
   return {
     binDir,
+    childEnvTrace,
     codexHome,
     fakeChannel,
     fakeCodex,
@@ -118,6 +123,7 @@ function launchEnv(setup, overrides = {}) {
     DISCORD_BOT_TOKEN: 'fixture-secret',
     DISCORD_BOT_USER_ID: 'fixture-bot',
     DISCORD_CONFIG_DIR: setup.stateDir,
+    CHILD_ENV_TRACE: setup.childEnvTrace,
     FAKE_CHANNEL_BIN: setup.fakeChannel,
     FAKE_CODEX_BIN: setup.fakeCodex,
     HOME: setup.home,
@@ -238,4 +244,90 @@ test('shell launcher resumes the exact captured thread after app-server replacem
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
+});
+
+test('Codex child receives only the explicit Discord instance allowlist', () => {
+  const setup = fixture();
+  const result = spawnSync(launcher, ['codex02', 'resume', 'thread-2'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      CODEX_APP_SERVER_URL: 'unix:///tmp/foreign-codex01.sock',
+      CODEX_DISCORD_UNKNOWN_SECRET: 'must-not-leak',
+      DISCORD_PROXY_URL: 'http://proxy.invalid',
+      DISCORD_UNKNOWN_SECRET: 'must-not-leak',
+    }),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(fs.readFileSync(setup.childEnvTrace, 'utf8').trim().split('\n'), [
+    `DISCORD_CONFIG_DIR=${setup.stateDir}`,
+    'DISCORD_INSTANCE=codex02',
+  ]);
+});
+
+test('recovery inserts exact resume after preserving global flags when no resume was supplied', () => {
+  const setup = fixture();
+  const result = spawnSync(
+    launcher,
+    ['codex02', '--dangerously-bypass-approvals-and-sandbox', '--profile', 'review'],
+    {
+      encoding: 'utf8',
+      env: launchEnv(setup, { TRANSPORT_FAIL_ONCE: '1' }),
+      timeout: 5000,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+  assert.deepEqual(tuiLaunches, [
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+  ]);
+});
+
+test('recovery discards the original prompt instead of replaying it after resume', () => {
+  const setup = fixture();
+  const result = spawnSync(
+    launcher,
+    [
+      'codex02',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--profile',
+      'review',
+      '--',
+      'initial prompt',
+    ],
+    {
+      encoding: 'utf8',
+      env: launchEnv(setup, { TRANSPORT_FAIL_ONCE: '1' }),
+      timeout: 5000,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+  assert.deepEqual(tuiLaunches, [
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+  ]);
+});
+
+test('recovery discards image prompt inputs instead of replaying them after resume', () => {
+  for (const imageArgs of [['--image', 'old.png'], ['-i', 'old.png'], ['--image=old.png']]) {
+    const setup = fixture();
+    const result = spawnSync(
+      launcher,
+      ['codex02', '--profile', 'review', ...imageArgs, '--', 'initial prompt'],
+      {
+        encoding: 'utf8',
+        env: launchEnv(setup, { TRANSPORT_FAIL_ONCE: '1' }),
+        timeout: 5000,
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+      .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+    assert.equal(tuiLaunches.length, 2);
+    assert.equal(tuiLaunches[1],
+      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
+  }
 });

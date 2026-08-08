@@ -3,11 +3,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const TARGET_VERSION = 1;
+const TARGET_VERSION = 2;
 
 function targetPaths(config) {
   return {
     live: path.join(config.paths.stateDir, 'app-server-target.json'),
+    invalidated: path.join(config.paths.stateDir, 'app-server-target.invalidated.json'),
     recovery: path.join(config.paths.stateDir, 'tui-recovery-target.json'),
   };
 }
@@ -19,19 +20,25 @@ function parseRecoveryTarget(raw) {
   } catch {
     return null;
   }
+  const legacyActive = record?.version === 1 && record.status === 'active'
+    && typeof record.activeTurnId === 'string' && record.activeTurnId !== '';
   if (
-    record?.version !== TARGET_VERSION
-    || record.status !== 'active'
+    ![1, TARGET_VERSION].includes(record?.version)
+    || (record.version === 1 && !legacyActive)
     || typeof record.threadId !== 'string'
     || !/^[0-9a-f-]{20,}$/i.test(record.threadId)
-    || typeof record.activeTurnId !== 'string'
     || !Array.isArray(record.loadedThreadIds)
-    || record.loadedThreadIds.length !== 1
-    || record.loadedThreadIds[0] !== record.threadId
+    || record.loadedThreadIds.length === 0
+    || new Set(record.loadedThreadIds).size !== record.loadedThreadIds.length
+    || !record.loadedThreadIds.includes(record.threadId)
   ) {
     return null;
   }
-  return record;
+  return {
+    version: TARGET_VERSION,
+    threadId: record.threadId,
+    loadedThreadIds: [...record.loadedThreadIds],
+  };
 }
 
 function writeAtomic(file, content, dependencies = {}) {
@@ -56,13 +63,23 @@ function captureRecoveryTarget(config, minimumMtimeMs = 0, dependencies = {}) {
   const files = targetPaths(config);
   let record;
   try {
+    fsImpl.statSync(files.invalidated);
+    clearRecoveryTarget(config, dependencies);
+    return false;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  try {
     if (minimumMtimeMs && fsImpl.statSync(files.live).mtimeMs < minimumMtimeMs) return false;
     record = parseRecoveryTarget(fsImpl.readFileSync(files.live, 'utf8'));
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
     return false;
   }
-  if (!record) return false;
+  if (!record) {
+    clearRecoveryTarget(config, dependencies);
+    return false;
+  }
   writeAtomic(files.recovery, `${JSON.stringify(record, null, 2)}\n`, dependencies);
   return true;
 }

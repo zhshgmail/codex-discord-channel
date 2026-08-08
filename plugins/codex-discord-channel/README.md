@@ -57,8 +57,10 @@ reasoning effort, service tier, personality, cwd, sandbox, and approval
 overrides; Discord metadata is carried only in the sanitized text envelope.
 Every positive acknowledgement is read back from the exact thread by the
 echoed client user message id before completion. A response without a persisted
-user item remains `structured_ack_uncertain`, so the gateway neither reports a
-false completion nor replays speculatively.
+user item remains `structured_ack_uncertain`, so the gateway does not report a
+false completion. The item moves to a visible fail-closed reconciliation lane; later FIFO
+items continue. Expiry schedules another exact proof check but never authorizes
+another `turn/start` call.
 
 `pending-delivery.json` uses a durable activation id and timestamp. The id
 defaults to the real installed plugin root. A new versioned install archives
@@ -75,12 +77,24 @@ backoff from 1 second to a 30-second maximum, and each tick re-verifies the
 durable PID/generation receiver authority before resolving the structured
 target. `owner.json` and volatile thread/session ids never gate these retries.
 The bounds are configurable with `CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS` and
-`CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS`.
+`CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS`. Uncertain-item proof rechecks use
+`CODEX_DISCORD_UNCERTAIN_RETRY_BASE_MS` and
+`CODEX_DISCORD_UNCERTAIN_RETRY_MAX_MS` (5 seconds and 5 minutes by default).
+These legacy-named settings never authorize replaying `turn/start`.
+`CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS` controls the receiver heartbeat expiry
+(3 minutes by default).
 
 If the shared endpoint or exact current thread is unavailable, the queue stays
 persisted and status reports a stable reason such as
 `shared_app_server_socket_missing`, `shared_app_server_no_loaded_thread`, or
 `shared_app_server_thread_ambiguous`. There is no terminal fallback.
+
+The receiver atomically writes `gateway-health.json`. Status verifies its
+PID/generation against `session-gateway.pid` and reports MCP-local Discord login
+separately, so an auxiliary MCP process cannot be mistaken for the active
+receiver. Queue health is explicit as `idle`, `queued`, `blocked`, `degraded`,
+or `unreadable`; degraded status includes the oldest uncertain message id,
+attempt count, and retry time without exposing message content.
 
 When no live receiver exists, Discord login, durable queue readiness, and an
 armed listener are sufficient to claim reception; target delivery reconnects

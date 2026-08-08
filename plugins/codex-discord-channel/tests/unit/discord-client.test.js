@@ -1236,6 +1236,7 @@ test('gateway shutdown fences an in-flight admission before releasing receiver a
     .split('\n')
     .map((line) => JSON.parse(line).event);
   const index = (event) => events.indexOf(event);
+  const lastIndex = (event) => events.lastIndexOf(event);
 
   assert.equal(exitCode, 0, stderr);
   assert.equal(signal, null);
@@ -1246,7 +1247,7 @@ test('gateway shutdown fences an in-flight admission before releasing receiver a
   assert.ok(index('receiver_deactivated') < index('reference_fetch_finished'));
   assert.ok(index('reference_fetch_finished') < index('client_destroy_finished'));
   assert.ok(index('client_destroy_finished') < index('drain_stop_started'));
-  assert.ok(index('drain_stop_finished') < index('authority_release_started'));
-  assert.ok(index('authority_release_started') < index('authority_released'));
+  assert.ok(index('drain_stop_finished') < lastIndex('authority_release_started'));
+  assert.ok(lastIndex('authority_release_started') < index('authority_released'));
   assert.ok(index('authority_released') < index('delivery_destroyed'));
 });

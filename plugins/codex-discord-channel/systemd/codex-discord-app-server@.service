@@ -16,6 +16,7 @@ ExecStart=/usr/bin/env ${NODE_BIN} ${CODEX_DISCORD_CHANNEL_BIN} app-server --ins
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
+OOMPolicy=continue
 TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal

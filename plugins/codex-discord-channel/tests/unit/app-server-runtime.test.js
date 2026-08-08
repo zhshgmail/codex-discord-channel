@@ -140,6 +140,8 @@ test('systemd templates load absolute runtime paths from each instance account f
     'utf8',
   );
   assert.match(appServerUnit, /^RefuseManualStop=yes$/m);
+  assert.match(appServerUnit, /^OOMPolicy=continue$/m);
+  assert.doesNotMatch(appServerUnit, /^KillMode=process$/m);
   const gatewayUnit = fs.readFileSync(
     path.join(systemdDir, 'codex-discord-channel@.service'),
     'utf8',

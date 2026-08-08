@@ -20,7 +20,7 @@ const MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2;
 const MAX_LIFECYCLE_PROOF_ATTEMPTS = 4;
 const MAX_LIFECYCLE_PROOF_DELAY_MS = 250;
 const DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]);
-const TARGET_CHECKPOINT_VERSION = 1;
+const TARGET_CHECKPOINT_VERSION = 2;
 const CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function parseTargetCheckpoint(raw) {
@@ -30,13 +30,13 @@ function parseTargetCheckpoint(raw) {
   } catch {
     return null;
   }
+  const legacyActive = record?.version === 1 && record.status === 'active' &&
+    typeof record.activeTurnId === 'string' && record.activeTurnId !== '';
   if (
-    record?.version !== TARGET_CHECKPOINT_VERSION ||
-    record.status !== 'active' ||
+    ![1, TARGET_CHECKPOINT_VERSION].includes(record?.version) ||
+    (record.version === 1 && !legacyActive) ||
     typeof record.threadId !== 'string' ||
     record.threadId === '' ||
-    typeof record.activeTurnId !== 'string' ||
-    record.activeTurnId === '' ||
     !Array.isArray(record.loadedThreadIds) ||
     record.loadedThreadIds.length === 0 ||
     record.loadedThreadIds.some((threadId) => typeof threadId !== 'string' || threadId === '')
@@ -53,8 +53,6 @@ function parseTargetCheckpoint(raw) {
   return {
     version: TARGET_CHECKPOINT_VERSION,
     threadId: record.threadId,
-    status: 'active',
-    activeTurnId: record.activeTurnId,
     loadedThreadIds,
   };
 }
@@ -668,6 +666,11 @@ class AppServerHost extends EventEmitter {
         ? path.join(config.paths.stateDir, 'app-server-target.json')
         : ''
     );
+    this.targetInvalidationPath = config.paths?.appServerTargetInvalidationPath || (
+      config.paths?.stateDir
+        ? path.join(config.paths.stateDir, 'app-server-target.invalidated.json')
+        : ''
+    );
     this.client = deps.client || new AppServerRpcClient(config, logger, deps);
     this.lastStatus = this.client.status();
     this.hasConnected = Boolean(this.lastStatus.available);
@@ -700,8 +703,6 @@ class AppServerHost extends EventEmitter {
     if (this.restoredTargetCheckpoint) {
       const checkpoint = this.restoredTargetCheckpoint;
       this.currentThreadId = checkpoint.threadId;
-      this.threadStatuses.set(checkpoint.threadId, checkpoint.status);
-      this.activeTurnIds.set(checkpoint.threadId, checkpoint.activeTurnId);
       this.knownLoadedThreadIds = new Set(checkpoint.loadedThreadIds);
     }
     this.timeoutRecoveryTarget = null;
@@ -726,12 +727,12 @@ class AppServerHost extends EventEmitter {
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
         if (thread?.id) {
-          this.loadedInventoryProven = false;
-          this.clearTargetCheckpoint();
-          this.restoredTargetCheckpoint = null;
           this.threadSelectionRevision += 1;
         }
         if (thread?.id && !thread.parentThreadId) {
+          this.loadedInventoryProven = false;
+          this.invalidateTargetCheckpoint('top_level_thread_started');
+          this.restoredTargetCheckpoint = null;
           this.currentThreadId = thread.id;
           this.threadStatuses.set(thread.id, thread.status?.type || 'unavailable');
           if (thread.status?.type === 'idle') this.emit('idle', { threadId: thread.id });
@@ -766,8 +767,7 @@ class AppServerHost extends EventEmitter {
         }
         if (threadId === this.currentThreadId) {
           this.threadSelectionRevision += 1;
-          this.clearTargetCheckpoint();
-          this.restoredTargetCheckpoint = null;
+          this.persistTargetCheckpoint();
         }
         return;
       }
@@ -784,8 +784,7 @@ class AppServerHost extends EventEmitter {
             this.timeoutRecoveryTarget = null;
           }
           if (threadId === this.currentThreadId) {
-            this.clearTargetCheckpoint();
-            this.restoredTargetCheckpoint = null;
+            this.persistTargetCheckpoint();
           }
         } else if (statusType === 'active' && threadId === this.currentThreadId) {
           this.persistTargetCheckpoint();
@@ -799,18 +798,17 @@ class AppServerHost extends EventEmitter {
       if (notification?.method === 'thread/closed') {
         const threadId = notification.params?.threadId;
         if (!threadId) return;
-        this.loadedInventoryProven = false;
-        this.clearTargetCheckpoint();
-        this.restoredTargetCheckpoint = null;
         this.threadSelectionRevision += 1;
+        if (this.loadedInventoryProven) this.knownLoadedThreadIds.delete(threadId);
         this.threadStatuses.delete(threadId);
         this.activeTurnIds.delete(threadId);
         if (this.timeoutRecoveryTarget?.threadId === threadId) {
           this.timeoutRecoveryTarget = null;
         }
         if (this.currentThreadId === threadId) {
+          this.loadedInventoryProven = false;
           this.currentThreadId = '';
-          this.clearTargetCheckpoint();
+          this.invalidateTargetCheckpoint('current_thread_closed');
           this.restoredTargetCheckpoint = null;
         }
         this.wakeThreadDeliveryWaiters(threadId);
@@ -840,9 +838,7 @@ class AppServerHost extends EventEmitter {
         const checkpoint = this.restoredTargetCheckpoint;
         this.currentThreadId = checkpoint.threadId;
         this.threadStatuses.clear();
-        this.threadStatuses.set(checkpoint.threadId, checkpoint.status);
         this.activeTurnIds.clear();
-        this.activeTurnIds.set(checkpoint.threadId, checkpoint.activeTurnId);
       } else if (retainTimeoutTarget) {
         const { threadId, turnId } = this.timeoutRecoveryTarget;
         this.currentThreadId = threadId;
@@ -945,25 +941,57 @@ class AppServerHost extends EventEmitter {
     }
   }
 
+  clearTargetInvalidation() {
+    if (!this.targetInvalidationPath) return;
+    try {
+      this.fs.unlinkSync(this.targetInvalidationPath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger('WARN', 'Unable to clear app-server target invalidation', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  invalidateTargetCheckpoint(reason) {
+    if (this.targetInvalidationPath) {
+      const directory = path.dirname(this.targetInvalidationPath);
+      const tempPath = `${this.targetInvalidationPath}.tmp-${process.pid}-${Date.now()}`;
+      try {
+        this.fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+        this.fs.writeFileSync(tempPath, `${JSON.stringify({
+          version: 1,
+          reason,
+          invalidatedAt: new Date().toISOString(),
+        }, null, 2)}\n`, { mode: 0o600 });
+        this.fs.renameSync(tempPath, this.targetInvalidationPath);
+        this.fs.chmodSync(this.targetInvalidationPath, 0o600);
+      } catch (error) {
+        try {
+          this.fs.unlinkSync(tempPath);
+        } catch {}
+        this.logger('WARN', 'Unable to persist app-server target invalidation', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    this.clearTargetCheckpoint();
+  }
+
   persistTargetCheckpoint() {
     if (!this.targetCheckpointPath) return;
     const threadId = this.currentThreadId;
-    const activeTurnId = this.activeTurnIds.get(threadId);
     if (
       !threadId ||
-      this.threadStatuses.get(threadId) !== 'active' ||
-      !activeTurnId ||
       !this.loadedInventoryProven ||
       !this.knownLoadedThreadIds.has(threadId)
     ) {
-      this.clearTargetCheckpoint();
       return;
     }
     const record = {
       version: TARGET_CHECKPOINT_VERSION,
       threadId,
-      status: 'active',
-      activeTurnId,
       loadedThreadIds: [...this.knownLoadedThreadIds].sort(),
     };
     const directory = path.dirname(this.targetCheckpointPath);
@@ -973,6 +1001,7 @@ class AppServerHost extends EventEmitter {
       this.fs.writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
       this.fs.renameSync(tempPath, this.targetCheckpointPath);
       this.fs.chmodSync(this.targetCheckpointPath, 0o600);
+      this.clearTargetInvalidation();
     } catch (error) {
       try {
         this.fs.unlinkSync(tempPath);
@@ -1027,6 +1056,13 @@ class AppServerHost extends EventEmitter {
         return { available: false, reason, status: 'unavailable' };
       }
       return this.resolveTargetAttempt(resolutionBudget);
+    };
+    const rejectUnprovableTopology = () => {
+      const reason = 'shared_app_server_thread_unprovable';
+      this.invalidateTargetCheckpoint(reason);
+      this.restoredTargetCheckpoint = null;
+      this.lastStatus = { configured: true, available: false, reason };
+      return { available: false, reason, status: 'unavailable' };
     };
     const requestForTarget = async (method, params) => {
       if (typeof this.client.requestOnConnection !== 'function') {
@@ -1099,7 +1135,7 @@ class AppServerHost extends EventEmitter {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
-        this.clearTargetCheckpoint();
+        this.invalidateTargetCheckpoint('no_loaded_thread');
         this.restoredTargetCheckpoint = null;
       }
       const reason = 'shared_app_server_no_loaded_thread';
@@ -1130,9 +1166,7 @@ class AppServerHost extends EventEmitter {
           }
           const addedThread = addedResponse?.thread;
           if (!addedThread || addedThread.id !== addedThreadId) {
-            const reason = 'shared_app_server_thread_unprovable';
-            this.lastStatus = { configured: true, available: false, reason };
-            return { available: false, reason, status: 'unavailable' };
+            return rejectUnprovableTopology();
           }
           if (addedThread.parentThreadId == null) {
             addedTopLevelThreadIds.add(addedThreadId);
@@ -1141,9 +1175,7 @@ class AppServerHost extends EventEmitter {
             typeof addedThread.parentThreadId !== 'string' ||
             addedThread.parentThreadId.trim() === ''
           ) {
-            const reason = 'shared_app_server_thread_unprovable';
-            this.lastStatus = { configured: true, available: false, reason };
-            return { available: false, reason, status: 'unavailable' };
+            return rejectUnprovableTopology();
           } else {
             addedParents.set(addedThreadId, addedThread.parentThreadId);
           }
@@ -1154,9 +1186,7 @@ class AppServerHost extends EventEmitter {
           let descendantId = addedThreadId;
           while (!trustedThreadIds.has(descendantId)) {
             if (lineage.has(descendantId)) {
-              const reason = 'shared_app_server_thread_unprovable';
-              this.lastStatus = { configured: true, available: false, reason };
-              return { available: false, reason, status: 'unavailable' };
+              return rejectUnprovableTopology();
             }
             lineage.add(descendantId);
             const parentThreadId = addedParents.get(descendantId);
@@ -1165,9 +1195,7 @@ class AppServerHost extends EventEmitter {
               typeof parentThreadId !== 'string' ||
               !loadedThreadIds.has(parentThreadId)
             ) {
-              const reason = 'shared_app_server_thread_unprovable';
-              this.lastStatus = { configured: true, available: false, reason };
-              return { available: false, reason, status: 'unavailable' };
+              return rejectUnprovableTopology();
             }
             descendantId = parentThreadId;
           }
@@ -1195,7 +1223,7 @@ class AppServerHost extends EventEmitter {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
-        this.clearTargetCheckpoint();
+        this.invalidateTargetCheckpoint('restored_target_invalid');
       }
       this.restoredTargetCheckpoint = null;
     }
@@ -1225,9 +1253,7 @@ class AppServerHost extends EventEmitter {
           }
           const candidate = candidateResponse?.thread;
           if (!candidate || candidate.id !== candidateThreadId) {
-            const reason = 'shared_app_server_thread_unprovable';
-            this.lastStatus = { configured: true, available: false, reason };
-            return { available: false, reason, status: 'unavailable' };
+            return rejectUnprovableTopology();
           }
           if (candidate.parentThreadId == null) {
             candidateParents.set(candidateThreadId, null);
@@ -1236,9 +1262,7 @@ class AppServerHost extends EventEmitter {
             typeof candidate.parentThreadId !== 'string' ||
             candidate.parentThreadId.trim() === ''
           ) {
-            const reason = 'shared_app_server_thread_unprovable';
-            this.lastStatus = { configured: true, available: false, reason };
-            return { available: false, reason, status: 'unavailable' };
+            return rejectUnprovableTopology();
           } else {
             candidateParents.set(candidateThreadId, candidate.parentThreadId);
           }
@@ -1250,9 +1274,7 @@ class AppServerHost extends EventEmitter {
             let descendantId = candidateThreadId;
             while (!rootThreadIds.has(descendantId)) {
               if (lineage.has(descendantId)) {
-                const reason = 'shared_app_server_thread_unprovable';
-                this.lastStatus = { configured: true, available: false, reason };
-                return { available: false, reason, status: 'unavailable' };
+                return rejectUnprovableTopology();
               }
               lineage.add(descendantId);
               const parentThreadId = candidateParents.get(descendantId);
@@ -1260,9 +1282,7 @@ class AppServerHost extends EventEmitter {
                 typeof parentThreadId !== 'string' ||
                 !loadedThreadIds.has(parentThreadId)
               ) {
-                const reason = 'shared_app_server_thread_unprovable';
-                this.lastStatus = { configured: true, available: false, reason };
-                return { available: false, reason, status: 'unavailable' };
+                return rejectUnprovableTopology();
               }
               descendantId = parentThreadId;
             }
@@ -1284,6 +1304,9 @@ class AppServerHost extends EventEmitter {
         const reason = topLevelThreads.length > 1
           ? 'shared_app_server_thread_ambiguous'
           : 'shared_app_server_thread_unprovable';
+        if (reason === 'shared_app_server_thread_unprovable') {
+          return rejectUnprovableTopology();
+        }
         this.lastStatus = { configured: true, available: false, reason };
         return { available: false, reason, status: 'unavailable' };
       }
@@ -1323,9 +1346,7 @@ class AppServerHost extends EventEmitter {
     }
     const thread = response?.thread;
     if (!thread || thread.id !== threadId || thread.parentThreadId) {
-      const reason = 'shared_app_server_thread_unprovable';
-      this.lastStatus = { configured: true, available: false, reason };
-      return { available: false, reason, status: 'unavailable' };
+      return rejectUnprovableTopology();
     }
     const status = thread.status?.type || 'unavailable';
     if (!['idle', 'active', 'systemError'].includes(status)) {
@@ -1353,8 +1374,7 @@ class AppServerHost extends EventEmitter {
     const target = { available: true, threadId: thread.id, status };
     const activeTurnId = status === 'active' ? this.activeTurnIds.get(thread.id) : '';
     if (activeTurnId) target.activeTurnId = activeTurnId;
-    if (activeTurnId) this.persistTargetCheckpoint();
-    else this.clearTargetCheckpoint();
+    this.persistTargetCheckpoint();
     Object.defineProperty(target, TARGET_GENERATION, {
       value: Object.freeze({ connectionGeneration, threadSelectionRevision }),
     });

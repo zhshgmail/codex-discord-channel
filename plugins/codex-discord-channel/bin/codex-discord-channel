@@ -12,8 +12,10 @@ const {
   startDiscordClient,
 } = require('../src/discord-client');
 const { createDiscordRestClient } = require('../src/discord-rest-client');
-const { createDelivery } = require('../src/delivery');
+const { createDelivery, readDeliveryQueueStatus } = require('../src/delivery');
+const { writeGatewayHealth } = require('../src/gateway-health');
 const { sendDiscordReplyOnce } = require('../src/reply-delivery');
+const { isCurrentReceiverOwnership } = require('../src/receiver-state');
 const { startGatewayDrainLoop } = require('../src/gateway-drain-loop');
 const { claimOwner, createOwner } = require('../src/owner-state');
 const { instanceDoctor, runAppServer } = require('../src/app-server-runtime');
@@ -189,11 +191,30 @@ async function runGateway(config = loadConfig()) {
     delivery.destroy();
     throw new Error(`Discord gateway did not start: ${discordState.reason || 'unknown'}`);
   }
+  const writeCurrentHealth = (lastDrain, overrides = {}) => {
+    if (!isCurrentReceiverOwnership(config, discordState.receiverOwnership)?.active) return null;
+    return writeGatewayHealth(config, {
+      receiverOwnership: discordState.receiverOwnership,
+      discordStarted: overrides.discordStarted ?? true,
+      discordReason: overrides.discordReason ?? null,
+      structured: delivery.status(),
+      queue: readDeliveryQueueStatus(config),
+      lastDrain: {
+        ...lastDrain,
+        at: lastDrain?.at || new Date().toISOString(),
+      },
+    });
+  };
+  const reportHealth = (lastDrain, overrides = {}) => delivery.coordinateReceiverOwnership(
+    () => writeCurrentHealth(lastDrain, overrides),
+  );
+  await reportHealth({ status: 'idle', reason: 'gateway_connected', deliveredCount: 0 });
   const drainLoop = startGatewayDrainLoop({
     config,
     delivery,
     receiverOwnership: discordState.receiverOwnership,
     logger,
+    reportHealth,
   });
   if (enabled(config.env.CODEX_DISCORD_GATEWAY_CLAIM_OWNER)) {
     try {
@@ -216,10 +237,13 @@ async function runGateway(config = loadConfig()) {
     } catch {}
     await drainLoop.stop();
     try {
-      await delivery.coordinateReceiverOwnership(() => releaseDiscordReceiverOwnership(
-        config,
-        discordState.receiverOwnership,
-      ));
+      await delivery.coordinateReceiverOwnership(() => {
+        writeCurrentHealth(
+        { status: 'stopped', reason: 'gateway_stopped', deliveredCount: 0 },
+        { discordStarted: false, discordReason: 'gateway_stopped' },
+        );
+        return releaseDiscordReceiverOwnership(config, discordState.receiverOwnership);
+      });
     } catch {}
     if (typeof delivery.destroy === 'function') delivery.destroy();
     process.exit(0);

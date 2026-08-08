@@ -205,6 +205,18 @@ function loadConfig(inputEnv = process.env, options = {}) {
     appServerRequestTimeoutMs: parseInteger(env.CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS, 30000),
     deliveryDrainIntervalMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS, 1000),
     deliveryDrainMaxBackoffMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS, 30000),
+    deliveryUncertainRetryBaseMs: parseInteger(
+      env.CODEX_DISCORD_UNCERTAIN_RETRY_BASE_MS,
+      5000,
+    ),
+    deliveryUncertainRetryMaxMs: parseInteger(
+      env.CODEX_DISCORD_UNCERTAIN_RETRY_MAX_MS,
+      300000,
+    ),
+    gatewayHealthStaleMs: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
+      180000,
+    ),
     parentPid: process.ppid,
     ownerId,
     cwd,

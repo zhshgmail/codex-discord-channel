@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -66,6 +66,31 @@ function requestMcp(command, args, options, requests) {
     for (const request of requests) child.stdin.write(`${JSON.stringify(request)}\n`);
   });
 }
+
+test('stale runtime check fails clearly within a bounded Node heap', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-runtime-check-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const copy = path.join(root, 'plugin');
+  fs.cpSync(pluginRoot, copy, {
+    recursive: true,
+    filter(source) {
+      return path.basename(source) !== 'node_modules';
+    },
+  });
+  fs.symlinkSync(path.join(pluginRoot, 'node_modules'), path.join(copy, 'node_modules'), 'dir');
+  fs.appendFileSync(path.join(copy, 'runtime', 'mcp-server.cjs'), '\n');
+
+  const result = spawnSync(
+    process.execPath,
+    ['--max-old-space-size=256', 'scripts/build-runtime.js', '--check'],
+    { cwd: copy, encoding: 'utf8', timeout: 10_000 },
+  );
+
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null, result.stderr);
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /runtime\/mcp-server\.cjs is stale/);
+});
 
 test('marketplace cache starts MCP without node_modules in an isolated Codex environment', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-cache-'));
@@ -146,7 +171,8 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
   assert.equal(initialized.result.serverInfo.version, '0.3.0');
   assert.ok(tools.result.tools.some((tool) => tool.name === 'discord_channel_status'));
   assert.equal(status.result.structuredContent.stateDir, stateDir);
-  assert.equal(status.result.structuredContent.discordReason, 'token_missing');
+  assert.equal(status.result.structuredContent.discordReason, 'gateway_health_missing');
+  assert.equal(status.result.structuredContent.mcpDiscordClientReason, 'token_missing');
   assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), true);
   assert.equal(fs.existsSync(path.join(home, '.codex')), false);
 });

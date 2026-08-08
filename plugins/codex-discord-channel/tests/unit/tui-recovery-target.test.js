@@ -28,21 +28,21 @@ function fixture() {
   return { config, live };
 }
 
-test('parser rejects malformed, idle, and ambiguous target checkpoints', () => {
+test('parser accepts exact idle targets and loaded descendants but rejects malformed bindings', () => {
   assert.equal(parseRecoveryTarget('{'), null);
-  assert.equal(parseRecoveryTarget(JSON.stringify({
-    version: 1,
+  assert.deepEqual(parseRecoveryTarget(JSON.stringify({
+    version: 2,
     threadId: THREAD_ID,
-    status: 'idle',
-    activeTurnId: 'turn-1',
-    loadedThreadIds: [THREAD_ID],
-  })), null);
-  assert.equal(parseRecoveryTarget(JSON.stringify({
-    version: 1,
-    threadId: THREAD_ID,
-    status: 'active',
-    activeTurnId: 'turn-1',
     loadedThreadIds: [THREAD_ID, '019f3763-d308-7871-bedc-e6489b02190f'],
+  })), {
+    version: 2,
+    threadId: THREAD_ID,
+    loadedThreadIds: [THREAD_ID, '019f3763-d308-7871-bedc-e6489b02190f'],
+  });
+  assert.equal(parseRecoveryTarget(JSON.stringify({
+    version: 2,
+    threadId: THREAD_ID,
+    loadedThreadIds: ['019f3763-d308-7871-bedc-e6489b02190f'],
   })), null);
 });
 
@@ -60,5 +60,43 @@ test('capture refuses a checkpoint older than the supervised launch', () => {
   const { config, live } = fixture();
   const afterLiveWrite = fs.statSync(live).mtimeMs + 1;
   assert.equal(captureRecoveryTarget(config, afterLiveWrite), false);
+  assert.equal(readRecoveryThread(config), '');
+});
+
+test('present malformed capture invalidates an earlier exact target', () => {
+  const { config, live } = fixture();
+  assert.equal(captureRecoveryTarget(config), true);
+  assert.equal(readRecoveryThread(config), THREAD_ID);
+
+  fs.writeFileSync(live, `${JSON.stringify({
+    version: 2,
+    threadId: THREAD_ID,
+    loadedThreadIds: ['019f3763-d308-7871-bedc-e6489b02190f'],
+  })}\n`);
+  assert.equal(captureRecoveryTarget(config), false);
+  assert.equal(readRecoveryThread(config), '');
+});
+
+test('a transient missing live checkpoint preserves the last exact recovery target', () => {
+  const { config, live } = fixture();
+  assert.equal(captureRecoveryTarget(config), true);
+  assert.equal(readRecoveryThread(config), THREAD_ID);
+
+  fs.unlinkSync(live);
+  assert.equal(captureRecoveryTarget(config), false);
+  assert.equal(readRecoveryThread(config), THREAD_ID);
+});
+
+test('an explicit live-target invalidation clears the last recovery target', () => {
+  const { config, live } = fixture();
+  assert.equal(captureRecoveryTarget(config), true);
+  assert.equal(readRecoveryThread(config), THREAD_ID);
+
+  fs.unlinkSync(live);
+  fs.writeFileSync(
+    path.join(config.paths.stateDir, 'app-server-target.invalidated.json'),
+    `${JSON.stringify({ version: 1, invalidatedAt: '2026-08-08T00:00:00.000Z' })}\n`,
+  );
+  assert.equal(captureRecoveryTarget(config), false);
   assert.equal(readRecoveryThread(config), '');
 });

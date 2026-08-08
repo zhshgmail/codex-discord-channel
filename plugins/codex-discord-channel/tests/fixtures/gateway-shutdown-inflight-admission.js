@@ -19,6 +19,9 @@ let releaseReference;
 let handling;
 
 const delivery = {
+  status() {
+    return { configured: true, available: true, reason: null };
+  },
   async enqueue() {
     record('enqueue_called');
     return { status: 'accepted', reason: 'discord_message_persisted' };
@@ -47,7 +50,9 @@ const config = {
   env: {},
   paths: {
     accessPath: '/unused/access.json',
+    gatewayHealthPath: path.join(path.dirname(eventsPath), 'gateway-health.json'),
     ownerPath: '/unused/owner.json',
+    stateDir: path.dirname(eventsPath),
   },
 };
 
@@ -144,7 +149,16 @@ Module._load = function load(request, parent, isMain) {
     if (request === '../src/config') return { loadConfig: () => config };
     if (request === '../src/discord-client') return discordClient;
     if (request === '../src/delivery') {
-      return { createDelivery: () => delivery, resolveReplyTarget: () => ({}) };
+      return {
+        createDelivery: () => delivery,
+        readDeliveryQueueStatus: () => ({
+          deliveryQueueDepth: 0,
+          deliveryReadyCount: 0,
+          deliveryUncertainCount: 0,
+          deliveryBlockedReason: null,
+        }),
+        resolveReplyTarget: () => ({}),
+      };
     }
     if (request === '../src/gateway-drain-loop') return drainLoop;
     if (request === '../src/owner-state') {

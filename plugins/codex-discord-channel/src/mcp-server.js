@@ -17,6 +17,7 @@ const {
 const { readDiscordHistory } = require('./history');
 const { claimOwner, createOwner, readOwner } = require('./owner-state');
 const { sendDiscordReplyOnce } = require('./reply-delivery');
+const { readGatewayHealthStatus } = require('./gateway-health');
 
 const SERVER_NAME = 'Codex Discord Channel';
 const SERVER_VERSION = '0.3.0';
@@ -174,13 +175,12 @@ async function callTool(context, name, args = {}) {
   if (name === 'discord_channel_status') {
     const owner = readOwner(context.config.paths.ownerPath);
     const deliveryQueue = readDeliveryQueueStatus(context.config);
+    const gatewayHealth = readGatewayHealthStatus(context.config);
     const deliveryDisabled = context.config.deliveryMode === 'off';
-    const structured = context.delivery?.status?.() || {
-      configured: Boolean(context.config.appServerUrl),
-      available: false,
-      reason: context.config.appServerUrl
-        ? 'shared_app_server_not_connected'
-        : 'shared_app_server_unconfigured',
+    const structured = {
+      configured: gatewayHealth.gatewaySharedAppServerConfigured,
+      available: gatewayHealth.gatewaySharedAppServerAvailable,
+      reason: gatewayHealth.gatewaySharedAppServerReason || gatewayHealth.gatewayHealthReason,
     };
     const payload = {
       instance: context.config.paths.instance,
@@ -194,6 +194,7 @@ async function callTool(context, name, args = {}) {
       loginDisabled: context.config.loginDisabled,
       deliveryMode: context.config.deliveryMode,
       ignoredDeliveryMode: context.config.ignoredDeliveryMode,
+      runtimeStatusSource: 'gateway_health',
       deliverySafety: deliveryDisabled ? 'persistence_disabled' : 'structured_only',
       structuredDeliveryState: deliveryDisabled
         ? 'disabled'
@@ -205,8 +206,11 @@ async function callTool(context, name, args = {}) {
       replyReceiptDir: context.config.paths.replyReceiptDir,
       ownerIsReceiveGate: false,
       ...deliveryQueue,
-      discordStarted: context.discordState.started,
-      discordReason: context.discordState.reason || null,
+      ...gatewayHealth,
+      discordStarted: gatewayHealth.gatewayDiscordStarted,
+      discordReason: gatewayHealth.gatewayDiscordReason,
+      mcpDiscordClientStarted: context.discordState.started,
+      mcpDiscordClientReason: context.discordState.reason || null,
       currentOwner: owner,
       thisOwnerId: context.config.ownerId,
     };

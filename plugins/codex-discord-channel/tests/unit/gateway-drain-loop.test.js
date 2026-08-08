@@ -195,6 +195,97 @@ test('pending queue without a target survives periodic retries with bounded back
   fixture.delivery.destroy();
 });
 
+test('each drain attempt reports a sanitized result for durable gateway health', async () => {
+  const fixture = await deliveryFixture();
+  await fixture.delivery.enqueue(discordMessage('message-health'));
+  const timers = createManualTimers();
+  const reports = [];
+  const loop = startGatewayDrainLoop({
+    config: fixture.config,
+    delivery: fixture.delivery,
+    receiverOwnership: fixture.receiverOwnership,
+    logger: () => {},
+    reportHealth(result) {
+      reports.push(result);
+    },
+    deps: {
+      clearTimeout: timers.clearTimeout,
+      setTimeout: timers.setTimeout,
+    },
+  });
+
+  await timers.runNext();
+
+  assert.deepEqual(reports, [{
+    status: 'queued',
+    reason: 'shared_app_server_no_loaded_thread',
+    deliveredCount: 0,
+    queueDepth: 1,
+  }]);
+  await loop.stop();
+  fixture.delivery.destroy();
+});
+
+test('empty queue resolves the live target before reporting idle', async () => {
+  const fixture = await deliveryFixture({ available: true });
+  const timers = createManualTimers();
+  const reports = [];
+  const loop = startGatewayDrainLoop({
+    config: fixture.config,
+    delivery: fixture.delivery,
+    receiverOwnership: fixture.receiverOwnership,
+    logger: () => {},
+    reportHealth(result) {
+      reports.push(result);
+    },
+    deps: {
+      clearTimeout: timers.clearTimeout,
+      setTimeout: timers.setTimeout,
+    },
+  });
+
+  await timers.runNext();
+
+  assert.deepEqual(fixture.targetAttempts, [true]);
+  assert.deepEqual(fixture.requests, []);
+  assert.deepEqual(reports, [{
+    status: 'idle',
+    reason: 'queue_empty',
+    deliveredCount: 0,
+    queueDepth: 0,
+  }]);
+  await loop.stop();
+  fixture.delivery.destroy();
+});
+
+test('a superseded receiver neither drains nor overwrites gateway health', async () => {
+  const fixture = await deliveryFixture();
+  const timers = createManualTimers();
+  const reports = [];
+  const loop = startGatewayDrainLoop({
+    config: fixture.config,
+    delivery: fixture.delivery,
+    receiverOwnership: fixture.receiverOwnership,
+    logger: () => {},
+    reportHealth(result) {
+      reports.push(result);
+    },
+    deps: {
+      clearTimeout: timers.clearTimeout,
+      setTimeout: timers.setTimeout,
+      isCurrentReceiverOwnership() {
+        return { active: false, reason: 'gateway_generation_changed' };
+      },
+    },
+  });
+
+  await timers.runNext();
+  assert.deepEqual(reports, []);
+  assert.equal(timers.pendingCount(), 0);
+  await loop.stop();
+  fixture.delivery.destroy();
+});
+
 test('periodic retry drains automatically when the structured target becomes available', async () => {
   const fixture = await deliveryFixture();
   await fixture.delivery.enqueue(discordMessage('message-recovers'));
@@ -268,7 +359,7 @@ test('gateway loop restart resumes a persisted queue through the same durable st
   second.delivery.destroy();
 });
 
-test('periodic drain follows durable receiver authority instead of owner or thread metadata', async () => {
+test('periodic drain stops permanently after durable receiver authority moves away', async () => {
   const fixture = await deliveryFixture({ available: true });
   await fixture.delivery.enqueue(discordMessage('message-authority'));
   fs.writeFileSync(fixture.config.paths.gatewayPidPath, `${JSON.stringify({
@@ -290,11 +381,11 @@ test('periodic drain follows durable receiver authority instead of owner or thre
   );
   await timers.runNext();
 
-  assert.deepEqual(
-    fixture.requests.map((request) => request.clientUserMessageId),
-    ['discord:dm-1:message-authority'],
-  );
-  assert.deepEqual(queueAt(fixture.dir).items, []);
+  assert.deepEqual(fixture.requests, []);
+  assert.deepEqual(queueAt(fixture.dir).items.map((item) => item.normalized.messageId), [
+    'message-authority',
+  ]);
+  assert.equal(timers.pendingCount(), 0);
 
   await loop.stop();
   fixture.delivery.destroy();

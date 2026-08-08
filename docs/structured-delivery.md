@@ -68,11 +68,14 @@ still verified against the complete bounded inventory before use. Subagent
 threads are never selected. Without a provable current thread, delivery fails
 closed.
 
-An exact active target is checkpointed across a gateway process restart. The
-checkpoint remains usable only while its target thread is still loaded, and
-submission still uses the recorded turn id as the `turn/steer`
-`expectedTurnId` precondition. Removed non-target threads do not invalidate
-that target. After either a restart or a same-runtime topology change, newly
+One exact top-level thread selection is checkpointed across a gateway process
+restart. The version-2 checkpoint stores only the stable thread id and its
+proven loaded-thread inventory; it never persists an active turn id. After a
+restart the gateway rereads that exact thread and recovers its current idle,
+active, or system-error state before choosing `turn/start` or `turn/steer`.
+The checkpoint remains usable only while its target thread is still loaded.
+Removed non-target threads do not invalidate that target. After either a
+restart or a same-runtime topology change, newly
 loaded threads are read without turns and must have an acyclic parent chain
 anchored in the previously proven inventory; self-parent, orphan, malformed,
 and cyclic lineage fail closed. A newly loaded top-level thread observed only
@@ -107,7 +110,7 @@ Newly admitted items are stamped with the active id. A restart of the same
 installed runtime can therefore recover its own pending items, while a new
 versioned runtime cannot replay the old backlog. Readiness checks before an
 authority transfer are read-only, so a successor that fails readiness does not
-modify the incumbent queue. Queue schema v2 makes an older runtime reject an
+modify the incumbent queue. Queue schema v3 makes an older runtime reject an
 activated queue instead of replaying it after rollback. Deployments without
 versioned install paths may set `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`
 explicitly.
@@ -140,9 +143,13 @@ Startup, reconnect,
 and missed-notification recovery perform the same local check without requiring
 a prior signal. If bounded local proof is unavailable, reconciliation reads the
 exact target thread and accepts only the same structured user item. A positive
-response without either durable proof is treated as acknowledgement uncertainty,
-retains the FIFO head, and enters reconciliation without replay. Later items
-retain FIFO order and wait for another drain.
+response without either durable proof is treated as acknowledgement
+uncertainty. That item moves into a visible reconciliation lane with its exact
+target, stable client id, attempt count, and next proof-check time. It no longer
+blocks unrelated later FIFO items. The gateway may check again for exact durable
+proof, but elapsed time is never permission to call `turn/start` again. If the
+app-server accepted the first request but neither proof path can observe it, the
+item remains fail-closed instead of risking a duplicate turn.
 
 The gateway also inspects the durable queue periodically. Missing endpoints,
 missing loaded threads, busy threads, and stale receiver authority retain the
@@ -174,15 +181,31 @@ exact local rollout record or the structured recovery read. Lifecycle signals,
 unrelated client ids, non-user items, malformed recovery responses, and items
 from a different thread are not proof. If the request is known to be rejected
 or was not sent, the queue head remains retryable. If the connection, timeout,
-or post-ack proof makes acceptance uncertain, the FIFO is blocked as
-`structured_ack_uncertain`.
+or post-ack proof makes acceptance uncertain, the item enters the fail-closed
+reconciliation lane as `structured_ack_uncertain`.
 
 The stable client user message id is echoed by the app-server on the persisted
-user item. Before clearing an uncertain block, the gateway reuses only a cached
+user item. When checking an uncertain item, the gateway reuses only a cached
 durable proof or verifies the local rollout again; remote endpoints and local
-records outside the bounded tail use the exact target-thread read. It then
-commits completion without a second structured submission. If proof is
-unavailable, the block remains.
+records outside the bounded tail use the exact target-thread read. A found
+proof commits completion without a second structured submission. Otherwise the
+item remains visible as degraded while later ready items continue. Neither its
+proof-check timestamp nor elapsed time permits a second structured submission.
+
+## Runtime Health
+
+The unique receiver writes `gateway-health.json` atomically with its exact
+PID/generation, Discord connection state, app-server state, queue counts, and
+last drain result. MCP status reads that record and verifies it against
+`session-gateway.pid`; an MCP-local Discord login is reported separately and
+cannot impersonate receiver health. Missing, malformed, superseded, or dead
+gateway health is explicit.
+
+The app-server systemd unit uses `OOMPolicy=continue`. If an MCP or tool child
+is selected by the OOM killer, systemd leaves the surviving app-server process
+running instead of converting the child failure into a TUI transport failure.
+Normal service shutdown still uses the default control-group cleanup; stale
+tool processes are not preserved past their owning app-server.
 
 ## Live Acceptance
 

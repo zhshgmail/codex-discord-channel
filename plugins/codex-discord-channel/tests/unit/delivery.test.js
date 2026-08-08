@@ -389,7 +389,7 @@ test('activation archives stale backlog before target resolution and delivers a 
   assert.equal(targetResolutions, 0);
   assert.deepEqual(requests, []);
   const activated = readQueue(dir);
-  assert.equal(activated.version, 2);
+  assert.equal(activated.version, 3);
   assert.deepEqual(activated.items, []);
   assert.deepEqual(activated.completed, []);
   assert.deepEqual(activated.activation, {
@@ -1144,7 +1144,7 @@ test('startup drain advances a crashed accepted head and submits the next FIFO i
   delivery.destroy();
 });
 
-test('startup drain probes an unreconciled crashed head once and remains blocked', async () => {
+test('startup drain probes an unreconciled crashed head once and defers it visibly', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-crash-blocked-'));
   writePendingQueue(dir, [discordMessage('m-crashed', 'unknown after crash')], {
     blocked: {
@@ -1182,7 +1182,11 @@ test('startup drain probes an unreconciled crashed head once and remains blocked
 
   assert.equal(reconciliationCount, 1);
   assert.equal(starts, 0);
-  assert.equal(readQueue(dir).blocked.reason, 'structured_ack_uncertain');
+  assert.equal(readQueue(dir).blocked, null);
+  assert.deepEqual(
+    readQueue(dir).uncertain.map((item) => item.normalized.messageId),
+    ['m-crashed'],
+  );
   delivery.destroy();
 });
 
@@ -1565,11 +1569,14 @@ test('receiver handoff waits for the incumbent delivery lease before committing 
   successorDelivery.destroy();
 });
 
-test('uncertain structured acknowledgement blocks replay and later FIFO items', async () => {
+test('uncertain structured acknowledgement is visible but cannot block later FIFO items', async () => {
   let starts = 0;
   const fixture = structuredFixture({
-    onStartTurn() {
+    onStartTurn(params) {
       starts += 1;
+      if (params.clientUserMessageId !== 'discord:c1:m1') {
+        return { turn: { id: 'turn-m2' } };
+      }
       const error = new Error('connection closed after request write');
       error.deliveryOutcome = 'uncertain';
       throw error;
@@ -1581,12 +1588,20 @@ test('uncertain structured acknowledgement blocks replay and later FIFO items', 
 
   assert.equal(first.status, 'failed');
   assert.equal(first.reason, 'structured_ack_uncertain');
-  assert.equal(second.status, 'failed');
-  assert.equal(second.reason, 'structured_ack_uncertain');
-  assert.equal(starts, 1);
+  assert.equal(second.status, 'delivered');
+  assert.equal(second.reason, 'turn_accepted');
+  assert.equal(starts, 2);
   const queue = readQueue(fixture.dir);
-  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), ['m1', 'm2']);
-  assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.uncertain.map((item) => item.normalized.messageId), ['m1']);
+  assert.equal(queue.blocked, null);
+  const queueStatus = readDeliveryQueueStatus(deliveryConfig(fixture.dir));
+  assert.equal(queueStatus.deliveryUncertainCount, 1);
+  assert.equal(queueStatus.deliveryState, 'degraded');
+  assert.equal(queueStatus.deliveryDegradedReason, 'structured_ack_uncertain');
+  assert.equal(queueStatus.deliveryOldestUncertainMessageId, 'm1');
+  assert.equal(queueStatus.deliveryOldestUncertainAttempts, 1);
+  assert.match(queueStatus.deliveryOldestUncertainRetryAt, /^\d{4}-/);
 });
 
 test('successful response without a persisted user item is not marked complete', async () => {
@@ -1607,10 +1622,11 @@ test('successful response without a persisted user item is not marked complete',
   assert.equal(result.status, 'failed');
   assert.equal(result.reason, 'structured_ack_uncertain');
   assert.equal(starts, 1);
-  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), ['m-ack-gap']);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.uncertain.map((item) => item.normalized.messageId), ['m-ack-gap']);
   assert.deepEqual(queue.completed, []);
-  assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
-  assert.equal(queue.blocked.clientUserMessageId, 'discord:c1:m-ack-gap');
+  assert.equal(queue.blocked, null);
+  assert.equal(queue.uncertain[0].delivery.clientUserMessageId, 'discord:c1:m-ack-gap');
 });
 
 test('unsupported acknowledgement recovery remains structured_ack_uncertain', async () => {
@@ -1630,17 +1646,26 @@ test('unsupported acknowledgement recovery remains structured_ack_uncertain', as
   const result = await fixture.delivery.deliver(
     discordMessage('m-unsupported-readback', 'must remain durable'),
   );
+  const duplicate = await fixture.delivery.enqueue(
+    discordMessage('m-unsupported-readback', 'must remain durable'),
+  );
   const queue = readQueue(fixture.dir);
 
   assert.equal(result.status, 'failed');
   assert.equal(result.reason, 'structured_ack_uncertain');
   assert.equal(starts, 1);
-  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), [
+  assert.equal(duplicate.status, 'accepted');
+  assert.equal(duplicate.reason, 'discord_message_already_pending');
+  assert.equal(duplicate.queueDepth, 1);
+  assert.deepEqual(queue.uncertain.map((item) => item.normalized.messageId), [
     'm-unsupported-readback',
   ]);
   assert.deepEqual(queue.completed, []);
-  assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
-  assert.equal(queue.blocked.clientUserMessageId, 'discord:c1:m-unsupported-readback');
+  assert.equal(queue.blocked, null);
+  assert.equal(
+    queue.uncertain[0].delivery.clientUserMessageId,
+    'discord:c1:m-unsupported-readback',
+  );
 });
 
 test('remote unsupported acknowledgement read remains structured_ack_uncertain', async (t) => {
@@ -1688,7 +1713,10 @@ test('remote unsupported acknowledgement read remains structured_ack_uncertain',
   assert.equal(result.status, 'failed');
   assert.equal(result.reason, 'structured_ack_uncertain');
   assert.deepEqual(queue.completed, []);
-  assert.equal(queue.blocked.reason, 'structured_ack_uncertain');
+  assert.equal(queue.blocked, null);
+  assert.deepEqual(queue.uncertain.map((item) => item.normalized.messageId), [
+    'm-remote-unsupported',
+  ]);
   assert.equal(
     requests.some((request) => request.method === 'thread/read' && request.params.includeTurns),
     true,
@@ -1745,6 +1773,134 @@ test('uncertain acknowledgement reconciles by client id without replaying turn/s
   assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m-reconcile']);
 });
 
+test('expired uncertain delivery remains fail closed and never replays turn/start', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-uncertain-retry-'));
+  const normalized = discordMessage('m-retry', 'retry me');
+  fs.writeFileSync(path.join(dir, 'pending-delivery.json'), `${JSON.stringify({
+    version: 3,
+    activation: {
+      id: TEST_ACTIVATION_ID,
+      activatedAt: '2026-07-20T00:00:00.000Z',
+    },
+    items: [],
+    uncertain: [{
+      version: 3,
+      activationId: TEST_ACTIVATION_ID,
+      queuedAt: '2026-07-20T00:00:01.000Z',
+      normalized,
+      delivery: {
+        state: 'structured_ack_uncertain',
+        attempts: 1,
+        firstDeferredAt: '2026-07-20T00:00:02.000Z',
+        lastDeferredAt: '2026-07-20T00:00:02.000Z',
+        retryAt: '2026-07-20T00:00:03.000Z',
+        threadId: 'thread-current',
+        clientUserMessageId: 'discord:c1:m-retry',
+      },
+    }],
+    completed: [],
+    archived: [],
+    blocked: null,
+  }, null, 2)}\n`);
+  const starts = [];
+  const delivered = new Set();
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    now: () => Date.parse('2026-07-20T00:00:04.000Z'),
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        starts.push(params.clientUserMessageId);
+        delivered.add(params.clientUserMessageId);
+        return { turn: { id: 'turn-retried' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return delivered.has(clientUserMessageId);
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  const result = await delivery.flush();
+
+  assert.equal(result.status, 'queued');
+  assert.equal(result.reason, 'structured_ack_uncertain');
+  assert.deepEqual(starts, []);
+  assert.deepEqual(readQueue(dir).items, []);
+  assert.deepEqual(readQueue(dir).uncertain.map((item) => item.normalized.messageId), ['m-retry']);
+  assert.deepEqual(readQueue(dir).completed, []);
+  delivery.destroy();
+});
+
+test('legacy global acknowledgement block migrates to retry lane without blocking later FIFO', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-uncertain-v2-'));
+  const first = discordMessage('m-legacy-uncertain', 'first');
+  const second = discordMessage('m-later', 'second');
+  fs.writeFileSync(path.join(dir, 'pending-delivery.json'), `${JSON.stringify({
+    version: 2,
+    activation: {
+      id: TEST_ACTIVATION_ID,
+      activatedAt: '2026-07-20T00:00:00.000Z',
+    },
+    items: [first, second].map((normalized) => ({
+      version: 2,
+      activationId: TEST_ACTIVATION_ID,
+      queuedAt: '2026-07-20T00:00:01.000Z',
+      normalized,
+    })),
+    completed: [],
+    archived: [],
+    blocked: {
+      reason: 'structured_ack_uncertain',
+      at: '2026-07-20T00:00:02.000Z',
+      threadId: 'thread-current',
+      clientUserMessageId: 'discord:c1:m-legacy-uncertain',
+    },
+  }, null, 2)}\n`);
+  const starts = [];
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryUncertainRetryBaseMs: 60_000,
+  }), () => {}, {
+    now: () => Date.parse('2026-07-20T00:00:03.000Z'),
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        starts.push(params.clientUserMessageId);
+        return { turn: { id: 'turn-later' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return starts.includes(clientUserMessageId);
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  const migrated = await delivery.flush();
+  const drained = await delivery.flush();
+
+  assert.equal(migrated.reason, 'structured_ack_uncertain');
+  assert.equal(drained.status, 'delivered');
+  assert.deepEqual(starts, ['discord:c1:m-later']);
+  assert.deepEqual(readQueue(dir).uncertain.map((item) => item.normalized.messageId), [
+    'm-legacy-uncertain',
+  ]);
+  assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-later']);
+  delivery.destroy();
+});
+
 test('post-accept uncertainty persists replay identity and reconciles after restart', async () => {
   let fixture;
   fixture = structuredFixture({
@@ -1764,8 +1920,12 @@ test('post-accept uncertainty persists replay identity and reconciles after rest
 
   assert.equal(uncertain.status, 'failed');
   assert.equal(uncertain.reason, 'structured_ack_uncertain');
-  assert.equal(persisted.blocked.threadId, 'thread-current');
-  assert.equal(persisted.blocked.clientUserMessageId, 'discord:c1:m-post-accept');
+  assert.equal(persisted.blocked, null);
+  assert.equal(persisted.uncertain[0].delivery.threadId, 'thread-current');
+  assert.equal(
+    persisted.uncertain[0].delivery.clientUserMessageId,
+    'discord:c1:m-post-accept',
+  );
   fixture.delivery.destroy();
 
   const reconciliations = [];
@@ -1886,6 +2046,13 @@ test('delivery status sanitizes malformed queue content', () => {
   assert.deepEqual(readDeliveryQueueStatus(deliveryConfig(dir)), {
     deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
     deliveryQueueDepth: null,
+    deliveryReadyCount: null,
+    deliveryUncertainCount: null,
+    deliveryState: 'unreadable',
+    deliveryDegradedReason: 'delivery_queue_unreadable',
+    deliveryOldestUncertainMessageId: null,
+    deliveryOldestUncertainRetryAt: null,
+    deliveryOldestUncertainAttempts: null,
     deliveryArchivedCount: null,
     deliveryActivatedAt: null,
     deliveryBlockedReason: 'delivery_queue_unreadable',

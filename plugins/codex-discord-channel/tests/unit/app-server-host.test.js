@@ -1491,7 +1491,7 @@ test('rejected timeout-recovery turn is discarded before the next target resolut
   );
 });
 
-test('accepted active target survives a gateway process restart through a durable checkpoint', async (t) => {
+test('accepted active target survives restart by rereading current turn state from its stable binding', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const config = {
@@ -1533,7 +1533,19 @@ test('accepted active target survives a gateway process restart through a durabl
       return { data: ['thread-a'], nextCursor: null };
     }
     if (method === 'thread/read') {
-      throw new Error('restart recovery must not reread the unchanged active thread');
+      assert.equal(params.threadId, 'thread-a');
+      return {
+        thread: {
+          id: 'thread-a',
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{
+            id: 'turn-across-restart',
+            status: 'inProgress',
+            items: [],
+          }],
+        },
+      };
     }
     if (method === 'turn/steer') {
       assert.equal(params.expectedTurnId, 'turn-across-restart');
@@ -1554,6 +1566,70 @@ test('accepted active target survives a gateway process restart through a durabl
     clientUserMessageId: 'discord:c1:m-after-restart',
     input: [{ type: 'text', text: 'continue after restart' }],
   }, recoveredTarget);
+});
+
+test('verified idle target survives a gateway process restart through a durable checkpoint', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-idle-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  const firstClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a', 'thread-child'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: params.threadId === 'thread-child' ? 'thread-a' : null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  const target = await firstHost.resolveTarget();
+  assert.equal(target.threadId, 'thread-a');
+  assert.equal(target.status, 'idle');
+  firstHost.destroy();
+
+  const checkpoint = JSON.parse(
+    fs.readFileSync(path.join(stateDir, 'app-server-target.json'), 'utf8'),
+  );
+  assert.equal(checkpoint.version, 2);
+  assert.equal(checkpoint.threadId, 'thread-a');
+  assert.deepEqual(checkpoint.loadedThreadIds, ['thread-a', 'thread-child']);
+
+  const secondClient = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a', 'thread-child'], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.threadId === 'thread-a') {
+      return {
+        thread: {
+          id: 'thread-a',
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') return { turn: { id: 'turn-after-idle-restart' } };
+    throw new Error(`unexpected method ${method}`);
+  });
+  const secondHost = createAppServerHost(config, () => {}, { client: secondClient });
+  t.after(() => secondHost.destroy());
+
+  const recovered = await secondHost.resolveTarget();
+  assert.equal(recovered.threadId, 'thread-a');
+  assert.equal(recovered.status, 'idle');
+  await secondHost.startTurn({
+    threadId: recovered.threadId,
+    clientUserMessageId: 'discord:c1:m-after-idle-restart',
+    input: [{ type: 'text', text: 'resume exact idle thread' }],
+  }, recovered);
 });
 
 async function createDurableTarget(config, turnId = 'turn-before-restart') {
@@ -1690,7 +1766,7 @@ test('gateway restart retains a durable active target when an unrelated loaded c
   };
   const firstClient = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
-      return { data: ['thread-a', 'thread-worker'], nextCursor: null };
+      return { data: ['thread-a', 'thread-b', 'thread-worker'], nextCursor: null };
     }
     if (method === 'thread/read') {
       return {
@@ -1707,20 +1783,53 @@ test('gateway restart retains a durable active target when an unrelated loaded c
     throw new Error(`unexpected method ${method}`);
   });
   const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  firstClient.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-a',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
   const idleTarget = await firstHost.resolveTarget();
   await firstHost.startTurn({
     threadId: idleTarget.threadId,
     clientUserMessageId: 'discord:c1:m-before-worker-close',
     input: [{ type: 'text', text: 'start active work' }],
   }, idleTarget);
+  firstClient.emit('notification', {
+    method: 'thread/closed',
+    params: { threadId: 'thread-worker' },
+  });
+  firstClient.emit('notification', {
+    method: 'thread/status/changed',
+    params: { threadId: 'thread-a', status: { type: 'active' } },
+  });
+  assert.equal(
+    fs.existsSync(path.join(stateDir, 'app-server-target.json')),
+    true,
+  );
   firstHost.destroy();
 
   const secondClient = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
-      return { data: ['thread-a'], nextCursor: null };
+      return { data: ['thread-a', 'thread-b'], nextCursor: null };
     }
     if (method === 'thread/read') {
-      throw new Error('worker closure must not force a read of the unchanged active thread');
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: params.threadId === 'thread-a' ? 'active' : 'idle' },
+          turns: params.threadId === 'thread-a' ? [{
+            id: 'turn-after-worker-close',
+            status: 'inProgress',
+            items: [],
+          }] : [],
+        },
+      };
     }
     if (method === 'turn/steer') {
       assert.equal(params.expectedTurnId, 'turn-after-worker-close');
@@ -1752,7 +1861,7 @@ test('gateway restart retains a durable active target when an unrelated loaded c
   };
   const firstClient = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
-      return { data: ['thread-a'], nextCursor: null };
+      return { data: ['thread-a', 'thread-b'], nextCursor: null };
     }
     if (method === 'thread/read') {
       return {
@@ -1769,17 +1878,45 @@ test('gateway restart retains a durable active target when an unrelated loaded c
     throw new Error(`unexpected method ${method}`);
   });
   const firstHost = createAppServerHost(config, () => {}, { client: firstClient });
+  firstClient.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-a',
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
   const idleTarget = await firstHost.resolveTarget();
   await firstHost.startTurn({
     threadId: idleTarget.threadId,
     clientUserMessageId: 'discord:c1:m-before-worker-start',
     input: [{ type: 'text', text: 'start active work' }],
   }, idleTarget);
+  firstClient.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: 'thread-worker',
+        parentThreadId: 'thread-a',
+        status: { type: 'active' },
+      },
+    },
+  });
+  firstClient.emit('notification', {
+    method: 'thread/status/changed',
+    params: { threadId: 'thread-a', status: { type: 'active' } },
+  });
+  assert.equal(
+    fs.existsSync(path.join(stateDir, 'app-server-target.json')),
+    true,
+  );
   firstHost.destroy();
 
   const secondClient = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') {
-      return { data: ['thread-a', 'thread-worker'], nextCursor: null };
+      return { data: ['thread-a', 'thread-b', 'thread-worker'], nextCursor: null };
     }
     if (method === 'thread/read' && params.threadId === 'thread-worker') {
       return {
@@ -1791,7 +1928,18 @@ test('gateway restart retains a durable active target when an unrelated loaded c
       };
     }
     if (method === 'thread/read') {
-      throw new Error('child addition must not force a read of the unchanged active root');
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: params.threadId === 'thread-a' ? 'active' : 'idle' },
+          turns: params.threadId === 'thread-a' ? [{
+            id: 'turn-before-worker-start',
+            status: 'inProgress',
+            items: [],
+          }] : [],
+        },
+      };
     }
     if (method === 'turn/steer') {
       assert.equal(params.expectedTurnId, 'turn-before-worker-start');
@@ -1847,6 +1995,10 @@ test('gateway restart rejects malformed parent lineage for an added thread', asy
   const target = await host.resolveTarget();
   assert.equal(target.available, false);
   assert.equal(target.reason, 'shared_app_server_thread_unprovable');
+  assert.equal(
+    fs.existsSync(path.join(stateDir, 'app-server-target.invalidated.json')),
+    true,
+  );
 });
 
 test('gateway restart rejects self-parent and orphan lineage for an added thread', async (t) => {
@@ -2382,7 +2534,7 @@ test('gateway restart clears a durable active target when no thread remains load
   assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
 });
 
-test('rejected durable active target is cleared before fresh thread resolution', async (t) => {
+test('stable binding rereads an ended turn and starts fresh instead of steering stale state', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-rejected-durable-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const config = {
@@ -2420,12 +2572,8 @@ test('rejected durable active target is cleared before fresh thread resolution',
     if (method === 'thread/loaded/list') {
       return { data: ['thread-a'], nextCursor: null };
     }
-    if (method === 'turn/steer') {
-      const error = new Error('expected turn is no longer active');
-      error.code = 'shared_app_server_request_rejected';
-      error.deliveryOutcome = 'rejected';
-      throw error;
-    }
+    if (method === 'turn/steer') throw new Error('stale turn must never be steered');
+    if (method === 'turn/start') return { turn: { id: 'turn-fresh-after-restart' } };
     if (method === 'thread/read') {
       return {
         thread: {
@@ -2440,24 +2588,15 @@ test('rejected durable active target is cleared before fresh thread resolution',
   const secondHost = createAppServerHost(config, () => {}, { client: secondClient });
   t.after(() => secondHost.destroy());
 
-  const staleTarget = await secondHost.resolveTarget();
-  await assert.rejects(
-    secondHost.startTurn({
-      threadId: staleTarget.threadId,
-      clientUserMessageId: 'discord:c1:m-reject-durable',
-      input: [{ type: 'text', text: 'must reject stale turn' }],
-    }, staleTarget),
-    (error) => error.deliveryOutcome === 'rejected',
-  );
-  assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), false);
-
-  secondClient.requests.length = 0;
   const freshTarget = await secondHost.resolveTarget();
   assert.equal(freshTarget.status, 'idle');
-  assert.equal(
-    secondClient.requests.some((request) => request.method === 'thread/read'),
-    true,
-  );
+  await secondHost.startTurn({
+    threadId: freshTarget.threadId,
+    clientUserMessageId: 'discord:c1:m-fresh-after-restart',
+    input: [{ type: 'text', text: 'start after stale turn ended' }],
+  }, freshTarget);
+  assert.equal(secondClient.requests.some((request) => request.method === 'turn/steer'), false);
+  assert.equal(secondClient.requests.some((request) => request.method === 'turn/start'), true);
 });
 
 test('durable active target survives the initial app-server connection event after restart', async (t) => {
@@ -2504,7 +2643,18 @@ test('durable active target survives the initial app-server connection event aft
       return { data: ['thread-a'], nextCursor: null };
     }
     if (method === 'thread/read') {
-      throw new Error('initial connection must not discard the restart checkpoint');
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+          turns: [{
+            id: 'turn-after-connect',
+            status: 'inProgress',
+            items: [],
+          }],
+        },
+      };
     }
     if (method === 'turn/steer') {
       assert.equal(params.expectedTurnId, 'turn-after-connect');
