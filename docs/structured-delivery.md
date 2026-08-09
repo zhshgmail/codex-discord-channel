@@ -113,7 +113,10 @@ authority transfer are read-only, so a successor that fails readiness does not
 modify the incumbent queue. Queue schema v3 makes an older runtime reject an
 activated queue instead of replaying it after rollback. Deployments without
 versioned install paths may set `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`
-explicitly.
+explicitly for standalone workers. The alias-owned launcher always supplies
+its real installed plugin root to each channel and TUI child after clearing
+inherited selectors, so an old state `.env` value cannot keep pre-upgrade ready
+or uncertain work eligible.
 
 If the activation or archive cannot be persisted, receiver activation fails and
 the gateway does not continue as an inbound receiver.

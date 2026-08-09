@@ -72,8 +72,11 @@ legacy, mismatched, pre-activation queued, and delayed pre-activation Discord
 events before target resolution, retaining only their Discord identity and
 timestamps for deduplication. A restart of the same installed runtime may
 recover matching post-activation items. `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`
-can set an explicit activation boundary when deployment paths are not
-versioned.
+can set an explicit activation boundary for standalone workers when deployment
+paths are not versioned. The alias-owned launcher instead pins every channel
+and TUI child to the real root of its own installed plugin, so a stale instance
+`.env` override cannot preserve an older activation across a marketplace
+upgrade.
 
 The standalone gateway checks the durable queue periodically as well as on
 app-server recovery events. A nonempty blocked queue retries with exponential

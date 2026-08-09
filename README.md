@@ -81,7 +81,10 @@ before it are stale as well. The archive retains only Discord identity and
 timestamps for deduplication; message content is removed. Restarts of the same
 installed runtime retain and recover only items stamped within that activation.
 Operators may set an explicit stable boundary with
-`CODEX_DISCORD_DELIVERY_ACTIVATION_ID`.
+`CODEX_DISCORD_DELIVERY_ACTIVATION_ID` for standalone workers. The alias-owned
+launcher always overlays its real installed plugin root for every channel and
+TUI child, so an older value retained in the instance `.env` cannot bridge two
+marketplace revisions.
 
 The standalone gateway also owns a periodic durable-queue check. A nonempty
 queue is retried without new Discord traffic or TUI activity, while unavailable
