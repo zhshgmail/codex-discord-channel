@@ -18,6 +18,13 @@ function assert(condition, message) {
   }
 }
 
+function appearsInOrder(document, before, after) {
+  const normalized = document.replace(/\s+/g, ' ').toLowerCase();
+  const beforeIndex = normalized.indexOf(before.toLowerCase());
+  const afterIndex = normalized.indexOf(after.toLowerCase());
+  return beforeIndex >= 0 && afterIndex > beforeIndex;
+}
+
 const manifest = readJson('.codex-plugin/plugin.json');
 const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
@@ -75,6 +82,14 @@ assert(
   'README must require alias exit before marketplace replacement removes its old cache',
 );
 assert(
+  appearsInOrder(
+    readme,
+    'Exit the selected alias first',
+    'from an ordinary shell, replace its marketplace revision',
+  ),
+  'README runtime update must order alias exit before marketplace replacement',
+);
+assert(
   !readme.includes('Install the new marketplace revision, then exit'),
   'README must not remove a running generation before alias exit',
 );
@@ -83,5 +98,22 @@ for (const [name, document] of [['plugin skill', pluginSkill], ['known issues', 
   assert(!document.includes('migrate the gateway'), `${name} must not prescribe split gateway migration`);
   assert(!document.includes("marketplace, then exit"), `${name} must not install before alias exit`);
 }
+assert(
+  appearsInOrder(pluginSkill, 'Exit only the selected alias', 'install the released plugin'),
+  'plugin skill must order alias exit before marketplace installation',
+);
+assert(
+  appearsInOrder(knownIssues, 'Exit the selected alias first', 'install the new plugin version'),
+  'known issues must order alias exit before marketplace installation',
+);
+const priorBrokenSkill = [
+  '1. Install the released plugin through that account configured marketplace.',
+  '2. Verify the account binding.',
+  '3. Exit only the selected alias and relaunch it.',
+].join('\n');
+assert(
+  !appearsInOrder(priorBrokenSkill, 'Exit only the selected alias', 'install the released plugin'),
+  'ordering gate must reject the prior install-before-exit skill regression',
+);
 
 process.stdout.write('smoke passed\n');
