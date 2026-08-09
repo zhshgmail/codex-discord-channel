@@ -1778,6 +1778,190 @@ test('successful response without a persisted user item is not marked complete',
   assert.equal(queue.uncertain[0].delivery.clientUserMessageId, 'discord:c1:m-ack-gap');
 });
 
+test('positive ack then real rollout UserMessage proof terminally reconciles uncertain without replay', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-real-rollout-ack-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { codexHome, rolloutPath } = createDeliveryRollout(t);
+  const clientUserMessageId = 'discord:c1:m-real-rollout-ack';
+  const client = new EventEmitter();
+  const requests = [];
+  let nowMs = Date.parse('2026-08-09T07:00:00.000Z');
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === 'thread/loaded/list') {
+      return { data: [ROLLOUT_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && !params.includeTurns) {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') return { turn: { id: 'turn-real-rollout-ack' } };
+    if (method === 'thread/read' && params.includeTurns) {
+      return {
+        thread: {
+          id: params.threadId,
+          turns: [{
+            id: 'turn-earlier-rpc-visible',
+            items: [{ type: 'userMessage', clientId: 'discord:c1:m-earlier' }],
+          }],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  const host = createAppServerHost(
+    {
+      appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+      env: { CODEX_HOME: codexHome, HOME: path.dirname(codexHome) },
+    },
+    () => {},
+    { client },
+  );
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    now: () => nowMs,
+    structuredHost: host,
+  });
+  t.after(() => delivery.destroy());
+  await delivery.activateReceiver(activeReceiver);
+
+  const uncertain = await delivery.deliver(
+    discordMessage('m-real-rollout-ack', 'persist before completing'),
+  );
+  const uncertainQueue = readQueue(dir);
+
+  assert.equal(uncertain.status, 'failed');
+  assert.equal(uncertain.reason, 'structured_ack_uncertain');
+  assert.deepEqual(uncertainQueue.items, []);
+  assert.deepEqual(uncertainQueue.completed, []);
+  assert.equal(uncertainQueue.uncertain.length, 1);
+  assert.equal(uncertainQueue.uncertain[0].delivery.attempts, 1);
+  assert.equal(uncertainQueue.uncertain[0].delivery.clientUserMessageId, clientUserMessageId);
+  assert.deepEqual(
+    requests.filter(({ method }) => method === 'turn/start' || method === 'turn/steer')
+      .map(({ method }) => method),
+    ['turn/start'],
+  );
+
+  const wrongRootThreadId = '019f3763-d308-7871-bedc-e6489b02190f';
+  const impostors = [
+    ['wrong root', {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: wrongRootThreadId,
+        turn_id: 'turn-wrong-root',
+        item: { type: 'UserMessage', client_id: clientUserMessageId },
+      },
+    }],
+    ['wrong client', {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: ROLLOUT_THREAD_ID,
+        turn_id: 'turn-wrong-client',
+        item: { type: 'UserMessage', client_id: 'discord:c1:m-other' },
+      },
+    }],
+    ['assistant item', {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: ROLLOUT_THREAD_ID,
+        turn_id: 'turn-assistant',
+        item: { type: 'AssistantMessage', client_id: clientUserMessageId },
+      },
+    }],
+    ['lowercase item', {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: ROLLOUT_THREAD_ID,
+        turn_id: 'turn-lowercase',
+        item: { type: 'userMessage', client_id: clientUserMessageId },
+      },
+    }],
+    ['shape-conflicting client id', {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: ROLLOUT_THREAD_ID,
+        turn_id: 'turn-conflicting-shape',
+        client_id: clientUserMessageId,
+        item: { type: 'UserMessage', client_id: 'discord:c1:m-other' },
+      },
+    }],
+    ['malformed item', {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: ROLLOUT_THREAD_ID,
+        turn_id: 'turn-malformed-item',
+        item: null,
+      },
+    }],
+  ];
+  for (const [name, record] of impostors) {
+    fs.appendFileSync(rolloutPath, `${JSON.stringify(record)}\n`);
+    assert.equal(
+      await host.hasDelivered(ROLLOUT_THREAD_ID, clientUserMessageId),
+      false,
+      `${name} must not prove delivery`,
+    );
+  }
+  fs.appendFileSync(rolloutPath, '{"type":"event_msg","payload":\n');
+  assert.equal(
+    await host.hasDelivered(ROLLOUT_THREAD_ID, clientUserMessageId),
+    false,
+    'malformed JSON must not prove delivery',
+  );
+
+  nowMs = Date.parse('2026-08-09T07:00:01.000Z');
+  fs.appendFileSync(rolloutPath, `${JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'item_completed',
+      thread_id: ROLLOUT_THREAD_ID,
+      turn_id: 'turn-real-rollout-ack',
+      item: {
+        type: 'UserMessage',
+        id: 'item-real-rollout-ack',
+        client_id: clientUserMessageId,
+        content: [],
+      },
+    },
+  })}\n`);
+
+  const reconciled = await delivery.flush();
+  const queue = readQueue(dir);
+  const queueStatus = readDeliveryQueueStatus(deliveryConfig(dir));
+
+  assert.equal(reconciled.status, 'delivered');
+  assert.equal(reconciled.reason, 'turn_already_accepted');
+  assert.deepEqual(
+    requests.filter(({ method }) => method === 'turn/start' || method === 'turn/steer')
+      .map(({ method }) => method),
+    ['turn/start'],
+  );
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.uncertain, []);
+  assert.equal(queue.completed.length, 1);
+  assert.equal(queue.completed[0].channelId, 'c1');
+  assert.equal(queue.completed[0].messageId, 'm-real-rollout-ack');
+  assert.equal(queue.completed[0].completedAt, '2026-08-09T07:00:01.000Z');
+  assert.equal(queueStatus.deliveryQueueDepth, 0);
+  assert.equal(queueStatus.deliveryReadyCount, 0);
+  assert.equal(queueStatus.deliveryUncertainCount, 0);
+  assert.equal(queueStatus.deliveryState, 'idle');
+  assert.equal(queueStatus.deliveryDegradedReason, null);
+  assert.equal(queueStatus.deliveryBlockedReason, null);
+});
+
 test('unsupported acknowledgement recovery remains structured_ack_uncertain', async () => {
   let starts = 0;
   const fixture = structuredFixture({
