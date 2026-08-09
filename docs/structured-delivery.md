@@ -131,6 +131,22 @@ a goal continuation that wins an idle-boundary race becomes the bounded delivery
 target instead of starving the FIFO. The active turn id is a request precondition
 only, not receiver ownership or session binding.
 
+A local app-server may reject `turn/steer` while naming both the exact expected
+turn and a different current canonical turn. The gateway trusts that identity
+only from the fully anchored local error form and only when its expected id is
+the id actually submitted. Before using the replacement it rechecks the same
+connection generation, thread-selection revision, top-level root, and fresh TUI
+lease, then retries the same logical delivery exactly once. A second such
+rejection retains the newly named active turn for the next drain but makes no
+third call and reports `thread_busy`. Generic, malformed, mismatched, and remote
+errors never establish a turn id; a known rejected request clears only the
+unproven active id so the stable root and checkpoint can be reread. A disconnect
+or any uncertain acknowledgement never authorizes this retry.
+
+A delayed duplicate `thread/started` for the already proven root under the same
+TUI lease does not erase its checkpoint or active-turn proof. A different root
+or lease still invalidates that binding.
+
 After either structured request is acknowledged, the gateway requires an exact
 durable user-item proof from the target thread. On a local app-server, the
 gateway first locates one rollout JSONL whose filename and first

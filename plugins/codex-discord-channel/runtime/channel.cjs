@@ -3349,7 +3349,7 @@ var require_ws = __commonJS({
 var require_app_server_host = __commonJS({
   "src/app-server-host.js"(exports2, module2) {
     "use strict";
-    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
     function parseTargetCheckpoint(raw) {
       let record;
       try {
@@ -3409,6 +3409,18 @@ var require_app_server_host = __commonJS({
       } catch {
         return !1;
       }
+    }
+    function authoritativeActiveTurnMismatch(endpoint, pending, message) {
+      if (!isLocalAppServer(endpoint) || pending?.method !== "turn/steer" || typeof pending.params?.expectedTurnId != "string")
+        return null;
+      let match = ACTIVE_TURN_MISMATCH.exec(String(message || ""));
+      if (!match) return null;
+      let [, expectedTurnId, activeTurnId] = match;
+      return !CANONICAL_TURN_ID.test(expectedTurnId) || !CANONICAL_TURN_ID.test(activeTurnId) || expectedTurnId !== pending.params.expectedTurnId || activeTurnId === expectedTurnId ? null : Object.freeze({
+        expectedTurnId,
+        activeTurnId,
+        provenance: "trusted_local_app_server_rejection"
+      });
     }
     function rolloutSessionsDir(config, deps) {
       if (typeof deps.rolloutSessionsDir == "string" && deps.rolloutSessionsDir !== "")
@@ -3681,12 +3693,16 @@ var require_app_server_host = __commonJS({
           let pending = this.pending.get(String(message.id));
           if (!pending) return;
           if (clearTimeout(pending.timer), this.pending.delete(String(message.id)), message.error) {
-            let error = deliveryError(
+            let mismatch = authoritativeActiveTurnMismatch(
+              this.endpoint,
+              pending,
+              message.error.message
+            ), error = deliveryError(
               message.error.message || "Shared app-server rejected the request.",
-              /active|busy|in progress/i.test(message.error.message || "") ? "thread_busy" : "shared_app_server_request_rejected",
+              mismatch || /active|busy|in progress/i.test(message.error.message || "") ? "thread_busy" : "shared_app_server_request_rejected",
               "rejected"
             );
-            error.rpcCode = message.error.code, pending.reject(error);
+            error.rpcCode = message.error.code, mismatch && (error.authoritativeActiveTurnMismatch = mismatch), pending.reject(error);
           } else
             pending.resolve(message.result);
           return;
@@ -3713,6 +3729,8 @@ var require_app_server_host = __commonJS({
             let pending2 = this.pending.get(id);
             pending2 && clearTimeout(pending2.timer), this.pending.delete(id), signal && abortListener && signal.removeEventListener("abort", abortListener);
           }, pending = {
+            method,
+            params,
             timer: null,
             resolve: (value) => {
               cleanup(), resolve(value);
@@ -3808,7 +3826,7 @@ var require_app_server_host = __commonJS({
             if (remoteIndex >= 0 && argv[remoteIndex + 1] === config.appServerUrl) return !0;
           }
           return !1;
-        }), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
+        }), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.activeTurnProvenance = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
           deps.lifecycleProofRetryDelaysMs
         );
         let fsPromises = deps.rolloutFsPromises || fs.promises, sessionsDir = rolloutSessionsDir(config, deps);
@@ -3837,32 +3855,36 @@ var require_app_server_host = __commonJS({
           if (notification?.method === "thread/started") {
             let thread = notification.params?.thread;
             if (thread?.id && (this.threadSelectionRevision += 1), thread?.id && !thread.parentThreadId) {
-              let lease = this.readTuiLease();
-              this.observedTuiLeaseTarget = lease.available && lease.record ? { leaseId: lease.record.leaseId, threadId: thread.id } : null, this.loadedInventoryProven = !1, this.invalidateTargetCheckpoint("top_level_thread_started"), this.restoredTargetCheckpoint = null, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, thread.status?.type || "unavailable"), thread.status?.type === "idle" && this.emit("idle", { threadId: thread.id });
+              let lease = this.readTuiLease(), sameProvenRoot = thread.id === this.currentThreadId && (this.loadedInventoryProven && this.knownLoadedThreadIds.has(thread.id) || this.restoredTargetCheckpoint?.threadId === thread.id), sameLease = !this.requireTuiLease || lease.available && lease.record && this.observedTuiLeaseTarget?.leaseId === lease.record.leaseId && this.observedTuiLeaseTarget.threadId === thread.id;
+              if (sameProvenRoot && sameLease) {
+                this.threadStatuses.has(thread.id) || this.threadStatuses.set(thread.id, thread.status?.type || "unavailable"), thread.status?.type === "idle" && this.threadStatuses.get(thread.id) === "idle" && this.emit("idle", { threadId: thread.id });
+                return;
+              }
+              this.observedTuiLeaseTarget = lease.available && lease.record ? { leaseId: lease.record.leaseId, threadId: thread.id } : null, this.loadedInventoryProven = !1, this.invalidateTargetCheckpoint("top_level_thread_started"), this.restoredTargetCheckpoint = null, this.activeTurnIds.delete(thread.id), this.activeTurnProvenance.delete(thread.id), this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, thread.status?.type || "unavailable"), thread.status?.type === "idle" && this.emit("idle", { threadId: thread.id });
             }
             return;
           }
           if (notification?.method === "turn/started") {
             let threadId = notification.params?.threadId, turnId = notification.params?.turn?.id;
             if (!threadId || !turnId) return;
-            this.threadStatuses.set(threadId, "active"), this.activeTurnIds.set(threadId, turnId), threadId === this.currentThreadId && (this.threadSelectionRevision += 1, this.persistTargetCheckpoint(), this.emit("active", { threadId, turnId }));
+            this.threadStatuses.set(threadId, "active"), this.activeTurnIds.set(threadId, turnId), this.activeTurnProvenance.set(threadId, "turn_started_notification"), threadId === this.currentThreadId && (this.threadSelectionRevision += 1, this.persistTargetCheckpoint(), this.emit("active", { threadId, turnId }));
             return;
           }
           if (notification?.method === "turn/completed") {
             let threadId = notification.params?.threadId, turnId = notification.params?.turn?.id;
             if (!threadId) return;
-            (!turnId || this.activeTurnIds.get(threadId) === turnId) && this.activeTurnIds.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (!turnId || this.timeoutRecoveryTarget.turnId === turnId) && (this.timeoutRecoveryTarget = null), threadId === this.currentThreadId && (this.threadSelectionRevision += 1, this.persistTargetCheckpoint());
+            (!turnId || this.activeTurnIds.get(threadId) === turnId) && (this.activeTurnIds.delete(threadId), this.activeTurnProvenance.delete(threadId)), this.timeoutRecoveryTarget?.threadId === threadId && (!turnId || this.timeoutRecoveryTarget.turnId === turnId) && (this.timeoutRecoveryTarget = null), threadId === this.currentThreadId && (this.threadSelectionRevision += 1, this.persistTargetCheckpoint());
             return;
           }
           if (notification?.method === "thread/status/changed" && notification.params?.threadId) {
             let { threadId, status } = notification.params, statusType = status?.type || "unavailable";
-            this.threadStatuses.set(threadId, statusType), statusType === "idle" ? (this.activeTurnIds.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), threadId === this.currentThreadId && this.persistTargetCheckpoint()) : statusType === "active" && threadId === this.currentThreadId && this.persistTargetCheckpoint(), threadId === this.currentThreadId && (this.threadSelectionRevision += 1), threadId === this.currentThreadId && status?.type === "idle" && this.emit("idle", { threadId });
+            this.threadStatuses.set(threadId, statusType), statusType === "idle" ? (this.activeTurnIds.delete(threadId), this.activeTurnProvenance.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), threadId === this.currentThreadId && this.persistTargetCheckpoint()) : statusType === "active" && threadId === this.currentThreadId && this.persistTargetCheckpoint(), threadId === this.currentThreadId && (this.threadSelectionRevision += 1), threadId === this.currentThreadId && status?.type === "idle" && this.emit("idle", { threadId });
             return;
           }
           if (notification?.method === "thread/closed") {
             let threadId = notification.params?.threadId;
             if (!threadId) return;
-            this.threadSelectionRevision += 1, this.loadedInventoryProven && this.knownLoadedThreadIds.delete(threadId), this.threadStatuses.delete(threadId), this.activeTurnIds.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), this.currentThreadId === threadId && (this.observedTuiLeaseTarget?.threadId === threadId && (this.observedTuiLeaseTarget = null), this.loadedInventoryProven = !1, this.currentThreadId = "", this.invalidateTargetCheckpoint("current_thread_closed"), this.restoredTargetCheckpoint = null), this.wakeThreadDeliveryWaiters(threadId), this.emit("threadClosed", { threadId });
+            this.threadSelectionRevision += 1, this.loadedInventoryProven && this.knownLoadedThreadIds.delete(threadId), this.threadStatuses.delete(threadId), this.activeTurnIds.delete(threadId), this.activeTurnProvenance.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), this.currentThreadId === threadId && (this.observedTuiLeaseTarget?.threadId === threadId && (this.observedTuiLeaseTarget = null), this.loadedInventoryProven = !1, this.currentThreadId = "", this.invalidateTargetCheckpoint("current_thread_closed"), this.restoredTargetCheckpoint = null), this.wakeThreadDeliveryWaiters(threadId), this.emit("threadClosed", { threadId });
           }
         }, this.onConnectionChanged = (event) => {
           if (this.threadSelectionRevision += 1, this.loadedInventoryProven = !1, this.lastStatus = this.client.status(), !this.lastStatus.available && this.lastStatus.reason === "shared_app_server_request_timeout") {
@@ -3872,12 +3894,12 @@ var require_app_server_host = __commonJS({
           let retainTimeoutTarget = !!this.timeoutRecoveryTarget && (this.lastStatus.available || this.lastStatus.reason === "shared_app_server_request_timeout");
           if (this.restoredTargetCheckpoint) {
             let checkpoint = this.restoredTargetCheckpoint;
-            this.currentThreadId = checkpoint.threadId, this.threadStatuses.clear(), this.activeTurnIds.clear();
+            this.currentThreadId = checkpoint.threadId, this.threadStatuses.clear(), this.activeTurnIds.clear(), this.activeTurnProvenance.clear();
           } else if (retainTimeoutTarget) {
             let { threadId, turnId } = this.timeoutRecoveryTarget;
-            this.currentThreadId = threadId, this.threadStatuses.clear(), this.threadStatuses.set(threadId, "active"), this.activeTurnIds.clear(), this.activeTurnIds.set(threadId, turnId);
+            this.currentThreadId = threadId, this.threadStatuses.clear(), this.threadStatuses.set(threadId, "active"), this.activeTurnIds.clear(), this.activeTurnIds.set(threadId, turnId), this.activeTurnProvenance.clear(), this.activeTurnProvenance.set(threadId, "timeout_recovery");
           } else
-            this.timeoutRecoveryTarget = null, this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.knownLoadedThreadIds.clear(), this.clearTargetCheckpoint(), this.restoredTargetCheckpoint = null;
+            this.timeoutRecoveryTarget = null, this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.activeTurnProvenance.clear(), this.knownLoadedThreadIds.clear(), this.clearTargetCheckpoint(), this.restoredTargetCheckpoint = null;
           let reconnected = this.lastStatus.available && (this.connectionWasLost || event?.recovered);
           this.lastStatus.available ? (this.hasConnected = !0, this.connectionWasLost = !1) : this.hasConnected && (this.connectionWasLost = !0), this.wakeAllDeliveryWaiters(), reconnected && this.emit("reconnect", event);
         }, this.client.on("notification", this.onNotification), this.client.on("connectionChanged", this.onConnectionChanged);
@@ -4041,7 +4063,7 @@ var require_app_server_host = __commonJS({
       }
       rememberAcceptedTurn(threadId, result, connectionGeneration = null) {
         let turnId = result?.turn?.id || result?.turnId;
-        !threadId || typeof turnId != "string" || !turnId || connectionGeneration != null && this.client.connectionGeneration !== connectionGeneration || (this.threadSelectionRevision += 1, this.currentThreadId = threadId, this.threadStatuses.set(threadId, "active"), this.activeTurnIds.set(threadId, turnId), this.persistTargetCheckpoint(), this.emit("active", { threadId, turnId }));
+        !threadId || typeof turnId != "string" || !turnId || connectionGeneration != null && this.client.connectionGeneration !== connectionGeneration || (this.threadSelectionRevision += 1, this.currentThreadId = threadId, this.threadStatuses.set(threadId, "active"), this.activeTurnIds.set(threadId, turnId), this.activeTurnProvenance.set(threadId, "turn_start_response"), this.persistTargetCheckpoint(), this.emit("active", { threadId, turnId }));
       }
       async resolveTarget() {
         return this.resolveTargetAttempt({ revisionRestarts: 0 });
@@ -4052,7 +4074,7 @@ var require_app_server_host = __commonJS({
           let { reason } = initialLease;
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
-        this.requireTuiLease && initialLease.record?.phase === "launching" && this.observedTuiLeaseTarget?.leaseId && this.observedTuiLeaseTarget.leaseId !== initialLease.record.leaseId && (this.threadSelectionRevision += 1, this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.knownLoadedThreadIds.clear(), this.loadedInventoryProven = !1, this.observedTuiLeaseTarget = null, this.invalidateTargetCheckpoint("tui_lease_replaced"), this.restoredTargetCheckpoint = null), this.loadedInventoryProven = !1;
+        this.requireTuiLease && initialLease.record?.phase === "launching" && this.observedTuiLeaseTarget?.leaseId && this.observedTuiLeaseTarget.leaseId !== initialLease.record.leaseId && (this.threadSelectionRevision += 1, this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.activeTurnProvenance.clear(), this.knownLoadedThreadIds.clear(), this.loadedInventoryProven = !1, this.observedTuiLeaseTarget = null, this.invalidateTargetCheckpoint("tui_lease_replaced"), this.restoredTargetCheckpoint = null), this.loadedInventoryProven = !1;
         let threadSelectionRevision = this.threadSelectionRevision, restoredTargetCheckpoint = this.restoredTargetCheckpoint, provenLoadedThreadIds = new Set(this.knownLoadedThreadIds), threadIds = [], seenThreadIds = /* @__PURE__ */ new Set(), cursor = "", connectionGeneration = null, seenCursors = /* @__PURE__ */ new Set(), loadedPageCount = 0, retryAfterRevision = () => {
           if (resolutionBudget.revisionRestarts += 1, resolutionBudget.revisionRestarts > MAX_TARGET_RESOLUTION_RESTARTS) {
             let reason = "shared_app_server_thread_ambiguous";
@@ -4108,7 +4130,7 @@ var require_app_server_host = __commonJS({
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
         if (threadIds.length === 0) {
-          restoredTargetCheckpoint && (this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.invalidateTargetCheckpoint("no_loaded_thread"), this.restoredTargetCheckpoint = null);
+          restoredTargetCheckpoint && (this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.activeTurnProvenance.clear(), this.invalidateTargetCheckpoint("no_loaded_thread"), this.restoredTargetCheckpoint = null);
           let reason = "shared_app_server_no_loaded_thread";
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
@@ -4154,7 +4176,7 @@ var require_app_server_host = __commonJS({
             return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
           }
         }
-        (restoredTargetCheckpoint || targetInvalid) && (targetInvalid && (this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.invalidateTargetCheckpoint("restored_target_invalid")), this.restoredTargetCheckpoint = null);
+        (restoredTargetCheckpoint || targetInvalid) && (targetInvalid && (this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.activeTurnProvenance.clear(), this.invalidateTargetCheckpoint("restored_target_invalid")), this.restoredTargetCheckpoint = null);
         let threadId = "", response;
         if (this.currentThreadId && threadIds.includes(this.currentThreadId) && (trustedThreadIds.has(this.currentThreadId) || validatedAddedResponses.has(this.currentThreadId)))
           threadId = this.currentThreadId, response = validatedAddedResponses.get(threadId);
@@ -4253,48 +4275,116 @@ var require_app_server_host = __commonJS({
           threadId: thread.id
         }), this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, status), status === "active") {
           let latestInProgressTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1);
-          latestInProgressTurnId ? this.activeTurnIds.set(thread.id, latestInProgressTurnId) : this.activeTurnIds.delete(thread.id);
+          latestInProgressTurnId ? (this.activeTurnIds.set(thread.id, latestInProgressTurnId), this.activeTurnProvenance.set(thread.id, "thread_read")) : (this.activeTurnIds.delete(thread.id), this.activeTurnProvenance.delete(thread.id));
         } else
-          this.activeTurnIds.delete(thread.id);
+          this.activeTurnIds.delete(thread.id), this.activeTurnProvenance.delete(thread.id);
         this.lastStatus = { configured: !0, available: !0, reason: null };
         let target = { available: !0, threadId: thread.id, status }, activeTurnId = status === "active" ? this.activeTurnIds.get(thread.id) : "";
         return activeTurnId && (target.activeTurnId = activeTurnId), this.persistTargetCheckpoint(), Object.defineProperty(target, TARGET_GENERATION, {
-          value: Object.freeze({ connectionGeneration, threadSelectionRevision })
+          value: Object.freeze({
+            connectionGeneration,
+            threadSelectionRevision,
+            threadId: thread.id,
+            leaseId: matchingLease.record?.leaseId || "",
+            activeTurnProvenance: this.activeTurnProvenance.get(thread.id) || ""
+          })
         }), target;
       }
       async startTurn(params, target) {
-        let generation = target?.[TARGET_GENERATION], validateTarget = () => {
-          let lease = this.readTuiLease(params.threadId);
+        let validateTarget = (candidate) => {
+          let generation = candidate?.[TARGET_GENERATION], lease = this.readTuiLease(params.threadId);
           if (!lease.available)
             throw deliveryError(
               "The supervised TUI lease is no longer fresh for structured delivery.",
               lease.reason
             );
-          let statusChanged = target?.status === "active" ? !target.activeTurnId || this.activeTurnIds.get(params.threadId) !== target.activeTurnId : this.threadStatuses.get(params.threadId) !== target?.status;
-          if (!generation || generation.threadSelectionRevision !== this.threadSelectionRevision || target.threadId !== params.threadId || this.currentThreadId !== params.threadId || statusChanged)
+          let statusChanged = candidate?.status === "active" ? !candidate.activeTurnId || this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId : this.threadStatuses.get(params.threadId) !== candidate?.status, connectionChanged = generation?.connectionGeneration != null && this.client.connectionGeneration !== generation.connectionGeneration;
+          if (!generation || connectionChanged || generation.threadSelectionRevision !== this.threadSelectionRevision || generation.threadId !== params.threadId || generation.leaseId !== (lease.record?.leaseId || "") || candidate.threadId !== params.threadId || this.currentThreadId !== params.threadId || statusChanged)
             throw deliveryError(
               "The current app-server thread changed before structured turn submission.",
               "shared_app_server_thread_changed"
             );
-        };
-        validateTarget();
-        let method = target.status === "active" ? "turn/steer" : "turn/start", requestParams = target.status === "active" ? { ...params, expectedTurnId: target.activeTurnId } : params, result, acceptedGeneration = null;
-        try {
+          return lease;
+        }, submit = async (candidate) => {
+          let generation = candidate[TARGET_GENERATION];
+          validateTarget(candidate);
+          let method = candidate.status === "active" ? "turn/steer" : "turn/start", requestParams = candidate.status === "active" ? { ...params, expectedTurnId: candidate.activeTurnId } : params;
           if (typeof this.client.requestOnConnection == "function") {
             let response = await this.client.requestOnConnection(
               method,
               requestParams,
               generation.connectionGeneration,
-              validateTarget,
+              () => validateTarget(candidate),
               !0
             );
-            result = response.result, acceptedGeneration = response.generation;
-          } else
-            result = await this.client.request(method, requestParams);
+            return {
+              method,
+              result: response.result,
+              acceptedGeneration: response.generation
+            };
+          }
+          return {
+            method,
+            result: await this.client.request(method, requestParams),
+            acceptedGeneration: null
+          };
+        }, rejectedWithoutSubmissionUncertainty = (error) => error?.deliveryOutcome === "rejected" || error?.deliveryOutcome === "not_sent", invalidateChangedLease = (candidate) => {
+          let generation = candidate?.[TARGET_GENERATION];
+          if (!this.requireTuiLease || !generation || this.currentThreadId !== params.threadId)
+            return !1;
+          let lease = this.readTuiLease(params.threadId);
+          return !lease.available || !lease.record || lease.record.leaseId === generation.leaseId ? !1 : (this.threadSelectionRevision += 1, this.timeoutRecoveryTarget = null, this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.activeTurnProvenance.clear(), this.knownLoadedThreadIds.clear(), this.loadedInventoryProven = !1, this.observedTuiLeaseTarget = null, this.invalidateTargetCheckpoint("tui_lease_replaced"), this.restoredTargetCheckpoint = null, !0);
+        }, clearUnprovenActiveTurn = (candidate) => {
+          candidate?.status !== "active" || this.currentThreadId !== params.threadId || this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId || (this.threadSelectionRevision += 1, this.timeoutRecoveryTarget = null, this.threadStatuses.set(params.threadId, "active"), this.activeTurnIds.delete(params.threadId), this.activeTurnProvenance.delete(params.threadId), this.persistTargetCheckpoint());
+        }, rebindAuthoritativeTurn = (candidate, error) => {
+          let mismatch = error?.authoritativeActiveTurnMismatch;
+          if (candidate?.status !== "active" || !rejectedWithoutSubmissionUncertainty(error) || mismatch?.provenance !== "trusted_local_app_server_rejection" || mismatch.expectedTurnId !== candidate.activeTurnId || !CANONICAL_TURN_ID.test(mismatch.activeTurnId) || mismatch.activeTurnId === candidate.activeTurnId)
+            return null;
+          let lease;
+          try {
+            lease = validateTarget(candidate);
+          } catch {
+            return invalidateChangedLease(candidate), null;
+          }
+          let generation = candidate[TARGET_GENERATION];
+          this.threadSelectionRevision += 1, this.timeoutRecoveryTarget = null, this.currentThreadId = params.threadId, this.threadStatuses.set(params.threadId, "active"), this.activeTurnIds.set(params.threadId, mismatch.activeTurnId), this.activeTurnProvenance.set(
+            params.threadId,
+            mismatch.provenance
+          ), this.persistTargetCheckpoint();
+          let rebound = {
+            available: !0,
+            threadId: params.threadId,
+            status: "active",
+            activeTurnId: mismatch.activeTurnId
+          };
+          return Object.defineProperty(rebound, TARGET_GENERATION, {
+            value: Object.freeze({
+              connectionGeneration: generation.connectionGeneration,
+              threadSelectionRevision: this.threadSelectionRevision,
+              threadId: params.threadId,
+              leaseId: lease.record?.leaseId || "",
+              activeTurnProvenance: mismatch.provenance
+            })
+          }), rebound;
+        }, submitted;
+        try {
+          submitted = await submit(target);
         } catch (error) {
-          throw method === "turn/steer" && error?.deliveryOutcome === "rejected" && this.activeTurnIds.get(params.threadId) === target.activeTurnId && (this.threadSelectionRevision += 1, this.timeoutRecoveryTarget = null, this.currentThreadId = "", this.threadStatuses.delete(params.threadId), this.activeTurnIds.delete(params.threadId), this.clearTargetCheckpoint(), this.restoredTargetCheckpoint = null), error;
+          if (target?.status !== "active") throw error;
+          let rebound = rebindAuthoritativeTurn(target, error);
+          if (!rebound)
+            throw rejectedWithoutSubmissionUncertainty(error) && (invalidateChangedLease(target) || clearUnprovenActiveTurn(target)), error;
+          try {
+            submitted = await submit(rebound);
+          } catch (retryError) {
+            throw rebindAuthoritativeTurn(rebound, retryError) ? (retryError.code = "thread_busy", retryError) : (rejectedWithoutSubmissionUncertainty(retryError) && (invalidateChangedLease(rebound) || clearUnprovenActiveTurn(rebound)), retryError);
+          }
         }
-        return method === "turn/start" && this.rememberAcceptedTurn(params.threadId, result, acceptedGeneration), result;
+        return submitted.method === "turn/start" && this.rememberAcceptedTurn(
+          params.threadId,
+          submitted.result,
+          submitted.acceptedGeneration
+        ), submitted.result;
       }
       async readDeliveredUserMessage(threadId, clientUserMessageId, signal = null) {
         let params = { threadId, includeTurns: !0 }, threadSelectionRevision, response;
@@ -4414,7 +4504,7 @@ var require_app_server_host = __commonJS({
         this.destroyed = !0;
         for (let waiters of this.deliveryWaiters.values())
           for (let waiter of [...waiters]) waiter.close();
-        this.deliveryWaiters.clear(), this.verifiedUserMessages.clear(), this.client.off("notification", this.onNotification), this.client.off("connectionChanged", this.onConnectionChanged), typeof this.client.destroy == "function" && this.client.destroy();
+        this.deliveryWaiters.clear(), this.verifiedUserMessages.clear(), this.activeTurnProvenance.clear(), this.client.off("notification", this.onNotification), this.client.off("connectionChanged", this.onConnectionChanged), typeof this.client.destroy == "function" && this.client.destroy();
       }
     };
     function createAppServerHost(config = {}, logger = () => {
