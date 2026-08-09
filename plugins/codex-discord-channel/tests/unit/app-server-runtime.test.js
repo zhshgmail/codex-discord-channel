@@ -107,7 +107,7 @@ test('app-server launch strips Discord and stale target controls from its child 
   assert.equal(launch.env.DISCORD_CONFIG_DIR, config.paths.stateDir);
 });
 
-test('runtime arguments provide an immutable systemd instance selection', () => {
+test('runtime arguments provide an immutable worker instance selection', () => {
   assert.deepEqual(parseRuntimeArgs([
     '--instance',
     'codex02',
@@ -124,36 +124,6 @@ test('plugin MCP manifest inherits the selected instance instead of hardcoding c
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', '..', '.mcp.json')));
   const server = manifest.mcpServers['codex-discord-channel'];
   assert.equal(Object.hasOwn(server, 'env'), false);
-});
-
-test('systemd templates load absolute runtime paths from each instance account file', () => {
-  const systemdDir = path.resolve(__dirname, '..', '..', 'systemd');
-  for (const name of ['codex-discord-app-server@.service', 'codex-discord-channel@.service']) {
-    const unit = fs.readFileSync(path.join(systemdDir, name), 'utf8');
-    assert.match(unit, /ConditionPathExists=%h\/\.codex\/channels\/discord\/%i\/account\.env/);
-    assert.match(unit, /EnvironmentFile=%h\/\.codex\/channels\/discord\/%i\/account\.env/);
-    assert.doesNotMatch(unit, /EnvironmentFile=.*app-server-network\.env/);
-    assert.match(unit, /ExecStart=\/usr\/bin\/env \$\{NODE_BIN\} \$\{CODEX_DISCORD_CHANNEL_BIN\}/);
-    assert.match(unit, /--instance %i --state-dir %h\/\.codex\/channels\/discord\/%i/);
-    assert.doesNotMatch(unit, /nvm\/versions\/node/);
-    assert.match(
-      unit,
-      /^UnsetEnvironment=CODEX_APP_SERVER_URL CODEX_DISCORD_APP_SERVER_URL$/m,
-    );
-    assert.doesNotMatch(unit, /^Environment=CODEX_(?:DISCORD_)?APP_SERVER_URL=$/m);
-  }
-  const appServerUnit = fs.readFileSync(
-    path.join(systemdDir, 'codex-discord-app-server@.service'),
-    'utf8',
-  );
-  assert.match(appServerUnit, /^RefuseManualStop=yes$/m);
-  assert.match(appServerUnit, /^OOMPolicy=continue$/m);
-  assert.doesNotMatch(appServerUnit, /^KillMode=process$/m);
-  const gatewayUnit = fs.readFileSync(
-    path.join(systemdDir, 'codex-discord-channel@.service'),
-    'utf8',
-  );
-  assert.doesNotMatch(gatewayUnit, /^RefuseManualStop=yes$/m);
 });
 
 test('real app-server entrypoint execs two processes with isolated account and Discord state', () => {

@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 "use strict";
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -254,6 +255,125 @@ var require_config = __commonJS({
       parseInteger,
       parseBool,
       stripQuotes
+    };
+  }
+});
+
+// src/access-state.js
+var require_access_state = __commonJS({
+  "src/access-state.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs"), path = require("node:path");
+    function asStringArray(value) {
+      return Array.isArray(value) ? value.filter((item) => typeof item == "string" && item.trim() !== "").map((item) => item.trim()) : [];
+    }
+    function defaultAccessState() {
+      return {
+        version: 1,
+        dmPolicy: "pairing",
+        allowFrom: [],
+        groups: {},
+        mentionPatterns: [],
+        replyToMode: "reply",
+        textChunkLimit: 1900,
+        chunkMode: "split"
+      };
+    }
+    function normalizeAccessState(payload) {
+      if (!payload || typeof payload != "object" || Array.isArray(payload))
+        throw new Error("access.json must contain an object");
+      let state = defaultAccessState();
+      state.version = Number.isInteger(payload.version) ? payload.version : state.version, state.dmPolicy = ["pairing", "closed", "open"].includes(payload.dmPolicy) ? payload.dmPolicy : state.dmPolicy, state.allowFrom = asStringArray(payload.allowFrom), state.mentionPatterns = asStringArray(payload.mentionPatterns), state.replyToMode = typeof payload.replyToMode == "string" ? payload.replyToMode : state.replyToMode, state.textChunkLimit = Number.isInteger(payload.textChunkLimit) ? payload.textChunkLimit : state.textChunkLimit, state.chunkMode = typeof payload.chunkMode == "string" ? payload.chunkMode : state.chunkMode;
+      let groups = payload.groups && typeof payload.groups == "object" && !Array.isArray(payload.groups) ? payload.groups : {};
+      for (let [channelId, rawGroup] of Object.entries(groups)) {
+        let group = rawGroup && typeof rawGroup == "object" && !Array.isArray(rawGroup) ? rawGroup : {};
+        state.groups[channelId] = {
+          requireMention: group.requireMention !== !1,
+          allowFrom: asStringArray(group.allowFrom),
+          allowBots: group.allowBots === !0
+        };
+      }
+      return state;
+    }
+    function ensureAccessFile(accessPath) {
+      fs.mkdirSync(path.dirname(accessPath), { recursive: !0, mode: 448 }), fs.existsSync(accessPath) || fs.writeFileSync(accessPath, `${JSON.stringify(defaultAccessState(), null, 2)}
+`, { mode: 384 });
+    }
+    function loadAccessState(accessPath) {
+      ensureAccessFile(accessPath);
+      let payload = JSON.parse(fs.readFileSync(accessPath, "utf8"));
+      return normalizeAccessState(payload);
+    }
+    function mentionsBot(content, botUserId, patterns = []) {
+      let text = String(content || "");
+      return botUserId && (text.includes(`<@${botUserId}>`) || text.includes(`<@!${botUserId}>`)) ? !0 : patterns.some((pattern) => {
+        try {
+          return new RegExp(pattern, "i").test(text);
+        } catch {
+          return !1;
+        }
+      });
+    }
+    function guildPolicy(state, message) {
+      let channelId = String(message.channelId || ""), policyChannelId = String(message.policyChannelId || "");
+      return channelId && Object.hasOwn(state.groups, channelId) ? state.groups[channelId] : policyChannelId && Object.hasOwn(state.groups, policyChannelId) ? state.groups[policyChannelId] : null;
+    }
+    function decideGuildEnvelopeAccess(state, message) {
+      let group = guildPolicy(state, message);
+      return group ? message.authorIsBot && group.allowBots !== !0 ? { allowed: !1, reason: "bot_author_denied" } : group.allowFrom.length > 0 && !group.allowFrom.includes(message.authorId) ? { allowed: !1, reason: "guild_sender_denied" } : { allowed: !0, reason: "guild_envelope_allowed" } : { allowed: !1, reason: "guild_channel_not_enabled" };
+    }
+    function decideAccess(state, message) {
+      if (message.source === "dm")
+        return state.dmPolicy === "open" ? { allowed: !0, reason: "dm_open" } : state.allowFrom.includes(message.authorId) ? { allowed: !0, reason: "dm_allowlisted" } : state.dmPolicy === "pairing" ? { allowed: !1, reason: "dm_pairing_required", requiresPairingCode: !0 } : { allowed: !1, reason: "dm_closed" };
+      let envelopeDecision = decideGuildEnvelopeAccess(state, message);
+      if (!envelopeDecision.allowed) return envelopeDecision;
+      let group = guildPolicy(state, message), currentMessageMentionsBot = message.mentionsEveryone === !0 || mentionsBot(message.content, message.botUserId, state.mentionPatterns), replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+      return group.requireMention && !currentMessageMentionsBot && !replyAuthorIsBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
+    }
+    var GUILD_HISTORY_CHANNEL_TYPES = /* @__PURE__ */ new Set([0, 5, 10, 11, 12]), GUILD_THREAD_CHANNEL_TYPES = /* @__PURE__ */ new Set([10, 11, 12]);
+    function historyGuildPolicy(state, target) {
+      let channelId = String(target.id || "");
+      if (channelId && Object.hasOwn(state.groups, channelId))
+        return state.groups[channelId];
+      let parentId = GUILD_THREAD_CHANNEL_TYPES.has(target.type) ? String(target.parentId || "") : "";
+      return parentId && Object.hasOwn(state.groups, parentId) ? state.groups[parentId] : null;
+    }
+    function dmCounterpartyId(target, botUserId) {
+      if (target.recipient?.id) return String(target.recipient.id);
+      let counterparty = Array.from(target.recipients?.values?.() || []).find((recipient) => String(recipient?.id || "") !== botUserId);
+      return String(counterparty?.id || "");
+    }
+    function decideHistoryTarget(state, target, botUserId) {
+      if (!target || typeof target != "object")
+        return { allowed: !1, reason: "history_target_not_allowed" };
+      if (target.type === 1 && !target.guildId) {
+        let counterpartyId = dmCounterpartyId(target, botUserId);
+        return counterpartyId ? state.dmPolicy === "open" ? { allowed: !0, reason: "dm_open", source: "dm", counterpartyId } : state.allowFrom.includes(counterpartyId) ? { allowed: !0, reason: "dm_allowlisted", source: "dm", counterpartyId } : { allowed: !1, reason: "history_target_not_allowed" } : { allowed: !1, reason: "history_target_not_allowed" };
+      }
+      let channelId = String(target.id || "");
+      return target.guildId && GUILD_HISTORY_CHANNEL_TYPES.has(target.type) && historyGuildPolicy(state, target) ? { allowed: !0, reason: "guild_channel_enabled", source: "guild" } : { allowed: !1, reason: "history_target_not_allowed" };
+    }
+    function allowHistoryMessage(state, target, message, botUserId) {
+      let targetDecision = decideHistoryTarget(state, target, botUserId);
+      if (!targetDecision.allowed) return !1;
+      let authorId = String(message?.author?.id || "");
+      if (!authorId) return !1;
+      if (authorId === botUserId) return !0;
+      if (targetDecision.source === "dm")
+        return authorId === targetDecision.counterpartyId;
+      let group = historyGuildPolicy(state, target);
+      return !(message.author?.bot && group.allowBots !== !0 || group.allowFrom.length > 0 && !group.allowFrom.includes(authorId));
+    }
+    module2.exports = {
+      allowHistoryMessage,
+      decideAccess,
+      decideGuildEnvelopeAccess,
+      decideHistoryTarget,
+      defaultAccessState,
+      ensureAccessFile,
+      loadAccessState,
+      mentionsBot,
+      normalizeAccessState
     };
   }
 });
@@ -4436,7 +4556,7 @@ var require_receiver_state = __commonJS({
       };
       return snapshot.source !== "legacy" && (result.generation = effective.record.generation), result;
     }
-    function isCurrentReceiverOwnership(config = {}, expected, deps = {}) {
+    function isCurrentReceiverOwnership2(config = {}, expected, deps = {}) {
       let snapshot = readReceiverAuthoritySnapshot(config, deps);
       if (!snapshot.valid) return { active: !1, reason: "gateway_authority_invalid" };
       if (!snapshot.record) return { active: !1, reason: "gateway_pid_missing" };
@@ -4508,7 +4628,7 @@ var require_receiver_state = __commonJS({
       getReceiverAuthorityPath,
       getStagedReceiverAuthorityPath,
       isActiveDiscordReceiver,
-      isCurrentReceiverOwnership,
+      isCurrentReceiverOwnership: isCurrentReceiverOwnership2,
       isProcessAlive,
       readReceiverAuthoritySnapshot,
       releaseReceiverOwnership,
@@ -5304,7 +5424,7 @@ ${normalized.content}${attachmentText}
       return fsImpl.writeFileSync(temp, `${JSON.stringify(context, null, 2)}
 `, { mode: 384 }), fsImpl.renameSync(temp, file), context;
     }
-    function readLastInboundContext2(config = {}, deps = {}) {
+    function readLastInboundContext(config = {}, deps = {}) {
       let file = getLastInboundPath(config);
       if (!file) return null;
       let fsImpl = deps.fs || fs;
@@ -5315,7 +5435,7 @@ ${normalized.content}${attachmentText}
     function resolveReplyTarget(args = {}, config = {}, deps = {}) {
       let channelId = typeof args.channelId == "string" ? args.channelId.trim() : "", replyTo = typeof args.replyTo == "string" ? args.replyTo.trim() : "";
       if (channelId) return { channelId, replyTo, usedLastInbound: !1 };
-      let context = readLastInboundContext2(config, deps);
+      let context = readLastInboundContext(config, deps);
       if (!context?.channelId)
         throw new Error("channelId is required and no last inbound Discord context is available.");
       return {
@@ -5509,129 +5629,10 @@ ${normalized.content}${attachmentText}
       formatEnvelope,
       normalizeDiscordMessage,
       readDeliveryQueueStatus: readDeliveryQueueStatus2,
-      readLastInboundContext: readLastInboundContext2,
+      readLastInboundContext,
       resolveReplyTarget,
       structuredSafeText,
       writeLastInboundContext
-    };
-  }
-});
-
-// src/access-state.js
-var require_access_state = __commonJS({
-  "src/access-state.js"(exports2, module2) {
-    "use strict";
-    var fs = require("node:fs"), path = require("node:path");
-    function asStringArray(value) {
-      return Array.isArray(value) ? value.filter((item) => typeof item == "string" && item.trim() !== "").map((item) => item.trim()) : [];
-    }
-    function defaultAccessState() {
-      return {
-        version: 1,
-        dmPolicy: "pairing",
-        allowFrom: [],
-        groups: {},
-        mentionPatterns: [],
-        replyToMode: "reply",
-        textChunkLimit: 1900,
-        chunkMode: "split"
-      };
-    }
-    function normalizeAccessState(payload) {
-      if (!payload || typeof payload != "object" || Array.isArray(payload))
-        throw new Error("access.json must contain an object");
-      let state = defaultAccessState();
-      state.version = Number.isInteger(payload.version) ? payload.version : state.version, state.dmPolicy = ["pairing", "closed", "open"].includes(payload.dmPolicy) ? payload.dmPolicy : state.dmPolicy, state.allowFrom = asStringArray(payload.allowFrom), state.mentionPatterns = asStringArray(payload.mentionPatterns), state.replyToMode = typeof payload.replyToMode == "string" ? payload.replyToMode : state.replyToMode, state.textChunkLimit = Number.isInteger(payload.textChunkLimit) ? payload.textChunkLimit : state.textChunkLimit, state.chunkMode = typeof payload.chunkMode == "string" ? payload.chunkMode : state.chunkMode;
-      let groups = payload.groups && typeof payload.groups == "object" && !Array.isArray(payload.groups) ? payload.groups : {};
-      for (let [channelId, rawGroup] of Object.entries(groups)) {
-        let group = rawGroup && typeof rawGroup == "object" && !Array.isArray(rawGroup) ? rawGroup : {};
-        state.groups[channelId] = {
-          requireMention: group.requireMention !== !1,
-          allowFrom: asStringArray(group.allowFrom),
-          allowBots: group.allowBots === !0
-        };
-      }
-      return state;
-    }
-    function ensureAccessFile(accessPath) {
-      fs.mkdirSync(path.dirname(accessPath), { recursive: !0, mode: 448 }), fs.existsSync(accessPath) || fs.writeFileSync(accessPath, `${JSON.stringify(defaultAccessState(), null, 2)}
-`, { mode: 384 });
-    }
-    function loadAccessState(accessPath) {
-      ensureAccessFile(accessPath);
-      let payload = JSON.parse(fs.readFileSync(accessPath, "utf8"));
-      return normalizeAccessState(payload);
-    }
-    function mentionsBot(content, botUserId, patterns = []) {
-      let text = String(content || "");
-      return botUserId && (text.includes(`<@${botUserId}>`) || text.includes(`<@!${botUserId}>`)) ? !0 : patterns.some((pattern) => {
-        try {
-          return new RegExp(pattern, "i").test(text);
-        } catch {
-          return !1;
-        }
-      });
-    }
-    function guildPolicy(state, message) {
-      let channelId = String(message.channelId || ""), policyChannelId = String(message.policyChannelId || "");
-      return channelId && Object.hasOwn(state.groups, channelId) ? state.groups[channelId] : policyChannelId && Object.hasOwn(state.groups, policyChannelId) ? state.groups[policyChannelId] : null;
-    }
-    function decideGuildEnvelopeAccess(state, message) {
-      let group = guildPolicy(state, message);
-      return group ? message.authorIsBot && group.allowBots !== !0 ? { allowed: !1, reason: "bot_author_denied" } : group.allowFrom.length > 0 && !group.allowFrom.includes(message.authorId) ? { allowed: !1, reason: "guild_sender_denied" } : { allowed: !0, reason: "guild_envelope_allowed" } : { allowed: !1, reason: "guild_channel_not_enabled" };
-    }
-    function decideAccess(state, message) {
-      if (message.source === "dm")
-        return state.dmPolicy === "open" ? { allowed: !0, reason: "dm_open" } : state.allowFrom.includes(message.authorId) ? { allowed: !0, reason: "dm_allowlisted" } : state.dmPolicy === "pairing" ? { allowed: !1, reason: "dm_pairing_required", requiresPairingCode: !0 } : { allowed: !1, reason: "dm_closed" };
-      let envelopeDecision = decideGuildEnvelopeAccess(state, message);
-      if (!envelopeDecision.allowed) return envelopeDecision;
-      let group = guildPolicy(state, message), currentMessageMentionsBot = message.mentionsEveryone === !0 || mentionsBot(message.content, message.botUserId, state.mentionPatterns), replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
-      return group.requireMention && !currentMessageMentionsBot && !replyAuthorIsBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
-    }
-    var GUILD_HISTORY_CHANNEL_TYPES = /* @__PURE__ */ new Set([0, 5, 10, 11, 12]), GUILD_THREAD_CHANNEL_TYPES = /* @__PURE__ */ new Set([10, 11, 12]);
-    function historyGuildPolicy(state, target) {
-      let channelId = String(target.id || "");
-      if (channelId && Object.hasOwn(state.groups, channelId))
-        return state.groups[channelId];
-      let parentId = GUILD_THREAD_CHANNEL_TYPES.has(target.type) ? String(target.parentId || "") : "";
-      return parentId && Object.hasOwn(state.groups, parentId) ? state.groups[parentId] : null;
-    }
-    function dmCounterpartyId(target, botUserId) {
-      if (target.recipient?.id) return String(target.recipient.id);
-      let counterparty = Array.from(target.recipients?.values?.() || []).find((recipient) => String(recipient?.id || "") !== botUserId);
-      return String(counterparty?.id || "");
-    }
-    function decideHistoryTarget(state, target, botUserId) {
-      if (!target || typeof target != "object")
-        return { allowed: !1, reason: "history_target_not_allowed" };
-      if (target.type === 1 && !target.guildId) {
-        let counterpartyId = dmCounterpartyId(target, botUserId);
-        return counterpartyId ? state.dmPolicy === "open" ? { allowed: !0, reason: "dm_open", source: "dm", counterpartyId } : state.allowFrom.includes(counterpartyId) ? { allowed: !0, reason: "dm_allowlisted", source: "dm", counterpartyId } : { allowed: !1, reason: "history_target_not_allowed" } : { allowed: !1, reason: "history_target_not_allowed" };
-      }
-      let channelId = String(target.id || "");
-      return target.guildId && GUILD_HISTORY_CHANNEL_TYPES.has(target.type) && historyGuildPolicy(state, target) ? { allowed: !0, reason: "guild_channel_enabled", source: "guild" } : { allowed: !1, reason: "history_target_not_allowed" };
-    }
-    function allowHistoryMessage(state, target, message, botUserId) {
-      let targetDecision = decideHistoryTarget(state, target, botUserId);
-      if (!targetDecision.allowed) return !1;
-      let authorId = String(message?.author?.id || "");
-      if (!authorId) return !1;
-      if (authorId === botUserId) return !0;
-      if (targetDecision.source === "dm")
-        return authorId === targetDecision.counterpartyId;
-      let group = historyGuildPolicy(state, target);
-      return !(message.author?.bot && group.allowBots !== !0 || group.allowFrom.length > 0 && !group.allowFrom.includes(authorId));
-    }
-    module2.exports = {
-      allowHistoryMessage,
-      decideAccess,
-      decideGuildEnvelopeAccess,
-      decideHistoryTarget,
-      defaultAccessState,
-      ensureAccessFile,
-      loadAccessState,
-      mentionsBot,
-      normalizeAccessState
     };
   }
 });
@@ -67333,8 +67334,8 @@ ${givenBlock}`;
     }
     __name(resolveBooleanIs, "resolveBooleanIs");
     var validationEnabled = !0;
-    function setGlobalValidationEnabled(enabled) {
-      validationEnabled = enabled;
+    function setGlobalValidationEnabled(enabled2) {
+      validationEnabled = enabled2;
     }
     __name(setGlobalValidationEnabled, "setGlobalValidationEnabled");
     function getGlobalValidationEnabled() {
@@ -72749,8 +72750,8 @@ var require_dist8 = __commonJS({
        * @deprecated
        * Use {@link SharedSlashCommand.setContexts} instead.
        */
-      setDMPermission(enabled) {
-        return validateDMPermission(enabled), Reflect.set(this, "dm_permission", enabled), this;
+      setDMPermission(enabled2) {
+        return validateDMPermission(enabled2), Reflect.set(this, "dm_permission", enabled2), this;
       }
       /**
        * Sets whether this command is NSFW.
@@ -73509,8 +73510,8 @@ var require_dist8 = __commonJS({
        * @see {@link https://discord.com/developers/docs/interactions/application-commands#permissions}
        * @deprecated Use {@link ContextMenuCommandBuilder.setContexts} instead.
        */
-      setDMPermission(enabled) {
-        return validateDMPermission2(enabled), Reflect.set(this, "dm_permission", enabled), this;
+      setDMPermission(enabled2) {
+        return validateDMPermission2(enabled2), Reflect.set(this, "dm_permission", enabled2), this;
       }
       /**
        * Sets a name localization for this command.
@@ -80706,8 +80707,8 @@ var require_AutoModerationRule = __commonJS({
        * @param {string} [reason] The reason for enabling or disabling this auto moderation rule
        * @returns {Promise<AutoModerationRule>}
        */
-      setEnabled(enabled = !0, reason) {
-        return this.edit({ enabled, reason });
+      setEnabled(enabled2 = !0, reason) {
+        return this.edit({ enabled: enabled2, reason });
       }
       /**
        * Sets the exempt roles for this auto moderation rule.
@@ -87505,7 +87506,7 @@ var require_AutoModerationRuleManager = __commonJS({
         triggerType,
         triggerMetadata,
         actions,
-        enabled,
+        enabled: enabled2,
         exemptRoles,
         exemptChannels,
         reason
@@ -87531,7 +87532,7 @@ var require_AutoModerationRuleManager = __commonJS({
                 custom_message: action.metadata?.customMessage
               }
             })),
-            enabled,
+            enabled: enabled2,
             exempt_roles: exemptRoles?.map((exemptRole) => this.guild.roles.resolveId(exemptRole)),
             exempt_channels: exemptChannels?.map((exemptChannel) => this.guild.channels.resolveId(exemptChannel))
           },
@@ -87560,7 +87561,7 @@ var require_AutoModerationRuleManager = __commonJS({
        * @param {AutoModerationRuleEditOptions} options Options for editing the auto moderation rule
        * @returns {Promise<AutoModerationRule>}
        */
-      async edit(autoModerationRule, { name, eventType, triggerMetadata, actions, enabled, exemptRoles, exemptChannels, reason }) {
+      async edit(autoModerationRule, { name, eventType, triggerMetadata, actions, enabled: enabled2, exemptRoles, exemptChannels, reason }) {
         let autoModerationRuleId = this.resolveId(autoModerationRule), data = await this.client.rest.patch(Routes2.guildAutoModerationRule(this.guild.id, autoModerationRuleId), {
           body: {
             name,
@@ -87581,7 +87582,7 @@ var require_AutoModerationRuleManager = __commonJS({
                 custom_message: action.metadata?.customMessage
               }
             })),
-            enabled,
+            enabled: enabled2,
             exempt_roles: exemptRoles?.map((exemptRole) => this.guild.roles.resolveId(exemptRole)),
             exempt_channels: exemptChannels?.map((exemptChannel) => this.guild.channels.resolveId(exemptChannel))
           },
@@ -90995,7 +90996,7 @@ var require_Guild = __commonJS({
        * })
        */
       async editWelcomeScreen(options) {
-        let { enabled, description, welcomeChannels } = options, welcome_channels = welcomeChannels?.map((welcomeChannelData) => {
+        let { enabled: enabled2, description, welcomeChannels } = options, welcome_channels = welcomeChannels?.map((welcomeChannelData) => {
           let emoji = this.emojis.resolve(welcomeChannelData.emoji);
           return {
             emoji_id: emoji?.id,
@@ -91007,7 +91008,7 @@ var require_Guild = __commonJS({
           body: {
             welcome_channels,
             description,
-            enabled
+            enabled: enabled2
           }
         });
         return new WelcomeScreen(this, patchData);
@@ -91223,8 +91224,8 @@ var require_Guild = __commonJS({
        * @param {string} [reason] Reason for changing the state of the guild's premium progress bar
        * @returns {Promise<Guild>}
        */
-      setPremiumProgressBarEnabled(enabled = !0, reason) {
-        return this.edit({ premiumProgressBarEnabled: enabled, reason });
+      setPremiumProgressBarEnabled(enabled2 = !0, reason) {
+        return this.edit({ premiumProgressBarEnabled: enabled2, reason });
       }
       /**
        * Edits the safety alerts channel of the guild.
@@ -93858,7 +93859,7 @@ var require_discord_client = __commonJS({
       createReceiverOwnership,
       effectiveReceiverOwnership,
       isActiveDiscordReceiver,
-      isCurrentReceiverOwnership,
+      isCurrentReceiverOwnership: isCurrentReceiverOwnership2,
       readReceiverAuthoritySnapshot,
       releaseReceiverOwnership
     } = require_receiver_state();
@@ -93869,7 +93870,7 @@ var require_discord_client = __commonJS({
         } catch {
         }
     }
-    function configureNetwork(config, logger) {
+    function configureNetwork2(config, logger) {
       config.insecureTls && (process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0");
       try {
         let { Agent, ProxyAgent, setGlobalDispatcher } = require_undici();
@@ -93893,9 +93894,9 @@ var require_discord_client = __commonJS({
         }
     }
     function isCurrentDiscordReceiverOwnership(config = {}, expected, deps = {}) {
-      return isCurrentReceiverOwnership(config, expected, deps);
+      return isCurrentReceiverOwnership2(config, expected, deps);
     }
-    function releaseDiscordReceiverOwnership(config = {}, expected, deps = {}) {
+    function releaseDiscordReceiverOwnership2(config = {}, expected, deps = {}) {
       return releaseReceiverOwnership(config, expected, deps);
     }
     async function resolveReferencedMessage(message, accessState) {
@@ -93986,7 +93987,7 @@ var require_discord_client = __commonJS({
     async function startDiscordClient2({ config, delivery, logger, claimReceiver = !1, deps = {} }) {
       if (!config.tokenConfigured || config.loginDisabled)
         return log(logger, "INFO", "Discord login disabled or token missing"), { started: !1, client: null, reason: config.tokenConfigured ? "login_disabled" : "token_missing" };
-      configureNetwork(config, logger);
+      configureNetwork2(config, logger);
       let authoritySnapshot = readReceiverAuthoritySnapshot(config, deps);
       if (claimReceiver && !authoritySnapshot.valid)
         throw new Error("Discord receiver authority record is invalid.");
@@ -94186,10 +94187,10 @@ var require_discord_client = __commonJS({
     }
     module2.exports = {
       confirmDiscordMessage: confirmDiscordMessage2,
-      configureNetwork,
+      configureNetwork: configureNetwork2,
       createDiscordMessageHandler,
       isCurrentDiscordReceiverOwnership,
-      releaseDiscordReceiverOwnership,
+      releaseDiscordReceiverOwnership: releaseDiscordReceiverOwnership2,
       prepareDiscordMessageSend: prepareDiscordMessageSend2,
       reconcileDiscordMessage: reconcileDiscordMessage2,
       resolveReferencedMessage,
@@ -94201,200 +94202,247 @@ var require_discord_client = __commonJS({
   }
 });
 
-// src/history.js
-var require_history = __commonJS({
-  "src/history.js"(exports2, module2) {
+// src/discord-rest-client.js
+var require_discord_rest_client = __commonJS({
+  "src/discord-rest-client.js"(exports2, module2) {
     "use strict";
-    var { allowHistoryMessage, decideHistoryTarget, loadAccessState } = require_access_state(), MAX_OUTPUT_BYTES = 64 * 1024, MAX_CONTENT_LENGTH = 16 * 1024, MAX_ATTACHMENTS = 10, ALLOWED_ARGS = /* @__PURE__ */ new Set(["channelId", "before", "limit"]), SNOWFLAKE_PATTERN = /^[1-9]\d{16,19}$/, MAX_SNOWFLAKE = (1n << 64n) - 1n;
-    function invalidHistoryArgs() {
-      throw new Error("invalid_history_args");
-    }
-    function ownString(args, key) {
-      if (!Object.hasOwn(args, key)) return null;
-      typeof args[key] != "string" && invalidHistoryArgs();
-      let value = args[key].trim();
-      return value || invalidHistoryArgs(), value;
-    }
-    function validateSnowflake(value) {
-      return value === null ? "" : ((!SNOWFLAKE_PATTERN.test(value) || BigInt(value) > MAX_SNOWFLAKE) && invalidHistoryArgs(), value);
-    }
-    function validateHistoryArgs(args) {
-      (!args || typeof args != "object" || Array.isArray(args)) && invalidHistoryArgs(), Object.keys(args).some((key) => !ALLOWED_ARGS.has(key)) && invalidHistoryArgs();
-      let channelId = validateSnowflake(ownString(args, "channelId")), before = validateSnowflake(ownString(args, "before")), limit = Object.hasOwn(args, "limit") ? args.limit : 20;
-      return (!Number.isInteger(limit) || limit < 1 || limit > 25) && invalidHistoryArgs(), { channelId, before, limit };
-    }
-    function boundedString(value, maxLength) {
-      return String(value || "").slice(0, maxLength);
-    }
-    function collectionValues(value) {
-      return Array.isArray(value) ? value : Array.from(value?.values?.() || []);
-    }
-    function compareNewestFirst(left, right) {
-      let leftTime = Number(left.createdTimestamp || 0), rightTime = Number(right.createdTimestamp || 0);
-      if (leftTime !== rightTime) return rightTime - leftTime;
-      let leftId = String(left.id || ""), rightId = String(right.id || "");
-      return leftId === rightId ? 0 : leftId < rightId ? 1 : -1;
-    }
-    function normalizeAttachments(attachments) {
-      return collectionValues(attachments).slice(0, MAX_ATTACHMENTS).map((attachment) => ({
-        id: boundedString(attachment?.id, 32),
-        name: boundedString(attachment?.name, 256),
-        size: Number.isSafeInteger(attachment?.size) && attachment.size >= 0 ? attachment.size : 0,
-        contentType: boundedString(attachment?.contentType, 128),
-        url: boundedString(attachment?.url, 2048)
-      }));
-    }
-    function resolvedReply(message, state, target, fetchedById, botUserId) {
-      let reference = message.reference;
-      if (!reference?.messageId || String(reference.channelId || "") !== String(target.id || "")) return null;
-      let referenced = fetchedById.get(String(reference.messageId));
-      return !referenced?.author?.id || !allowHistoryMessage(state, target, referenced, botUserId) ? null : {
-        messageId: String(referenced.id),
-        authorId: String(referenced.author.id),
-        authorName: boundedString(referenced.author.username || referenced.author.displayName, 256)
+    var DISCORD_API_BASE = "https://discord.com/api/v10";
+    function normalizeRestMessage(message) {
+      return !message || typeof message != "object" ? null : {
+        id: String(message.id || ""),
+        channelId: String(message.channel_id || ""),
+        content: String(message.content || ""),
+        nonce: String(message.nonce || ""),
+        reference: {
+          messageId: String(message.message_reference?.message_id || "")
+        },
+        author: { id: String(message.author?.id || "") }
       };
     }
-    function normalizeHistoryMessage(message, state, target, fetchedById, botUserId) {
-      let createdAt = "";
-      return message.createdAt instanceof Date ? createdAt = message.createdAt.toISOString() : Number.isFinite(message.createdTimestamp) && (createdAt = new Date(message.createdTimestamp).toISOString()), {
-        source: target.guildId ? "guild" : "dm",
-        channelId: String(target.id || ""),
-        guildId: target.guildId ? String(target.guildId) : null,
-        messageId: String(message.id || ""),
-        createdAt,
-        authorId: String(message.author?.id || ""),
-        authorName: boundedString(message.author?.username || message.author?.displayName, 256),
-        authorIsBot: !!message.author?.bot,
-        content: boundedString(message.content, MAX_CONTENT_LENGTH),
-        attachments: normalizeAttachments(message.attachments),
-        replyTo: resolvedReply(message, state, target, fetchedById, botUserId)
-      };
+    function discordRestError(response, body) {
+      let status = Number(response?.status) || 0, error = new Error(`Discord REST request failed with HTTP ${status || "unknown"}.`);
+      error.status = status, error.statusCode = status;
+      let code = body?.code;
+      return (Number.isInteger(code) || /^\d+$/.test(String(code || ""))) && (error.code = Number(code)), error;
     }
-    function outputBytes(value) {
-      return Buffer.byteLength(JSON.stringify(value), "utf8");
-    }
-    function fitsDefaultOutput(value) {
-      return outputBytes(value) <= MAX_OUTPUT_BYTES;
-    }
-    function fitFirstMessage(result, normalized, messageId, fitsOutput) {
-      let candidate = () => ({
-        ...result,
-        messages: [normalized],
-        hasMore: !0,
-        nextBefore: messageId
-      });
-      for (; !fitsOutput(candidate()) && normalized.attachments.length > 0; )
-        normalized.attachments.pop();
-      for (; !fitsOutput(candidate()) && normalized.content.length > 0; )
-        normalized.content = normalized.content.slice(0, Math.floor(normalized.content.length / 2));
-      return candidate();
-    }
-    async function fetchTarget(client, channelId) {
-      try {
-        let target = await client?.channels?.fetch?.(channelId);
-        if (!target) throw new Error("missing channel");
-        return target;
-      } catch {
-        throw new Error("history_channel_inaccessible");
-      }
-    }
-    function isDiscordPermissionError(error) {
-      return error?.status === 403 || error?.statusCode === 403 || error?.code === 50013;
-    }
-    async function fetchMessages(target, options) {
-      try {
-        if (typeof target.messages?.fetch != "function") throw new Error("unsupported channel");
-        return await target.messages.fetch(options);
-      } catch (error) {
-        throw isDiscordPermissionError(error) ? new Error("history_channel_inaccessible") : new Error("history_fetch_failed");
-      }
-    }
-    async function readDiscordHistory2({ args, config, client, fitsOutput = fitsDefaultOutput }) {
-      let validated = validateHistoryArgs(args);
-      if (!validated.channelId) throw new Error("history_target_not_allowed");
-      let state;
-      try {
-        state = loadAccessState(config?.paths?.accessPath);
-      } catch {
-        throw new Error("history_fetch_failed");
-      }
-      let target = await fetchTarget(client, validated.channelId), botUserId = String(client?.user?.id || config?.botUserId || ""), targetDecision = decideHistoryTarget(state, target, botUserId);
-      if (!targetDecision.allowed) throw new Error("history_target_not_allowed");
-      let fetchOptions = { limit: validated.limit + 1 };
-      validated.before && (fetchOptions.before = validated.before);
-      let fetched = collectionValues(await fetchMessages(target, fetchOptions)).sort(compareNewestFirst), fetchedById = new Map(fetched.map((item) => [String(item.id || ""), item])), page = fetched.slice(0, validated.limit), rawHasMore = fetched.length > validated.limit, allowed = page.filter((item) => allowHistoryMessage(state, target, item, botUserId)), result = {
-        channelId: String(target.id || validated.channelId),
-        channelName: boundedString(target.name || target.recipient?.username, 256),
-        source: targetDecision.source,
-        messages: [],
-        hasMore: rawHasMore,
-        nextBefore: rawHasMore && page.length > 0 ? String(page.at(-1).id || "") : ""
-      }, budgetTruncated = !1;
-      for (let item of allowed) {
-        let normalized = normalizeHistoryMessage(item, state, target, fetchedById, botUserId), messageId = String(item.id || ""), candidate = {
-          ...result,
-          messages: [...result.messages, normalized],
-          hasMore: !0,
-          nextBefore: messageId
-        };
-        if (result.messages.length === 0 && !fitsOutput(candidate) && (candidate = fitFirstMessage(result, normalized, messageId, fitsOutput)), !fitsOutput(candidate)) {
-          budgetTruncated = !0;
-          break;
+    async function requestDiscord(fetchImpl, token, route, init = {}) {
+      let response = await fetchImpl(`${DISCORD_API_BASE}${route}`, {
+        ...init,
+        headers: {
+          Authorization: `Bot ${token}`,
+          ...init.body ? { "Content-Type": "application/json" } : {},
+          ...init.headers
         }
-        result.messages.push(normalized);
+      }), bodyText = await response.text(), body = null;
+      try {
+        body = bodyText ? JSON.parse(bodyText) : null;
+      } catch {
       }
-      return budgetTruncated && (result.hasMore = !0, result.nextBefore = result.messages.at(-1)?.messageId || ""), result;
+      if (!response.ok) throw discordRestError(response, body);
+      return body;
+    }
+    function createDiscordRestClient2({ token, botUserId, fetchImpl = globalThis.fetch }) {
+      if (typeof fetchImpl != "function") throw new Error("Discord REST fetch implementation is unavailable.");
+      let channels = /* @__PURE__ */ new Map();
+      function channelFor(channelId) {
+        if (channels.has(channelId)) return channels.get(channelId);
+        let encodedChannelId = encodeURIComponent(channelId), channel = {
+          id: channelId,
+          messages: {
+            async fetch(query) {
+              if (typeof query == "string") {
+                let body2 = await requestDiscord(
+                  fetchImpl,
+                  token,
+                  `/channels/${encodedChannelId}/messages/${encodeURIComponent(query)}`
+                );
+                return normalizeRestMessage(body2);
+              }
+              let limit = Math.max(1, Math.min(100, Number(query?.limit) || 50)), body = await requestDiscord(
+                fetchImpl,
+                token,
+                `/channels/${encodedChannelId}/messages?limit=${limit}`
+              );
+              return new Map((Array.isArray(body) ? body : []).map((message) => {
+                let normalized = normalizeRestMessage(message);
+                return [normalized.id, normalized];
+              }));
+            }
+          },
+          async send(payload) {
+            let body = { content: payload.content, tts: !1 };
+            typeof payload.nonce == "string" && payload.nonce !== "" && (body.nonce = payload.nonce, body.enforce_nonce = payload.enforceNonce === !0), payload.reply?.messageReference && (body.message_reference = {
+              message_id: payload.reply.messageReference,
+              fail_if_not_exists: payload.reply.failIfNotExists === !0
+            });
+            let sent = await requestDiscord(
+              fetchImpl,
+              token,
+              `/channels/${encodedChannelId}/messages`,
+              { method: "POST", body: JSON.stringify(body) }
+            );
+            return normalizeRestMessage(sent);
+          }
+        };
+        return channels.set(channelId, channel), channel;
+      }
+      return {
+        user: { id: String(botUserId || "") },
+        channels: {
+          async fetch(channelId) {
+            return channelFor(String(channelId || ""));
+          }
+        }
+      };
     }
     module2.exports = {
-      readDiscordHistory: readDiscordHistory2,
-      validateHistoryArgs
+      createDiscordRestClient: createDiscordRestClient2,
+      normalizeRestMessage
     };
   }
 });
 
-// src/owner-state.js
-var require_owner_state = __commonJS({
-  "src/owner-state.js"(exports2, module2) {
+// src/gateway-health.js
+var require_gateway_health = __commonJS({
+  "src/gateway-health.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path");
-    function readJson(file) {
-      try {
-        return JSON.parse(fs.readFileSync(file, "utf8"));
-      } catch (error) {
-        if (error && error.code === "ENOENT") return null;
-        throw error;
-      }
+    var fs = require("node:fs"), path = require("node:path"), {
+      effectiveReceiverOwnership,
+      readReceiverAuthoritySnapshot,
+      sameReceiverOwnership
+    } = require_receiver_state(), GATEWAY_HEALTH_VERSION = 1;
+    function currentTimeMs(deps = {}) {
+      let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
+      return Number.isFinite(value) ? value : Date.now();
     }
-    function createOwner2(config) {
+    function getGatewayHealthPath(config = {}) {
+      return config.paths?.gatewayHealthPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "gateway-health.json") : "");
+    }
+    function normalizedReceiver(receiverOwnership) {
+      let pid = Number(receiverOwnership?.pid), generation = typeof receiverOwnership?.generation == "string" ? receiverOwnership.generation.trim() : "";
+      return !Number.isSafeInteger(pid) || pid <= 0 || !generation ? null : { pid, generation };
+    }
+    function normalizedStructured(value = {}) {
       return {
-        version: 1,
-        instance: config.paths.instance,
-        ownerId: config.ownerId,
-        pid: config.pid,
-        hostname: config.hostname,
-        cwd: config.cwd,
-        startedAt: config.startedAt
+        configured: !!value.configured,
+        available: !!value.available,
+        reason: typeof value.reason == "string" && value.reason ? value.reason : null
       };
     }
-    function claimOwner2(ownerPath, owner) {
-      fs.mkdirSync(path.dirname(ownerPath), { recursive: !0, mode: 448 });
-      let tempPath = `${ownerPath}.${process.pid}.${Date.now()}.tmp`;
-      return fs.writeFileSync(tempPath, `${JSON.stringify(owner, null, 2)}
-`, { mode: 384 }), fs.renameSync(tempPath, ownerPath), owner;
+    function normalizedQueue(value = {}) {
+      let integerOrNull = (field) => Number.isInteger(value[field]) && value[field] >= 0 ? value[field] : null;
+      return {
+        depth: integerOrNull("deliveryQueueDepth"),
+        ready: integerOrNull("deliveryReadyCount"),
+        uncertain: integerOrNull("deliveryUncertainCount"),
+        blockedReason: typeof value.deliveryBlockedReason == "string" && value.deliveryBlockedReason ? value.deliveryBlockedReason : null
+      };
     }
-    function readOwner2(ownerPath) {
-      let owner = readJson(ownerPath);
-      return !owner || typeof owner != "object" ? null : owner;
+    function normalizedLastDrain(value = {}, deps = {}) {
+      return {
+        status: typeof value.status == "string" && value.status ? value.status : "unknown",
+        reason: typeof value.reason == "string" && value.reason ? value.reason : null,
+        at: typeof value.at == "string" && value.at ? value.at : new Date(currentTimeMs(deps)).toISOString()
+      };
     }
-    function isCurrentOwner(ownerPath, ownerId) {
-      let owner = readOwner2(ownerPath);
-      return !!(owner && owner.ownerId === ownerId);
+    function writeGatewayHealth2(config = {}, state = {}, deps = {}) {
+      let file = getGatewayHealthPath(config);
+      if (!file) throw new Error("Discord gateway health path is not configured.");
+      let receiver = normalizedReceiver(state.receiverOwnership);
+      if (!receiver) throw new Error("Discord gateway health requires exact receiver ownership.");
+      let fsImpl = deps.fs || fs, record = {
+        version: GATEWAY_HEALTH_VERSION,
+        receiver,
+        updatedAt: new Date(currentTimeMs(deps)).toISOString(),
+        discord: {
+          started: !!state.discordStarted,
+          reason: typeof state.discordReason == "string" && state.discordReason ? state.discordReason : null
+        },
+        structured: normalizedStructured(state.structured),
+        queue: normalizedQueue(state.queue),
+        lastDrain: normalizedLastDrain(state.lastDrain, deps)
+      };
+      fsImpl.mkdirSync(path.dirname(file), { recursive: !0, mode: 448 });
+      let temp = `${file}.${process.pid}.${currentTimeMs(deps)}.tmp`;
+      try {
+        fsImpl.writeFileSync(temp, `${JSON.stringify(record, null, 2)}
+`, { mode: 384 }), fsImpl.renameSync(temp, file);
+      } finally {
+        try {
+          fsImpl.rmSync(temp, { force: !0 });
+        } catch {
+        }
+      }
+      return record;
+    }
+    function emptyStatus(file, reason, valid = !1, receiverPresent = !1) {
+      return {
+        gatewayHealthPath: file,
+        gatewayHealthValid: valid,
+        gatewayReceiverPresent: receiverPresent,
+        gatewayLive: !1,
+        gatewayHealthReason: reason,
+        gatewayPid: null,
+        gatewayGeneration: null,
+        gatewayUpdatedAt: null,
+        gatewayDiscordStarted: !1,
+        gatewayDiscordReason: reason,
+        gatewayStructuredDeliveryState: "unavailable",
+        gatewaySharedAppServerConfigured: !1,
+        gatewaySharedAppServerAvailable: !1,
+        gatewaySharedAppServerReason: reason,
+        gatewayLastDrainStatus: null,
+        gatewayLastDrainReason: null,
+        gatewayLastDrainAt: null,
+        gatewayObservedQueueDepth: null,
+        gatewayObservedReadyCount: null,
+        gatewayObservedUncertainCount: null,
+        gatewayObservedBlockedReason: null
+      };
+    }
+    function readGatewayHealthStatus(config = {}, deps = {}) {
+      let file = getGatewayHealthPath(config), authority = readReceiverAuthoritySnapshot(config, deps), effective = authority.valid && effectiveReceiverOwnership(authority, deps)?.record || null, receiverPresent = !!effective, fsImpl = deps.fs || fs, record;
+      try {
+        record = JSON.parse(fsImpl.readFileSync(file, "utf8"));
+      } catch (error) {
+        return emptyStatus(
+          file,
+          error?.code === "ENOENT" ? "gateway_health_missing" : "gateway_health_invalid",
+          !1,
+          receiverPresent
+        );
+      }
+      let receiver = normalizedReceiver(record?.receiver);
+      if (record?.version !== GATEWAY_HEALTH_VERSION || !receiver || typeof record.updatedAt != "string" || !record.discord || !record.structured || !record.queue || !record.lastDrain)
+        return emptyStatus(file, "gateway_health_invalid", !1, receiverPresent);
+      let updatedAtMs = Date.parse(record.updatedAt), staleMs = Math.max(1e3, Number(config.gatewayHealthStaleMs) || 18e4), expired = !Number.isFinite(updatedAtMs) || currentTimeMs(deps) - updatedAtMs > staleMs, authorityMatches = !!(effective && sameReceiverOwnership(receiver, effective)), live = authorityMatches && !expired, reason = live ? null : authorityMatches && expired ? "gateway_health_expired" : "gateway_health_stale", structured = normalizedStructured(record.structured);
+      return {
+        gatewayHealthPath: file,
+        gatewayHealthValid: !0,
+        gatewayReceiverPresent: receiverPresent,
+        gatewayLive: live,
+        gatewayHealthReason: reason,
+        gatewayPid: receiver.pid,
+        gatewayGeneration: receiver.generation,
+        gatewayUpdatedAt: record.updatedAt,
+        gatewayDiscordStarted: live && !!record.discord.started,
+        gatewayDiscordReason: live ? record.discord.reason || null : reason,
+        gatewayStructuredDeliveryState: live && record.discord.started && structured.available ? "available" : "unavailable",
+        gatewaySharedAppServerConfigured: live && structured.configured,
+        gatewaySharedAppServerAvailable: live && structured.available,
+        gatewaySharedAppServerReason: live ? structured.reason : reason,
+        gatewayLastDrainStatus: record.lastDrain.status || null,
+        gatewayLastDrainReason: record.lastDrain.reason || null,
+        gatewayLastDrainAt: record.lastDrain.at || null,
+        gatewayObservedQueueDepth: Number.isInteger(record.queue.depth) ? record.queue.depth : null,
+        gatewayObservedReadyCount: Number.isInteger(record.queue.ready) ? record.queue.ready : null,
+        gatewayObservedUncertainCount: Number.isInteger(record.queue.uncertain) ? record.queue.uncertain : null,
+        gatewayObservedBlockedReason: record.queue.blockedReason || null
+      };
     }
     module2.exports = {
-      claimOwner: claimOwner2,
-      createOwner: createOwner2,
-      isCurrentOwner,
-      readOwner: readOwner2
+      readGatewayHealthStatus,
+      writeGatewayHealth: writeGatewayHealth2
     };
   }
 });
@@ -94795,163 +94843,923 @@ var require_reply_delivery = __commonJS({
   }
 });
 
-// src/gateway-health.js
-var require_gateway_health = __commonJS({
-  "src/gateway-health.js"(exports2, module2) {
+// src/gateway-drain-loop.js
+var require_gateway_drain_loop = __commonJS({
+  "src/gateway-drain-loop.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), {
-      effectiveReceiverOwnership,
-      readReceiverAuthoritySnapshot,
-      sameReceiverOwnership
-    } = require_receiver_state(), GATEWAY_HEALTH_VERSION = 1;
-    function currentTimeMs(deps = {}) {
-      let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
-      return Number.isFinite(value) ? value : Date.now();
+    var { readDeliveryQueueStatus: readDeliveryQueueStatus2 } = require_delivery(), { isCurrentReceiverOwnership: isCurrentReceiverOwnership2 } = require_receiver_state(), DEFAULT_DRAIN_INTERVAL_MS = 1e3, DEFAULT_DRAIN_MAX_BACKOFF_MS = 3e4, MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+    function positiveDelay(value, fallback) {
+      let parsed = Number(value);
+      return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, MAX_TIMER_DELAY_MS) : fallback;
     }
-    function getGatewayHealthPath(config = {}) {
-      return config.paths?.gatewayHealthPath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "gateway-health.json") : "");
-    }
-    function normalizedReceiver(receiverOwnership) {
-      let pid = Number(receiverOwnership?.pid), generation = typeof receiverOwnership?.generation == "string" ? receiverOwnership.generation.trim() : "";
-      return !Number.isSafeInteger(pid) || pid <= 0 || !generation ? null : { pid, generation };
-    }
-    function normalizedStructured(value = {}) {
-      return {
-        configured: !!value.configured,
-        available: !!value.available,
-        reason: typeof value.reason == "string" && value.reason ? value.reason : null
-      };
-    }
-    function normalizedQueue(value = {}) {
-      let integerOrNull = (field) => Number.isInteger(value[field]) && value[field] >= 0 ? value[field] : null;
-      return {
-        depth: integerOrNull("deliveryQueueDepth"),
-        ready: integerOrNull("deliveryReadyCount"),
-        uncertain: integerOrNull("deliveryUncertainCount"),
-        blockedReason: typeof value.deliveryBlockedReason == "string" && value.deliveryBlockedReason ? value.deliveryBlockedReason : null
-      };
-    }
-    function normalizedLastDrain(value = {}, deps = {}) {
-      return {
-        status: typeof value.status == "string" && value.status ? value.status : "unknown",
-        reason: typeof value.reason == "string" && value.reason ? value.reason : null,
-        at: typeof value.at == "string" && value.at ? value.at : new Date(currentTimeMs(deps)).toISOString()
-      };
-    }
-    function writeGatewayHealth(config = {}, state = {}, deps = {}) {
-      let file = getGatewayHealthPath(config);
-      if (!file) throw new Error("Discord gateway health path is not configured.");
-      let receiver = normalizedReceiver(state.receiverOwnership);
-      if (!receiver) throw new Error("Discord gateway health requires exact receiver ownership.");
-      let fsImpl = deps.fs || fs, record = {
-        version: GATEWAY_HEALTH_VERSION,
-        receiver,
-        updatedAt: new Date(currentTimeMs(deps)).toISOString(),
-        discord: {
-          started: !!state.discordStarted,
-          reason: typeof state.discordReason == "string" && state.discordReason ? state.discordReason : null
-        },
-        structured: normalizedStructured(state.structured),
-        queue: normalizedQueue(state.queue),
-        lastDrain: normalizedLastDrain(state.lastDrain, deps)
-      };
-      fsImpl.mkdirSync(path.dirname(file), { recursive: !0, mode: 448 });
-      let temp = `${file}.${process.pid}.${currentTimeMs(deps)}.tmp`;
-      try {
-        fsImpl.writeFileSync(temp, `${JSON.stringify(record, null, 2)}
-`, { mode: 384 }), fsImpl.renameSync(temp, file);
-      } finally {
+    function log(logger, level, message, meta) {
+      if (typeof logger == "function")
         try {
-          fsImpl.rmSync(temp, { force: !0 });
+          logger(level, message, meta);
         } catch {
         }
-      }
-      return record;
     }
-    function emptyStatus(file, reason, valid = !1, receiverPresent = !1) {
-      return {
-        gatewayHealthPath: file,
-        gatewayHealthValid: valid,
-        gatewayReceiverPresent: receiverPresent,
-        gatewayLive: !1,
-        gatewayHealthReason: reason,
-        gatewayPid: null,
-        gatewayGeneration: null,
-        gatewayUpdatedAt: null,
-        gatewayDiscordStarted: !1,
-        gatewayDiscordReason: reason,
-        gatewayStructuredDeliveryState: "unavailable",
-        gatewaySharedAppServerConfigured: !1,
-        gatewaySharedAppServerAvailable: !1,
-        gatewaySharedAppServerReason: reason,
-        gatewayLastDrainStatus: null,
-        gatewayLastDrainReason: null,
-        gatewayLastDrainAt: null,
-        gatewayObservedQueueDepth: null,
-        gatewayObservedReadyCount: null,
-        gatewayObservedUncertainCount: null,
-        gatewayObservedBlockedReason: null
+    function startGatewayDrainLoop2({
+      config,
+      delivery,
+      receiverOwnership,
+      logger = () => {
+      },
+      reportHealth = () => {
+      },
+      deps = {}
+    }) {
+      if (typeof delivery?.flush != "function")
+        throw new Error("Discord gateway delivery does not provide structured queue draining.");
+      if (typeof delivery?.refreshTargetCheckpoint != "function")
+        throw new Error("Discord gateway delivery cannot refresh the TUI recovery target.");
+      let baseDelayMs = positiveDelay(config?.deliveryDrainIntervalMs, DEFAULT_DRAIN_INTERVAL_MS), maxBackoffMs = Math.max(
+        baseDelayMs,
+        positiveDelay(config?.deliveryDrainMaxBackoffMs, DEFAULT_DRAIN_MAX_BACKOFF_MS)
+      ), scheduleTimeout = deps.setTimeout || setTimeout, cancelTimeout = deps.clearTimeout || clearTimeout, queueStatus = deps.readDeliveryQueueStatus || readDeliveryQueueStatus2, checkOwnership = deps.isCurrentReceiverOwnership || isCurrentReceiverOwnership2, report = async (result) => {
+        try {
+          await reportHealth(result);
+        } catch (error) {
+          log(logger, "ERROR", "Failed to persist Discord gateway health", {
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+        return result;
+      }, stopped = !1, timer = null, generation = 0, activeTick = null, retryDelayMs = baseDelayMs, increaseBackoff = () => (retryDelayMs = Math.min(maxBackoffMs, retryDelayMs * 2), retryDelayMs), drainOnce = async () => {
+        let receiver = checkOwnership(config, receiverOwnership, deps);
+        if (!receiver?.active)
+          return stopped = !0, generation += 1, log(logger, "INFO", "Stopping Discord queue drain after receiver ownership changed", {
+            reason: receiver?.reason || "gateway_generation_changed",
+            activePid: receiver?.pid
+          }), baseDelayMs;
+        let status = queueStatus(config, deps);
+        if (status.deliveryQueueDepth === 0) {
+          try {
+            await delivery.refreshTargetCheckpoint();
+          } catch (error) {
+            let reason = error?.code || "shared_app_server_unavailable";
+            return log(logger, "ERROR", "Cannot refresh the Discord TUI recovery target", {
+              reason,
+              error: error instanceof Error ? error.message : String(error)
+            }), await report({
+              status: "failed",
+              reason,
+              deliveredCount: 0,
+              queueDepth: 0
+            }), increaseBackoff();
+          }
+          return checkOwnership(config, receiverOwnership, deps)?.active ? (retryDelayMs = baseDelayMs, await report({ status: "idle", reason: "queue_empty", deliveredCount: 0, queueDepth: 0 }), baseDelayMs) : (stopped = !0, generation += 1, baseDelayMs);
+        }
+        if (!Number.isInteger(status.deliveryQueueDepth) || status.deliveryQueueDepth < 0)
+          return log(logger, "ERROR", "Cannot inspect durable Discord delivery queue", {
+            reason: status.deliveryBlockedReason || "delivery_queue_unreadable"
+          }), await report({
+            status: "failed",
+            reason: status.deliveryBlockedReason || "delivery_queue_unreadable",
+            deliveredCount: 0,
+            queueDepth: null
+          }), increaseBackoff();
+        let result = await delivery.flush({
+          verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps)
+        });
+        return result?.status === "queued" && ["gateway_generation_changed", "gateway_receiver_missing"].includes(result?.reason) || !checkOwnership(config, receiverOwnership, deps)?.active ? (stopped = !0, generation += 1, baseDelayMs) : (await report(result), result?.status === "queued" || result?.status === "failed" ? increaseBackoff() : (retryDelayMs = baseDelayMs, baseDelayMs));
+      }, runTick, schedule = (delayMs) => {
+        if (stopped) return;
+        let expectedGeneration = ++generation;
+        timer = scheduleTimeout(() => runTick(expectedGeneration), delayMs), typeof timer?.unref == "function" && timer.unref();
       };
-    }
-    function readGatewayHealthStatus2(config = {}, deps = {}) {
-      let file = getGatewayHealthPath(config), authority = readReceiverAuthoritySnapshot(config, deps), effective = authority.valid && effectiveReceiverOwnership(authority, deps)?.record || null, receiverPresent = !!effective, fsImpl = deps.fs || fs, record;
-      try {
-        record = JSON.parse(fsImpl.readFileSync(file, "utf8"));
-      } catch (error) {
-        return emptyStatus(
-          file,
-          error?.code === "ENOENT" ? "gateway_health_missing" : "gateway_health_invalid",
-          !1,
-          receiverPresent
-        );
-      }
-      let receiver = normalizedReceiver(record?.receiver);
-      if (record?.version !== GATEWAY_HEALTH_VERSION || !receiver || typeof record.updatedAt != "string" || !record.discord || !record.structured || !record.queue || !record.lastDrain)
-        return emptyStatus(file, "gateway_health_invalid", !1, receiverPresent);
-      let updatedAtMs = Date.parse(record.updatedAt), staleMs = Math.max(1e3, Number(config.gatewayHealthStaleMs) || 18e4), expired = !Number.isFinite(updatedAtMs) || currentTimeMs(deps) - updatedAtMs > staleMs, authorityMatches = !!(effective && sameReceiverOwnership(receiver, effective)), live = authorityMatches && !expired, reason = live ? null : authorityMatches && expired ? "gateway_health_expired" : "gateway_health_stale", structured = normalizedStructured(record.structured);
-      return {
-        gatewayHealthPath: file,
-        gatewayHealthValid: !0,
-        gatewayReceiverPresent: receiverPresent,
-        gatewayLive: live,
-        gatewayHealthReason: reason,
-        gatewayPid: receiver.pid,
-        gatewayGeneration: receiver.generation,
-        gatewayUpdatedAt: record.updatedAt,
-        gatewayDiscordStarted: live && !!record.discord.started,
-        gatewayDiscordReason: live ? record.discord.reason || null : reason,
-        gatewayStructuredDeliveryState: live && record.discord.started && structured.available ? "available" : "unavailable",
-        gatewaySharedAppServerConfigured: live && structured.configured,
-        gatewaySharedAppServerAvailable: live && structured.available,
-        gatewaySharedAppServerReason: live ? structured.reason : reason,
-        gatewayLastDrainStatus: record.lastDrain.status || null,
-        gatewayLastDrainReason: record.lastDrain.reason || null,
-        gatewayLastDrainAt: record.lastDrain.at || null,
-        gatewayObservedQueueDepth: Number.isInteger(record.queue.depth) ? record.queue.depth : null,
-        gatewayObservedReadyCount: Number.isInteger(record.queue.ready) ? record.queue.ready : null,
-        gatewayObservedUncertainCount: Number.isInteger(record.queue.uncertain) ? record.queue.uncertain : null,
-        gatewayObservedBlockedReason: record.queue.blockedReason || null
+      return runTick = async (expectedGeneration) => {
+        if (stopped || expectedGeneration !== generation || activeTick) return;
+        timer = null;
+        let operation = drainOnce();
+        activeTick = operation;
+        let nextDelayMs = retryDelayMs;
+        try {
+          nextDelayMs = await operation;
+        } catch (error) {
+          nextDelayMs = increaseBackoff(), log(logger, "ERROR", "Periodic Discord queue drain failed", {
+            error: error instanceof Error ? error.message : String(error)
+          }), await report({
+            status: "failed",
+            reason: "gateway_drain_failed",
+            deliveredCount: 0,
+            queueDepth: null
+          });
+        } finally {
+          activeTick === operation && (activeTick = null), schedule(nextDelayMs);
+        }
+      }, schedule(baseDelayMs), {
+        async stop() {
+          stopped || (stopped = !0, generation += 1, timer != null && cancelTimeout(timer), timer = null), activeTick && await activeTick.catch(() => {
+          });
+        }
       };
     }
     module2.exports = {
-      readGatewayHealthStatus: readGatewayHealthStatus2,
-      writeGatewayHealth
+      startGatewayDrainLoop: startGatewayDrainLoop2
+    };
+  }
+});
+
+// src/owner-state.js
+var require_owner_state = __commonJS({
+  "src/owner-state.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs"), path = require("node:path");
+    function readJson(file) {
+      try {
+        return JSON.parse(fs.readFileSync(file, "utf8"));
+      } catch (error) {
+        if (error && error.code === "ENOENT") return null;
+        throw error;
+      }
+    }
+    function createOwner2(config) {
+      return {
+        version: 1,
+        instance: config.paths.instance,
+        ownerId: config.ownerId,
+        pid: config.pid,
+        hostname: config.hostname,
+        cwd: config.cwd,
+        startedAt: config.startedAt
+      };
+    }
+    function claimOwner2(ownerPath, owner) {
+      fs.mkdirSync(path.dirname(ownerPath), { recursive: !0, mode: 448 });
+      let tempPath = `${ownerPath}.${process.pid}.${Date.now()}.tmp`;
+      return fs.writeFileSync(tempPath, `${JSON.stringify(owner, null, 2)}
+`, { mode: 384 }), fs.renameSync(tempPath, ownerPath), owner;
+    }
+    function readOwner(ownerPath) {
+      let owner = readJson(ownerPath);
+      return !owner || typeof owner != "object" ? null : owner;
+    }
+    function isCurrentOwner(ownerPath, ownerId) {
+      let owner = readOwner(ownerPath);
+      return !!(owner && owner.ownerId === ownerId);
+    }
+    module2.exports = {
+      claimOwner: claimOwner2,
+      createOwner: createOwner2,
+      isCurrentOwner,
+      readOwner
+    };
+  }
+});
+
+// src/app-server-runtime.js
+var require_app_server_runtime = __commonJS({
+  "src/app-server-runtime.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs"), path = require("node:path");
+    function canonicalPath(input) {
+      let current = path.resolve(input), suffix = [];
+      for (; !fs.existsSync(current); ) {
+        let parent = path.dirname(current);
+        if (parent === current) break;
+        suffix.unshift(path.basename(current)), current = parent;
+      }
+      let resolved = fs.existsSync(current) ? fs.realpathSync.native(current) : current;
+      return path.join(resolved, ...suffix);
+    }
+    function pathContains(parent, child) {
+      let relative = path.relative(canonicalPath(parent), canonicalPath(child));
+      return relative === "" || !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+    }
+    function accountStateRelationship(accountHome, stateDir) {
+      let account = canonicalPath(accountHome), state = canonicalPath(stateDir);
+      return account === state ? "same" : pathContains(account, state) ? "account_contains_state" : pathContains(state, account) ? "state_contains_account" : "disjoint";
+    }
+    function sanitizedAppServerEnv(config) {
+      let env = { ...config.env };
+      for (let key of Object.keys(env))
+        key.startsWith("DISCORD_") && delete env[key], (key === "CODEX_THREAD_ID" || key === "CODEX_SESSION_ID" || key === "CODEX_APP_SERVER_URL" || key === "CODEX_APP_SERVER_SOCKET" || key === "CODEX_CWD" || key.startsWith("CODEX_TARGET_") || key.startsWith("CODEX_DISCORD_") || key.startsWith("CODEX_TURN_") || key.startsWith("CODEX_WAKE_") || key.startsWith("CODEX_DENY_")) && delete env[key];
+      return env;
+    }
+    function buildAppServerLaunch(config) {
+      if (config.accountHomeSource === "default") {
+        let error = new Error(
+          `CODEX_HOME must be set in ${config.paths.accountEnvPath} or the service environment`
+        );
+        throw error.code = "codex_account_home_required", error;
+      }
+      let command = String(config.env.NODE_BIN || "").trim(), codexBin = String(config.env.CODEX_BIN || "").trim();
+      if (!path.isAbsolute(command) || !path.isAbsolute(codexBin)) {
+        let error = new Error(
+          "NODE_BIN and the CODEX_BIN JavaScript entry point must both be absolute paths"
+        );
+        throw error.code = "codex_bin_required", error;
+      }
+      return {
+        command,
+        args: [codexBin, "app-server", "--listen", config.appServerUrl],
+        env: {
+          ...sanitizedAppServerEnv(config),
+          CODEX_HOME: config.codexHome,
+          DISCORD_INSTANCE: config.paths.instance,
+          DISCORD_CONFIG_DIR: config.paths.stateDir,
+          CODEX_DISCORD_APP_SERVER_URL: config.appServerUrl
+        }
+      };
+    }
+    function runAppServer2(config, dependencies = {}) {
+      let launch = buildAppServerLaunch(config), execve = dependencies.execve || process.execve;
+      if (typeof execve != "function") {
+        let error = new Error("Node 22.15 or newer is required for process.execve");
+        throw error.code = "node_execve_required", error;
+      }
+      return execve(launch.command, [launch.command, ...launch.args], launch.env);
+    }
+    function instanceDoctor2(config) {
+      return {
+        instance: config.paths.instance,
+        accountEnvPath: config.paths.accountEnvPath,
+        accountBindingPath: config.paths.accountBindingPath,
+        accountBindingLoaded: config.accountBindingLoaded,
+        legacyInstanceFallbackUsed: config.legacyInstanceFallbackUsed,
+        accountEnvLoaded: config.accountEnvLoaded,
+        accountHomeSource: config.accountHomeSource,
+        codexHome: config.codexHome,
+        discordStateDir: config.paths.stateDir,
+        appServerUrl: config.appServerUrl,
+        botUserId: config.botUserId,
+        botTokenConfigured: config.tokenConfigured,
+        accountStateRelationship: accountStateRelationship(config.codexHome, config.paths.stateDir)
+      };
+    }
+    module2.exports = {
+      buildAppServerLaunch,
+      accountStateRelationship,
+      instanceDoctor: instanceDoctor2,
+      runAppServer: runAppServer2,
+      sanitizedAppServerEnv
+    };
+  }
+});
+
+// src/instance-launcher.js
+var require_instance_launcher = __commonJS({
+  "src/instance-launcher.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs"), path = require("node:path"), { sanitizedAppServerEnv } = require_app_server_runtime(), { loadEnvFile } = require_config(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]);
+    function verifyAccountBinding(config) {
+      let binding = {};
+      if (!loadEnvFile(config.paths.accountBindingPath, binding, {
+        allowedKeys: ACCOUNT_BINDING_KEYS,
+        strict: !0
+      })) throw new Error(`Discord account binding is missing: ${config.paths.accountBindingPath}`);
+      if (binding.DISCORD_INSTANCE !== config.paths.instance || path.resolve(binding.DISCORD_CONFIG_DIR || "") !== path.resolve(config.paths.stateDir))
+        throw new Error(`Discord account binding does not match instance ${config.paths.instance}`);
+    }
+    function verifyLiveProcess(config, pid, dependencies = {}) {
+      if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`Invalid live service PID: ${pid}`);
+      let readFileSync = dependencies.readFileSync || fs.readFileSync, entries;
+      try {
+        entries = readFileSync(`/proc/${pid}/environ`).toString("utf8").split("\0").filter(Boolean);
+      } catch {
+        throw new Error(`Cannot read live service identity for PID ${pid}`);
+      }
+      let env = Object.fromEntries(entries.map((entry) => {
+        let separator = entry.indexOf("=");
+        return separator === -1 ? [entry, ""] : [entry.slice(0, separator), entry.slice(separator + 1)];
+      }));
+      if (!(env.CODEX_HOME !== config.codexHome || env.DISCORD_INSTANCE !== config.paths.instance || path.resolve(env.DISCORD_CONFIG_DIR || "") !== path.resolve(config.paths.stateDir))) return;
+      let argv = [];
+      try {
+        argv = readFileSync(`/proc/${pid}/cmdline`).toString("utf8").split("\0").filter(Boolean);
+      } catch {
+      }
+      if (!(!env.CODEX_HOME && !env.DISCORD_INSTANCE && !env.DISCORD_CONFIG_DIR && path.join(env.HOME || "", ".codex") === config.codexHome && argv.includes("app-server") && argv.includes("--listen") && argv.includes(config.appServerUrl)))
+        throw new Error(`Live service PID ${pid} does not match instance ${config.paths.instance}`);
+    }
+    function requireInstancePrerequisites(config) {
+      if (config.accountHomeSource === "default")
+        throw new Error(`CODEX_HOME is not pinned in ${config.paths.accountEnvPath}`);
+      if (verifyAccountBinding(config), !config.tokenConfigured || !config.botUserId)
+        throw new Error(`Discord bot credentials are incomplete in ${config.paths.envFile}`);
+      let nodeBin = String(config.env.NODE_BIN || "").trim(), codexBin = String(config.env.CODEX_BIN || "").trim();
+      if (!path.isAbsolute(nodeBin) || !path.isAbsolute(codexBin))
+        throw new Error("NODE_BIN and CODEX_BIN must be absolute paths in account.env");
+      return { codexBin, nodeBin };
+    }
+    function requireInstanceReady(config, dependencies = {}) {
+      let statSync = dependencies.statSync || fs.statSync, existsSync = dependencies.existsSync || fs.existsSync, { codexBin, nodeBin } = requireInstancePrerequisites(config), authPath = path.join(config.codexHome, "auth.json");
+      if (!existsSync(authPath) || !statSync(authPath).isFile()) {
+        let error = new Error(
+          `OpenAI account is not logged in under ${config.codexHome}; run the account login command first`
+        );
+        throw error.code = "openai_account_login_missing", error;
+      }
+      return { authPath, codexBin, nodeBin };
+    }
+    function buildTuiLaunch(config, codexArgs = [], dependencies = {}) {
+      let { codexBin, nodeBin } = requireInstanceReady(config, dependencies);
+      return {
+        command: nodeBin,
+        args: [codexBin, "--remote", config.appServerUrl, ...codexArgs],
+        env: {
+          ...sanitizedAppServerEnv(config),
+          CODEX_HOME: config.codexHome,
+          DISCORD_INSTANCE: config.paths.instance,
+          DISCORD_CONFIG_DIR: config.paths.stateDir
+        }
+      };
+    }
+    function runTui2(config, codexArgs = [], dependencies = {}) {
+      let launch = buildTuiLaunch(config, codexArgs, dependencies), execve = dependencies.execve || process.execve;
+      if (typeof execve != "function") throw new Error("Node 22.15 or newer is required for process.execve");
+      return execve(launch.command, [launch.command, ...launch.args], launch.env);
+    }
+    module2.exports = {
+      buildTuiLaunch,
+      requireInstanceReady,
+      runTui: runTui2,
+      verifyAccountBinding,
+      verifyLiveProcess
+    };
+  }
+});
+
+// src/history.js
+var require_history = __commonJS({
+  "src/history.js"(exports2, module2) {
+    "use strict";
+    var { allowHistoryMessage, decideHistoryTarget, loadAccessState } = require_access_state(), MAX_OUTPUT_BYTES = 64 * 1024, MAX_CONTENT_LENGTH = 16 * 1024, MAX_ATTACHMENTS = 10, ALLOWED_ARGS = /* @__PURE__ */ new Set(["channelId", "before", "limit"]), SNOWFLAKE_PATTERN = /^[1-9]\d{16,19}$/, MAX_SNOWFLAKE = (1n << 64n) - 1n;
+    function invalidHistoryArgs() {
+      throw new Error("invalid_history_args");
+    }
+    function ownString(args, key) {
+      if (!Object.hasOwn(args, key)) return null;
+      typeof args[key] != "string" && invalidHistoryArgs();
+      let value = args[key].trim();
+      return value || invalidHistoryArgs(), value;
+    }
+    function validateSnowflake(value) {
+      return value === null ? "" : ((!SNOWFLAKE_PATTERN.test(value) || BigInt(value) > MAX_SNOWFLAKE) && invalidHistoryArgs(), value);
+    }
+    function validateHistoryArgs(args) {
+      (!args || typeof args != "object" || Array.isArray(args)) && invalidHistoryArgs(), Object.keys(args).some((key) => !ALLOWED_ARGS.has(key)) && invalidHistoryArgs();
+      let channelId = validateSnowflake(ownString(args, "channelId")), before = validateSnowflake(ownString(args, "before")), limit = Object.hasOwn(args, "limit") ? args.limit : 20;
+      return (!Number.isInteger(limit) || limit < 1 || limit > 25) && invalidHistoryArgs(), { channelId, before, limit };
+    }
+    function boundedString(value, maxLength) {
+      return String(value || "").slice(0, maxLength);
+    }
+    function collectionValues(value) {
+      return Array.isArray(value) ? value : Array.from(value?.values?.() || []);
+    }
+    function compareNewestFirst(left, right) {
+      let leftTime = Number(left.createdTimestamp || 0), rightTime = Number(right.createdTimestamp || 0);
+      if (leftTime !== rightTime) return rightTime - leftTime;
+      let leftId = String(left.id || ""), rightId = String(right.id || "");
+      return leftId === rightId ? 0 : leftId < rightId ? 1 : -1;
+    }
+    function normalizeAttachments(attachments) {
+      return collectionValues(attachments).slice(0, MAX_ATTACHMENTS).map((attachment) => ({
+        id: boundedString(attachment?.id, 32),
+        name: boundedString(attachment?.name, 256),
+        size: Number.isSafeInteger(attachment?.size) && attachment.size >= 0 ? attachment.size : 0,
+        contentType: boundedString(attachment?.contentType, 128),
+        url: boundedString(attachment?.url, 2048)
+      }));
+    }
+    function resolvedReply(message, state, target, fetchedById, botUserId) {
+      let reference = message.reference;
+      if (!reference?.messageId || String(reference.channelId || "") !== String(target.id || "")) return null;
+      let referenced = fetchedById.get(String(reference.messageId));
+      return !referenced?.author?.id || !allowHistoryMessage(state, target, referenced, botUserId) ? null : {
+        messageId: String(referenced.id),
+        authorId: String(referenced.author.id),
+        authorName: boundedString(referenced.author.username || referenced.author.displayName, 256)
+      };
+    }
+    function normalizeHistoryMessage(message, state, target, fetchedById, botUserId) {
+      let createdAt = "";
+      return message.createdAt instanceof Date ? createdAt = message.createdAt.toISOString() : Number.isFinite(message.createdTimestamp) && (createdAt = new Date(message.createdTimestamp).toISOString()), {
+        source: target.guildId ? "guild" : "dm",
+        channelId: String(target.id || ""),
+        guildId: target.guildId ? String(target.guildId) : null,
+        messageId: String(message.id || ""),
+        createdAt,
+        authorId: String(message.author?.id || ""),
+        authorName: boundedString(message.author?.username || message.author?.displayName, 256),
+        authorIsBot: !!message.author?.bot,
+        content: boundedString(message.content, MAX_CONTENT_LENGTH),
+        attachments: normalizeAttachments(message.attachments),
+        replyTo: resolvedReply(message, state, target, fetchedById, botUserId)
+      };
+    }
+    function outputBytes(value) {
+      return Buffer.byteLength(JSON.stringify(value), "utf8");
+    }
+    function fitsDefaultOutput(value) {
+      return outputBytes(value) <= MAX_OUTPUT_BYTES;
+    }
+    function fitFirstMessage(result, normalized, messageId, fitsOutput) {
+      let candidate = () => ({
+        ...result,
+        messages: [normalized],
+        hasMore: !0,
+        nextBefore: messageId
+      });
+      for (; !fitsOutput(candidate()) && normalized.attachments.length > 0; )
+        normalized.attachments.pop();
+      for (; !fitsOutput(candidate()) && normalized.content.length > 0; )
+        normalized.content = normalized.content.slice(0, Math.floor(normalized.content.length / 2));
+      return candidate();
+    }
+    async function fetchTarget(client, channelId) {
+      try {
+        let target = await client?.channels?.fetch?.(channelId);
+        if (!target) throw new Error("missing channel");
+        return target;
+      } catch {
+        throw new Error("history_channel_inaccessible");
+      }
+    }
+    function isDiscordPermissionError(error) {
+      return error?.status === 403 || error?.statusCode === 403 || error?.code === 50013;
+    }
+    async function fetchMessages(target, options) {
+      try {
+        if (typeof target.messages?.fetch != "function") throw new Error("unsupported channel");
+        return await target.messages.fetch(options);
+      } catch (error) {
+        throw isDiscordPermissionError(error) ? new Error("history_channel_inaccessible") : new Error("history_fetch_failed");
+      }
+    }
+    async function readDiscordHistory({ args, config, client, fitsOutput = fitsDefaultOutput }) {
+      let validated = validateHistoryArgs(args);
+      if (!validated.channelId) throw new Error("history_target_not_allowed");
+      let state;
+      try {
+        state = loadAccessState(config?.paths?.accessPath);
+      } catch {
+        throw new Error("history_fetch_failed");
+      }
+      let target = await fetchTarget(client, validated.channelId), botUserId = String(client?.user?.id || config?.botUserId || ""), targetDecision = decideHistoryTarget(state, target, botUserId);
+      if (!targetDecision.allowed) throw new Error("history_target_not_allowed");
+      let fetchOptions = { limit: validated.limit + 1 };
+      validated.before && (fetchOptions.before = validated.before);
+      let fetched = collectionValues(await fetchMessages(target, fetchOptions)).sort(compareNewestFirst), fetchedById = new Map(fetched.map((item) => [String(item.id || ""), item])), page = fetched.slice(0, validated.limit), rawHasMore = fetched.length > validated.limit, allowed = page.filter((item) => allowHistoryMessage(state, target, item, botUserId)), result = {
+        channelId: String(target.id || validated.channelId),
+        channelName: boundedString(target.name || target.recipient?.username, 256),
+        source: targetDecision.source,
+        messages: [],
+        hasMore: rawHasMore,
+        nextBefore: rawHasMore && page.length > 0 ? String(page.at(-1).id || "") : ""
+      }, budgetTruncated = !1;
+      for (let item of allowed) {
+        let normalized = normalizeHistoryMessage(item, state, target, fetchedById, botUserId), messageId = String(item.id || ""), candidate = {
+          ...result,
+          messages: [...result.messages, normalized],
+          hasMore: !0,
+          nextBefore: messageId
+        };
+        if (result.messages.length === 0 && !fitsOutput(candidate) && (candidate = fitFirstMessage(result, normalized, messageId, fitsOutput)), !fitsOutput(candidate)) {
+          budgetTruncated = !0;
+          break;
+        }
+        result.messages.push(normalized);
+      }
+      return budgetTruncated && (result.hasMore = !0, result.nextBefore = result.messages.at(-1)?.messageId || ""), result;
+    }
+    module2.exports = {
+      readDiscordHistory,
+      validateHistoryArgs
     };
   }
 });
 
 // src/mcp-server.js
-var readline = require("node:readline"), { loadConfig } = require_config(), {
-  createDelivery,
-  readDeliveryQueueStatus,
-  readLastInboundContext
-} = require_delivery(), {
+var require_mcp_server = __commonJS({
+  "src/mcp-server.js"(exports2, module2) {
+    "use strict";
+    var readline = require("node:readline"), { loadConfig: loadConfig2 } = require_config(), {
+      createDelivery: createDelivery2,
+      readDeliveryQueueStatus: readDeliveryQueueStatus2,
+      readLastInboundContext
+    } = require_delivery(), {
+      confirmDiscordMessage: confirmDiscordMessage2,
+      prepareDiscordMessageSend: prepareDiscordMessageSend2,
+      reconcileDiscordMessage: reconcileDiscordMessage2,
+      sendDiscordMessage: sendDiscordMessage2,
+      startDiscordClient: startDiscordClient2
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.2", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    function makeLogger2() {
+      return (level, message, meta) => {
+        let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;
+        process.stderr.write(`${(/* @__PURE__ */ new Date()).toISOString()} ${level} ${message}${suffix}
+`);
+      };
+    }
+    function send(message) {
+      process.stdout.write(`${JSON.stringify(message)}
+`);
+    }
+    function sendResult(id, result) {
+      send({ jsonrpc: "2.0", id, result });
+    }
+    function sendError(id, code, message) {
+      send({ jsonrpc: "2.0", id, error: { code, message } });
+    }
+    function textResult(text, structuredContent = {}) {
+      return {
+        content: [{ type: "text", text }],
+        structuredContent
+      };
+    }
+    function historyToolResult(history) {
+      return textResult(JSON.stringify(history), {
+        channel: {
+          id: history.channelId,
+          name: history.channelName
+        },
+        source: history.source,
+        page: {
+          hasMore: history.hasMore,
+          nextBefore: history.nextBefore
+        },
+        messageCount: history.messages.length
+      });
+    }
+    function historyToolResultFits(history) {
+      return Buffer.byteLength(JSON.stringify(historyToolResult(history)), "utf8") <= MAX_TOOL_RESULT_BYTES;
+    }
+    function toolList() {
+      return [
+        {
+          name: "discord_channel_status",
+          title: "Discord Channel Status",
+          description: "Read the current Discord channel plugin status for this Codex session.",
+          inputSchema: { type: "object", properties: {} },
+          annotations: { readOnlyHint: !0, destructiveHint: !1, idempotentHint: !0, openWorldHint: !1 }
+        },
+        {
+          name: "discord_channel_read_owner",
+          title: "Read Discord Channel Owner",
+          description: "Read the active owner for this Discord bot instance.",
+          inputSchema: { type: "object", properties: {} },
+          annotations: { readOnlyHint: !0, destructiveHint: !1, idempotentHint: !0, openWorldHint: !1 }
+        },
+        {
+          name: "discord_channel_claim_owner",
+          title: "Claim Discord Channel Owner",
+          description: "Claim this process as the active owner for the selected Discord bot instance.",
+          inputSchema: { type: "object", properties: {} },
+          annotations: { readOnlyHint: !1, destructiveHint: !0, idempotentHint: !0, openWorldHint: !1 }
+        },
+        {
+          name: "discord_channel_read_history",
+          title: "Read Discord Channel History",
+          description: "Read bounded recent history from an authorized Discord channel.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              channelId: {
+                type: "string",
+                pattern: "^[1-9]\\d{16,19}$",
+                description: "Optional Discord channel id. Defaults to the last accepted inbound Discord message."
+              },
+              before: {
+                type: "string",
+                pattern: "^[1-9]\\d{16,19}$",
+                description: "Optional exclusive Discord message id cursor."
+              },
+              limit: { type: "integer", minimum: 1, maximum: 25, default: 20 }
+            },
+            additionalProperties: !1
+          },
+          annotations: { readOnlyHint: !0, destructiveHint: !1, idempotentHint: !0, openWorldHint: !0 }
+        },
+        {
+          name: "discord_channel_send",
+          title: "Send Discord Message",
+          description: "Send a Discord message through the session-owned bot.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              channelId: { type: "string", description: "Exact Discord channel id. Required for replies and followups." },
+              content: { type: "string", description: "Message text to send." },
+              replyTo: { type: "string", description: "Exact source Discord message id. Required unless followup is true." },
+              followup: {
+                type: "boolean",
+                default: !1,
+                description: "Explicitly allow an additional message after this source Discord message was already answered."
+              }
+            },
+            required: ["channelId", "content"],
+            anyOf: [
+              { required: ["replyTo"] },
+              {
+                required: ["followup"],
+                properties: { followup: { const: !0 } }
+              }
+            ],
+            additionalProperties: !1
+          },
+          annotations: { readOnlyHint: !1, destructiveHint: !1, idempotentHint: !1, openWorldHint: !0 }
+        }
+      ];
+    }
+    function historyArgsWithDefaultChannel(args, config) {
+      if (!args || typeof args != "object" || Array.isArray(args) || Object.hasOwn(args, "channelId")) return args;
+      let inbound;
+      try {
+        inbound = readLastInboundContext(config);
+      } catch {
+        throw new Error("history_target_not_allowed");
+      }
+      let channelId = typeof inbound?.channelId == "string" ? inbound.channelId.trim() : "";
+      if (!channelId) throw new Error("history_target_not_allowed");
+      return { ...args, channelId };
+    }
+    function makeContext(config, discordState, delivery = null) {
+      return {
+        config,
+        discordState,
+        delivery,
+        claim() {
+          return claimOwner2(config.paths.ownerPath, createOwner2(config));
+        }
+      };
+    }
+    async function callTool(context, name, args = {}) {
+      if (name === "discord_channel_status") {
+        let owner = readOwner(context.config.paths.ownerPath), deliveryQueue = readDeliveryQueueStatus2(context.config), gatewayHealth = readGatewayHealthStatus(context.config), deliveryDisabled = context.config.deliveryMode === "off", structured = {
+          configured: gatewayHealth.gatewaySharedAppServerConfigured,
+          available: gatewayHealth.gatewaySharedAppServerAvailable,
+          reason: gatewayHealth.gatewaySharedAppServerReason || gatewayHealth.gatewayHealthReason
+        }, payload = {
+          instance: context.config.paths.instance,
+          stateDir: context.config.paths.stateDir,
+          accessPath: context.config.paths.accessPath,
+          ownerPath: context.config.paths.ownerPath,
+          envLoaded: context.config.envLoaded,
+          tokenConfigured: context.config.tokenConfigured,
+          proxyConfigured: !!context.config.proxyUrl,
+          insecureTls: context.config.insecureTls,
+          loginDisabled: context.config.loginDisabled,
+          deliveryMode: context.config.deliveryMode,
+          ignoredDeliveryMode: context.config.ignoredDeliveryMode,
+          runtimeStatusSource: "gateway_health",
+          deliverySafety: deliveryDisabled ? "persistence_disabled" : "structured_only",
+          structuredDeliveryState: deliveryDisabled ? "disabled" : structured.available ? "available" : "unavailable",
+          sharedAppServerConfigured: !!structured.configured,
+          sharedAppServerAvailable: !!structured.available,
+          sharedAppServerReason: structured.reason || null,
+          gatewayPidPath: context.config.paths.gatewayPidPath,
+          replyReceiptDir: context.config.paths.replyReceiptDir,
+          ownerIsReceiveGate: !1,
+          ...deliveryQueue,
+          ...gatewayHealth,
+          discordStarted: gatewayHealth.gatewayDiscordStarted,
+          discordReason: gatewayHealth.gatewayDiscordReason,
+          mcpDiscordClientStarted: context.discordState.started,
+          mcpDiscordClientReason: context.discordState.reason || null,
+          currentOwner: owner,
+          thisOwnerId: context.config.ownerId
+        };
+        return textResult(JSON.stringify(payload, null, 2), payload);
+      }
+      if (name === "discord_channel_read_owner") {
+        let owner = readOwner(context.config.paths.ownerPath);
+        return textResult(JSON.stringify(owner, null, 2), { owner });
+      }
+      if (name === "discord_channel_claim_owner") {
+        let owner = context.claim();
+        return textResult(`Claimed Discord channel owner for instance ${owner.instance}.`, { owner });
+      }
+      if (name === "discord_channel_send") {
+        let sent = await sendDiscordReplyOnce2({
+          args,
+          config: context.config,
+          content: args.content,
+          preflight: (target, identity) => prepareDiscordMessageSend2(
+            context.discordState.client,
+            { ...args, ...target, ...identity }
+          ),
+          sender: (target, prepared, identity) => sendDiscordMessage2(
+            context.discordState.client,
+            { ...args, ...target, ...identity },
+            prepared
+          ),
+          confirmer: (target, prepared, sent2, receipt) => confirmDiscordMessage2(
+            context.discordState.client,
+            { ...args, ...target, nonce: receipt.nonce, enforceNonce: !0 },
+            prepared,
+            sent2
+          ),
+          reconciler: (target, prepared, receipt) => reconcileDiscordMessage2(
+            context.discordState.client,
+            { ...args, ...target, nonce: receipt.nonce, enforceNonce: !0 },
+            prepared,
+            receipt
+          )
+        }), message = sent.duplicateSuppressed ? `Suppressed duplicate Discord reply for source message ${sent.sourceMessageId}.` : `Sent Discord message ${sent.messageId}.`;
+        return textResult(message, sent);
+      }
+      if (name === "discord_channel_read_history") {
+        let history = await readDiscordHistory({
+          args: historyArgsWithDefaultChannel(args, context.config),
+          config: context.config,
+          client: context.discordState.client,
+          fitsOutput: historyToolResultFits
+        });
+        return historyToolResult(history);
+      }
+      throw new Error(`Unknown tool: ${name}`);
+    }
+    async function handleRequest(context, message) {
+      let { id, method, params } = message;
+      if (method === "initialize") {
+        sendResult(id, {
+          protocolVersion: params?.protocolVersion || "2025-11-25",
+          capabilities: { tools: {} },
+          serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+          instructions: "Use this plugin to inspect the persistent Discord inbound queue and send replies. Inbound delivery uses only a shared app-server; unavailable structured delivery remains queued and never falls back to terminal input."
+        });
+        return;
+      }
+      if (method === "ping") {
+        sendResult(id, {});
+        return;
+      }
+      if (method === "tools/list") {
+        sendResult(id, { tools: toolList() });
+        return;
+      }
+      if (method === "tools/call") {
+        try {
+          let args = params != null && Object.hasOwn(params, "arguments") ? params.arguments : {}, result = await callTool(context, params?.name, args);
+          sendResult(id, result);
+        } catch (error) {
+          sendError(id, -32602, error instanceof Error ? error.message : String(error));
+        }
+        return;
+      }
+      id !== void 0 && sendError(id, -32601, `Method not found: ${method}`);
+    }
+    async function main2() {
+      let logger = makeLogger2(), config = loadConfig2();
+      claimOwner2(config.paths.ownerPath, createOwner2(config));
+      let delivery = createDelivery2(config, logger), discordState = await startDiscordClient2({ config, delivery, logger }).catch((error) => (logger("ERROR", "Discord startup failed", { error: error instanceof Error ? error.message : String(error) }), { started: !1, client: null, reason: "startup_failed" })), context = makeContext(config, discordState, delivery);
+      readline.createInterface({ input: process.stdin, crlfDelay: 1 / 0 }).on("line", (line) => {
+        if (line.trim() === "") return;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          return;
+        }
+        handleRequest(context, message);
+      });
+    }
+    module2.exports = {
+      SERVER_VERSION,
+      callTool,
+      handleRequest,
+      main: main2,
+      toolList
+    };
+    require.main === module2 && main2().catch((error) => {
+      process.stderr.write(`${error instanceof Error ? error.stack : String(error)}
+`), process.exit(1);
+    });
+  }
+});
+
+// bin/codex-discord-channel
+var { loadConfig } = require_config(), {
+  configureNetwork,
   confirmDiscordMessage,
   prepareDiscordMessageSend,
   reconcileDiscordMessage,
+  releaseDiscordReceiverOwnership,
   sendDiscordMessage,
   startDiscordClient
-} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.2", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+} = require_discord_client(), { createDiscordRestClient } = require_discord_rest_client(), { createDelivery, readDeliveryQueueStatus } = require_delivery(), { writeGatewayHealth } = require_gateway_health(), { sendDiscordReplyOnce } = require_reply_delivery(), { isCurrentReceiverOwnership } = require_receiver_state(), { startGatewayDrainLoop } = require_gateway_drain_loop(), { claimOwner, createOwner } = require_owner_state(), { instanceDoctor, runAppServer } = require_app_server_runtime(), { runTui } = require_instance_launcher();
+function usage() {
+  process.stderr.write([
+    "Usage:",
+    "  codex-discord-channel              # run MCP server",
+    "  codex-discord-channel gateway [--instance ID --state-dir PATH]",
+    "  codex-discord-channel app-server [--instance ID --state-dir PATH]",
+    "  codex-discord-channel instance-doctor [--instance ID --state-dir PATH]",
+    "  codex-discord-channel tui-check [--instance ID --state-dir PATH]",
+    "  codex-discord-channel live-check [--instance ID --state-dir PATH] --pid PID --pid PID",
+    "  codex-discord-channel tui [--instance ID --state-dir PATH] [-- CODEX_ARGS...]",
+    "  codex-discord-channel tui-recovery-target ACTION [ACTION_ARGS...] [--instance ID --state-dir PATH]",
+    "  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID] [--followup]",
+    "",
+    "The send command reads message text from stdin. A guarded reply requires exact --channel and --reply-to values."
+  ].join(`
+`)), process.stderr.write(`
+`);
+}
+function parseTuiArgs(argv) {
+  let separator = argv.indexOf("--"), runtimeArgs = separator === -1 ? argv : argv.slice(0, separator);
+  return { codexArgs: separator === -1 ? [] : argv.slice(separator + 1), runtimeArgs };
+}
+function parseLiveCheckArgs(argv) {
+  let runtimeArgs = [], pids = [];
+  for (let index = 0; index < argv.length; index += 1)
+    if (argv[index] === "--pid") {
+      let pid = Number(argv[index + 1]);
+      if (!Number.isSafeInteger(pid)) throw new Error("--pid requires an integer");
+      pids.push(pid), index += 1;
+    } else
+      runtimeArgs.push(argv[index]);
+  if (pids.length !== 2) throw new Error("live-check requires exactly two --pid values");
+  return { pids, runtimeArgs };
+}
+function parseRuntimeArgs(argv) {
+  let env = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    let arg = argv[index];
+    if (arg === "--instance") {
+      let value = argv[index + 1];
+      if (!value) throw new Error("--instance requires a value");
+      env.DISCORD_INSTANCE = value, index += 1;
+    } else if (arg === "--state-dir") {
+      let value = argv[index + 1];
+      if (!value) throw new Error("--state-dir requires a value");
+      env.DISCORD_CONFIG_DIR = value, index += 1;
+    } else
+      throw new Error(`Unknown runtime argument: ${arg}`);
+  }
+  return env;
+}
+function loadRuntimeConfig(argv, options = {}) {
+  return loadConfig({ ...process.env, ...parseRuntimeArgs(argv) }, options);
+}
+function parseSendArgs(argv) {
+  let args = { channelId: "", replyTo: "", followup: !1 };
+  for (let index = 0; index < argv.length; index += 1) {
+    let arg = argv[index];
+    if (arg === "--channel")
+      args.channelId = argv[index + 1] || "", index += 1;
+    else if (arg === "--reply-to")
+      args.replyTo = argv[index + 1] || "", index += 1;
+    else if (arg === "--followup")
+      args.followup = !0;
+    else if (arg === "-h" || arg === "--help")
+      args.help = !0;
+    else
+      throw new Error(`Unknown argument: ${arg}`);
+  }
+  return args;
+}
+function readStdin() {
+  return new Promise((resolve, reject) => {
+    let text = "";
+    process.stdin.setEncoding("utf8"), process.stdin.on("data", (chunk) => {
+      text += chunk;
+    }), process.stdin.on("error", reject), process.stdin.on("end", () => resolve(text));
+  });
+}
+async function sendViaRest(args, deps = {}) {
+  let content = (await (deps.readStdin || readStdin)()).trim();
+  if (!content) throw new Error("stdin message content is required");
+  let config = deps.config || loadConfig();
+  if (!config.tokenConfigured)
+    throw new Error(`Discord token is not configured in ${config.paths.envFile}`);
+  (deps.configureNetwork || configureNetwork)(config, () => {
+  });
+  let client = (deps.createDiscordRestClient || createDiscordRestClient)({
+    token: config.token,
+    botUserId: config.botUserId,
+    fetchImpl: deps.fetchImpl || globalThis.fetch
+  }), sent = await sendDiscordReplyOnce({
+    args,
+    config,
+    content,
+    preflight: (target, identity) => prepareDiscordMessageSend(
+      client,
+      { ...args, ...target, ...identity, content }
+    ),
+    sender: (target, prepared, identity) => sendDiscordMessage(
+      client,
+      { ...args, ...target, ...identity, content },
+      prepared
+    ),
+    confirmer: (target, prepared, message, receipt) => confirmDiscordMessage(
+      client,
+      { ...args, ...target, nonce: receipt.nonce, enforceNonce: !0, content },
+      prepared,
+      message
+    ),
+    reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
+      client,
+      { ...args, ...target, nonce: receipt.nonce, enforceNonce: !0, content },
+      prepared,
+      receipt
+    )
+  });
+  return (deps.writeOutput || ((text) => process.stdout.write(text)))(`${JSON.stringify(sent)}
+`), sent;
+}
 function makeLogger() {
   return (level, message, meta) => {
     let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;
@@ -94959,274 +95767,172 @@ function makeLogger() {
 `);
   };
 }
-function send(message) {
-  process.stdout.write(`${JSON.stringify(message)}
-`);
+function enabled(value) {
+  return /^(1|true|yes|on)$/i.test(String(value || "").trim());
 }
-function sendResult(id, result) {
-  send({ jsonrpc: "2.0", id, result });
-}
-function sendError(id, code, message) {
-  send({ jsonrpc: "2.0", id, error: { code, message } });
-}
-function textResult(text, structuredContent = {}) {
-  return {
-    content: [{ type: "text", text }],
-    structuredContent
-  };
-}
-function historyToolResult(history) {
-  return textResult(JSON.stringify(history), {
-    channel: {
-      id: history.channelId,
-      name: history.channelName
-    },
-    source: history.source,
-    page: {
-      hasMore: history.hasMore,
-      nextBefore: history.nextBefore
-    },
-    messageCount: history.messages.length
-  });
-}
-function historyToolResultFits(history) {
-  return Buffer.byteLength(JSON.stringify(historyToolResult(history)), "utf8") <= MAX_TOOL_RESULT_BYTES;
-}
-function toolList() {
-  return [
-    {
-      name: "discord_channel_status",
-      title: "Discord Channel Status",
-      description: "Read the current Discord channel plugin status for this Codex session.",
-      inputSchema: { type: "object", properties: {} },
-      annotations: { readOnlyHint: !0, destructiveHint: !1, idempotentHint: !0, openWorldHint: !1 }
-    },
-    {
-      name: "discord_channel_read_owner",
-      title: "Read Discord Channel Owner",
-      description: "Read the active owner for this Discord bot instance.",
-      inputSchema: { type: "object", properties: {} },
-      annotations: { readOnlyHint: !0, destructiveHint: !1, idempotentHint: !0, openWorldHint: !1 }
-    },
-    {
-      name: "discord_channel_claim_owner",
-      title: "Claim Discord Channel Owner",
-      description: "Claim this process as the active owner for the selected Discord bot instance.",
-      inputSchema: { type: "object", properties: {} },
-      annotations: { readOnlyHint: !1, destructiveHint: !0, idempotentHint: !0, openWorldHint: !1 }
-    },
-    {
-      name: "discord_channel_read_history",
-      title: "Read Discord Channel History",
-      description: "Read bounded recent history from an authorized Discord channel.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          channelId: {
-            type: "string",
-            pattern: "^[1-9]\\d{16,19}$",
-            description: "Optional Discord channel id. Defaults to the last accepted inbound Discord message."
-          },
-          before: {
-            type: "string",
-            pattern: "^[1-9]\\d{16,19}$",
-            description: "Optional exclusive Discord message id cursor."
-          },
-          limit: { type: "integer", minimum: 1, maximum: 25, default: 20 }
-        },
-        additionalProperties: !1
-      },
-      annotations: { readOnlyHint: !0, destructiveHint: !1, idempotentHint: !0, openWorldHint: !0 }
-    },
-    {
-      name: "discord_channel_send",
-      title: "Send Discord Message",
-      description: "Send a Discord message through the session-owned bot.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          channelId: { type: "string", description: "Exact Discord channel id. Required for replies and followups." },
-          content: { type: "string", description: "Message text to send." },
-          replyTo: { type: "string", description: "Exact source Discord message id. Required unless followup is true." },
-          followup: {
-            type: "boolean",
-            default: !1,
-            description: "Explicitly allow an additional message after this source Discord message was already answered."
-          }
-        },
-        required: ["channelId", "content"],
-        anyOf: [
-          { required: ["replyTo"] },
-          {
-            required: ["followup"],
-            properties: { followup: { const: !0 } }
-          }
-        ],
-        additionalProperties: !1
-      },
-      annotations: { readOnlyHint: !1, destructiveHint: !1, idempotentHint: !1, openWorldHint: !0 }
-    }
-  ];
-}
-function historyArgsWithDefaultChannel(args, config) {
-  if (!args || typeof args != "object" || Array.isArray(args) || Object.hasOwn(args, "channelId")) return args;
-  let inbound;
+async function runGateway(config = loadConfig()) {
+  let logger = makeLogger(), delivery = createDelivery(config, logger), discordState;
   try {
-    inbound = readLastInboundContext(config);
-  } catch {
-    throw new Error("history_target_not_allowed");
+    discordState = await startDiscordClient({ config, delivery, logger, claimReceiver: !0 });
+  } catch (error) {
+    throw delivery.destroy(), error;
   }
-  let channelId = typeof inbound?.channelId == "string" ? inbound.channelId.trim() : "";
-  if (!channelId) throw new Error("history_target_not_allowed");
-  return { ...args, channelId };
-}
-function makeContext(config, discordState, delivery = null) {
-  return {
+  if (!discordState.started)
+    throw delivery.destroy(), new Error(`Discord gateway did not start: ${discordState.reason || "unknown"}`);
+  let writeCurrentHealth = (lastDrain, overrides = {}) => isCurrentReceiverOwnership(config, discordState.receiverOwnership)?.active ? writeGatewayHealth(config, {
+    receiverOwnership: discordState.receiverOwnership,
+    discordStarted: overrides.discordStarted ?? !0,
+    discordReason: overrides.discordReason ?? null,
+    structured: delivery.status(),
+    queue: readDeliveryQueueStatus(config),
+    lastDrain: {
+      ...lastDrain,
+      at: lastDrain?.at || (/* @__PURE__ */ new Date()).toISOString()
+    }
+  }) : null, reportHealth = (lastDrain, overrides = {}) => delivery.coordinateReceiverOwnership(
+    () => writeCurrentHealth(lastDrain, overrides)
+  );
+  await reportHealth({ status: "idle", reason: "gateway_connected", deliveredCount: 0 });
+  let drainLoop = startGatewayDrainLoop({
     config,
-    discordState,
     delivery,
-    claim() {
-      return claimOwner(config.paths.ownerPath, createOwner(config));
+    receiverOwnership: discordState.receiverOwnership,
+    logger,
+    reportHealth
+  });
+  if (enabled(config.env.CODEX_DISCORD_GATEWAY_CLAIM_OWNER))
+    try {
+      claimOwner(config.paths.ownerPath, createOwner(config));
+    } catch (error) {
+      logger("ERROR", "Failed to update optional Discord owner metadata", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  let keepAlive = setInterval(() => {
+  }, 2 ** 30), stopping = !1, stop = async () => {
+    if (!stopping) {
+      stopping = !0, clearInterval(keepAlive), typeof delivery.deactivateReceiver == "function" && delivery.deactivateReceiver();
+      try {
+        discordState.client?.destroy && await discordState.client.destroy();
+      } catch {
+      }
+      await drainLoop.stop();
+      try {
+        await delivery.coordinateReceiverOwnership(() => (writeCurrentHealth(
+          { status: "stopped", reason: "gateway_stopped", deliveredCount: 0 },
+          { discordStarted: !1, discordReason: "gateway_stopped" }
+        ), releaseDiscordReceiverOwnership(config, discordState.receiverOwnership)));
+      } catch {
+      }
+      typeof delivery.destroy == "function" && delivery.destroy(), process.exit(0);
     }
   };
-}
-async function callTool(context, name, args = {}) {
-  if (name === "discord_channel_status") {
-    let owner = readOwner(context.config.paths.ownerPath), deliveryQueue = readDeliveryQueueStatus(context.config), gatewayHealth = readGatewayHealthStatus(context.config), deliveryDisabled = context.config.deliveryMode === "off", structured = {
-      configured: gatewayHealth.gatewaySharedAppServerConfigured,
-      available: gatewayHealth.gatewaySharedAppServerAvailable,
-      reason: gatewayHealth.gatewaySharedAppServerReason || gatewayHealth.gatewayHealthReason
-    }, payload = {
-      instance: context.config.paths.instance,
-      stateDir: context.config.paths.stateDir,
-      accessPath: context.config.paths.accessPath,
-      ownerPath: context.config.paths.ownerPath,
-      envLoaded: context.config.envLoaded,
-      tokenConfigured: context.config.tokenConfigured,
-      proxyConfigured: !!context.config.proxyUrl,
-      insecureTls: context.config.insecureTls,
-      loginDisabled: context.config.loginDisabled,
-      deliveryMode: context.config.deliveryMode,
-      ignoredDeliveryMode: context.config.ignoredDeliveryMode,
-      runtimeStatusSource: "gateway_health",
-      deliverySafety: deliveryDisabled ? "persistence_disabled" : "structured_only",
-      structuredDeliveryState: deliveryDisabled ? "disabled" : structured.available ? "available" : "unavailable",
-      sharedAppServerConfigured: !!structured.configured,
-      sharedAppServerAvailable: !!structured.available,
-      sharedAppServerReason: structured.reason || null,
-      gatewayPidPath: context.config.paths.gatewayPidPath,
-      replyReceiptDir: context.config.paths.replyReceiptDir,
-      ownerIsReceiveGate: !1,
-      ...deliveryQueue,
-      ...gatewayHealth,
-      discordStarted: gatewayHealth.gatewayDiscordStarted,
-      discordReason: gatewayHealth.gatewayDiscordReason,
-      mcpDiscordClientStarted: context.discordState.started,
-      mcpDiscordClientReason: context.discordState.reason || null,
-      currentOwner: owner,
-      thisOwnerId: context.config.ownerId
-    };
-    return textResult(JSON.stringify(payload, null, 2), payload);
-  }
-  if (name === "discord_channel_read_owner") {
-    let owner = readOwner(context.config.paths.ownerPath);
-    return textResult(JSON.stringify(owner, null, 2), { owner });
-  }
-  if (name === "discord_channel_claim_owner") {
-    let owner = context.claim();
-    return textResult(`Claimed Discord channel owner for instance ${owner.instance}.`, { owner });
-  }
-  if (name === "discord_channel_send") {
-    let sent = await sendDiscordReplyOnce({
-      args,
-      config: context.config,
-      content: args.content,
-      preflight: (target, identity) => prepareDiscordMessageSend(
-        context.discordState.client,
-        { ...args, ...target, ...identity }
-      ),
-      sender: (target, prepared, identity) => sendDiscordMessage(
-        context.discordState.client,
-        { ...args, ...target, ...identity },
-        prepared
-      ),
-      confirmer: (target, prepared, sent2, receipt) => confirmDiscordMessage(
-        context.discordState.client,
-        { ...args, ...target, nonce: receipt.nonce, enforceNonce: !0 },
-        prepared,
-        sent2
-      ),
-      reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
-        context.discordState.client,
-        { ...args, ...target, nonce: receipt.nonce, enforceNonce: !0 },
-        prepared,
-        receipt
-      )
-    }), message = sent.duplicateSuppressed ? `Suppressed duplicate Discord reply for source message ${sent.sourceMessageId}.` : `Sent Discord message ${sent.messageId}.`;
-    return textResult(message, sent);
-  }
-  if (name === "discord_channel_read_history") {
-    let history = await readDiscordHistory({
-      args: historyArgsWithDefaultChannel(args, context.config),
-      config: context.config,
-      client: context.discordState.client,
-      fitsOutput: historyToolResultFits
-    });
-    return historyToolResult(history);
-  }
-  throw new Error(`Unknown tool: ${name}`);
-}
-async function handleRequest(context, message) {
-  let { id, method, params } = message;
-  if (method === "initialize") {
-    sendResult(id, {
-      protocolVersion: params?.protocolVersion || "2025-11-25",
-      capabilities: { tools: {} },
-      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-      instructions: "Use this plugin to inspect the persistent Discord inbound queue and send replies. Inbound delivery uses only a shared app-server; unavailable structured delivery remains queued and never falls back to terminal input."
-    });
-    return;
-  }
-  if (method === "ping") {
-    sendResult(id, {});
-    return;
-  }
-  if (method === "tools/list") {
-    sendResult(id, { tools: toolList() });
-    return;
-  }
-  if (method === "tools/call") {
-    try {
-      let args = params != null && Object.hasOwn(params, "arguments") ? params.arguments : {}, result = await callTool(context, params?.name, args);
-      sendResult(id, result);
-    } catch (error) {
-      sendError(id, -32602, error instanceof Error ? error.message : String(error));
-    }
-    return;
-  }
-  id !== void 0 && sendError(id, -32601, `Method not found: ${method}`);
+  process.once("SIGTERM", () => {
+    stop();
+  }), process.once("SIGINT", () => {
+    stop();
+  });
 }
 async function main() {
-  let logger = makeLogger(), config = loadConfig();
-  claimOwner(config.paths.ownerPath, createOwner(config));
-  let delivery = createDelivery(config, logger), discordState = await startDiscordClient({ config, delivery, logger }).catch((error) => (logger("ERROR", "Discord startup failed", { error: error instanceof Error ? error.message : String(error) }), { started: !1, client: null, reason: "startup_failed" })), context = makeContext(config, discordState, delivery);
-  readline.createInterface({ input: process.stdin, crlfDelay: 1 / 0 }).on("line", (line) => {
-    if (line.trim() === "") return;
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
+  let [command, ...rest] = process.argv.slice(2);
+  if (!command) {
+    await require_mcp_server().main();
+    return;
+  }
+  if (command === "send") {
+    let args = parseSendArgs(rest);
+    if (args.help) {
+      usage();
       return;
     }
-    handleRequest(context, message);
-  });
+    await sendViaRest(args);
+    return;
+  }
+  if (command === "gateway") {
+    await runGateway(loadRuntimeConfig(rest));
+    return;
+  }
+  if (command === "app-server") {
+    let code = await runAppServer(loadRuntimeConfig(rest, { loadDiscordEnv: !1 }));
+    code !== 0 && (process.exitCode = code);
+    return;
+  }
+  if (command === "instance-doctor") {
+    process.stdout.write(`${JSON.stringify(instanceDoctor(loadRuntimeConfig(rest)), null, 2)}
+`);
+    return;
+  }
+  if (command === "tui-check") {
+    require_instance_launcher().requireInstanceReady(loadRuntimeConfig(rest));
+    return;
+  }
+  if (command === "tui-login-state") {
+    try {
+      require_instance_launcher().requireInstanceReady(loadRuntimeConfig(rest));
+    } catch (error) {
+      if (error?.code !== "openai_account_login_missing") throw error;
+      process.exitCode = 10;
+    }
+    return;
+  }
+  if (command === "live-check") {
+    let args = parseLiveCheckArgs(rest), config = loadRuntimeConfig(args.runtimeArgs), { verifyLiveProcess } = require_instance_launcher();
+    for (let pid of args.pids) verifyLiveProcess(config, pid);
+    return;
+  }
+  if (command === "tui") {
+    let args = parseTuiArgs(rest);
+    runTui(loadRuntimeConfig(args.runtimeArgs), args.codexArgs);
+    return;
+  }
+  if (command === "tui-recovery-target") {
+    let [action, ...tail] = rest;
+    if (!["begin", "snapshot", "read", "clear", "clear-owned"].includes(action))
+      throw new Error("tui-recovery-target action must be begin, snapshot, read, clear, or clear-owned");
+    let actionArgs = [];
+    action === "begin" && (actionArgs = tail.splice(0, 4)), action === "snapshot" && (actionArgs = tail.splice(0, 2)), action === "clear-owned" && (actionArgs = tail.splice(0, 1));
+    let config = loadRuntimeConfig(tail), target = require_tui_recovery_target();
+    if (action === "begin") {
+      let [pidText, startTicks, leaseId, startedAtText] = actionArgs, supervisorPid = Number(pidText), startedAtMs = Number(startedAtText);
+      if (!/^\d+$/.test(pidText || "") || !Number.isSafeInteger(supervisorPid) || !/^\d+$/.test(startTicks || "") || !leaseId || !/^\d+$/.test(startedAtText || "") || !Number.isSafeInteger(startedAtMs))
+        throw new Error("tui-recovery-target begin requires PID START_TICKS LEASE_ID STARTED_AT_MS");
+      target.beginTuiLease(config, {
+        leaseId,
+        supervisorPid,
+        supervisorStartTicks: startTicks,
+        startedAtMs
+      });
+    } else if (action === "snapshot") {
+      let [mtimeText, leaseId] = actionArgs, minimumMtimeMs = Number(mtimeText);
+      if (!/^\d+$/.test(mtimeText || "") || !Number.isSafeInteger(minimumMtimeMs) || !leaseId)
+        throw new Error("tui-recovery-target snapshot requires MIN_MTIME_MS LEASE_ID");
+      target.captureRecoveryTarget(config, minimumMtimeMs, { leaseId }) || (process.exitCode = 10);
+    } else if (action === "read") {
+      let threadId = target.readRecoveryThread(config);
+      threadId ? process.stdout.write(`${threadId}
+`) : process.exitCode = 10;
+    } else if (action === "clear-owned") {
+      let [leaseId] = actionArgs;
+      if (!leaseId) throw new Error("tui-recovery-target clear-owned requires LEASE_ID");
+      target.clearRecoveryTarget(config, { leaseId });
+    } else
+      target.clearRecoveryTarget(config);
+    return;
+  }
+  if (command === "-h" || command === "--help") {
+    usage();
+    return;
+  }
+  throw new Error(`Unknown command: ${command}`);
 }
 module.exports = {
-  SERVER_VERSION,
-  callTool,
-  handleRequest,
   main,
-  toolList
+  parseLiveCheckArgs,
+  parseRuntimeArgs,
+  parseSendArgs,
+  parseTuiArgs,
+  readStdin,
+  sendViaRest
 };
 require.main === module && main().catch((error) => {
   process.stderr.write(`${error instanceof Error ? error.stack : String(error)}

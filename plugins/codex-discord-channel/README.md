@@ -2,16 +2,16 @@
 
 This directory is the plugin payload for `codex-discord-channel`.
 
-For installation, instance configuration, shared app-server startup, systemd
-operation, access-policy examples, and the troubleshooting matrix, start with
+For installation, instance configuration, alias-owned worker startup,
+access-policy examples, and the troubleshooting matrix, start with
 the repository [README](../../README.md).
 
 Multi-account deployments use one `account.env` per Discord instance. The
 repository README documents the independent `CODEX_HOME` and
-`DISCORD_CONFIG_DIR` boundaries, the fail-closed `app-server` command, and the
-bundled systemd templates. The interactive `codex-discord-instance` launcher
+`DISCORD_CONFIG_DIR` boundaries and the fail-closed worker commands. The
+interactive `codex-discord-instance` launcher
 can bootstrap a missing isolated OpenAI login only when attached to a TTY;
-gateway and systemd paths never prompt and remain fail-closed.
+noninteractive worker paths never prompt and remain fail-closed.
 
 The generic `CODEX_APP_SERVER_URL` is ignored for instance routing. Only the
 plugin-specific endpoint or the socket under that instance state directory may

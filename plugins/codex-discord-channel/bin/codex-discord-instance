@@ -43,7 +43,9 @@ read_account_value() {
 node_bin=$(read_account_value NODE_BIN)
 codex_bin=$(read_account_value CODEX_BIN)
 codex_home=$(read_account_value CODEX_HOME)
-channel_bin=$(read_account_value CODEX_DISCORD_CHANNEL_BIN)
+launcher_path=$(readlink -f "${BASH_SOURCE[0]}")
+plugin_root=$(dirname "$(dirname "$launcher_path")")
+channel_bin="$plugin_root/runtime/channel.cjs"
 if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin ]]; then
   echo "Instance executable paths are unavailable for $instance" >&2
   exit 1
@@ -79,11 +81,8 @@ elif ((login_state != 0)); then
   exit "$login_state"
 fi
 
-app_service="codex-discord-app-server@$instance.service"
-gateway_service="codex-discord-channel@$instance.service"
-systemctl --user enable --now "$app_service" "$gateway_service" >/dev/null
-
 socket="$state_dir/app-server.sock"
+lock_file="$state_dir/instance-launcher.lock"
 timeout_seconds=${CODEX_DISCORD_START_TIMEOUT_SECONDS:-15}
 if [[ ! $timeout_seconds =~ ^[0-9]+$ ]]; then
   echo "CODEX_DISCORD_START_TIMEOUT_SECONDS must be a non-negative integer" >&2
@@ -122,6 +121,12 @@ read_recovery_target() {
 
 watcher_pid=''
 watcher_stop=''
+app_pid=''
+gateway_pid=''
+tui_pid=''
+socket_owned=0
+launcher_lock_owned=0
+socket_absence_proven=0
 launcher_pid=$$
 launcher_start_ticks=$(awk '{print $22}' "/proc/$launcher_pid/stat")
 current_lease_id=''
@@ -138,25 +143,100 @@ stop_watcher() {
   watcher_pid=''
   watcher_stop=''
 }
+stop_worker() {
+  local pid=$1
+  [[ -n $pid ]] || return 0
+  if worker_running "$pid"; then
+    kill -TERM "$pid" 2>/dev/null || true
+    local stop_deadline=$((SECONDS + 5))
+    while worker_running "$pid" && ((SECONDS < stop_deadline)); do
+      sleep 0.05
+    done
+    if worker_running "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+worker_running() {
+  local pid=$1
+  local state
+  kill -0 "$pid" 2>/dev/null || return 1
+  state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)
+  [[ $state != Z && -n $state ]]
+}
 cleanup_launcher() {
   local status=$?
+  local may_remove_socket=0
   trap - EXIT
   stop_watcher
   if [[ -n $current_lease_id ]]; then
     "$node_bin" "$channel_bin" tui-recovery-target clear-owned "$current_lease_id" \
       "${runtime_args[@]}" >/dev/null 2>&1 || true
   fi
+  stop_worker "$tui_pid"
+  stop_worker "$gateway_pid"
+  if ((launcher_lock_owned == 1 && socket_absence_proven == 1)) && [[ -n $app_pid ]]; then
+    may_remove_socket=1
+  fi
+  stop_worker "$app_pid"
+  if ((socket_owned == 1 || may_remove_socket == 1)); then
+    rm -f "$socket"
+  fi
   exit "$status"
 }
 trap cleanup_launcher EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+exec {launcher_lock_fd}>"$lock_file"
+if ! flock -n "$launcher_lock_fd"; then
+  echo "Discord instance $instance already has an active launcher" >&2
+  exit 73
+fi
+launcher_lock_owned=1
+if [[ -e $socket ]]; then
+  echo "Discord instance $instance already has an app-server socket; stop the legacy service before relaunching" >&2
+  exit 73
+fi
+socket_absence_proven=1
+
+worker_env=(
+  env
+  "${child_env_unsets[@]}"
+  -u CODEX_THREAD_ID
+  -u CODEX_SESSION_ID
+  -u CODEX_TARGET_THREAD_ID
+  -u CODEX_APP_SERVER_SOCKET
+  CODEX_HOME="$codex_home"
+  DISCORD_INSTANCE="$instance"
+  DISCORD_CONFIG_DIR="$state_dir"
+)
+umask 077
+"${worker_env[@]}" "$node_bin" "$channel_bin" app-server "${runtime_args[@]}" \
+  >>"$state_dir/app-server.log" 2>&1 &
+app_pid=$!
+"${worker_env[@]}" "$node_bin" "$channel_bin" gateway "${runtime_args[@]}" \
+  >>"$state_dir/session-gateway.log" 2>&1 &
+gateway_pid=$!
 
 deadline=$((SECONDS + timeout_seconds))
 while ((SECONDS <= deadline)); do
-  if systemctl --user is-active --quiet "$app_service" \
-    && systemctl --user is-active --quiet "$gateway_service" \
-    && [[ -S $socket ]]; then
-    app_pid=$(systemctl --user show --property MainPID --value "$app_service")
-    gateway_pid=$(systemctl --user show --property MainPID --value "$gateway_service")
+  # The socket was proven absent after this launcher acquired the instance lock.
+  # Any socket observed after its app-server child starts belongs to this launch,
+  # even if the sibling gateway fails before the full live-check can complete.
+  if [[ -S $socket ]]; then
+    socket_owned=1
+  fi
+  if ! worker_running "$app_pid"; then
+    echo "Discord app-server for $instance exited during startup; see $state_dir/app-server.log" >&2
+    exit 1
+  fi
+  if ! worker_running "$gateway_pid"; then
+    echo "Discord gateway for $instance exited during startup; see $state_dir/session-gateway.log" >&2
+    exit 1
+  fi
+  if [[ -S $socket ]]; then
     "$node_bin" "$channel_bin" live-check "${runtime_args[@]}" \
       --pid "$app_pid" --pid "$gateway_pid" >/dev/null
     codex_args=("$@")
@@ -186,9 +266,28 @@ while ((SECONDS <= deadline)); do
         CODEX_HOME="$codex_home" \
         DISCORD_INSTANCE="$instance" \
         DISCORD_CONFIG_DIR="$state_dir" \
-        "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}"
-      tui_status=$?
+        "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}" \
+        <&0 >&1 2>&2 &
+      tui_pid=$!
+      completed_pid=''
+      wait -n -p completed_pid "$tui_pid" "$app_pid" "$gateway_pid"
+      child_status=$?
       set -e
+      if [[ $completed_pid != "$tui_pid" ]]; then
+        failed_worker=app-server
+        if [[ $completed_pid == "$gateway_pid" ]]; then
+          failed_worker=gateway
+          gateway_pid=''
+        elif [[ $completed_pid == "$app_pid" ]]; then
+          app_pid=''
+        fi
+        stop_worker "$tui_pid"
+        tui_pid=''
+        echo "Discord $failed_worker for $instance exited while the TUI was active" >&2
+        exit 75
+      fi
+      tui_status=$child_status
+      tui_pid=''
       stop_watcher
       snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
 

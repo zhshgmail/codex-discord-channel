@@ -67,6 +67,49 @@ function requestMcp(command, args, options, requests) {
   });
 }
 
+test('marketplace cache starts the worker CLI without node_modules', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-worker-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const installedRoot = path.join(root, 'installed-plugin');
+  const stateDir = path.join(root, 'discord', 'codex01');
+  const codexHome = path.join(root, 'codex-home');
+  fs.cpSync(pluginRoot, installedRoot, {
+    recursive: true,
+    filter(source) {
+      return !['node_modules', '.env'].includes(path.basename(source));
+    },
+  });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'account.env'), [
+    `CODEX_HOME=${codexHome}`,
+    `CODEX_BIN=${path.join(root, 'unused-codex.js')}`,
+    `NODE_BIN=${process.execPath}`,
+    '',
+  ].join('\n'));
+
+  assert.deepEqual(findNamed(installedRoot, 'node_modules'), []);
+  const worker = path.join(installedRoot, 'runtime', 'channel.cjs');
+  assert.equal(fs.existsSync(worker), true, 'runtime/channel.cjs must be committed');
+  const result = spawnSync(process.execPath, [worker, '--help'], {
+    cwd: installedRoot,
+    encoding: 'utf8',
+    env: {
+      HOME: root,
+      CODEX_HOME: codexHome,
+      DISCORD_INSTANCE: 'codex01',
+      DISCORD_CONFIG_DIR: stateDir,
+      NODE_PATH: '',
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /Cannot find module/);
+  const imports = [...fs.readFileSync(worker, 'utf8')
+    .matchAll(/(?:require|__require)\(["']([^"']+)["']\)/g)]
+    .map((match) => match[1]);
+  assert.deepEqual(imports.filter((specifier) => !specifier.startsWith('node:')), []);
+});
+
 test('stale runtime check fails clearly within a bounded Node heap', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-runtime-check-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -168,7 +211,7 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
     requests,
   );
 
-  assert.equal(initialized.result.serverInfo.version, '0.3.1');
+  assert.equal(initialized.result.serverInfo.version, '0.3.2');
   assert.ok(tools.result.tools.some((tool) => tool.name === 'discord_channel_status'));
   assert.equal(status.result.structuredContent.stateDir, stateDir);
   assert.equal(status.result.structuredContent.discordReason, 'gateway_health_missing');

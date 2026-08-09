@@ -201,11 +201,10 @@ last drain result. MCP status reads that record and verifies it against
 cannot impersonate receiver health. Missing, malformed, superseded, or dead
 gateway health is explicit.
 
-The app-server systemd unit uses `OOMPolicy=continue`. If an MCP or tool child
-is selected by the OOM killer, systemd leaves the surviving app-server process
-running instead of converting the child failure into a TUI transport failure.
-Normal service shutdown still uses the default control-group cleanup; stale
-tool processes are not preserved past their owning app-server.
+The instance launcher owns the app-server and gateway as children of one TUI
+generation. Exiting the TUI stops both workers. No user service or global
+supervisor survives the alias, so a later marketplace launch cannot retain old
+business logic in an external process.
 
 ## Live Acceptance
 

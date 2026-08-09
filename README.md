@@ -146,7 +146,7 @@ Prerequisites:
 - Node.js 22 or newer;
 - a Discord bot with Message Content intent enabled;
 - one private token file per instance; and
-- one shared Codex app-server used by both the gateway and visible TUI.
+- one isolated `CODEX_HOME` and Discord state directory per alias.
 
 ```bash
 codex plugin marketplace add zhshgmail/codex-discord-channel --ref main
@@ -156,10 +156,10 @@ codex plugin add codex-discord-channel@personal
 Use a new Codex thread after installation so the MCP server is loaded.
 
 Marketplace installation copies the plugin into the Codex cache but does not
-run `npm install` or package lifecycle hooks. The MCP entrypoint therefore uses
-the committed `runtime/mcp-server.cjs` bundle, which contains `discord.js`,
-`undici`, and `ws`. `npm ci` and `npm run build:runtime` are development steps
-for regenerating that bundle, not installation requirements.
+run `npm install` or package lifecycle hooks. Both the MCP entrypoint and the
+gateway/app-server worker therefore use committed self-contained bundles:
+`runtime/mcp-server.cjs` and `runtime/channel.cjs`. `npm ci` and
+`npm run build:runtime` are development steps, not installation requirements.
 
 For a review branch or pinned deployment, replace `main` with the exact branch,
 tag, or commit approved for that deployment. Do not assume an open MCP
@@ -191,7 +191,6 @@ For example:
 CODEX_HOME=/home/USER/.codex-account-01
 CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
 NODE_BIN=/absolute/path/to/node
-CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
 ```
 
 ```env
@@ -199,16 +198,17 @@ CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
 CODEX_HOME=/home/USER/.codex-account-02
 CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
 NODE_BIN=/absolute/path/to/node
-CODEX_DISCORD_CHANNEL_BIN=/absolute/path/to/codex-discord-channel
 ```
 
 Each instance still has its own `.env` containing a different
 `DISCORD_BOT_TOKEN` and `DISCORD_BOT_USER_ID`. The plugin loads `account.env`
 before `.env` and pins the selected Discord state directory before applying
 `CODEX_HOME`, so changing accounts cannot silently move the bot state.
-`account.env` is strict: only `CODEX_HOME`, `CODEX_BIN`, `NODE_BIN`, and
-`CODEX_DISCORD_CHANNEL_BIN` are accepted. Put proxy and CA variables in the
-optional instance-local `app-server-network.env`; unknown keys fail closed.
+`account.env` is strict: `CODEX_HOME`, `CODEX_BIN`, and `NODE_BIN` select the
+account runtime. The legacy `CODEX_DISCORD_CHANNEL_BIN` key is accepted for
+rollback compatibility but ignored by the current launcher. Put proxy and CA
+variables in the optional instance-local `app-server-network.env`; unknown keys
+fail closed.
 
 Bind MCP discovery to the same instance even when a launcher does not preserve
 Discord environment variables. Create `$CODEX_HOME/discord-instance.env`:
@@ -218,7 +218,7 @@ DISCORD_INSTANCE=codex02
 DISCORD_CONFIG_DIR=/home/USER/.codex/channels/discord/codex02
 ```
 
-This file accepts only those two keys. Explicit command-line service selection
+This file accepts only those two keys. Explicit command-line worker selection
 must agree with it, so a stale or edited environment file cannot redirect one
 instance onto another instance's bot state.
 
@@ -234,7 +234,7 @@ codex-discord-channel app-server
 Instance routing ignores the generic `CODEX_APP_SERVER_URL`; an inherited
 endpoint from another Codex process must not redirect this bot. Only
 `CODEX_DISCORD_APP_SERVER_URL` or the instance-local socket default selects the
-Discord delivery endpoint. The systemd templates explicitly clear both values
+Discord delivery endpoint. The instance launcher clears both inherited values
 before loading instance state.
 
 Inspect the non-secret effective identity before startup:
@@ -246,30 +246,30 @@ codex-discord-channel instance-doctor
 ```
 
 Use the instance launcher for the visible TUI. It validates the account login
-and bot configuration, enables and starts both systemd units, waits for the
-instance socket, and then supervises the matching Codex client:
+and bot configuration, takes a nonblocking instance lock, starts the app-server
+and gateway as its own children, waits for the instance socket, and then starts
+the matching Codex client:
 
 ```bash
 codex-discord-instance codex02
 ```
 
-The supervisor snapshots the one proven active top-level thread while the TUI
-is running. If the app-server process crashes and systemd replaces its Unix
-socket, the supervisor reconnects and resumes that exact thread. It does not
-recover an ordinary Codex command failure, an ambiguous target, a user exit,
-or more than five app-server replacements in one minute. Use the instance
-launcher for recovery; a direct `codex --remote ...` process has no supervising
-parent and exits when its WebSocket transport is reset.
+The launcher always resolves `runtime/channel.cjs` beside its own marketplace
+install, so a stale path in `account.env` cannot mix worker versions. Its child
+workers are stopped when that TUI exits; there is no user or system service and
+no box-wide singleton. Two aliases can run different installed versions because
+each launcher owns only its own account, state directory, lock, socket, and
+children. A crashed app-server ends the attached remote TUI; relaunch the alias
+to start one coherent generation.
 
 On the first interactive launch, if the Discord instance configuration is
 valid and only the isolated OpenAI account login is missing, the launcher runs
 the configured `NODE_BIN` and `CODEX_BIN` as `codex login` with that instance's
 `CODEX_HOME`. It retries readiness only after login exits successfully. This
 bootstrap requires both stdin and stdout to be TTYs; cancellation, login
-failure, or a noninteractive invocation exits before either systemd service or
-the Codex TUI starts. Gateway and systemd entry points never attempt account
-login and remain fail-closed. Discord credentials are not passed to the login
-process.
+failure, or a noninteractive invocation exits before either worker or the Codex
+TUI starts. Noninteractive worker entry points never attempt account login and
+remain fail-closed. Discord credentials are not passed to the login process.
 
 An alias may select the instance, but it is not the isolation or startup
 boundary:
@@ -279,14 +279,8 @@ alias codex02='codex-discord-instance codex02'
 ```
 
 `CODEX_BIN` is the Codex JavaScript entry point executed by `NODE_BIN`, not a
-shell launcher or alias. The bundled templates under
-`plugins/codex-discord-channel/systemd/` start one
-app-server and one gateway per `%i`. They consume absolute executable paths
-from `account.env`; this avoids relying on an interactive `nvm` PATH. Copy both
-templates to `$HOME/.config/systemd/user/` and enable the same instance name
-for both units. Keep `account.env` mode `0600`. The visible TUI must use the
-matching account and socket. Prefer the launcher above; the equivalent
-low-level command below deliberately has no automatic recovery:
+shell launcher or alias. Keep `account.env` mode `0600`. The low-level command
+below is for diagnosis only and deliberately does not start or own the gateway:
 
 ```bash
 CODEX_HOME="$HOME/.codex-account-02" \
@@ -295,27 +289,13 @@ DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
 codex --remote "unix://$HOME/.codex/channels/discord/codex02/app-server.sock"
 ```
 
-### Runtime Updates Without Dropping The TUI
+### Runtime Updates
 
-Install plugin revisions into versioned directories. After changing only
-`CODEX_DISCORD_CHANNEL_BIN` in `account.env`, restart the gateway service:
-
-```bash
-systemctl --user restart codex-discord-channel@codex02.service
-```
-
-Do not restart `codex-discord-app-server@codex02.service` from a TUI attached
-to that instance. The app-server is the TUI transport; restarting it terminates
-an unsupervised client immediately and invokes supervisor recovery for a client
-started by `codex-discord-instance`. The bundled app-server unit sets
-`RefuseManualStop=yes` so an accidental `stop` or `restart` fails closed.
-Systemd may still recover an app-server process that crashes on its own.
-
-A planned app-server replacement is a separate maintenance operation: first
-ensure the visible TUI was started by `codex-discord-instance`, preserve its
-exact thread checkpoint, and obtain explicit operator approval. Updating the
-Discord gateway or its dependencies does not require replacing the Codex
-app-server.
+Install the new marketplace revision, then exit and relaunch that alias. The
+old TUI and its two child workers remain one old generation until exit; the new
+launcher and both new workers then come from one new cache directory. No Linux
+restart, systemd reload, global service restart, or external runtime copy is
+required. Upgrade aliases independently and canary one before the next.
 
 The plugin MCP manifest intentionally does not hardcode `codex01`; it inherits
 the instance variables from the selected Codex process and falls back to that
@@ -393,18 +373,6 @@ Run exactly one gateway for that state directory:
 DISCORD_INSTANCE=codex01 \
 DISCORD_CONFIG_DIR="$STATE_DIR" \
 codex-discord-channel gateway
-```
-
-For a user systemd service, use an absolute Node path in `ExecStart`. User
-services do not reliably inherit an interactive `nvm` shell:
-
-```ini
-[Service]
-Environment=DISCORD_INSTANCE=codex01
-Environment=DISCORD_CONFIG_DIR=%h/.codex/channels/discord/codex01
-ExecStart=/absolute/path/to/node /absolute/path/to/codex-discord-channel gateway
-Restart=always
-RestartSec=5
 ```
 
 Keep any retired `discord-codex-bridge` service disabled. Two receivers sharing
@@ -531,8 +499,6 @@ Do not commit `.env` or print Discord tokens.
 Useful non-secret checks:
 
 ```bash
-systemctl --user status codex-discord-channel@codex01.service --no-pager -l
-journalctl --user -u codex-discord-channel@codex01.service -n 200 --no-pager
 jq '{blocked,ready:(.items|length),uncertain:(.uncertain|length),completed:(.completed|length)}' \
   "$HOME/.codex/channels/discord/codex01/pending-delivery.json"
 cat "$HOME/.codex/channels/discord/codex01/gateway-health.json"
@@ -544,7 +510,7 @@ file both reach the fallback; inspect the command exit code separately.
 
 | Symptom | Check | Corrective action |
 |---|---|---|
-| `node: command not found` under systemd or a noninteractive shell | `ExecStart` and the service environment | Use an absolute Node 22+ path. |
+| `node: command not found` in a noninteractive shell | `NODE_BIN` in `account.env` | Use an absolute Node 22+ path. |
 | Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Install the intended revision, migrate the gateway, and start a new Codex thread. A closed MCP transport cannot hot-reload. |
 | `guild_mention_required` | `access.json` `requireMention`, bot user id, `mentionPatterns`, and reply audience | Correct the exact user/role mention pattern. Do not edit `owner.json` or legacy `state.json` as a workaround. |
 | `guild_channel_not_enabled` in a thread | Runtime revision, thread parent id, and the parent entry in `access.json` | Upgrade past `0.2.1+git.92d5d37cc13b` and enable the parent channel. New threads inherit parent policy automatically. |
@@ -554,13 +520,8 @@ file both reach the fallback; inspect the command exit code separately.
 | Queue is degraded by `structured_ack_uncertain` | `deliveryOldestUncertainMessageId`, proof-check time, and exact target read-back | Preserve the item. The gateway completes it only from exact durable proof, never from timeout or automatic `turn/start` replay, while continuing later ready items. |
 | One Discord question receives repeated answers | Reply receipt for the exact source channel and message id | Use `discord_channel_send` with exact `channelId` and `replyTo`; automatic repeats are suppressed. Use `followup` only deliberately and do not bypass the guard with a generic Discord sender. |
 | Messages reappear after deployment | Runtime path and delivery activation id | Use versioned install paths. Do not reuse an old activation id across incompatible releases. |
-| Discord login or send fails behind a corporate network | Status booleans for proxy/TLS and service environment | Configure `DISCORD_PROXY_URL`; use `DISCORD_INSECURE_TLS` only where the local trust boundary explicitly requires it. Never log the values. |
+| Discord login or send fails behind a corporate network | Status booleans for proxy/TLS and worker environment | Configure `DISCORD_PROXY_URL`; use `DISCORD_INSECURE_TLS` only where the local trust boundary explicitly requires it. Never log the values. |
 | `/clear` is followed by delivery to an old thread | Current runtime version and target checkpoint | Upgrade and verify thread rotation in the exact visible TUI. `owner.json` must not be used as the message receive gate. |
-
-The app-server unit uses `OOMPolicy=continue`, so an OOM-killed MCP or tool
-child does not automatically stop the surviving app-server and disconnect the
-visible TUI. Normal service shutdown retains systemd's control-group cleanup;
-do not preserve stale tool subprocesses across an app-server replacement.
 
 The reproduced false-completion incident and its fixed boundary are documented
 in [Known Issues And Operational Boundaries](docs/known-issues.md).

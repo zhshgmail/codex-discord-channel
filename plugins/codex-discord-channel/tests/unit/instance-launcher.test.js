@@ -82,7 +82,7 @@ test('launcher rejects an OpenAI account that is not logged in', () => {
   );
 });
 
-test('launcher fails before systemd when Discord bot credentials are missing', () => {
+test('launcher fails before worker startup when Discord bot credentials are missing', () => {
   const config = instanceFixture();
   config.tokenConfigured = false;
   assert.throws(() => requireInstanceReady(config), /credentials are incomplete/);
