@@ -314,6 +314,9 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   };
 
   const result = await callTool(context, 'discord_channel_status');
+  assert.equal(result.structuredContent.accountBindingLoaded, false);
+  assert.equal(result.structuredContent.legacyInstanceFallbackUsed, false);
+  assert.equal(result.structuredContent.accountHomeSource, 'default');
   assert.equal(result.structuredContent.envLoaded, true);
   assert.equal(result.structuredContent.tokenConfigured, true);
   assert.equal(result.structuredContent.proxyConfigured, true);

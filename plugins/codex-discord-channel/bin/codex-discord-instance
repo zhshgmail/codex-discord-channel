@@ -17,7 +17,10 @@ if [[ ! $instance =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
   exit 2
 fi
 
-state_dir=${DISCORD_CONFIG_DIR:-"$HOME/.codex/channels/discord/$instance"}
+# The positional instance is the authority boundary.  An alias can be launched
+# from a shell (or a resumed TUI) that still carries another instance's
+# DISCORD_CONFIG_DIR, so inherited Discord selection must never override it.
+state_dir="$HOME/.codex/channels/discord/$instance"
 account_env="$state_dir/account.env"
 if [[ ! -f $account_env ]]; then
   echo "Missing instance account file: $account_env" >&2

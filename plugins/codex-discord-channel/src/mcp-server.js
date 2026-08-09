@@ -20,7 +20,7 @@ const { sendDiscordReplyOnce } = require('./reply-delivery');
 const { readGatewayHealthStatus } = require('./gateway-health');
 
 const SERVER_NAME = 'Codex Discord Channel';
-const SERVER_VERSION = '0.3.2';
+const SERVER_VERSION = '0.3.3';
 const MAX_TOOL_RESULT_BYTES = 64 * 1024;
 
 function makeLogger() {
@@ -187,6 +187,9 @@ async function callTool(context, name, args = {}) {
       stateDir: context.config.paths.stateDir,
       accessPath: context.config.paths.accessPath,
       ownerPath: context.config.paths.ownerPath,
+      accountBindingLoaded: context.config.accountBindingLoaded,
+      legacyInstanceFallbackUsed: context.config.legacyInstanceFallbackUsed,
+      accountHomeSource: context.config.accountHomeSource,
       envLoaded: context.config.envLoaded,
       tokenConfigured: context.config.tokenConfigured,
       proxyConfigured: Boolean(context.config.proxyUrl),

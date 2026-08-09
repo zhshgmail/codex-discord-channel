@@ -487,7 +487,7 @@ class AppServerRpcClient extends EventEmitter {
         clientInfo: {
           name: 'codex-discord-channel',
           title: 'Discord Channel Gateway',
-          version: '0.3.2',
+          version: '0.3.3',
         },
         capabilities: {
           experimentalApi: true,
@@ -1442,6 +1442,16 @@ class AppServerHost extends EventEmitter {
         ({ threadId, response } = notifiedTarget);
       } else if (topLevelThreads.length === 1) {
         [{ threadId, response }] = topLevelThreads;
+        if (
+          initialLease.record?.phase === 'launching' &&
+          !this.currentThreadId &&
+          !this.observedTuiLeaseTarget
+        ) {
+          this.observedTuiLeaseTarget = {
+            leaseId: initialLease.record.leaseId,
+            threadId,
+          };
+        }
       } else {
         const reason = topLevelThreads.length > 1
           ? 'shared_app_server_thread_ambiguous'

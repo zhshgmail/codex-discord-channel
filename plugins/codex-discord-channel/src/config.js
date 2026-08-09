@@ -45,6 +45,20 @@ function parseInteger(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function inferCodexHomeFromPluginCache(cwd) {
+  const resolvedCwd = path.resolve(String(cwd || ''));
+  const marker = `${path.sep}plugins${path.sep}cache${path.sep}`;
+  const markerIndex = resolvedCwd.lastIndexOf(marker);
+  if (markerIndex <= 0) return '';
+  const candidate = resolvedCwd.slice(0, markerIndex);
+  const bindingPath = path.join(candidate, 'discord-instance.env');
+  try {
+    return fs.statSync(bindingPath).isFile() ? candidate : '';
+  } catch {
+    return '';
+  }
+}
+
 function loadEnvFile(file, env, options = {}) {
   if (!file || !fs.existsSync(file)) return false;
   const text = fs.readFileSync(file, 'utf8');
@@ -92,6 +106,14 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.DISCORD_STATE_DIR ||
     env.DISCORD_CONFIG_DIR
   );
+  let codexHomeFromPluginCache = false;
+  if (!env.CODEX_HOME && !instanceWasExplicit) {
+    const inferredCodexHome = inferCodexHomeFromPluginCache(options.cwd || process.cwd());
+    if (inferredCodexHome) {
+      env.CODEX_HOME = inferredCodexHome;
+      codexHomeFromPluginCache = true;
+    }
+  }
   const codexHomeWasExplicit = Boolean(env.CODEX_HOME);
   let initialPaths = resolvePaths(env);
   let accountBindingLoaded = false;
@@ -126,7 +148,7 @@ function loadConfig(inputEnv = process.env, options = {}) {
   });
   const accountEnvCodexHome = String(env.CODEX_HOME || '').trim();
   const accountHomeSource = inputCodexHome
-    ? 'process'
+    ? (codexHomeFromPluginCache ? 'plugin_cache' : 'process')
     : (accountEnvLoaded && accountEnvCodexHome ? 'account_env' : 'default');
   if (accountHomeSource !== 'default') {
     env.CODEX_HOME = expandPath(env.CODEX_HOME, env);

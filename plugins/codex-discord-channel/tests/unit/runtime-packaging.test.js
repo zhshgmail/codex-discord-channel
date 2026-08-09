@@ -181,15 +181,17 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
     fs.mkdirSync(directory, { recursive: true });
   }
   const stateDir = path.join(xdgState, 'discord', 'packaging-test');
+  fs.writeFileSync(path.join(codexHome, 'discord-instance.env'), [
+    'DISCORD_INSTANCE=packaging-test',
+    `DISCORD_CONFIG_DIR=${stateDir}`,
+    '',
+  ].join('\n'));
   const env = {
     HOME: home,
-    CODEX_HOME: codexHome,
     XDG_CONFIG_HOME: xdgConfig,
     XDG_CACHE_HOME: xdgCache,
     XDG_DATA_HOME: xdgData,
     XDG_STATE_HOME: xdgState,
-    DISCORD_INSTANCE: 'packaging-test',
-    DISCORD_CONFIG_DIR: stateDir,
     DISCORD_CHANNEL_DISABLE_LOGIN: '1',
     CODEX_DISCORD_DELIVERY_MODE: 'off',
     NODE_PATH: '',
@@ -211,7 +213,7 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
     requests,
   );
 
-  assert.equal(initialized.result.serverInfo.version, '0.3.2');
+  assert.equal(initialized.result.serverInfo.version, '0.3.3');
   assert.ok(tools.result.tools.some((tool) => tool.name === 'discord_channel_status'));
   assert.equal(status.result.structuredContent.stateDir, stateDir);
   assert.equal(status.result.structuredContent.discordReason, 'gateway_health_missing');

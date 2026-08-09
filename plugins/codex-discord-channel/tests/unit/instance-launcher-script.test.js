@@ -205,6 +205,35 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
 });
 
+test('instance argument ignores Discord state inherited from another alias', () => {
+  const setup = fixture();
+  const foreignStateDir = path.join(
+    setup.home,
+    '.codex',
+    'channels',
+    'discord',
+    'codex01',
+  );
+  fs.mkdirSync(foreignStateDir, { recursive: true });
+
+  const result = spawnSync(setup.launcher, ['codex02', 'resume', 'thread-2'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      DISCORD_INSTANCE: 'codex01',
+      DISCORD_CONFIG_DIR: foreignStateDir,
+    }),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const trace = fs.readFileSync(setup.trace, 'utf8').trim().split('\n');
+  assert.ok(trace.includes(
+    `node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`,
+  ));
+  assert.ok(trace.includes(
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`,
+  ));
+});
+
 test('first-run TTY login succeeds before workers and the TUI start', () => {
   const setup = fixture();
   const command = `${setup.launcher} codex02`;

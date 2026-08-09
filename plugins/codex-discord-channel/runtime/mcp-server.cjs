@@ -133,6 +133,16 @@ var require_config = __commonJS({
       let parsed = Number.parseInt(String(value ?? ""), 10);
       return Number.isFinite(parsed) ? parsed : fallback;
     }
+    function inferCodexHomeFromPluginCache(cwd) {
+      let resolvedCwd = path.resolve(String(cwd || "")), marker = `${path.sep}plugins${path.sep}cache${path.sep}`, markerIndex = resolvedCwd.lastIndexOf(marker);
+      if (markerIndex <= 0) return "";
+      let candidate = resolvedCwd.slice(0, markerIndex), bindingPath = path.join(candidate, "discord-instance.env");
+      try {
+        return fs.statSync(bindingPath).isFile() ? candidate : "";
+      } catch {
+        return "";
+      }
+    }
     function loadEnvFile(file, env, options = {}) {
       if (!file || !fs.existsSync(file)) return !1;
       let text = fs.readFileSync(file, "utf8");
@@ -162,7 +172,12 @@ var require_config = __commonJS({
       return !0;
     }
     function loadConfig2(inputEnv = process.env, options = {}) {
-      let env = { ...inputEnv }, instanceWasExplicit = !!(env.DISCORD_INSTANCE || env.DISCORD_BRIDGE_INSTANCE || env.DISCORD_STATE_DIR || env.DISCORD_CONFIG_DIR), codexHomeWasExplicit = !!env.CODEX_HOME, initialPaths = resolvePaths(env), accountBindingLoaded = !1;
+      let env = { ...inputEnv }, instanceWasExplicit = !!(env.DISCORD_INSTANCE || env.DISCORD_BRIDGE_INSTANCE || env.DISCORD_STATE_DIR || env.DISCORD_CONFIG_DIR), codexHomeFromPluginCache = !1;
+      if (!env.CODEX_HOME && !instanceWasExplicit) {
+        let inferredCodexHome = inferCodexHomeFromPluginCache(options.cwd || process.cwd());
+        inferredCodexHome && (env.CODEX_HOME = inferredCodexHome, codexHomeFromPluginCache = !0);
+      }
+      let codexHomeWasExplicit = !!env.CODEX_HOME, initialPaths = resolvePaths(env), accountBindingLoaded = !1;
       (!instanceWasExplicit || codexHomeWasExplicit) && (accountBindingLoaded = loadEnvFile(initialPaths.accountBindingPath, env, {
         allowedKeys: ACCOUNT_BINDING_KEYS,
         rejectConflicts: !0,
@@ -178,7 +193,7 @@ var require_config = __commonJS({
         allowedKeys: ACCOUNT_ENV_KEYS,
         rejectConflicts: !0,
         strict: !0
-      }), accountEnvCodexHome = String(env.CODEX_HOME || "").trim(), accountHomeSource = inputCodexHome ? "process" : accountEnvLoaded && accountEnvCodexHome ? "account_env" : "default";
+      }), accountEnvCodexHome = String(env.CODEX_HOME || "").trim(), accountHomeSource = inputCodexHome ? codexHomeFromPluginCache ? "plugin_cache" : "process" : accountEnvLoaded && accountEnvCodexHome ? "account_env" : "default";
       accountHomeSource !== "default" && (env.CODEX_HOME = expandPath(env.CODEX_HOME, env));
       let paths = resolvePaths(env);
       paths.accountBindingPath !== initialPaths.accountBindingPath && (accountBindingLoaded = loadEnvFile(paths.accountBindingPath, env, {
@@ -3513,7 +3528,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.2"
+              version: "0.3.3"
             },
             capabilities: {
               experimentalApi: !0,
@@ -4064,7 +4079,10 @@ var require_app_server_host = __commonJS({
           if (notifiedTarget)
             ({ threadId, response } = notifiedTarget);
           else if (topLevelThreads.length === 1)
-            [{ threadId, response }] = topLevelThreads;
+            [{ threadId, response }] = topLevelThreads, initialLease.record?.phase === "launching" && !this.currentThreadId && !this.observedTuiLeaseTarget && (this.observedTuiLeaseTarget = {
+              leaseId: initialLease.record.leaseId,
+              threadId
+            });
           else {
             let reason = topLevelThreads.length > 1 ? "shared_app_server_thread_ambiguous" : "shared_app_server_thread_unprovable";
             return reason === "shared_app_server_thread_unprovable" ? rejectUnprovableTopology() : (this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" });
@@ -94951,7 +94969,7 @@ var readline = require("node:readline"), { loadConfig } = require_config(), {
   reconcileDiscordMessage,
   sendDiscordMessage,
   startDiscordClient
-} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.2", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.3", MAX_TOOL_RESULT_BYTES = 64 * 1024;
 function makeLogger() {
   return (level, message, meta) => {
     let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;
@@ -95101,6 +95119,9 @@ async function callTool(context, name, args = {}) {
       stateDir: context.config.paths.stateDir,
       accessPath: context.config.paths.accessPath,
       ownerPath: context.config.paths.ownerPath,
+      accountBindingLoaded: context.config.accountBindingLoaded,
+      legacyInstanceFallbackUsed: context.config.legacyInstanceFallbackUsed,
+      accountHomeSource: context.config.accountHomeSource,
       envLoaded: context.config.envLoaded,
       tokenConfigured: context.config.tokenConfigured,
       proxyConfigured: !!context.config.proxyUrl,

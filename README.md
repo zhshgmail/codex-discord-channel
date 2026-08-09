@@ -105,39 +105,23 @@ uncertain message id, attempts, and retry time without message content.
 
 ## Required Live Migration
 
-A TUI started as a direct `codex ... resume` process uses a private embedded
-app-server. This repository change cannot attach to that private server. Live
-exact-console verification therefore requires a release/install plus process
-migration:
+A direct `codex ... resume` TUI uses a private embedded app-server and cannot be
+attached after startup. Install the released marketplace artifact, exit only
+the selected alias at an operator-approved time, and relaunch it through
+`codex-discord-instance INSTANCE resume --last`. That one launcher owns the
+matching app-server, gateway, and TUI as child processes from the same installed
+cache directory. It registers no systemd unit and requires no Linux restart.
 
-1. End the direct TUI process at an operator-approved time.
-2. Start a persistent app-server on the instance socket:
+After relaunch, require `discord_channel_status` to report the intended
+`instance`, `stateDir`, `accountBindingLoaded: true`,
+`legacyInstanceFallbackUsed: false`, `sharedAppServerAvailable: true`, and
+`discordStarted: true`. Then send controlled direct-mention, `@here`, and
+`@everyone` probes from an independent identity and confirm each stable source
+message ID plus original `created_at` appears in that exact visible TUI.
 
-   ```bash
-   STATE_DIR="${DISCORD_CONFIG_DIR:-$HOME/.codex/channels/discord/codex01}"
-   SOCKET="$STATE_DIR/app-server.sock"
-   mkdir -p "$STATE_DIR"
-   DISCORD_INSTANCE=codex01 DISCORD_CONFIG_DIR="$STATE_DIR" \
-     codex-discord-channel app-server
-   ```
-
-3. Relaunch the visible TUI against that same endpoint:
-
-   ```bash
-   codex --remote "unix://$SOCKET" resume <THREAD_ID>
-   ```
-
-4. Install the released plugin and restart the `codex01` gateway under normal
-   operator change control so it runs the released code.
-5. Verify `discord_channel_status` reports `deliverySafety:
-   "structured_only"`, `sharedAppServerAvailable: true`, and
-   `discordStarted: true`.
-6. Send a controlled allowed Discord message and confirm that its structured
-   turn appears in that exact visible TUI. Repeat after `/clear` to verify
-   thread rotation.
-
-Until every step is complete, report only repository/test readiness or queued
-unavailability. Do not claim passive or exact-console success.
+Until those live checks pass for that consumer, report only repository/test
+readiness or queued unavailability. A passing consumer does not make another
+alias green.
 
 ## Remote Marketplace Install
 
@@ -297,9 +281,13 @@ launcher and both new workers then come from one new cache directory. No Linux
 restart, systemd reload, global service restart, or external runtime copy is
 required. Upgrade aliases independently and canary one before the next.
 
-The plugin MCP manifest intentionally does not hardcode `codex01`; it inherits
-the instance variables from the selected Codex process and falls back to that
-account's `discord-instance.env` binding.
+The plugin MCP manifest intentionally does not hardcode `codex01`. When Codex
+preserves the selected instance variables, the MCP uses them directly. When
+Codex starts a marketplace MCP with those variables stripped, the MCP derives
+its own `CODEX_HOME` only from its physical
+`$CODEX_HOME/plugins/cache/...` working directory and loads that account's
+mode-`0600` `discord-instance.env`. It does not search another account or use a
+box-wide singleton.
 
 Create `$HOME/.codex/channels/discord/codex01/.env` locally:
 

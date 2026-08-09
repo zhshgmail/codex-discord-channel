@@ -148,6 +148,35 @@ test('account binding routes an MCP process without inherited Discord variables'
   assert.equal(config.paths.stateDir, stateDir);
 });
 
+test('installed MCP recovers its account binding from plugin cache cwd when Codex strips env', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const codexHome = path.join(home, '.codex-account-02');
+  const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
+  const pluginCwd = path.join(
+    codexHome,
+    'plugins',
+    'cache',
+    'personal',
+    'codex-discord-channel',
+    '0.3.3+codex.account-bound-runtime',
+  );
+  fs.mkdirSync(pluginCwd, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, 'discord-instance.env'), [
+    'DISCORD_INSTANCE=codex02',
+    `DISCORD_CONFIG_DIR=${stateDir}`,
+    '',
+  ].join('\n'));
+
+  const config = loadConfig({ HOME: home }, { cwd: pluginCwd });
+
+  assert.equal(config.accountHomeSource, 'plugin_cache');
+  assert.equal(config.accountBindingLoaded, true);
+  assert.equal(config.legacyInstanceFallbackUsed, false);
+  assert.equal(config.codexHome, codexHome);
+  assert.equal(config.paths.instance, 'codex02');
+  assert.equal(config.paths.stateDir, stateDir);
+});
+
 test('legacy codex01 install remains routable until an account binding is created', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const legacyStateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
