@@ -272,9 +272,11 @@ effective receiver generation may accept Discord events. Keep the retired
 
 ## Installed Plugin Changes Do Not Appear In An Existing Session
 
-An already-open MCP transport does not hot-load replaced plugin code. Install
-the new plugin version through that account's marketplace, then exit and
-relaunch only the complete alias. The alias-owned launcher starts its matching
-gateway, app-server, and TUI from one versioned cache generation; do not migrate
-one worker independently. The versioned runtime directory also keeps the
-durable delivery activation boundary from replaying an old backlog.
+An already-open MCP transport does not hot-load replaced plugin code. Exit the
+selected alias first, then use an ordinary shell to install the new plugin
+version through that account's marketplace, update its version-pinned alias
+path, and relaunch the complete alias. The installer may remove the old cache;
+never replace it under a running launcher. The alias-owned launcher starts its
+matching gateway, app-server, and TUI from one versioned cache generation; do
+not migrate one worker independently. The versioned runtime directory also
+keeps the durable delivery activation boundary from replaying an old backlog.

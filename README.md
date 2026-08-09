@@ -106,11 +106,12 @@ uncertain message id, attempts, and retry time without message content.
 ## Required Live Migration
 
 A direct `codex ... resume` TUI uses a private embedded app-server and cannot be
-attached after startup. Install the released marketplace artifact, exit only
-the selected alias at an operator-approved time, and relaunch it through
-`codex-discord-instance INSTANCE resume --last`. That one launcher owns the
-matching app-server, gateway, and TUI as child processes from the same installed
-cache directory. It registers no systemd unit and requires no Linux restart.
+attached after startup. Exit the selected alias first at an operator-approved
+time. From an ordinary shell, install the released marketplace artifact and
+then relaunch it through `codex-discord-instance INSTANCE resume --last`. That
+one launcher owns the matching app-server, gateway, and TUI as child processes
+from the same installed cache directory. It registers no systemd unit and
+requires no Linux restart.
 
 After relaunch, require `discord_channel_status` to report the intended
 `instance`, `stateDir`, `accountBindingLoaded: true`,
@@ -264,11 +265,13 @@ that the gateway, app-server, and visible TUI are one coherent generation.
 
 ### Runtime Updates
 
-Install the new marketplace revision, then exit and relaunch that alias. The
-old TUI and its two child workers remain one old generation until exit; the new
-launcher and both new workers then come from one new cache directory. No Linux
-restart, systemd reload, global service restart, or external runtime copy is
-required. Upgrade aliases independently and canary one before the next.
+Exit the selected alias first. From an ordinary shell, replace its marketplace
+revision and install the new plugin, update any version-pinned alias path, then
+relaunch that alias. The Codex CLI may remove the previous installed cache while
+installing the replacement, so installing before exit can strand a running old
+launcher without its helper files. No Linux restart, systemd reload, global
+service restart, or external runtime copy is required. Upgrade aliases
+independently and canary one before the next.
 
 The plugin MCP manifest intentionally does not hardcode `codex01`. When Codex
 preserves the selected instance variables, the MCP uses them directly. When
@@ -476,7 +479,7 @@ file both reach the fallback; inspect the command exit code separately.
 | Symptom | Check | Corrective action |
 |---|---|---|
 | `node: command not found` in a noninteractive shell | `NODE_BIN` in `account.env` | Use an absolute Node 22+ path. |
-| Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Install the intended revision, exit the selected alias, then relaunch it with `codex-discord-instance INSTANCE resume --last`. A closed MCP transport cannot hot-reload. |
+| Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Exit the selected alias first; from an ordinary shell install the intended revision, update its alias path, then relaunch it with `codex-discord-instance INSTANCE resume --last`. A closed MCP transport cannot hot-reload. |
 | `guild_mention_required` | `access.json` `requireMention`, bot user id, `mentionPatterns`, and reply audience | Correct the exact user/role mention pattern. Do not edit `owner.json` or legacy `state.json` as a workaround. |
 | `guild_channel_not_enabled` in a thread | Runtime revision, thread parent id, and the parent entry in `access.json` | Upgrade past `0.2.1+git.92d5d37cc13b` and enable the parent channel. New threads inherit parent policy automatically. |
 | Peer bot messages are absent | Group `allowFrom`, `allowBots`, current group id, and mention pattern | Allowlist the peer bot and set `allowBots: true` only for the intended group. |

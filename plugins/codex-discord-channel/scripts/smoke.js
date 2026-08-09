@@ -70,9 +70,18 @@ assert(
   readme.includes('codex-discord-instance INSTANCE resume --last'),
   'README must prescribe the alias-owned launcher for production startup',
 );
+assert(
+  readme.includes('Exit the selected alias first'),
+  'README must require alias exit before marketplace replacement removes its old cache',
+);
+assert(
+  !readme.includes('Install the new marketplace revision, then exit'),
+  'README must not remove a running generation before alias exit',
+);
 for (const [name, document] of [['plugin skill', pluginSkill], ['known issues', knownIssues]]) {
   assert(!document.includes('codex --remote <same-endpoint>'), `${name} must not prescribe a bare remote TUI`);
   assert(!document.includes('migrate the gateway'), `${name} must not prescribe split gateway migration`);
+  assert(!document.includes("marketplace, then exit"), `${name} must not install before alias exit`);
 }
 
 process.stdout.write('smoke passed\n');

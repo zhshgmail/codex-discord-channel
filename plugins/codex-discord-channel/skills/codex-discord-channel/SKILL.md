@@ -74,14 +74,17 @@ A direct `codex ... resume` TUI has a private embedded app-server and cannot be
 joined by the gateway. Exact-console delivery requires one operator-approved
 whole-alias relaunch:
 
-1. Install the released plugin through that account's configured marketplace.
-2. Verify the account binding and alias point at the same versioned cache.
-3. Exit only that alias and relaunch it with
+1. Exit only the selected alias; keep every other alias running.
+2. From an ordinary shell, install the released plugin through that account's
+   configured marketplace and update any version-pinned alias path.
+3. Verify the account binding and alias point at the same versioned cache, then
+   relaunch it with
    `codex-discord-instance INSTANCE resume --last`.
 4. Verify an allowed Discord-origin turn in the exact visible TUI, then repeat
    after `/clear`.
 
-The launcher owns the matching app-server, gateway, and TUI as one generation.
+The installer may remove the previous cache, so never replace a plugin under a
+running alias. The launcher owns the matching app-server, gateway, and TUI as one generation.
 Do not start workers separately, register systemd units, copy a development
 checkout, or claim live ownership without exact-console evidence. Repository
 tests prove the delivery contract, not the live process migration.
