@@ -45,6 +45,7 @@ function normalizeDiscordMessage(message, referencedMessage = null) {
     authorId: message.author?.id || message.authorId || '',
     authorName: message.author?.username || message.authorName || '',
     authorIsBot: Boolean(message.author?.bot || message.authorIsBot),
+    mentionsEveryone: Boolean(message.mentions?.everyone),
     repliedToAuthorId: hasReference ? String(referencedMessage?.author?.id || '') : '',
     repliedToContent: hasReference && typeof referencedMessage?.content === 'string'
       ? referencedMessage.content

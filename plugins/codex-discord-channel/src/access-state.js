@@ -114,18 +114,13 @@ function decideAccess(state, message) {
   if (!envelopeDecision.allowed) return envelopeDecision;
 
   const group = guildPolicy(state, message);
-  const currentMessageMentionsBot = mentionsBot(message.content, message.botUserId, state.mentionPatterns);
+  const currentMessageMentionsBot = message.mentionsEveryone === true ||
+    mentionsBot(message.content, message.botUserId, state.mentionPatterns);
   const replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
-  const referencedMessageMentionsBot = mentionsBot(
-    message.repliedToContent,
-    message.botUserId,
-    state.mentionPatterns,
-  );
   if (
     group.requireMention &&
     !currentMessageMentionsBot &&
-    !replyAuthorIsBot &&
-    !referencedMessageMentionsBot
+    !replyAuthorIsBot
   ) {
     return { allowed: false, reason: 'guild_mention_required' };
   }

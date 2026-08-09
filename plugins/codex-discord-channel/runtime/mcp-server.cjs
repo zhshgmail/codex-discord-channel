@@ -3513,7 +3513,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.0"
+              version: "0.3.1"
             },
             capabilities: {
               experimentalApi: !0,
@@ -4541,6 +4541,7 @@ var require_delivery = __commonJS({
         authorId: message.author?.id || message.authorId || "",
         authorName: message.author?.username || message.authorName || "",
         authorIsBot: !!(message.author?.bot || message.authorIsBot),
+        mentionsEveryone: !!message.mentions?.everyone,
         repliedToAuthorId: hasReference ? String(referencedMessage?.author?.id || "") : "",
         repliedToContent: hasReference && typeof referencedMessage?.content == "string" ? referencedMessage.content : "",
         createdAt: Number.isFinite(createdTimestamp) ? new Date(createdTimestamp).toISOString() : null,
@@ -5584,12 +5585,8 @@ var require_access_state = __commonJS({
         return state.dmPolicy === "open" ? { allowed: !0, reason: "dm_open" } : state.allowFrom.includes(message.authorId) ? { allowed: !0, reason: "dm_allowlisted" } : state.dmPolicy === "pairing" ? { allowed: !1, reason: "dm_pairing_required", requiresPairingCode: !0 } : { allowed: !1, reason: "dm_closed" };
       let envelopeDecision = decideGuildEnvelopeAccess(state, message);
       if (!envelopeDecision.allowed) return envelopeDecision;
-      let group = guildPolicy(state, message), currentMessageMentionsBot = mentionsBot(message.content, message.botUserId, state.mentionPatterns), replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId, referencedMessageMentionsBot = mentionsBot(
-        message.repliedToContent,
-        message.botUserId,
-        state.mentionPatterns
-      );
-      return group.requireMention && !currentMessageMentionsBot && !replyAuthorIsBot && !referencedMessageMentionsBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
+      let group = guildPolicy(state, message), currentMessageMentionsBot = message.mentionsEveryone === !0 || mentionsBot(message.content, message.botUserId, state.mentionPatterns), replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+      return group.requireMention && !currentMessageMentionsBot && !replyAuthorIsBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
     }
     var GUILD_HISTORY_CHANNEL_TYPES = /* @__PURE__ */ new Set([0, 5, 10, 11, 12]), GUILD_THREAD_CHANNEL_TYPES = /* @__PURE__ */ new Set([10, 11, 12]);
     function historyGuildPolicy(state, target) {
@@ -94954,7 +94951,7 @@ var readline = require("node:readline"), { loadConfig } = require_config(), {
   reconcileDiscordMessage,
   sendDiscordMessage,
   startDiscordClient
-} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.0", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.1", MAX_TOOL_RESULT_BYTES = 64 * 1024;
 function makeLogger() {
   return (level, message, meta) => {
     let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

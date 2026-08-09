@@ -96,7 +96,7 @@ test('guild reply to another author does not satisfy the mention requirement', (
   assert.equal(decision.reason, 'guild_mention_required');
 });
 
-test('guild reply to a peer message mentioning the active bot satisfies the mention requirement', () => {
+test('guild reply to a peer message mentioning the active bot does not inherit that mention', () => {
   const state = normalizeAccessState({ groups: { c1: {} } });
   const decision = decideAccess(state, {
     source: 'guild',
@@ -109,8 +109,8 @@ test('guild reply to a peer message mentioning the active bot satisfies the ment
     repliedToContent: 'asking <@bot> and another agent',
   });
 
-  assert.equal(decision.allowed, true);
-  assert.equal(decision.reason, 'guild_allowed');
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'guild_mention_required');
 });
 
 test('guild reply to a peer message not mentioning the active bot remains denied', () => {
@@ -144,6 +144,33 @@ test('guild reply with no normalized replied author still requires a mention', (
 
   assert.equal(decision.allowed, false);
   assert.equal(decision.reason, 'guild_mention_required');
+});
+
+test('Discord broadcast satisfies the mention requirement only when the platform marks it', () => {
+  const state = normalizeAccessState({ groups: { c1: {} } });
+  const allowed = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'u1',
+    authorIsBot: false,
+    content: '@everyone coordinated update',
+    mentionsEveryone: true,
+    botUserId: 'bot',
+  });
+  const deniedLiteral = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'u1',
+    authorIsBot: false,
+    content: '@everyone coordinated update',
+    mentionsEveryone: false,
+    botUserId: 'bot',
+  });
+
+  assert.equal(allowed.allowed, true);
+  assert.equal(allowed.reason, 'guild_allowed');
+  assert.equal(deniedLiteral.allowed, false);
+  assert.equal(deniedLiteral.reason, 'guild_mention_required');
 });
 
 test('guild channel can disable mention requirement', () => {

@@ -283,6 +283,7 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
     id: 'm1',
     createdTimestamp: Date.parse('2026-07-21T20:00:00.000Z'),
     author: { id: 'u1', username: 'alice', bot: false },
+    mentions: { everyone: true },
     reference: { messageId: 'm0' },
     content: 'reply',
     attachments: new Map(),
@@ -293,6 +294,7 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
   assert.equal(normalized.repliedToAuthorId, 'u0');
   assert.equal(normalized.repliedToContent, 'parent');
   assert.equal(normalized.createdAt, '2026-07-21T20:00:00.000Z');
+  assert.equal(normalized.mentionsEveryone, true);
 
   const withoutReference = normalizeDiscordMessage({
     channelId: 'c1',
@@ -303,6 +305,7 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
   }, { author: { id: 'must-not-leak' }, content: 'must-not-leak' });
   assert.equal(withoutReference.repliedToAuthorId, '');
   assert.equal(withoutReference.repliedToContent, '');
+  assert.equal(withoutReference.mentionsEveryone, false);
 });
 
 test('normalizeDiscordMessage keeps the thread destination and inherits parent policy', () => {

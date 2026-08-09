@@ -168,7 +168,7 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
     requests,
   );
 
-  assert.equal(initialized.result.serverInfo.version, '0.3.0');
+  assert.equal(initialized.result.serverInfo.version, '0.3.1');
   assert.ok(tools.result.tools.some((tool) => tool.name === 'discord_channel_status'));
   assert.equal(status.result.structuredContent.stateDir, stateDir);
   assert.equal(status.result.structuredContent.discordReason, 'gateway_health_missing');
