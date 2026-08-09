@@ -50,13 +50,7 @@ function inferCodexHomeFromPluginCache(cwd) {
   const marker = `${path.sep}plugins${path.sep}cache${path.sep}`;
   const markerIndex = resolvedCwd.lastIndexOf(marker);
   if (markerIndex <= 0) return '';
-  const candidate = resolvedCwd.slice(0, markerIndex);
-  const bindingPath = path.join(candidate, 'discord-instance.env');
-  try {
-    return fs.statSync(bindingPath).isFile() ? candidate : '';
-  } catch {
-    return '';
-  }
+  return resolvedCwd.slice(0, markerIndex);
 }
 
 function loadEnvFile(file, env, options = {}) {
@@ -123,6 +117,13 @@ function loadConfig(inputEnv = process.env, options = {}) {
       rejectConflicts: true,
       strict: true,
     });
+  }
+  if (codexHomeFromPluginCache && !accountBindingLoaded) {
+    const error = new Error(
+      `Discord account binding is missing for installed plugin account ${initialPaths.accountBindingPath}`,
+    );
+    error.code = 'discord_account_binding_missing';
+    throw error;
   }
   initialPaths = resolvePaths(env);
   let legacyInstanceFallbackUsed = false;

@@ -761,6 +761,12 @@ class AppServerHost extends EventEmitter {
       const checkpoint = this.restoredTargetCheckpoint;
       this.currentThreadId = checkpoint.threadId;
       this.knownLoadedThreadIds = new Set(checkpoint.loadedThreadIds);
+      if (this.requireTuiLease && checkpoint.leaseId) {
+        this.observedTuiLeaseTarget = {
+          leaseId: checkpoint.leaseId,
+          threadId: checkpoint.threadId,
+        };
+      }
     }
     this.timeoutRecoveryTarget = null;
     this.onNotification = (notification) => {
@@ -1126,7 +1132,8 @@ class AppServerHost extends EventEmitter {
       }
       if (expectedThreadId) {
         const activeMatch = record.phase === 'active' && record.threadId === expectedThreadId;
-        const observedMatch = this.observedTuiLeaseTarget?.leaseId === record.leaseId
+        const observedMatch = record.phase === 'launching'
+          && this.observedTuiLeaseTarget?.leaseId === record.leaseId
           && this.observedTuiLeaseTarget.threadId === expectedThreadId;
         if (!activeMatch && !observedMatch) {
           const reason = record.phase === 'active'
@@ -1179,6 +1186,22 @@ class AppServerHost extends EventEmitter {
       const { reason } = initialLease;
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
+    }
+    if (
+      this.requireTuiLease &&
+      initialLease.record?.phase === 'launching' &&
+      this.observedTuiLeaseTarget?.leaseId &&
+      this.observedTuiLeaseTarget.leaseId !== initialLease.record.leaseId
+    ) {
+      this.threadSelectionRevision += 1;
+      this.currentThreadId = '';
+      this.threadStatuses.clear();
+      this.activeTurnIds.clear();
+      this.knownLoadedThreadIds.clear();
+      this.loadedInventoryProven = false;
+      this.observedTuiLeaseTarget = null;
+      this.invalidateTargetCheckpoint('tui_lease_replaced');
+      this.restoredTargetCheckpoint = null;
     }
     this.loadedInventoryProven = false;
     const threadSelectionRevision = this.threadSelectionRevision;
@@ -1511,6 +1534,12 @@ class AppServerHost extends EventEmitter {
       const { reason } = matchingLease;
       this.lastStatus = { configured: true, available: false, reason };
       return { available: false, reason, status: 'unavailable' };
+    }
+    if (this.requireTuiLease && matchingLease.record) {
+      this.observedTuiLeaseTarget = {
+        leaseId: matchingLease.record.leaseId,
+        threadId: thread.id,
+      };
     }
     this.knownLoadedThreadIds = new Set(threadIds);
     this.loadedInventoryProven = true;

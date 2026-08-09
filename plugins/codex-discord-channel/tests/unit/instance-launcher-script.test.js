@@ -21,6 +21,7 @@ function fixture() {
   const pluginRuntimeDir = path.join(home, 'plugin', 'runtime');
   const trace = path.join(home, 'trace.log');
   const childEnvTrace = path.join(home, 'child-env.log');
+  const channelEnvTrace = path.join(home, 'channel-env.log');
   const loginMarker = path.join(home, 'login-complete');
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
@@ -38,6 +39,9 @@ function fixture() {
   fs.writeFileSync(fakeChannel, '// fixture\n');
   executable(fakeNode, [
     '#!/usr/bin/env bash',
+    'if [[ $1 == "$FAKE_CHANNEL_BIN" ]]; then',
+    '  printf "%s|%s|%s|%s\n" "$2" "${CODEX_HOME-UNSET}" "${DISCORD_CONFIG_DIR-UNSET}" "${DISCORD_STATE_DIR-UNSET}" >>"$CHANNEL_ENV_TRACE"',
+    'fi',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
     '    begin)',
@@ -152,6 +156,7 @@ function fixture() {
   ].join('\n'));
   return {
     binDir,
+    channelEnvTrace,
     childEnvTrace,
     codexHome,
     fakeChannel,
@@ -172,6 +177,7 @@ function launchEnv(setup, overrides = {}) {
     DISCORD_BOT_USER_ID: 'fixture-bot',
     DISCORD_CONFIG_DIR: setup.stateDir,
     CHILD_ENV_TRACE: setup.childEnvTrace,
+    CHANNEL_ENV_TRACE: setup.channelEnvTrace,
     FAKE_CHANNEL_BIN: setup.fakeChannel,
     FAKE_CODEX_BIN: setup.fakeCodex,
     HOME: setup.home,
@@ -219,8 +225,10 @@ test('instance argument ignores Discord state inherited from another alias', () 
   const result = spawnSync(setup.launcher, ['codex02', 'resume', 'thread-2'], {
     encoding: 'utf8',
     env: launchEnv(setup, {
+      CODEX_HOME: path.join(setup.home, '.codex-account-01'),
       DISCORD_INSTANCE: 'codex01',
       DISCORD_CONFIG_DIR: foreignStateDir,
+      DISCORD_STATE_DIR: foreignStateDir,
     }),
   });
 
@@ -232,6 +240,14 @@ test('instance argument ignores Discord state inherited from another alias', () 
   assert.ok(trace.includes(
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`,
   ));
+  const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
+  assert.ok(channelEnvironments.length > 0);
+  for (const entry of channelEnvironments) {
+    const [, codexHome, configDir, legacyStateDir] = entry.split('|');
+    assert.equal(codexHome, setup.codexHome);
+    assert.equal(configDir, setup.stateDir);
+    assert.equal(legacyStateDir, 'UNSET');
+  }
 });
 
 test('first-run TTY login succeeds before workers and the TUI start', () => {

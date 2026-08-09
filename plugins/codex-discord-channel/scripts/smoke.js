@@ -21,6 +21,7 @@ function assert(condition, message) {
 const manifest = readJson('.codex-plugin/plugin.json');
 const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
+const readme = fs.readFileSync(path.resolve(root, '..', '..', 'README.md'), 'utf8');
 
 assert(manifest.name === 'codex-discord-channel', 'manifest name mismatch');
 assert(
@@ -61,5 +62,10 @@ assert(fs.existsSync(path.join(root, 'runtime', 'mcp-server.cjs')), 'missing MCP
 assert(fs.existsSync(path.join(root, 'runtime', 'channel.cjs')), 'missing worker runtime bundle');
 assert(fs.existsSync(path.join(root, 'THIRD_PARTY_NOTICES.txt')), 'missing bundled dependency notices');
 assert(!fs.existsSync(path.join(root, '.env')), 'plugin root must not contain .env');
+assert(!readme.includes('## Start The Shared Runtime'), 'README must not prescribe split shared-runtime startup');
+assert(
+  readme.includes('codex-discord-instance INSTANCE resume --last'),
+  'README must prescribe the alias-owned launcher for production startup',
+);
 
 process.stdout.write('smoke passed\n');

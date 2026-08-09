@@ -177,6 +177,28 @@ test('installed MCP recovers its account binding from plugin cache cwd when Code
   assert.equal(config.paths.stateDir, stateDir);
 });
 
+test('installed MCP without its account binding cannot fall into a global legacy instance', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const codexHome = path.join(home, '.codex-account-02');
+  const pluginCwd = path.join(
+    codexHome,
+    'plugins',
+    'cache',
+    'personal',
+    'codex-discord-channel',
+    '0.3.3+codex.account-bound-runtime',
+  );
+  const legacyStateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
+  fs.mkdirSync(pluginCwd, { recursive: true });
+  fs.mkdirSync(legacyStateDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyStateDir, '.env'), 'DISCORD_BOT_TOKEN=legacy-token\n');
+
+  assert.throws(
+    () => loadConfig({ HOME: home }, { cwd: pluginCwd }),
+    (error) => error.code === 'discord_account_binding_missing',
+  );
+});
+
 test('legacy codex01 install remains routable until an account binding is created', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const legacyStateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');

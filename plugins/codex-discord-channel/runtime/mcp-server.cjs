@@ -135,13 +135,7 @@ var require_config = __commonJS({
     }
     function inferCodexHomeFromPluginCache(cwd) {
       let resolvedCwd = path.resolve(String(cwd || "")), marker = `${path.sep}plugins${path.sep}cache${path.sep}`, markerIndex = resolvedCwd.lastIndexOf(marker);
-      if (markerIndex <= 0) return "";
-      let candidate = resolvedCwd.slice(0, markerIndex), bindingPath = path.join(candidate, "discord-instance.env");
-      try {
-        return fs.statSync(bindingPath).isFile() ? candidate : "";
-      } catch {
-        return "";
-      }
+      return markerIndex <= 0 ? "" : resolvedCwd.slice(0, markerIndex);
     }
     function loadEnvFile(file, env, options = {}) {
       if (!file || !fs.existsSync(file)) return !1;
@@ -178,11 +172,17 @@ var require_config = __commonJS({
         inferredCodexHome && (env.CODEX_HOME = inferredCodexHome, codexHomeFromPluginCache = !0);
       }
       let codexHomeWasExplicit = !!env.CODEX_HOME, initialPaths = resolvePaths(env), accountBindingLoaded = !1;
-      (!instanceWasExplicit || codexHomeWasExplicit) && (accountBindingLoaded = loadEnvFile(initialPaths.accountBindingPath, env, {
+      if ((!instanceWasExplicit || codexHomeWasExplicit) && (accountBindingLoaded = loadEnvFile(initialPaths.accountBindingPath, env, {
         allowedKeys: ACCOUNT_BINDING_KEYS,
         rejectConflicts: !0,
         strict: !0
-      })), initialPaths = resolvePaths(env);
+      })), codexHomeFromPluginCache && !accountBindingLoaded) {
+        let error = new Error(
+          `Discord account binding is missing for installed plugin account ${initialPaths.accountBindingPath}`
+        );
+        throw error.code = "discord_account_binding_missing", error;
+      }
+      initialPaths = resolvePaths(env);
       let legacyInstanceFallbackUsed = !1;
       if (!instanceWasExplicit && !accountBindingLoaded) {
         let legacyStateDir = path.join(initialPaths.baseDir, "codex01"), legacyEnvFile = path.join(legacyStateDir, ".env"), defaultEnvFile = path.join(initialPaths.stateDir, ".env");
@@ -3703,7 +3703,10 @@ var require_app_server_host = __commonJS({
         }
         if (this.restoredTargetCheckpoint) {
           let checkpoint = this.restoredTargetCheckpoint;
-          this.currentThreadId = checkpoint.threadId, this.knownLoadedThreadIds = new Set(checkpoint.loadedThreadIds);
+          this.currentThreadId = checkpoint.threadId, this.knownLoadedThreadIds = new Set(checkpoint.loadedThreadIds), this.requireTuiLease && checkpoint.leaseId && (this.observedTuiLeaseTarget = {
+            leaseId: checkpoint.leaseId,
+            threadId: checkpoint.threadId
+          });
         }
         this.timeoutRecoveryTarget = null, this.onNotification = (notification) => {
           if (notification?.method === "item/started" || notification?.method === "item/completed") {
@@ -3898,7 +3901,7 @@ var require_app_server_host = __commonJS({
           if (!this.hasRemoteTuiChild(record.supervisorPid))
             return { available: !1, reason: "shared_app_server_tui_process_missing" };
           if (expectedThreadId) {
-            let activeMatch = record.phase === "active" && record.threadId === expectedThreadId, observedMatch = this.observedTuiLeaseTarget?.leaseId === record.leaseId && this.observedTuiLeaseTarget.threadId === expectedThreadId;
+            let activeMatch = record.phase === "active" && record.threadId === expectedThreadId, observedMatch = record.phase === "launching" && this.observedTuiLeaseTarget?.leaseId === record.leaseId && this.observedTuiLeaseTarget.threadId === expectedThreadId;
             if (!activeMatch && !observedMatch)
               return { available: !1, reason: record.phase === "active" ? "shared_app_server_tui_lease_mismatch" : "shared_app_server_tui_lease_unbound" };
           }
@@ -3929,7 +3932,7 @@ var require_app_server_host = __commonJS({
           let { reason } = initialLease;
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
-        this.loadedInventoryProven = !1;
+        this.requireTuiLease && initialLease.record?.phase === "launching" && this.observedTuiLeaseTarget?.leaseId && this.observedTuiLeaseTarget.leaseId !== initialLease.record.leaseId && (this.threadSelectionRevision += 1, this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.knownLoadedThreadIds.clear(), this.loadedInventoryProven = !1, this.observedTuiLeaseTarget = null, this.invalidateTargetCheckpoint("tui_lease_replaced"), this.restoredTargetCheckpoint = null), this.loadedInventoryProven = !1;
         let threadSelectionRevision = this.threadSelectionRevision, restoredTargetCheckpoint = this.restoredTargetCheckpoint, provenLoadedThreadIds = new Set(this.knownLoadedThreadIds), threadIds = [], seenThreadIds = /* @__PURE__ */ new Set(), cursor = "", connectionGeneration = null, seenCursors = /* @__PURE__ */ new Set(), loadedPageCount = 0, retryAfterRevision = () => {
           if (resolutionBudget.revisionRestarts += 1, resolutionBudget.revisionRestarts > MAX_TARGET_RESOLUTION_RESTARTS) {
             let reason = "shared_app_server_thread_ambiguous";
@@ -4125,7 +4128,10 @@ var require_app_server_host = __commonJS({
           let { reason } = matchingLease;
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
-        if (this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, status), status === "active") {
+        if (this.requireTuiLease && matchingLease.record && (this.observedTuiLeaseTarget = {
+          leaseId: matchingLease.record.leaseId,
+          threadId: thread.id
+        }), this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, status), status === "active") {
           let latestInProgressTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1);
           latestInProgressTurnId ? this.activeTurnIds.set(thread.id, latestInProgressTurnId) : this.activeTurnIds.delete(thread.id);
         } else

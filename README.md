@@ -206,14 +206,9 @@ This file accepts only those two keys. Explicit command-line worker selection
 must agree with it, so a stale or edited environment file cannot redirect one
 instance onto another instance's bot state.
 
-The account-isolated app-server entry point fails closed when `CODEX_HOME` is
-not explicit:
-
-```bash
-DISCORD_INSTANCE=codex02 \
-DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
-codex-discord-channel app-server
-```
+The low-level `app-server` and `gateway` entry points are internal worker
+commands. Do not start them directly for an interactive installation; the
+instance launcher supplies and owns their complete account identity.
 
 Instance routing ignores the generic `CODEX_APP_SERVER_URL`; an inherited
 endpoint from another Codex process must not redirect this bot. Only
@@ -263,15 +258,9 @@ alias codex02='codex-discord-instance codex02'
 ```
 
 `CODEX_BIN` is the Codex JavaScript entry point executed by `NODE_BIN`, not a
-shell launcher or alias. Keep `account.env` mode `0600`. The low-level command
-below is for diagnosis only and deliberately does not start or own the gateway:
-
-```bash
-CODEX_HOME="$HOME/.codex-account-02" \
-DISCORD_INSTANCE=codex02 \
-DISCORD_CONFIG_DIR="$HOME/.codex/channels/discord/codex02" \
-codex --remote "unix://$HOME/.codex/channels/discord/codex02/app-server.sock"
-```
+shell launcher or alias. Keep `account.env` mode `0600`. Do not launch a bare
+`codex --remote` client: it bypasses the alias-owned lifecycle and cannot prove
+that the gateway, app-server, and visible TUI are one coherent generation.
 
 ### Runtime Updates
 
@@ -342,30 +331,18 @@ explicit policy override.
 `access.json` is the receive-policy authority. A legacy `state.json` may remain
 after migration, but editing it does not update current access policy.
 
-## Start The Shared Runtime
+## Start One Alias-Owned Runtime
 
-Use one socket per instance:
-
-```bash
-STATE_DIR="${DISCORD_CONFIG_DIR:-$HOME/.codex/channels/discord/codex01}"
-SOCKET="$STATE_DIR/app-server.sock"
-mkdir -p "$STATE_DIR"
-DISCORD_INSTANCE=codex01 DISCORD_CONFIG_DIR="$STATE_DIR" \
-  codex-discord-channel app-server
-codex --remote "unix://$SOCKET" resume <THREAD_ID>
-```
-
-Run exactly one gateway for that state directory:
+Start or resume the selected instance only through its installed launcher:
 
 ```bash
-DISCORD_INSTANCE=codex01 \
-DISCORD_CONFIG_DIR="$STATE_DIR" \
-codex-discord-channel gateway
+codex-discord-instance INSTANCE resume --last
 ```
 
-Keep any retired `discord-codex-bridge` service disabled. Two receivers sharing
-one bot make diagnosis ambiguous even when queue deduplication prevents some
-duplicates.
+That one process owns the matching app-server, gateway, and visible TUI. Do not
+start worker commands separately and do not register systemd units. Keep any
+retired `discord-codex-bridge` service disabled; two receivers sharing one bot
+make diagnosis ambiguous even when queue deduplication prevents some duplicates.
 
 ## Use The Plugin
 
@@ -499,11 +476,11 @@ file both reach the fallback; inspect the command exit code separately.
 | Symptom | Check | Corrective action |
 |---|---|---|
 | `node: command not found` in a noninteractive shell | `NODE_BIN` in `account.env` | Use an absolute Node 22+ path. |
-| Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Install the intended revision, migrate the gateway, and start a new Codex thread. A closed MCP transport cannot hot-reload. |
+| Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Install the intended revision, exit the selected alias, then relaunch it with `codex-discord-instance INSTANCE resume --last`. A closed MCP transport cannot hot-reload. |
 | `guild_mention_required` | `access.json` `requireMention`, bot user id, `mentionPatterns`, and reply audience | Correct the exact user/role mention pattern. Do not edit `owner.json` or legacy `state.json` as a workaround. |
 | `guild_channel_not_enabled` in a thread | Runtime revision, thread parent id, and the parent entry in `access.json` | Upgrade past `0.2.1+git.92d5d37cc13b` and enable the parent channel. New threads inherit parent policy automatically. |
 | Peer bot messages are absent | Group `allowFrom`, `allowBots`, current group id, and mention pattern | Allowlist the peer bot and set `allowBots: true` only for the intended group. |
-| Gateway says connected but the visible TUI receives nothing | Confirm both processes use the same `app-server.sock` | Relaunch the TUI with `codex --remote`. A direct TUI has a private embedded server. |
+| Gateway says connected but the visible TUI receives nothing | Confirm the launcher, gateway, app-server, and TUI belong to the same alias and installed revision | Exit and relaunch the complete alias with `codex-discord-instance INSTANCE resume --last`; do not attach a bare remote TUI. |
 | Queue is stuck at `thread_busy` | Exact current thread and active turn identity | Let the current turn advance; do not start a second receiver or inject terminal input. |
 | Queue is degraded by `structured_ack_uncertain` | `deliveryOldestUncertainMessageId`, proof-check time, and exact target read-back | Preserve the item. The gateway completes it only from exact durable proof, never from timeout or automatic `turn/start` replay, while continuing later ready items. |
 | One Discord question receives repeated answers | Reply receipt for the exact source channel and message id | Use `discord_channel_send` with exact `channelId` and `replyTo`; automatic repeats are suppressed. Use `followup` only deliberately and do not bypass the guard with a generic Discord sender. |

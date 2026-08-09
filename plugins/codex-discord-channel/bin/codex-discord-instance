@@ -61,8 +61,20 @@ while IFS= read -r name; do
     DISCORD_*|CODEX_DISCORD_*|CODEX_APP_SERVER_URL) child_env_unsets+=(-u "$name") ;;
   esac
 done < <(compgen -e)
+instance_runtime_env=(
+  env
+  "${child_env_unsets[@]}"
+  -u CODEX_THREAD_ID
+  -u CODEX_SESSION_ID
+  -u CODEX_TARGET_THREAD_ID
+  -u CODEX_APP_SERVER_SOCKET
+  CODEX_HOME="$codex_home"
+  DISCORD_INSTANCE="$instance"
+  DISCORD_CONFIG_DIR="$state_dir"
+)
+channel_command=("${instance_runtime_env[@]}" "$node_bin" "$channel_bin")
 set +e
-"$node_bin" "$channel_bin" tui-login-state "${runtime_args[@]}" >/dev/null
+"${channel_command[@]}" tui-login-state "${runtime_args[@]}" >/dev/null
 login_state=$?
 set -e
 if ((login_state == 10)); then
@@ -79,7 +91,7 @@ if ((login_state == 10)); then
     -u CODEX_APP_SERVER_SOCKET \
     CODEX_HOME="$codex_home" \
     "$node_bin" "$codex_bin" login
-  "$node_bin" "$channel_bin" tui-check "${runtime_args[@]}" >/dev/null
+  "${channel_command[@]}" tui-check "${runtime_args[@]}" >/dev/null
 elif ((login_state != 0)); then
   exit "$login_state"
 fi
@@ -106,7 +118,7 @@ socket_generation() {
 begin_tui_lease() {
   local lease_id=$1
   local started_at_ms=$2
-  "$node_bin" "$channel_bin" tui-recovery-target begin \
+  "${channel_command[@]}" tui-recovery-target begin \
     "$launcher_pid" "$launcher_start_ticks" "$lease_id" "$started_at_ms" \
     "${runtime_args[@]}" >/dev/null
 }
@@ -114,12 +126,12 @@ begin_tui_lease() {
 snapshot_recovery_target() {
   local minimum_mtime_ms=$1
   local lease_id=$2
-  "$node_bin" "$channel_bin" tui-recovery-target snapshot "$minimum_mtime_ms" "$lease_id" \
+  "${channel_command[@]}" tui-recovery-target snapshot "$minimum_mtime_ms" "$lease_id" \
     "${runtime_args[@]}" >/dev/null
 }
 
 read_recovery_target() {
-  "$node_bin" "$channel_bin" tui-recovery-target read "${runtime_args[@]}"
+  "${channel_command[@]}" tui-recovery-target read "${runtime_args[@]}"
 }
 
 watcher_pid=''
@@ -174,7 +186,7 @@ cleanup_launcher() {
   trap - EXIT
   stop_watcher
   if [[ -n $current_lease_id ]]; then
-    "$node_bin" "$channel_bin" tui-recovery-target clear-owned "$current_lease_id" \
+    "${channel_command[@]}" tui-recovery-target clear-owned "$current_lease_id" \
       "${runtime_args[@]}" >/dev/null 2>&1 || true
   fi
   stop_worker "$tui_pid"
@@ -204,22 +216,11 @@ if [[ -e $socket ]]; then
 fi
 socket_absence_proven=1
 
-worker_env=(
-  env
-  "${child_env_unsets[@]}"
-  -u CODEX_THREAD_ID
-  -u CODEX_SESSION_ID
-  -u CODEX_TARGET_THREAD_ID
-  -u CODEX_APP_SERVER_SOCKET
-  CODEX_HOME="$codex_home"
-  DISCORD_INSTANCE="$instance"
-  DISCORD_CONFIG_DIR="$state_dir"
-)
 umask 077
-"${worker_env[@]}" "$node_bin" "$channel_bin" app-server "${runtime_args[@]}" \
+"${channel_command[@]}" app-server "${runtime_args[@]}" \
   >>"$state_dir/app-server.log" 2>&1 &
 app_pid=$!
-"${worker_env[@]}" "$node_bin" "$channel_bin" gateway "${runtime_args[@]}" \
+"${channel_command[@]}" gateway "${runtime_args[@]}" \
   >>"$state_dir/session-gateway.log" 2>&1 &
 gateway_pid=$!
 
@@ -240,7 +241,7 @@ while ((SECONDS <= deadline)); do
     exit 1
   fi
   if [[ -S $socket ]]; then
-    "$node_bin" "$channel_bin" live-check "${runtime_args[@]}" \
+    "${channel_command[@]}" live-check "${runtime_args[@]}" \
       --pid "$app_pid" --pid "$gateway_pid" >/dev/null
     codex_args=("$@")
     recovery_stamps=()
@@ -295,7 +296,7 @@ while ((SECONDS <= deadline)); do
       snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
 
       if ((tui_status == 0 || tui_status == 130 || tui_status == 143)); then
-        "$node_bin" "$channel_bin" tui-recovery-target clear-owned "$current_lease_id" \
+        "${channel_command[@]}" tui-recovery-target clear-owned "$current_lease_id" \
           "${runtime_args[@]}" >/dev/null
         exit "$tui_status"
       fi

@@ -292,9 +292,9 @@ test('host requires a fresh matching supervised TUI lease before selecting a loa
     phase: 'launching',
   })}\n`, { mode: 0o600 });
   fs.utimesSync(leasePath, new Date(now), new Date(now));
-  const unbound = await host.resolveTarget();
-  assert.equal(unbound.available, false);
-  assert.equal(unbound.reason, 'shared_app_server_tui_lease_unbound');
+  const rebound = await host.resolveTarget();
+  assert.equal(rebound.available, true);
+  assert.equal(rebound.threadId, DELIVERY_THREAD_ID);
 
   client.emit('notification', {
     method: 'thread/started',
@@ -370,6 +370,67 @@ test('fresh host binds a launching lease to one resumed root without thread/star
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(stateDir, 'app-server-target.json'), 'utf8')).leaseId,
     'lease-0000000000000003',
+  );
+});
+
+test('surviving host rebinds a replacement launching lease without thread/started', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-replacement-lease-'));
+  const leasePath = path.join(stateDir, 'tui-recovery-target.json');
+  const now = Date.now();
+  const writeLease = (leaseId) => {
+    fs.writeFileSync(leasePath, `${JSON.stringify({
+      version: 3,
+      leaseId,
+      supervisorPid: 4242,
+      supervisorStartTicks: '12345',
+      startedAtMs: now - 100,
+      phase: 'launching',
+    })}\n`, { mode: 0o600 });
+    fs.utimesSync(leasePath, new Date(now), new Date(now));
+  };
+  writeLease('lease-0000000000000004');
+
+  const client = new FakeRpcClient((method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.threadId === DELIVERY_THREAD_ID) {
+      return {
+        thread: {
+          id: DELIVERY_THREAD_ID,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-replacement-test.sock',
+    paths: { stateDir },
+    requireTuiLease: true,
+    tuiLeaseStaleMs: 3000,
+  }, () => {}, {
+    client,
+    hasRemoteTuiChild: () => true,
+    now: () => now,
+    readProcessStartTicks: () => '12345',
+  });
+  t.after(() => {
+    host.destroy();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  assert.equal((await host.resolveTarget()).available, true);
+  writeLease('lease-0000000000000005');
+
+  const replacement = await host.resolveTarget();
+  assert.equal(replacement.available, true);
+  assert.equal(replacement.threadId, DELIVERY_THREAD_ID);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(stateDir, 'app-server-target.json'), 'utf8')).leaseId,
+    'lease-0000000000000005',
   );
 });
 
