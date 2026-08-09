@@ -4,6 +4,143 @@ Standalone Codex plugin project for Discord session delivery. The plugin lives
 at `plugins/codex-discord-channel` and is exposed through the repository
 marketplace at `.agents/plugins/marketplace.json`.
 
+## v0.3.5 Team Install And Upgrade
+
+Team release: [v0.3.5](https://github.com/zhshgmail/codex-discord-channel/releases/tag/v0.3.5).
+
+This is the current team-host rollout, not a claim of cross-host portability.
+The marketplace MCP manifest in v0.3.5 still pins the team's absolute Node
+path; a host with a different Node path needs a later manifest fix.
+
+One instance is one launcher-owned process tree: launcher, app-server, Discord
+gateway, and visible Codex TUI. The plugin installs no systemd unit. Normal
+install or upgrade needs no Linux restart, `systemctl`, `pkill`, or `killall`.
+
+### First Install
+
+Choose an instance and its isolated Codex account:
+
+```bash
+INSTANCE=codex02
+ACCOUNT_HOME="$HOME/.codex-account-02"
+STATE_DIR="$HOME/.codex/channels/discord/$INSTANCE"
+mkdir -p "$ACCOUNT_HOME" "$STATE_DIR"
+chmod 700 "$ACCOUNT_HOME" "$STATE_DIR"
+```
+
+Create `$STATE_DIR/account.env` with absolute paths:
+
+```env
+CODEX_HOME=/home/USER/.codex-account-02
+CODEX_BIN=/absolute/path/to/@openai/codex/bin/codex.js
+NODE_BIN=/absolute/path/to/node
+```
+
+Create `$ACCOUNT_HOME/discord-instance.env`:
+
+```env
+DISCORD_INSTANCE=codex02
+DISCORD_CONFIG_DIR=/home/USER/.codex/channels/discord/codex02
+```
+
+Create mode-`0600` `$STATE_DIR/.env` and the
+[`access.json`](#configure-an-instance) receive policy. Never print or commit
+the token file.
+
+```env
+DISCORD_INSTANCE=codex02
+DISCORD_BOT_TOKEN=replace-locally
+DISCORD_BOT_USER_ID=replace-with-the-bot-user-id
+```
+
+Install the pinned tag from an ordinary shell:
+
+```bash
+CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
+  zhshgmail/codex-discord-channel --ref v0.3.5
+CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
+
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.5+codex.alias-isolated-runtime"
+test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
+```
+
+Start a new session with no trailing arguments, or resume an existing one.
+Everything after the instance name is passed to Codex:
+
+```bash
+"$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE"
+"$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" -C /absolute/workspace/path
+"$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" \
+  -C /absolute/workspace/path resume --last
+"$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" --profile PROFILE resume --last
+```
+
+Use `-C /absolute/workspace/path` to pin the Codex working context. Model,
+profile, sandbox, and other Codex settings still come from that account's
+`config.toml` or normal Codex arguments. The first interactive launch may run
+`codex login` for `ACCOUNT_HOME`. Do not
+start `app-server`, `gateway`, a bare `codex --remote`, or a new systemd unit
+separately. The launcher supplies the correct `CODEX_HOME`, instance, state
+directory, socket, and installed activation root to every child.
+
+### Upgrade To v0.3.5
+
+Upgrade one alias at a time:
+
+1. Finish or hand over its active turn, then exit that alias's visible TUI
+   normally. The launcher stops only its own three children.
+2. In an ordinary shell, confirm that exact alias is gone and its state socket
+   is absent. Never use a box-wide process count as proof.
+3. Inspect the configured marketplace/plugin names, replace the cache, and
+   update the shell alias to the new versioned launcher path.
+4. Relaunch the whole alias and run the live checks below.
+
+```bash
+CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace list --json
+CODEX_HOME="$ACCOUNT_HOME" codex plugin list --json
+CODEX_HOME="$ACCOUNT_HOME" codex plugin remove codex-discord-channel@personal
+CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace remove personal
+CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
+  zhshgmail/codex-discord-channel --ref v0.3.5
+CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
+
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.5+codex.alias-isolated-runtime"
+test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
+"$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" resume --last
+```
+
+If the marketplace already points at `v0.3.5`, use
+`codex plugin marketplace upgrade personal` instead of replacing it. Never
+install over a running alias: the installer may remove files used by that
+generation, and an open MCP transport cannot hot-reload the replacement.
+
+### Stop And Recovery Rules
+
+- Normal stop is exiting the selected TUI.
+- If its launcher is stuck, verify the exact absolute launcher path, instance,
+  PID, start time, children, and state directory; send `TERM` only to that
+  launcher PID and let its cleanup trap stop its children.
+- Never use `pkill codex`, `pkill node`, `killall`, an unresolved stale PID,
+  or another alias's process, socket, config, or queue.
+- The only relevant `systemctl --user disable --now` command is for a retired
+  `discord-codex-bridge@INSTANCE.service` that actually exists. v0.3.5 itself
+  has no service.
+- Never edit, delete, or replay `pending-delivery.json` during an upgrade.
+
+### Minimum Live Acceptance
+
+In the exact visible TUI, require `discord_channel_status` to report the
+intended instance/state directory, live gateway, available shared app-server,
+available structured delivery, and Discord started. Then prove a fresh direct
+mention appears automatically with its original `created_at` and stable
+Discord client id. Repeat once after `/clear`. A positive RPC response or an
+empty queue alone is not delivery proof.
+
+If old messages, a stale socket, `structured_ack_uncertain`, `thread_busy`,
+or a wrong visible TUI remains, stop at RED and use
+[Known Issues And Operational Boundaries](docs/known-issues.md). Do not repair
+those symptoms by replaying the queue or killing unrelated processes.
+
 ## What It Does
 
 - Reuses one Discord bot instance and state directory per configured instance.
@@ -139,13 +276,13 @@ alias green.
 
 Prerequisites:
 
-- Node.js 22 or newer;
+- Node.js 22.15.0 or newer;
 - a Discord bot with Message Content intent enabled;
 - one private token file per instance; and
 - one isolated `CODEX_HOME` and Discord state directory per alias.
 
 ```bash
-codex plugin marketplace add zhshgmail/codex-discord-channel --ref main
+codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.5
 codex plugin add codex-discord-channel@personal
 ```
 
@@ -157,8 +294,8 @@ gateway/app-server worker therefore use committed self-contained bundles:
 `runtime/mcp-server.cjs` and `runtime/channel.cjs`. `npm ci` and
 `npm run build:runtime` are development steps, not installation requirements.
 
-For a review branch or pinned deployment, replace `main` with the exact branch,
-tag, or commit approved for that deployment. Do not assume an open MCP
+For a review branch or pinned deployment, replace `v0.3.5` with the exact
+branch, tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
 
 ## Configure An Instance
