@@ -155,7 +155,12 @@ durable user-item proof from the target thread. On a local app-server, the
 gateway first locates one rollout JSONL whose filename and first
 `session_meta.payload.id` exactly match the target thread. It reads only a
 bounded recent tail and accepts only an exact structured
-`event_msg.payload.type=user_message` record carrying the stable client id.
+`event_msg` in one of two forms: the legacy `payload.type=user_message` record
+must carry the stable `payload.client_id`; the current rollout
+`payload.type=item_completed` record must carry the exact target
+`payload.thread_id` plus an object `payload.item` whose type is exactly
+`UserMessage` and whose `client_id` is the same stable client id. A wrong root,
+client id, item type or record shape is not proof.
 `item/started` and `item/completed` lifecycle notifications are wake-up signals
 that start strictly bounded verifier retries; they are never proof themselves.
 Startup, reconnect,

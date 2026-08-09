@@ -158,7 +158,7 @@ test('installed MCP recovers its account binding from plugin cache cwd when Code
     'cache',
     'personal',
     'codex-discord-channel',
-    '0.3.4+codex.alias-isolated-runtime',
+    '0.3.5+codex.alias-isolated-runtime',
   );
   fs.mkdirSync(pluginCwd, { recursive: true });
   fs.writeFileSync(path.join(codexHome, 'discord-instance.env'), [
@@ -186,7 +186,7 @@ test('installed MCP without its account binding cannot fall into a global legacy
     'cache',
     'personal',
     'codex-discord-channel',
-    '0.3.4+codex.alias-isolated-runtime',
+    '0.3.5+codex.alias-isolated-runtime',
   );
   const legacyStateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
   fs.mkdirSync(pluginCwd, { recursive: true });
