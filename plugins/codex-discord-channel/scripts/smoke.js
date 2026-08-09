@@ -5,7 +5,7 @@ const path = require('node:path');
 const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
-const PACKAGE_VERSION = '0.3.3';
+const PACKAGE_VERSION = '0.3.4';
 const PLUGIN_VERSION_PREFIX = `${PACKAGE_VERSION}+codex.`;
 
 function readJson(relativePath) {
@@ -21,7 +21,10 @@ function assert(condition, message) {
 const manifest = readJson('.codex-plugin/plugin.json');
 const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
-const readme = fs.readFileSync(path.resolve(root, '..', '..', 'README.md'), 'utf8');
+const repoRoot = path.resolve(root, '..', '..');
+const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+const pluginSkill = fs.readFileSync(path.join(root, 'skills', 'codex-discord-channel', 'SKILL.md'), 'utf8');
+const knownIssues = fs.readFileSync(path.join(repoRoot, 'docs', 'known-issues.md'), 'utf8');
 
 assert(manifest.name === 'codex-discord-channel', 'manifest name mismatch');
 assert(
@@ -67,5 +70,9 @@ assert(
   readme.includes('codex-discord-instance INSTANCE resume --last'),
   'README must prescribe the alias-owned launcher for production startup',
 );
+for (const [name, document] of [['plugin skill', pluginSkill], ['known issues', knownIssues]]) {
+  assert(!document.includes('codex --remote <same-endpoint>'), `${name} must not prescribe a bare remote TUI`);
+  assert(!document.includes('migrate the gateway'), `${name} must not prescribe split gateway migration`);
+}
 
 process.stdout.write('smoke passed\n');

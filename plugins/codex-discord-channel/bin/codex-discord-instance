@@ -58,7 +58,9 @@ runtime_args=(--instance "$instance" --state-dir "$state_dir")
 child_env_unsets=()
 while IFS= read -r name; do
   case $name in
-    DISCORD_*|CODEX_DISCORD_*|CODEX_APP_SERVER_URL) child_env_unsets+=(-u "$name") ;;
+    DISCORD_*|CODEX_DISCORD_*|CODEX_APP_SERVER_URL|CODEX_ACCOUNT_ENV_FILE|CODEX_NETWORK_ENV_FILE)
+      child_env_unsets+=(-u "$name")
+      ;;
   esac
 done < <(compgen -e)
 instance_runtime_env=(

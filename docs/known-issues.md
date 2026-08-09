@@ -261,8 +261,10 @@ therefore not a valid reply path for a reply-required turn.
 ## Gateway Is Healthy But Messages Go To No Visible Console
 
 The gateway and visible TUI must share the same externally reachable Codex
-app-server. Start the TUI with `codex --remote <same-endpoint> ...`; a direct
-TUI uses a private embedded server that this gateway cannot prove or target.
+app-server. Exit only the affected alias and relaunch it with
+`codex-discord-instance INSTANCE resume --last`; a direct TUI uses a private
+embedded server that this gateway cannot prove or target. Do not start a bare
+remote TUI or either worker independently.
 
 Verify `session-gateway.pid` before investigating model behavior. Exactly one
 effective receiver generation may accept Discord events. Keep the retired
@@ -271,6 +273,8 @@ effective receiver generation may accept Discord events. Keep the retired
 ## Installed Plugin Changes Do Not Appear In An Existing Session
 
 An already-open MCP transport does not hot-load replaced plugin code. Install
-the new plugin version, migrate the gateway under change control, and start a
-new Codex thread. Use a versioned runtime directory so the durable delivery
-activation boundary cannot replay an old backlog.
+the new plugin version through that account's marketplace, then exit and
+relaunch only the complete alias. The alias-owned launcher starts its matching
+gateway, app-server, and TUI from one versioned cache generation; do not migrate
+one worker independently. The versioned runtime directory also keeps the
+durable delivery activation boundary from replaying an old backlog.

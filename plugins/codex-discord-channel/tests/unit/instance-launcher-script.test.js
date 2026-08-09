@@ -40,7 +40,7 @@ function fixture() {
   executable(fakeNode, [
     '#!/usr/bin/env bash',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" ]]; then',
-    '  printf "%s|%s|%s|%s\n" "$2" "${CODEX_HOME-UNSET}" "${DISCORD_CONFIG_DIR-UNSET}" "${DISCORD_STATE_DIR-UNSET}" >>"$CHANNEL_ENV_TRACE"',
+    '  printf "%s|%s|%s|%s|%s|%s\n" "$2" "${CODEX_HOME-UNSET}" "${DISCORD_CONFIG_DIR-UNSET}" "${DISCORD_STATE_DIR-UNSET}" "${CODEX_ACCOUNT_ENV_FILE-UNSET}" "${CODEX_NETWORK_ENV_FILE-UNSET}" >>"$CHANNEL_ENV_TRACE"',
     'fi',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
@@ -104,7 +104,7 @@ function fixture() {
     '  while true; do sleep 0.1; done',
     'fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" ]]; then',
-    '  env | LC_ALL=C sort | grep -E "^(DISCORD_|CODEX_DISCORD_|CODEX_APP_SERVER_URL=)" >>"$CHILD_ENV_TRACE" || true',
+    '  env | LC_ALL=C sort | grep -E "^(DISCORD_|CODEX_DISCORD_|CODEX_APP_SERVER_URL=|CODEX_ACCOUNT_ENV_FILE=|CODEX_NETWORK_ENV_FILE=)" >>"$CHILD_ENV_TRACE" || true',
     'fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${TUI_STAY_ACTIVE:-0} == 1 ]]; then',
     '  trap \'exit 0\' TERM INT',
@@ -226,6 +226,8 @@ test('instance argument ignores Discord state inherited from another alias', () 
     encoding: 'utf8',
     env: launchEnv(setup, {
       CODEX_HOME: path.join(setup.home, '.codex-account-01'),
+      CODEX_ACCOUNT_ENV_FILE: path.join(setup.home, 'foreign-account.env'),
+      CODEX_NETWORK_ENV_FILE: path.join(setup.home, 'foreign-network.env'),
       DISCORD_INSTANCE: 'codex01',
       DISCORD_CONFIG_DIR: foreignStateDir,
       DISCORD_STATE_DIR: foreignStateDir,
@@ -243,10 +245,12 @@ test('instance argument ignores Discord state inherited from another alias', () 
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
   for (const entry of channelEnvironments) {
-    const [, codexHome, configDir, legacyStateDir] = entry.split('|');
+    const [, codexHome, configDir, legacyStateDir, accountEnvFile, networkEnvFile] = entry.split('|');
     assert.equal(codexHome, setup.codexHome);
     assert.equal(configDir, setup.stateDir);
     assert.equal(legacyStateDir, 'UNSET');
+    assert.equal(accountEnvFile, 'UNSET');
+    assert.equal(networkEnvFile, 'UNSET');
   }
 });
 
@@ -423,7 +427,9 @@ test('Codex child receives only the explicit Discord instance allowlist', () => 
     encoding: 'utf8',
     env: launchEnv(setup, {
       CODEX_APP_SERVER_URL: 'unix:///tmp/foreign-codex01.sock',
+      CODEX_ACCOUNT_ENV_FILE: path.join(setup.home, 'foreign-account.env'),
       CODEX_DISCORD_UNKNOWN_SECRET: 'must-not-leak',
+      CODEX_NETWORK_ENV_FILE: path.join(setup.home, 'foreign-network.env'),
       DISCORD_PROXY_URL: 'http://proxy.invalid',
       DISCORD_UNKNOWN_SECRET: 'must-not-leak',
     }),
