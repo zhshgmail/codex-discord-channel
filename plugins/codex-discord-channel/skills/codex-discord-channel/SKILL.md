@@ -145,8 +145,10 @@ one-reply guard. A new inbound Discord message gets a new receipt identity.
 
 ## Guild Reply Audience
 
-With `requireMention: true`, a reply reaches the union of the referenced
-author, agents mentioned in the referenced message, and agents explicitly
-mentioned in the new reply. Every bot evaluates that union independently after
-normal authorization. With `requireMention: false`, mention and reply audience
-do not gate otherwise-authorized group messages.
+With `requireMention: true`, an otherwise-authorized guild message is accepted
+only when the current message directly mentions the bot, Discord marks the
+current message as `@everyone` or `@here`, or the current message directly
+replies to that bot's own message. A reply to a peer does not inherit mentions
+from the referenced message. Literal broadcast lookalikes do not count as
+Discord broadcast metadata. With `requireMention: false`, mention and reply
+audience do not gate otherwise-authorized guild messages.
