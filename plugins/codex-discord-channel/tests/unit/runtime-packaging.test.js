@@ -221,3 +221,79 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
   assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), true);
   assert.equal(fs.existsSync(path.join(home, '.codex')), false);
 });
+
+test('two stripped marketplace MCP children recover only their own account bindings', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-accounts-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home, { recursive: true });
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(pluginRoot, '.codex-plugin', 'plugin.json'),
+    'utf8',
+  ));
+  const observed = [];
+
+  for (const instance of ['codex01', 'codex02']) {
+    const codexHome = path.join(root, `.codex-account-${instance.slice(-2)}`);
+    const stateDir = path.join(root, 'discord', instance);
+    const installedRoot = path.join(
+      codexHome,
+      'plugins',
+      'cache',
+      'personal',
+      'codex-discord-channel',
+      manifest.version,
+    );
+    fs.mkdirSync(path.dirname(installedRoot), { recursive: true });
+    fs.cpSync(pluginRoot, installedRoot, {
+      recursive: true,
+      filter(source) {
+        return !['node_modules', '.env'].includes(path.basename(source));
+      },
+    });
+    fs.writeFileSync(path.join(codexHome, 'discord-instance.env'), [
+      `DISCORD_INSTANCE=${instance}`,
+      `DISCORD_CONFIG_DIR=${stateDir}`,
+      '',
+    ].join('\n'));
+
+    const mcp = JSON.parse(fs.readFileSync(path.join(installedRoot, '.mcp.json'), 'utf8'))
+      .mcpServers['codex-discord-channel'];
+    const requests = [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } },
+      {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'discord_channel_status', arguments: {} },
+      },
+    ];
+    const [, status] = await requestMcp(
+      process.execPath,
+      mcp.args,
+      {
+        cwd: installedRoot,
+        env: {
+          HOME: home,
+          DISCORD_CHANNEL_DISABLE_LOGIN: '1',
+          CODEX_DISCORD_DELIVERY_MODE: 'off',
+          NODE_PATH: '',
+        },
+      },
+      requests,
+    );
+    observed.push(status.result.structuredContent);
+  }
+
+  assert.deepEqual(observed.map((status) => status.instance), ['codex01', 'codex02']);
+  assert.deepEqual(observed.map((status) => status.accountBindingLoaded), [true, true]);
+  assert.deepEqual(observed.map((status) => status.legacyInstanceFallbackUsed), [false, false]);
+  assert.deepEqual(observed.map((status) => status.accountHomeSource), [
+    'plugin_cache',
+    'plugin_cache',
+  ]);
+  assert.notEqual(observed[0].stateDir, observed[1].stateDir);
+  assert.equal(observed[0].stateDir, path.join(root, 'discord', 'codex01'));
+  assert.equal(observed[1].stateDir, path.join(root, 'discord', 'codex02'));
+  assert.equal(fs.existsSync(path.join(home, '.codex')), false);
+});
