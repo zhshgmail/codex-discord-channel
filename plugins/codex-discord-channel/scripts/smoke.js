@@ -25,6 +25,15 @@ function appearsInOrder(document, before, after) {
   return beforeIndex >= 0 && afterIndex > beforeIndex;
 }
 
+function markdownSection(document, heading) {
+  const start = document.indexOf(`${heading}\n`);
+  if (start < 0) return '';
+  const contentStart = start + heading.length + 1;
+  const rest = document.slice(contentStart);
+  const nextHeading = rest.search(/\n#{1,3} /);
+  return nextHeading < 0 ? rest : rest.slice(0, nextHeading);
+}
+
 const manifest = readJson('.codex-plugin/plugin.json');
 const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
@@ -81,9 +90,10 @@ assert(
   readme.includes('Exit the selected alias first'),
   'README must require alias exit before marketplace replacement removes its old cache',
 );
+const runtimeUpdates = markdownSection(readme, '### Runtime Updates');
 assert(
   appearsInOrder(
-    readme,
+    runtimeUpdates,
     'Exit the selected alias first',
     'from an ordinary shell, replace its marketplace revision',
   ),
@@ -99,11 +109,19 @@ for (const [name, document] of [['plugin skill', pluginSkill], ['known issues', 
   assert(!document.includes("marketplace, then exit"), `${name} must not install before alias exit`);
 }
 assert(
-  appearsInOrder(pluginSkill, 'Exit only the selected alias', 'install the released plugin'),
+  appearsInOrder(
+    markdownSection(pluginSkill, '## Alias-Owned Runtime Boundary'),
+    'Exit only the selected alias',
+    'install the released plugin',
+  ),
   'plugin skill must order alias exit before marketplace installation',
 );
 assert(
-  appearsInOrder(knownIssues, 'Exit the selected alias first', 'install the new plugin version'),
+  appearsInOrder(
+    markdownSection(knownIssues, '## Installed Plugin Changes Do Not Appear In An Existing Session'),
+    'Exit the selected alias first',
+    'install the new plugin version',
+  ),
   'known issues must order alias exit before marketplace installation',
 );
 const priorBrokenSkill = [
@@ -114,6 +132,20 @@ const priorBrokenSkill = [
 assert(
   !appearsInOrder(priorBrokenSkill, 'Exit only the selected alias', 'install the released plugin'),
   'ordering gate must reject the prior install-before-exit skill regression',
+);
+const priorCrossSectionFalseGreen = [
+  '## Earlier Section',
+  'Exit the selected alias first.',
+  '### Runtime Updates',
+  'From an ordinary shell, replace its marketplace revision, then exit the selected alias.',
+].join('\n');
+assert(
+  !appearsInOrder(
+    markdownSection(priorCrossSectionFalseGreen, '### Runtime Updates'),
+    'Exit the selected alias first',
+    'from an ordinary shell, replace its marketplace revision',
+  ),
+  'ordering gate must not borrow an exit step from another README section',
 );
 
 process.stdout.write('smoke passed\n');
