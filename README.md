@@ -117,6 +117,13 @@ generation, and an open MCP transport cannot hot-reload the replacement.
 ### Stop And Recovery Rules
 
 - Normal stop is exiting the selected TUI.
+- An upgrade is an operator-controlled maintenance action, not a task that the
+  running Codex should schedule for itself. Finish or hand over the current
+  turn, choose the maintenance window explicitly, and only then exit the TUI.
+- The plugin and `codex-discord-instance` do not start or require `tmux`. Do
+  not put an upgrade behind a detached `tmux`, background waiter, or script
+  that waits indefinitely for the active TUI to disappear. That hides the new
+  TUI and makes launcher ownership ambiguous.
 - If its launcher is stuck, verify the exact absolute launcher path, instance,
   PID, start time, children, and state directory; send `TERM` only to that
   launcher PID and let its cleanup trap stop its children.
@@ -126,6 +133,62 @@ generation, and an open MCP transport cannot hot-reload the replacement.
   `discord-codex-bridge@INSTANCE.service` that actually exists. v0.3.5 itself
   has no service.
 - Never edit, delete, or replay `pending-delivery.json` during an upgrade.
+
+### Upgrade Recovery: Old Alias And Active Launcher
+
+An interactive shell that was open before an upgrade keeps the alias value it
+already loaded. If the old cache was removed, that shell can still try to run
+the old path:
+
+```text
+-bash: .../0.3.4+codex.alias-isolated-runtime/bin/codex-discord-instance:
+No such file or directory
+```
+
+Refresh and inspect the shell definition before retrying. `source` reloads the
+alias; `hash -r` only clears Bash's executable lookup cache.
+
+```bash
+source ~/.bashrc
+hash -r
+alias codex02
+type -a codex02
+```
+
+The alias must name the intended installed version. If the retry instead says:
+
+```text
+Discord instance codex02 already has an active launcher
+```
+
+the launcher has failed its nonblocking lock acquisition and exits with status
+73. This normally means another process still owns that instance; the lock
+file's mere existence is not the proof. Do not delete the lock, socket, queue,
+or PID files, and do not start a second receiver.
+
+```bash
+INSTANCE=codex02
+STATE_DIR="$HOME/.codex/channels/discord/$INSTANCE"
+
+ps -eo pid,ppid,sid,tty,lstart,args | \
+  grep "[c]odex-discord-instance $INSTANCE"
+lsof "$STATE_DIR/instance-launcher.lock"
+```
+
+- If the existing TUI is visible, return to it instead of launching another
+  generation.
+- If an operator deliberately started that TUI inside `tmux`, attach to the
+  exact live session. `tmux` is external supervision, not plugin behavior or a
+  required installation step.
+- If the existing TUI is no longer reachable, first finish or hand over any
+  active work. Verify the exact launcher PID, start time, command, children,
+  state directory, and lock ownership. Then send `TERM` only to that launcher
+  PID and wait for its owned children and socket to disappear. Start the new
+  generation in the terminal where the user expects to see the TUI.
+
+Never solve either error by `pkill`, `killall`, removing the state directory,
+or launching from a detached upgrade waiter. A fresh install or upgrade on
+another machine must work without `tmux`.
 
 ### Minimum Live Acceptance
 
@@ -627,6 +690,8 @@ file both reach the fallback; inspect the command exit code separately.
 | Symptom | Check | Corrective action |
 |---|---|---|
 | `node: command not found` in a noninteractive shell | `NODE_BIN` in `account.env` | Use an absolute Node 22+ path. |
+| An old versioned launcher path reports `No such file or directory` immediately after upgrade | `alias INSTANCE` and `type -a INSTANCE` in the current shell | Reload the shell configuration with `source ~/.bashrc`; verify the alias names the installed version before retrying. Do not reinstall merely to repair an in-memory alias. |
+| `Discord instance INSTANCE already has an active launcher` | Exact launcher process plus the holder of `instance-launcher.lock` | Return to the existing visible TUI. If it is unreachable, establish a safe maintenance boundary, `TERM` only the verified launcher PID, wait for its children/socket to disappear, then relaunch in the intended visible terminal. Never delete the lock or start a second receiver. |
 | Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Exit the selected alias first; from an ordinary shell install the intended revision, update its alias path, then relaunch it with `codex-discord-instance INSTANCE resume --last`. A closed MCP transport cannot hot-reload. |
 | `guild_mention_required` | `access.json` `requireMention`, bot user id, `mentionPatterns`, and reply audience | Correct the exact user/role mention pattern. Do not edit `owner.json` or legacy `state.json` as a workaround. |
 | `guild_channel_not_enabled` in a thread | Runtime revision, thread parent id, and the parent entry in `access.json` | Upgrade past `0.2.1+git.92d5d37cc13b` and enable the parent channel. New threads inherit parent policy automatically. |
