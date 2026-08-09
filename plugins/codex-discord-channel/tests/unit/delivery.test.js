@@ -264,12 +264,14 @@ test('formatEnvelope includes Discord metadata, content, and attachments', () =>
   const envelope = formatEnvelope({
     ...discordMessage('m1', '<@bot> hello'),
     guildId: 'g1',
+    createdAt: '2026-08-08T23:42:24.881Z',
     attachments: [{ id: 'a1', name: 'x.txt', url: 'https://example.test/x' }],
   });
   assert.match(envelope, /source="discord"/);
   assert.match(envelope, /channel_id="c1"/);
   assert.match(envelope, /guild_id="g1"/);
   assert.match(envelope, /message_id="m1"/);
+  assert.match(envelope, /created_at="2026-08-08T23:42:24\.881Z"/);
   assert.match(envelope, /<@bot> hello/);
   assert.match(envelope, /x\.txt: https:\/\/example\.test\/x/);
 });

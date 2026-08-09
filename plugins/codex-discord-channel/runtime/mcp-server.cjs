@@ -4560,6 +4560,7 @@ var require_delivery = __commonJS({
         ` channel_id="${escapeAttr(normalized.channelId)}"`,
         normalized.guildId ? ` guild_id="${escapeAttr(normalized.guildId)}"` : "",
         ` message_id="${escapeAttr(normalized.messageId)}"`,
+        normalized.createdAt ? ` created_at="${escapeAttr(normalized.createdAt)}"` : "",
         ` author_id="${escapeAttr(normalized.authorId)}"`,
         ` author_name="${escapeAttr(normalized.authorName)}"`,
         ' reply="required">'
