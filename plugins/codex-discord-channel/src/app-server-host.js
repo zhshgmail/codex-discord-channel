@@ -23,6 +23,8 @@ const MAX_LIFECYCLE_PROOF_DELAY_MS = 250;
 const DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]);
 const TARGET_CHECKPOINT_VERSION = 3;
 const CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
 
 function parseTargetCheckpoint(raw) {
   let record;
@@ -113,6 +115,32 @@ function isLocalAppServer(endpoint) {
   } catch {
     return false;
   }
+}
+
+function authoritativeActiveTurnMismatch(endpoint, pending, message) {
+  if (
+    !isLocalAppServer(endpoint) ||
+    pending?.method !== 'turn/steer' ||
+    typeof pending.params?.expectedTurnId !== 'string'
+  ) {
+    return null;
+  }
+  const match = ACTIVE_TURN_MISMATCH.exec(String(message || ''));
+  if (!match) return null;
+  const [, expectedTurnId, activeTurnId] = match;
+  if (
+    !CANONICAL_TURN_ID.test(expectedTurnId) ||
+    !CANONICAL_TURN_ID.test(activeTurnId) ||
+    expectedTurnId !== pending.params.expectedTurnId ||
+    activeTurnId === expectedTurnId
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    expectedTurnId,
+    activeTurnId,
+    provenance: 'trusted_local_app_server_rejection',
+  });
 }
 
 function rolloutSessionsDir(config, deps) {
@@ -528,14 +556,20 @@ class AppServerRpcClient extends EventEmitter {
       clearTimeout(pending.timer);
       this.pending.delete(String(message.id));
       if (message.error) {
+        const mismatch = authoritativeActiveTurnMismatch(
+          this.endpoint,
+          pending,
+          message.error.message,
+        );
         const error = deliveryError(
           message.error.message || 'Shared app-server rejected the request.',
-          /active|busy|in progress/i.test(message.error.message || '')
+          mismatch || /active|busy|in progress/i.test(message.error.message || '')
             ? 'thread_busy'
             : 'shared_app_server_request_rejected',
           'rejected',
         );
         error.rpcCode = message.error.code;
+        if (mismatch) error.authoritativeActiveTurnMismatch = mismatch;
         pending.reject(error);
       } else {
         pending.resolve(message.result);
@@ -573,6 +607,8 @@ class AppServerRpcClient extends EventEmitter {
         if (signal && abortListener) signal.removeEventListener('abort', abortListener);
       };
       const pending = {
+        method,
+        params,
         timer: null,
         resolve: (value) => {
           cleanup();
@@ -728,6 +764,7 @@ class AppServerHost extends EventEmitter {
     this.threadSelectionRevision = 0;
     this.threadStatuses = new Map();
     this.activeTurnIds = new Map();
+    this.activeTurnProvenance = new Map();
     this.knownLoadedThreadIds = new Set();
     this.verifiedUserMessages = new Map();
     this.deliveryWaiters = new Map();
@@ -794,12 +831,38 @@ class AppServerHost extends EventEmitter {
         }
         if (thread?.id && !thread.parentThreadId) {
           const lease = this.readTuiLease();
+          const sameProvenRoot = thread.id === this.currentThreadId && (
+            (
+              this.loadedInventoryProven &&
+              this.knownLoadedThreadIds.has(thread.id)
+            ) || this.restoredTargetCheckpoint?.threadId === thread.id
+          );
+          const sameLease = !this.requireTuiLease || (
+            lease.available &&
+            lease.record &&
+            this.observedTuiLeaseTarget?.leaseId === lease.record.leaseId &&
+            this.observedTuiLeaseTarget.threadId === thread.id
+          );
+          if (sameProvenRoot && sameLease) {
+            if (!this.threadStatuses.has(thread.id)) {
+              this.threadStatuses.set(thread.id, thread.status?.type || 'unavailable');
+            }
+            if (
+              thread.status?.type === 'idle' &&
+              this.threadStatuses.get(thread.id) === 'idle'
+            ) {
+              this.emit('idle', { threadId: thread.id });
+            }
+            return;
+          }
           this.observedTuiLeaseTarget = lease.available && lease.record
             ? { leaseId: lease.record.leaseId, threadId: thread.id }
             : null;
           this.loadedInventoryProven = false;
           this.invalidateTargetCheckpoint('top_level_thread_started');
           this.restoredTargetCheckpoint = null;
+          this.activeTurnIds.delete(thread.id);
+          this.activeTurnProvenance.delete(thread.id);
           this.currentThreadId = thread.id;
           this.threadStatuses.set(thread.id, thread.status?.type || 'unavailable');
           if (thread.status?.type === 'idle') this.emit('idle', { threadId: thread.id });
@@ -812,6 +875,7 @@ class AppServerHost extends EventEmitter {
         if (!threadId || !turnId) return;
         this.threadStatuses.set(threadId, 'active');
         this.activeTurnIds.set(threadId, turnId);
+        this.activeTurnProvenance.set(threadId, 'turn_started_notification');
         if (threadId === this.currentThreadId) {
           this.threadSelectionRevision += 1;
           this.persistTargetCheckpoint();
@@ -825,6 +889,7 @@ class AppServerHost extends EventEmitter {
         if (!threadId) return;
         if (!turnId || this.activeTurnIds.get(threadId) === turnId) {
           this.activeTurnIds.delete(threadId);
+          this.activeTurnProvenance.delete(threadId);
         }
         if (
           this.timeoutRecoveryTarget?.threadId === threadId &&
@@ -847,6 +912,7 @@ class AppServerHost extends EventEmitter {
         this.threadStatuses.set(threadId, statusType);
         if (statusType === 'idle') {
           this.activeTurnIds.delete(threadId);
+          this.activeTurnProvenance.delete(threadId);
           if (this.timeoutRecoveryTarget?.threadId === threadId) {
             this.timeoutRecoveryTarget = null;
           }
@@ -869,6 +935,7 @@ class AppServerHost extends EventEmitter {
         if (this.loadedInventoryProven) this.knownLoadedThreadIds.delete(threadId);
         this.threadStatuses.delete(threadId);
         this.activeTurnIds.delete(threadId);
+        this.activeTurnProvenance.delete(threadId);
         if (this.timeoutRecoveryTarget?.threadId === threadId) {
           this.timeoutRecoveryTarget = null;
         }
@@ -909,6 +976,7 @@ class AppServerHost extends EventEmitter {
         this.currentThreadId = checkpoint.threadId;
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
+        this.activeTurnProvenance.clear();
       } else if (retainTimeoutTarget) {
         const { threadId, turnId } = this.timeoutRecoveryTarget;
         this.currentThreadId = threadId;
@@ -916,11 +984,14 @@ class AppServerHost extends EventEmitter {
         this.threadStatuses.set(threadId, 'active');
         this.activeTurnIds.clear();
         this.activeTurnIds.set(threadId, turnId);
+        this.activeTurnProvenance.clear();
+        this.activeTurnProvenance.set(threadId, 'timeout_recovery');
       } else {
         this.timeoutRecoveryTarget = null;
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
+        this.activeTurnProvenance.clear();
         this.knownLoadedThreadIds.clear();
         this.clearTargetCheckpoint();
         this.restoredTargetCheckpoint = null;
@@ -1172,6 +1243,7 @@ class AppServerHost extends EventEmitter {
     this.currentThreadId = threadId;
     this.threadStatuses.set(threadId, 'active');
     this.activeTurnIds.set(threadId, turnId);
+    this.activeTurnProvenance.set(threadId, 'turn_start_response');
     this.persistTargetCheckpoint();
     this.emit('active', { threadId, turnId });
   }
@@ -1197,6 +1269,7 @@ class AppServerHost extends EventEmitter {
       this.currentThreadId = '';
       this.threadStatuses.clear();
       this.activeTurnIds.clear();
+      this.activeTurnProvenance.clear();
       this.knownLoadedThreadIds.clear();
       this.loadedInventoryProven = false;
       this.observedTuiLeaseTarget = null;
@@ -1300,6 +1373,7 @@ class AppServerHost extends EventEmitter {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
+        this.activeTurnProvenance.clear();
         this.invalidateTargetCheckpoint('no_loaded_thread');
         this.restoredTargetCheckpoint = null;
       }
@@ -1388,6 +1462,7 @@ class AppServerHost extends EventEmitter {
         this.currentThreadId = '';
         this.threadStatuses.clear();
         this.activeTurnIds.clear();
+        this.activeTurnProvenance.clear();
         this.invalidateTargetCheckpoint('restored_target_invalid');
       }
       this.restoredTargetCheckpoint = null;
@@ -1552,11 +1627,14 @@ class AppServerHost extends EventEmitter {
         .at(-1);
       if (latestInProgressTurnId) {
         this.activeTurnIds.set(thread.id, latestInProgressTurnId);
+        this.activeTurnProvenance.set(thread.id, 'thread_read');
       } else {
         this.activeTurnIds.delete(thread.id);
+        this.activeTurnProvenance.delete(thread.id);
       }
     } else {
       this.activeTurnIds.delete(thread.id);
+      this.activeTurnProvenance.delete(thread.id);
     }
     this.lastStatus = { configured: true, available: true, reason: null };
     const target = { available: true, threadId: thread.id, status };
@@ -1564,14 +1642,20 @@ class AppServerHost extends EventEmitter {
     if (activeTurnId) target.activeTurnId = activeTurnId;
     this.persistTargetCheckpoint();
     Object.defineProperty(target, TARGET_GENERATION, {
-      value: Object.freeze({ connectionGeneration, threadSelectionRevision }),
+      value: Object.freeze({
+        connectionGeneration,
+        threadSelectionRevision,
+        threadId: thread.id,
+        leaseId: matchingLease.record?.leaseId || '',
+        activeTurnProvenance: this.activeTurnProvenance.get(thread.id) || '',
+      }),
     });
     return target;
   }
 
   async startTurn(params, target) {
-    const generation = target?.[TARGET_GENERATION];
-    const validateTarget = () => {
+    const validateTarget = (candidate) => {
+      const generation = candidate?.[TARGET_GENERATION];
       const lease = this.readTuiLease(params.threadId);
       if (!lease.available) {
         throw deliveryError(
@@ -1579,13 +1663,19 @@ class AppServerHost extends EventEmitter {
           lease.reason,
         );
       }
-      const statusChanged = target?.status === 'active'
-        ? !target.activeTurnId || this.activeTurnIds.get(params.threadId) !== target.activeTurnId
-        : this.threadStatuses.get(params.threadId) !== target?.status;
+      const statusChanged = candidate?.status === 'active'
+        ? !candidate.activeTurnId ||
+          this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId
+        : this.threadStatuses.get(params.threadId) !== candidate?.status;
+      const connectionChanged = generation?.connectionGeneration != null &&
+        this.client.connectionGeneration !== generation.connectionGeneration;
       if (
         !generation ||
+        connectionChanged ||
         generation.threadSelectionRevision !== this.threadSelectionRevision ||
-        target.threadId !== params.threadId ||
+        generation.threadId !== params.threadId ||
+        generation.leaseId !== (lease.record?.leaseId || '') ||
+        candidate.threadId !== params.threadId ||
         this.currentThreadId !== params.threadId ||
         statusChanged
       ) {
@@ -1594,48 +1684,166 @@ class AppServerHost extends EventEmitter {
           'shared_app_server_thread_changed',
         );
       }
+      return lease;
     };
-    validateTarget();
-    const method = target.status === 'active' ? 'turn/steer' : 'turn/start';
-    const requestParams = target.status === 'active'
-      ? { ...params, expectedTurnId: target.activeTurnId }
-      : params;
-    let result;
-    let acceptedGeneration = null;
-    try {
+
+    const submit = async (candidate) => {
+      const generation = candidate[TARGET_GENERATION];
+      validateTarget(candidate);
+      const method = candidate.status === 'active' ? 'turn/steer' : 'turn/start';
+      const requestParams = candidate.status === 'active'
+        ? { ...params, expectedTurnId: candidate.activeTurnId }
+        : params;
       if (typeof this.client.requestOnConnection === 'function') {
         const response = await this.client.requestOnConnection(
           method,
           requestParams,
           generation.connectionGeneration,
-          validateTarget,
+          () => validateTarget(candidate),
           true,
         );
-        result = response.result;
-        acceptedGeneration = response.generation;
-      } else {
-        result = await this.client.request(method, requestParams);
+        return {
+          method,
+          result: response.result,
+          acceptedGeneration: response.generation,
+        };
       }
-    } catch (error) {
+      return {
+        method,
+        result: await this.client.request(method, requestParams),
+        acceptedGeneration: null,
+      };
+    };
+
+    const rejectedWithoutSubmissionUncertainty = (error) => (
+      error?.deliveryOutcome === 'rejected' || error?.deliveryOutcome === 'not_sent'
+    );
+
+    const invalidateChangedLease = (candidate) => {
+      const generation = candidate?.[TARGET_GENERATION];
+      if (!this.requireTuiLease || !generation || this.currentThreadId !== params.threadId) {
+        return false;
+      }
+      const lease = this.readTuiLease(params.threadId);
       if (
-        method === 'turn/steer' &&
-        error?.deliveryOutcome === 'rejected' &&
-        this.activeTurnIds.get(params.threadId) === target.activeTurnId
+        !lease.available ||
+        !lease.record ||
+        lease.record.leaseId === generation.leaseId
       ) {
-        this.threadSelectionRevision += 1;
-        this.timeoutRecoveryTarget = null;
-        this.currentThreadId = '';
-        this.threadStatuses.delete(params.threadId);
-        this.activeTurnIds.delete(params.threadId);
-        this.clearTargetCheckpoint();
-        this.restoredTargetCheckpoint = null;
+        return false;
       }
-      throw error;
+      this.threadSelectionRevision += 1;
+      this.timeoutRecoveryTarget = null;
+      this.currentThreadId = '';
+      this.threadStatuses.clear();
+      this.activeTurnIds.clear();
+      this.activeTurnProvenance.clear();
+      this.knownLoadedThreadIds.clear();
+      this.loadedInventoryProven = false;
+      this.observedTuiLeaseTarget = null;
+      this.invalidateTargetCheckpoint('tui_lease_replaced');
+      this.restoredTargetCheckpoint = null;
+      return true;
+    };
+
+    const clearUnprovenActiveTurn = (candidate) => {
+      if (
+        candidate?.status !== 'active' ||
+        this.currentThreadId !== params.threadId ||
+        this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId
+      ) {
+        return;
+      }
+      this.threadSelectionRevision += 1;
+      this.timeoutRecoveryTarget = null;
+      this.threadStatuses.set(params.threadId, 'active');
+      this.activeTurnIds.delete(params.threadId);
+      this.activeTurnProvenance.delete(params.threadId);
+      this.persistTargetCheckpoint();
+    };
+
+    const rebindAuthoritativeTurn = (candidate, error) => {
+      const mismatch = error?.authoritativeActiveTurnMismatch;
+      if (
+        candidate?.status !== 'active' ||
+        !rejectedWithoutSubmissionUncertainty(error) ||
+        mismatch?.provenance !== 'trusted_local_app_server_rejection' ||
+        mismatch.expectedTurnId !== candidate.activeTurnId ||
+        !CANONICAL_TURN_ID.test(mismatch.activeTurnId) ||
+        mismatch.activeTurnId === candidate.activeTurnId
+      ) {
+        return null;
+      }
+      let lease;
+      try {
+        lease = validateTarget(candidate);
+      } catch {
+        invalidateChangedLease(candidate);
+        return null;
+      }
+      const generation = candidate[TARGET_GENERATION];
+      this.threadSelectionRevision += 1;
+      this.timeoutRecoveryTarget = null;
+      this.currentThreadId = params.threadId;
+      this.threadStatuses.set(params.threadId, 'active');
+      this.activeTurnIds.set(params.threadId, mismatch.activeTurnId);
+      this.activeTurnProvenance.set(
+        params.threadId,
+        mismatch.provenance,
+      );
+      this.persistTargetCheckpoint();
+      const rebound = {
+        available: true,
+        threadId: params.threadId,
+        status: 'active',
+        activeTurnId: mismatch.activeTurnId,
+      };
+      Object.defineProperty(rebound, TARGET_GENERATION, {
+        value: Object.freeze({
+          connectionGeneration: generation.connectionGeneration,
+          threadSelectionRevision: this.threadSelectionRevision,
+          threadId: params.threadId,
+          leaseId: lease.record?.leaseId || '',
+          activeTurnProvenance: mismatch.provenance,
+        }),
+      });
+      return rebound;
+    };
+
+    let submitted;
+    try {
+      submitted = await submit(target);
+    } catch (error) {
+      if (target?.status !== 'active') throw error;
+      const rebound = rebindAuthoritativeTurn(target, error);
+      if (!rebound) {
+        if (rejectedWithoutSubmissionUncertainty(error)) {
+          if (!invalidateChangedLease(target)) clearUnprovenActiveTurn(target);
+        }
+        throw error;
+      }
+      try {
+        submitted = await submit(rebound);
+      } catch (retryError) {
+        const nextAuthoritative = rebindAuthoritativeTurn(rebound, retryError);
+        if (nextAuthoritative) {
+          retryError.code = 'thread_busy';
+          throw retryError;
+        }
+        if (rejectedWithoutSubmissionUncertainty(retryError)) {
+          if (!invalidateChangedLease(rebound)) clearUnprovenActiveTurn(rebound);
+        }
+        throw retryError;
+      }
     }
-    if (method === 'turn/start') {
-      this.rememberAcceptedTurn(params.threadId, result, acceptedGeneration);
+    if (submitted.method === 'turn/start') {
+      this.rememberAcceptedTurn(
+        params.threadId,
+        submitted.result,
+        submitted.acceptedGeneration,
+      );
     }
-    return result;
+    return submitted.result;
   }
 
   async readDeliveredUserMessage(threadId, clientUserMessageId, signal = null) {
@@ -1845,6 +2053,7 @@ class AppServerHost extends EventEmitter {
     }
     this.deliveryWaiters.clear();
     this.verifiedUserMessages.clear();
+    this.activeTurnProvenance.clear();
     this.client.off('notification', this.onNotification);
     this.client.off('connectionChanged', this.onConnectionChanged);
     if (typeof this.client.destroy === 'function') this.client.destroy();

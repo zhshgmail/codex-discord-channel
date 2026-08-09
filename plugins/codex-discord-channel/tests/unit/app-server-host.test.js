@@ -32,6 +32,9 @@ class FakeRpcClient extends EventEmitter {
 
 const DELIVERY_THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190e';
 const OTHER_DELIVERY_THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190f';
+const ACTIVE_TURN_A = '019f3763-d308-7871-bedc-e6489b021910';
+const ACTIVE_TURN_B = '019f3763-d308-7871-bedc-e6489b021911';
+const ACTIVE_TURN_C = '019f3763-d308-7871-bedc-e6489b021912';
 
 function sessionMeta(threadId = DELIVERY_THREAD_ID) {
   return { type: 'session_meta', payload: { id: threadId } };
@@ -52,6 +55,24 @@ function userLifecycleSignal(method, threadId, clientId) {
       turnId: 'turn-delivery-proof',
       item: { type: 'userMessage', clientId },
     },
+  };
+}
+
+function activeThread(threadId, turnId, items = []) {
+  return {
+    thread: {
+      id: threadId,
+      parentThreadId: null,
+      status: { type: 'active', activeFlags: [] },
+      turns: [{ id: turnId, status: 'inProgress', items }],
+    },
+  };
+}
+
+function activeTurnMismatchError(expectedTurnId, activeTurnId) {
+  return {
+    code: -32602,
+    message: `expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``,
   };
 }
 
@@ -118,8 +139,13 @@ function createFakeWebSocket(server, options = {}) {
       const request = JSON.parse(text);
       if (!Object.hasOwn(request, 'id')) return;
       Promise.resolve(server(request, this.connectionIndex)).then((reply) => {
-        const result = Object.hasOwn(reply, 'afterResponse') ? reply.result : reply;
-        this.emit('message', JSON.stringify({ id: request.id, result }));
+        const response = Object.hasOwn(reply, 'error')
+          ? { id: request.id, error: reply.error }
+          : {
+            id: request.id,
+            result: Object.hasOwn(reply, 'afterResponse') ? reply.result : reply,
+          };
+        this.emit('message', JSON.stringify(response));
         if (Object.hasOwn(reply, 'afterResponse')) reply.afterResponse(this);
       });
     }
@@ -3034,6 +3060,474 @@ test('active goal turn recovered from thread/read accepts input with an exact tu
       expectedTurnId: 'goal-continuation-2',
     },
   }]);
+});
+
+test('trusted local A-to-B active-turn mismatch retries once as one exact-readback delivery', async (t) => {
+  const requests = [];
+  let accepted = false;
+  const clientUserMessageId = 'discord:c1:m-active-rebind';
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    requests.push(request);
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return activeThread(
+        DELIVERY_THREAD_ID,
+        accepted ? ACTIVE_TURN_B : ACTIVE_TURN_A,
+        accepted ? [{ type: 'userMessage', clientId: clientUserMessageId }] : [],
+      );
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_A) {
+      return { error: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B) };
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_B) {
+      accepted = true;
+      return { turnId: ACTIVE_TURN_B };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { WebSocket },
+  );
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.activeTurnId, ACTIVE_TURN_A);
+  const params = {
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId,
+    input: [{ type: 'text', text: 'one logical Discord delivery' }],
+  };
+
+  assert.deepEqual(await host.startTurn(params, target), { turnId: ACTIVE_TURN_B });
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientUserMessageId), true);
+  const steerRequests = requests.filter((request) => request.method === 'turn/steer');
+  assert.equal(steerRequests.length, 2);
+  assert.deepEqual(
+    steerRequests.map((request) => request.params.expectedTurnId),
+    [ACTIVE_TURN_A, ACTIVE_TURN_B],
+  );
+  assert.deepEqual(
+    new Set(steerRequests.map((request) => request.params.clientUserMessageId)),
+    new Set([clientUserMessageId]),
+  );
+});
+
+test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven root', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-rebind-cap-'));
+  const requests = [];
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    requests.push(request);
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return activeThread(DELIVERY_THREAD_ID, ACTIVE_TURN_A);
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_A) {
+      return { error: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B) };
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_B) {
+      return { error: activeTurnMismatchError(ACTIVE_TURN_B, ACTIVE_TURN_C) };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  }, () => {}, { WebSocket });
+  t.after(() => {
+    host.destroy();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const target = await host.resolveTarget();
+  const checkpointPath = path.join(stateDir, 'app-server-target.json');
+  await assert.rejects(
+    host.startTurn({
+      threadId: DELIVERY_THREAD_ID,
+      clientUserMessageId: 'discord:c1:m-active-rebind-cap',
+      input: [{ type: 'text', text: 'bounded retry' }],
+    }, target),
+    (error) => error.code === 'thread_busy' && error.deliveryOutcome === 'rejected',
+  );
+
+  const steerRequests = requests.filter((request) => request.method === 'turn/steer');
+  assert.equal(steerRequests.length, 2);
+  assert.deepEqual(
+    steerRequests.map((request) => request.params.expectedTurnId),
+    [ACTIVE_TURN_A, ACTIVE_TURN_B],
+  );
+  assert.equal(host.activeTurnIds.get(DELIVERY_THREAD_ID), ACTIVE_TURN_C);
+  assert.equal(
+    host.activeTurnProvenance.get(DELIVERY_THREAD_ID),
+    'trusted_local_app_server_rejection',
+  );
+  assert.deepEqual(host.status(), { configured: true, available: true, reason: null });
+  assert.equal(fs.existsSync(checkpointPath), true);
+  assert.equal(JSON.parse(fs.readFileSync(checkpointPath, 'utf8')).threadId, DELIVERY_THREAD_ID);
+
+  const readsBefore = requests.filter((request) => request.method === 'thread/read').length;
+  const nextTarget = await host.resolveTarget();
+  assert.equal(nextTarget.activeTurnId, ACTIVE_TURN_C);
+  assert.equal(
+    requests.filter((request) => request.method === 'thread/read').length,
+    readsBefore,
+  );
+});
+
+test('untrusted active-turn rejection text never changes identity and forces exact revalidation', async (t) => {
+  const cases = [
+    {
+      name: 'generic busy error',
+      endpoint: 'ws://127.0.0.1:4500',
+      message: 'thread is busy with another active turn',
+    },
+    {
+      name: 'malformed mismatch wording',
+      endpoint: 'ws://127.0.0.1:4500',
+      message: `expected active turn id ${ACTIVE_TURN_A} but found ${ACTIVE_TURN_B}`,
+    },
+    {
+      name: 'mismatched expected identity',
+      endpoint: 'ws://127.0.0.1:4500',
+      message: activeTurnMismatchError(ACTIVE_TURN_C, ACTIVE_TURN_B).message,
+    },
+    {
+      name: 'non-canonical found identity',
+      endpoint: 'ws://127.0.0.1:4500',
+      message: `expected active turn id \`${ACTIVE_TURN_A}\` but found \`turn-b\``,
+    },
+    {
+      name: 'remote endpoint cannot attest mismatch identity',
+      endpoint: 'ws://example.com:4500',
+      message: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B).message,
+    },
+  ];
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (t) => {
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-untrusted-rebind-'));
+      const requests = [];
+      let rejected = false;
+      const { WebSocket } = createFakeWebSocket(async (request) => {
+        requests.push(request);
+        if (request.method === 'initialize') return {};
+        if (request.method === 'thread/loaded/list') {
+          return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+        }
+        if (request.method === 'thread/read') {
+          return activeThread(
+            DELIVERY_THREAD_ID,
+            rejected ? ACTIVE_TURN_B : ACTIVE_TURN_A,
+          );
+        }
+        if (request.method === 'turn/steer') {
+          rejected = true;
+          return { error: { code: -32602, message: scenario.message } };
+        }
+        throw new Error(`unexpected method ${request.method}`);
+      });
+      const host = createAppServerHost({
+        appServerUrl: scenario.endpoint,
+        paths: { stateDir },
+      }, () => {}, { WebSocket });
+      t.after(() => {
+        host.destroy();
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      });
+
+      const target = await host.resolveTarget();
+      await assert.rejects(host.startTurn({
+        threadId: DELIVERY_THREAD_ID,
+        clientUserMessageId: `discord:c1:${scenario.name}`,
+        input: [{ type: 'text', text: scenario.name }],
+      }, target), (error) => error.deliveryOutcome === 'rejected');
+
+      assert.equal(
+        requests.filter((request) => request.method === 'turn/steer').length,
+        1,
+      );
+      assert.equal(host.currentThreadId, DELIVERY_THREAD_ID);
+      assert.equal(host.activeTurnIds.has(DELIVERY_THREAD_ID), false);
+      assert.equal(fs.existsSync(path.join(stateDir, 'app-server-target.json')), true);
+      assert.deepEqual(host.status(), { configured: true, available: true, reason: null });
+
+      const readCount = requests.filter((request) => request.method === 'thread/read').length;
+      const revalidated = await host.resolveTarget();
+      assert.equal(revalidated.activeTurnId, ACTIVE_TURN_B);
+      assert.equal(
+        requests.filter((request) => request.method === 'thread/read').length > readCount,
+        true,
+      );
+    });
+  }
+});
+
+test('active-turn mismatch does not retry after connection, revision, or root changes', async (t) => {
+  const scenarios = [
+    {
+      name: 'connection generation changes',
+      mutate(host, socket) {
+        socket.close();
+      },
+    },
+    {
+      name: 'thread selection revision changes',
+      mutate(host, socket) {
+        socket.emit('message', JSON.stringify({
+          method: 'thread/status/changed',
+          params: {
+            threadId: DELIVERY_THREAD_ID,
+            status: { type: 'active', activeFlags: [] },
+          },
+        }));
+      },
+    },
+    {
+      name: 'root thread changes',
+      mutate(host, socket) {
+        socket.emit('message', JSON.stringify({
+          method: 'thread/started',
+          params: {
+            thread: {
+              id: OTHER_DELIVERY_THREAD_ID,
+              parentThreadId: null,
+              status: { type: 'idle' },
+            },
+          },
+        }));
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async (t) => {
+      const requests = [];
+      let host;
+      const { WebSocket } = createFakeWebSocket(async (request) => {
+        requests.push(request);
+        if (request.method === 'initialize') return {};
+        if (request.method === 'thread/loaded/list') {
+          return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+        }
+        if (request.method === 'thread/read') {
+          return activeThread(DELIVERY_THREAD_ID, ACTIVE_TURN_A);
+        }
+        if (request.method === 'turn/steer') {
+          return {
+            error: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B),
+            afterResponse: (socket) => scenario.mutate(host, socket),
+          };
+        }
+        throw new Error(`unexpected method ${request.method}`);
+      });
+      host = createAppServerHost(
+        { appServerUrl: 'ws://127.0.0.1:4500' },
+        () => {},
+        { WebSocket },
+      );
+      t.after(() => host.destroy());
+      const target = await host.resolveTarget();
+
+      await assert.rejects(host.startTurn({
+        threadId: DELIVERY_THREAD_ID,
+        clientUserMessageId: `discord:c1:${scenario.name}`,
+        input: [{ type: 'text', text: scenario.name }],
+      }, target), (error) => error.deliveryOutcome === 'rejected');
+      assert.equal(
+        requests.filter((request) => request.method === 'turn/steer').length,
+        1,
+      );
+    });
+  }
+});
+
+test('active-turn mismatch does not retry across a supervised TUI lease change', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-rebind-lease-'));
+  const leasePath = path.join(stateDir, 'tui-recovery-target.json');
+  const checkpointPath = path.join(stateDir, 'app-server-target.json');
+  const now = Date.now();
+  const writeLease = (leaseId) => {
+    fs.writeFileSync(leasePath, `${JSON.stringify({
+      version: 3,
+      leaseId,
+      supervisorPid: 4242,
+      supervisorStartTicks: '12345',
+      startedAtMs: now - 100,
+      phase: 'active',
+      threadId: DELIVERY_THREAD_ID,
+      loadedThreadIds: [DELIVERY_THREAD_ID],
+    })}\n`, { mode: 0o600 });
+    fs.utimesSync(leasePath, new Date(now), new Date(now));
+  };
+  writeLease('lease-active-rebind-000001');
+
+  const requests = [];
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    requests.push(request);
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return activeThread(DELIVERY_THREAD_ID, ACTIVE_TURN_A);
+    }
+    if (request.method === 'turn/steer') {
+      return {
+        error: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B),
+        afterResponse: () => writeLease('lease-active-rebind-000002'),
+      };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+    requireTuiLease: true,
+    tuiLeaseStaleMs: 3000,
+  }, () => {}, {
+    WebSocket,
+    hasRemoteTuiChild: () => true,
+    now: () => now,
+    readProcessStartTicks: () => '12345',
+  });
+  t.after(() => {
+    host.destroy();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+  const target = await host.resolveTarget();
+  assert.equal(fs.existsSync(checkpointPath), true);
+
+  await assert.rejects(host.startTurn({
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-lease-changed',
+    input: [{ type: 'text', text: 'do not cross the TUI lease' }],
+  }, target), (error) => error.deliveryOutcome === 'rejected');
+  assert.equal(requests.filter((request) => request.method === 'turn/steer').length, 1);
+  assert.equal(host.currentThreadId, '');
+  assert.equal(fs.existsSync(checkpointPath), false);
+});
+
+test('disconnect after the one active-turn retry is uncertain and never submits a third call', async (t) => {
+  const requests = [];
+  let sockets;
+  const fixture = createFakeWebSocket(async (request) => {
+    requests.push(request);
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return activeThread(DELIVERY_THREAD_ID, ACTIVE_TURN_A);
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_A) {
+      return { error: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B) };
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_B) {
+      queueMicrotask(() => sockets[0].close());
+      return new Promise(() => {});
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  sockets = fixture.sockets;
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { WebSocket: fixture.WebSocket },
+  );
+  t.after(() => host.destroy());
+  const target = await host.resolveTarget();
+
+  await assert.rejects(host.startTurn({
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId: 'discord:c1:m-retry-disconnect',
+    input: [{ type: 'text', text: 'uncertain retry' }],
+  }, target), (error) => (
+    error.code === 'shared_app_server_disconnected' &&
+    error.deliveryOutcome === 'uncertain'
+  ));
+  assert.equal(requests.filter((request) => request.method === 'turn/steer').length, 2);
+});
+
+test('delayed same-root thread start preserves a proven same-lease checkpoint', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-delayed-root-start-'));
+  const leasePath = path.join(stateDir, 'tui-recovery-target.json');
+  const checkpointPath = path.join(stateDir, 'app-server-target.json');
+  const invalidationPath = path.join(stateDir, 'app-server-target.invalidated.json');
+  const now = Date.now();
+  const writeLease = (leaseId) => {
+    fs.writeFileSync(leasePath, `${JSON.stringify({
+      version: 3,
+      leaseId,
+      supervisorPid: 4242,
+      supervisorStartTicks: '12345',
+      startedAtMs: now - 100,
+      phase: 'active',
+      threadId: DELIVERY_THREAD_ID,
+      loadedThreadIds: [DELIVERY_THREAD_ID],
+    })}\n`, { mode: 0o600 });
+    fs.utimesSync(leasePath, new Date(now), new Date(now));
+  };
+  writeLease('lease-delayed-start-00001');
+  const client = new FakeRpcClient((method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') return activeThread(params.threadId, ACTIVE_TURN_A);
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-delayed-start.sock',
+    paths: { stateDir },
+    requireTuiLease: true,
+    tuiLeaseStaleMs: 3000,
+  }, () => {}, {
+    client,
+    hasRemoteTuiChild: () => true,
+    now: () => now,
+    readProcessStartTicks: () => '12345',
+  });
+  t.after(() => {
+    host.destroy();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  await host.resolveTarget();
+  const checkpointBefore = fs.readFileSync(checkpointPath, 'utf8');
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  assert.equal(fs.readFileSync(checkpointPath, 'utf8'), checkpointBefore);
+  assert.equal(fs.existsSync(invalidationPath), false);
+  assert.equal(host.activeTurnIds.get(DELIVERY_THREAD_ID), ACTIVE_TURN_A);
+
+  writeLease('lease-delayed-start-00002');
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  assert.equal(fs.existsSync(checkpointPath), false);
+  assert.equal(fs.existsSync(invalidationPath), true);
+  assert.equal(host.activeTurnIds.has(DELIVERY_THREAD_ID), false);
 });
 
 test('active turn recovery ignores an older ghost in-progress turn', async () => {

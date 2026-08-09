@@ -73,6 +73,7 @@ instance_runtime_env=(
   CODEX_HOME="$codex_home"
   DISCORD_INSTANCE="$instance"
   DISCORD_CONFIG_DIR="$state_dir"
+  CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root"
 )
 channel_command=("${instance_runtime_env[@]}" "$node_bin" "$channel_bin")
 set +e
@@ -272,6 +273,7 @@ while ((SECONDS <= deadline)); do
         CODEX_HOME="$codex_home" \
         DISCORD_INSTANCE="$instance" \
         DISCORD_CONFIG_DIR="$state_dir" \
+        CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
         "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}" \
         <&0 >&1 2>&2 &
       tui_pid=$!

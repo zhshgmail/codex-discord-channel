@@ -18,6 +18,7 @@ function fixture() {
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
   const binDir = path.join(home, 'bin');
   const pluginBinDir = path.join(home, 'plugin', 'bin');
+  const pluginRoot = path.join(home, 'plugin');
   const pluginRuntimeDir = path.join(home, 'plugin', 'runtime');
   const trace = path.join(home, 'trace.log');
   const childEnvTrace = path.join(home, 'child-env.log');
@@ -40,7 +41,9 @@ function fixture() {
   executable(fakeNode, [
     '#!/usr/bin/env bash',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" ]]; then',
-    '  printf "%s|%s|%s|%s|%s|%s\n" "$2" "${CODEX_HOME-UNSET}" "${DISCORD_CONFIG_DIR-UNSET}" "${DISCORD_STATE_DIR-UNSET}" "${CODEX_ACCOUNT_ENV_FILE-UNSET}" "${CODEX_NETWORK_ENV_FILE-UNSET}" >>"$CHANNEL_ENV_TRACE"',
+    '  state_activation=$(awk -F= \'$1 == "CODEX_DISCORD_DELIVERY_ACTIVATION_ID" { print substr($0, index($0, "=") + 1) }\' "$STATE_DIR/.env")',
+    '  effective_activation=${CODEX_DISCORD_DELIVERY_ACTIVATION_ID:-$state_activation}',
+    '  printf "%s|%s|%s|%s|%s|%s|%s\n" "$2" "${CODEX_HOME-UNSET}" "${DISCORD_CONFIG_DIR-UNSET}" "${DISCORD_STATE_DIR-UNSET}" "${CODEX_ACCOUNT_ENV_FILE-UNSET}" "${CODEX_NETWORK_ENV_FILE-UNSET}" "$effective_activation" >>"$CHANNEL_ENV_TRACE"',
     'fi',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
@@ -154,6 +157,10 @@ function fixture() {
     `NODE_BIN=${fakeNode}`,
     '',
   ].join('\n'));
+  fs.writeFileSync(path.join(stateDir, '.env'), [
+    'CODEX_DISCORD_DELIVERY_ACTIVATION_ID=/marketplace/0.3.0/stale-plugin-root',
+    '',
+  ].join('\n'));
   return {
     binDir,
     channelEnvTrace,
@@ -164,6 +171,7 @@ function fixture() {
     home,
     launcher,
     loginMarker,
+    pluginRoot,
     stateDir,
     trace,
     tuiCount: path.join(home, 'tui-count'),
@@ -208,6 +216,11 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.some((line) => line.startsWith(`node ${setup.fakeChannel} live-check `)));
   assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`));
+  const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
+  assert.ok(channelEnvironments.length > 0);
+  for (const entry of channelEnvironments) {
+    assert.equal(entry.split('|')[6], setup.pluginRoot);
+  }
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
 });
 
@@ -245,12 +258,14 @@ test('instance argument ignores Discord state inherited from another alias', () 
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
   for (const entry of channelEnvironments) {
-    const [, codexHome, configDir, legacyStateDir, accountEnvFile, networkEnvFile] = entry.split('|');
+    const [, codexHome, configDir, legacyStateDir, accountEnvFile, networkEnvFile,
+      activationId] = entry.split('|');
     assert.equal(codexHome, setup.codexHome);
     assert.equal(configDir, setup.stateDir);
     assert.equal(legacyStateDir, 'UNSET');
     assert.equal(accountEnvFile, 'UNSET');
     assert.equal(networkEnvFile, 'UNSET');
+    assert.equal(activationId, setup.pluginRoot);
   }
 });
 
@@ -436,6 +451,7 @@ test('Codex child receives only the explicit Discord instance allowlist', () => 
   });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(fs.readFileSync(setup.childEnvTrace, 'utf8').trim().split('\n'), [
+    `CODEX_DISCORD_DELIVERY_ACTIVATION_ID=${setup.pluginRoot}`,
     `DISCORD_CONFIG_DIR=${setup.stateDir}`,
     'DISCORD_INSTANCE=codex02',
   ]);

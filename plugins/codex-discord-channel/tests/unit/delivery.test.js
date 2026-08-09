@@ -188,6 +188,7 @@ function writePendingQueue(dir, messages, options = {}) {
       queuedAt,
       normalized,
     })),
+    uncertain: options.uncertain || [],
     completed: options.completed || [],
     archived: options.archived || [],
     blocked: options.blocked || null,
@@ -422,6 +423,102 @@ test('activation archives stale backlog before target resolution and delivers a 
   assert.deepEqual(drained.items, []);
   assert.deepEqual(drained.completed.map((item) => item.messageId), ['m-fresh']);
   assert.deepEqual(drained.archived.map((item) => item.messageId), ['m-stale']);
+  delivery.destroy();
+});
+
+test('cross-version activation archives ready and uncertain backlog before delivering fresh input', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-cross-version-activation-'));
+  const staleReady = discordMessage('m-stale-ready', 'ready content must be discarded');
+  const staleUncertain = discordMessage(
+    'm-stale-uncertain',
+    'uncertain content must be discarded',
+  );
+  writePendingQueue(dir, [staleReady], {
+    activationId: '/marketplace/0.3.0/stale-plugin-root',
+    activatedAt: '2026-08-08T20:00:00.000Z',
+    queuedAt: '2026-08-08T20:00:01.000Z',
+    uncertain: [{
+      version: 3,
+      activationId: '/marketplace/0.3.0/stale-plugin-root',
+      queuedAt: '2026-08-08T20:00:02.000Z',
+      normalized: staleUncertain,
+      delivery: {
+        state: 'structured_ack_uncertain',
+        attempts: 1,
+        retryAt: '2026-08-08T20:00:03.000Z',
+        threadId: 'thread-from-old-runtime',
+        clientUserMessageId: 'discord:c1:m-stale-uncertain',
+      },
+    }],
+    blocked: {
+      reason: 'structured_ack_uncertain',
+      threadId: 'thread-from-old-runtime',
+      clientUserMessageId: 'discord:c1:m-stale-uncertain',
+    },
+  });
+  const requests = [];
+  let targetResolutions = 0;
+  const delivery = createDelivery(deliveryConfig(dir, {
+    deliveryActivationId: '/marketplace/0.3.4/current-plugin-root',
+  }), () => {}, {
+    now: () => Date.parse('2026-08-09T00:00:00.000Z'),
+    structuredHost: {
+      async resolveTarget() {
+        targetResolutions += 1;
+        return { available: true, threadId: 'thread-current', status: 'idle' };
+      },
+      async startTurn(params) {
+        requests.push(params);
+        return { turn: { id: 'turn-fresh' } };
+      },
+      async hasDelivered(_threadId, clientUserMessageId) {
+        return requestWasPersisted(requests, clientUserMessageId);
+      },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await delivery.activateReceiver(activeReceiver);
+
+  assert.equal(targetResolutions, 0);
+  assert.deepEqual(requests, []);
+  let queue = readQueue(dir);
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.uncertain, []);
+  assert.equal(queue.blocked, null);
+  assert.deepEqual(queue.archived.map((item) => item.messageId), [
+    'm-stale-ready',
+    'm-stale-uncertain',
+  ]);
+  const archivedJson = JSON.stringify(queue.archived);
+  assert.equal(archivedJson.includes('ready content must be discarded'), false);
+  assert.equal(archivedJson.includes('uncertain content must be discarded'), false);
+  assert.equal(archivedJson.includes('thread-from-old-runtime'), false);
+  assert.equal(archivedJson.includes('clientUserMessageId'), false);
+
+  for (const message of [staleReady, staleUncertain]) {
+    const duplicate = await delivery.enqueue(message);
+    assert.equal(duplicate.status, 'duplicate');
+    assert.equal(duplicate.reason, 'discord_message_archived_at_activation');
+  }
+  queue = readQueue(dir);
+  assert.equal(queue.archived.length, 2);
+
+  const fresh = await delivery.deliver(discordMessage('m-fresh-v034', 'deliver current input'));
+
+  assert.equal(fresh.status, 'delivered');
+  assert.equal(targetResolutions, 1);
+  assert.deepEqual(requests.map((request) => request.clientUserMessageId), [
+    'discord:c1:m-fresh-v034',
+  ]);
+  queue = readQueue(dir);
+  assert.deepEqual(queue.completed.map((item) => item.messageId), ['m-fresh-v034']);
+  assert.equal(queue.archived.length, 2);
   delivery.destroy();
 });
 
