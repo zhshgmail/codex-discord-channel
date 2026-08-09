@@ -3917,6 +3917,105 @@ test('exact rollout parser rejects wrong identity, wrong item, malformed data, a
       ],
     },
     {
+      name: 'completed user message with the wrong event root',
+      records: [
+        sessionMeta(),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            thread_id: OTHER_DELIVERY_THREAD_ID,
+            item: { type: 'UserMessage', client_id: clientId },
+          },
+        },
+      ],
+    },
+    {
+      name: 'completed user message with the wrong client id',
+      records: [
+        sessionMeta(),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            thread_id: DELIVERY_THREAD_ID,
+            item: { type: 'UserMessage', client_id: 'discord:c1:other' },
+          },
+        },
+      ],
+    },
+    {
+      name: 'completed assistant item',
+      records: [
+        sessionMeta(),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            thread_id: DELIVERY_THREAD_ID,
+            item: { type: 'AgentMessage', client_id: clientId },
+          },
+        },
+      ],
+    },
+    {
+      name: 'completed item with a lowercase shape-conflicting type',
+      records: [
+        sessionMeta(),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            thread_id: DELIVERY_THREAD_ID,
+            item: { type: 'userMessage', client_id: clientId },
+          },
+        },
+      ],
+    },
+    {
+      name: 'completed item missing the nested item',
+      records: [
+        sessionMeta(),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            thread_id: DELIVERY_THREAD_ID,
+            client_id: clientId,
+          },
+        },
+      ],
+    },
+    {
+      name: 'completed user item missing its nested client id',
+      records: [
+        sessionMeta(),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            thread_id: DELIVERY_THREAD_ID,
+            client_id: clientId,
+            item: { type: 'UserMessage' },
+          },
+        },
+      ],
+    },
+    {
+      name: 'unrelated completed item with a content-only client id decoy',
+      records: [
+        sessionMeta(),
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'item_completed',
+            thread_id: DELIVERY_THREAD_ID,
+            item: { type: 'CommandExecution', content: clientId },
+          },
+        },
+      ],
+    },
+    {
       name: 'malformed JSON only',
       records: ['{"type":"session_meta"', `{"client_id":"${clientId}"`],
     },
