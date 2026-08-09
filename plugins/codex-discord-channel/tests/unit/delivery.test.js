@@ -879,6 +879,127 @@ test('matching lifecycle signal plus rollout evidence completes without a full t
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-item-ack']);
 });
 
+test('positive ack then real rollout UserMessage proof terminally reconciles uncertain without replay', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-real-rollout-ack-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { codexHome, rolloutPath } = createDeliveryRollout(t);
+  const client = new EventEmitter();
+  const requests = [];
+  const messageId = 'm-real-rollout-proof';
+  const clientUserMessageId = `discord:c1:${messageId}`;
+  client.status = () => ({ configured: true, available: true, reason: null });
+  client.request = async (method, params) => {
+    requests.push({ method, params });
+    if (method === 'thread/loaded/list') {
+      return { data: [ROLLOUT_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && !params.includeTurns) {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+        },
+      };
+    }
+    if (method === 'turn/start') {
+      return { turn: { id: 'turn-authoritative-but-not-yet-durable' } };
+    }
+    if (method === 'thread/read' && params.includeTurns) {
+      return {
+        thread: {
+          id: params.threadId,
+          turns: [{
+            id: 'turn-earlier-visible-only',
+            items: [{ type: 'userMessage', clientId: 'discord:c1:earlier' }],
+          }],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  const host = createAppServerHost(
+    {
+      appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+      env: { CODEX_HOME: codexHome, HOME: path.dirname(codexHome) },
+    },
+    () => {},
+    { client },
+  );
+  const config = deliveryConfig(dir);
+  const delivery = createDelivery(config, () => {}, { structuredHost: host });
+  t.after(() => delivery.destroy());
+
+  const first = await delivery.deliver(discordMessage(messageId, 'persist exactly once'));
+  const uncertainQueue = readQueue(dir);
+
+  assert.equal(first.status, 'failed');
+  assert.equal(first.reason, 'structured_ack_uncertain');
+  assert.deepEqual(uncertainQueue.items, []);
+  assert.equal(uncertainQueue.uncertain.length, 1);
+  assert.equal(uncertainQueue.uncertain[0].delivery.attempts, 1);
+  assert.deepEqual(uncertainQueue.completed, []);
+  assert.equal(
+    requests.filter((request) => ['turn/start', 'turn/steer'].includes(request.method)).length,
+    1,
+  );
+  assert.equal(
+    requests.filter((request) => request.method === 'thread/read' && request.params.includeTurns).length,
+    1,
+  );
+
+  fs.appendFileSync(rolloutPath, `${JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'item_completed',
+      thread_id: ROLLOUT_THREAD_ID,
+      turn_id: 'turn-authoritative-but-not-yet-durable',
+      item: {
+        type: 'UserMessage',
+        id: 'stable-user-item-id',
+        client_id: clientUserMessageId,
+        content: [],
+      },
+    },
+  })}\n`);
+
+  const reconciled = await delivery.flush();
+  const completedQueue = readQueue(dir);
+  const queueStatus = readDeliveryQueueStatus(config);
+
+  assert.equal(reconciled.status, 'delivered');
+  assert.equal(reconciled.reason, 'turn_already_accepted');
+  assert.deepEqual(completedQueue.items, []);
+  assert.deepEqual(completedQueue.uncertain, []);
+  assert.deepEqual(
+    completedQueue.completed.map((item) => ({
+      channelId: item.channelId,
+      messageId: item.messageId,
+    })),
+    [{ channelId: 'c1', messageId }],
+  );
+  assert.match(completedQueue.completed[0].completedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(
+    Date.parse(completedQueue.completed[0].completedAt) >=
+      Date.parse(uncertainQueue.uncertain[0].delivery.lastDeferredAt),
+    true,
+  );
+  assert.equal(
+    requests.filter((request) => ['turn/start', 'turn/steer'].includes(request.method)).length,
+    1,
+  );
+  assert.equal(
+    requests.filter((request) => request.method === 'thread/read' && request.params.includeTurns).length,
+    1,
+  );
+  assert.equal(queueStatus.deliveryQueueDepth, 0);
+  assert.equal(queueStatus.deliveryReadyCount, 0);
+  assert.equal(queueStatus.deliveryUncertainCount, 0);
+  assert.equal(queueStatus.deliveryState, 'idle');
+  assert.equal(queueStatus.deliveryDegradedReason, null);
+  assert.equal(queueStatus.deliveryBlockedReason, null);
+});
+
 test('busy target drains one FIFO item per idle transition and dynamically follows rotation', async () => {
   const fixture = structuredFixture({
     onStartTurn(_params, controls) {

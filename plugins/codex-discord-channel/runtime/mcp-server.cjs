@@ -3372,8 +3372,8 @@ var require_app_server_host = __commonJS({
         }
         let lineEnd = completeEnd - 1;
         for (; lineEnd >= lowerBound; ) {
-          let previousNewline = tail.lastIndexOf(10, lineEnd - 1), lineStart = Math.max(lowerBound, previousNewline + 1), record = parseRolloutLine(tail.subarray(lineStart, lineEnd));
-          if (record?.type === "event_msg" && record.payload && typeof record.payload == "object" && !Array.isArray(record.payload) && record.payload.type === "user_message" && record.payload.client_id === clientUserMessageId)
+          let previousNewline = tail.lastIndexOf(10, lineEnd - 1), lineStart = Math.max(lowerBound, previousNewline + 1), record = parseRolloutLine(tail.subarray(lineStart, lineEnd)), payload = record?.payload, item = payload?.item, legacyUserMessage = payload?.type === "user_message" && payload.client_id === clientUserMessageId, completedUserMessage = payload?.type === "item_completed" && payload.thread_id === threadId && item && typeof item == "object" && !Array.isArray(item) && item.type === "UserMessage" && item.client_id === clientUserMessageId;
+          if (record?.type === "event_msg" && payload && typeof payload == "object" && !Array.isArray(payload) && (legacyUserMessage || completedUserMessage))
             return !0;
           if (previousNewline < lowerBound) break;
           lineEnd = previousNewline;

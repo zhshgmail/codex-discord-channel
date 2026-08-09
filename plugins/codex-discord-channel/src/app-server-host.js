@@ -247,13 +247,27 @@ async function rolloutContainsUserMessage(
       const previousNewline = tail.lastIndexOf(0x0a, lineEnd - 1);
       const lineStart = Math.max(lowerBound, previousNewline + 1);
       const record = parseRolloutLine(tail.subarray(lineStart, lineEnd));
+      const payload = record?.payload;
+      const item = payload?.item;
+      const legacyUserMessage = (
+        payload?.type === 'user_message' &&
+        payload.client_id === clientUserMessageId
+      );
+      const completedUserMessage = (
+        payload?.type === 'item_completed' &&
+        payload.thread_id === threadId &&
+        item &&
+        typeof item === 'object' &&
+        !Array.isArray(item) &&
+        item.type === 'UserMessage' &&
+        item.client_id === clientUserMessageId
+      );
       if (
         record?.type === 'event_msg' &&
-        record.payload &&
-        typeof record.payload === 'object' &&
-        !Array.isArray(record.payload) &&
-        record.payload.type === 'user_message' &&
-        record.payload.client_id === clientUserMessageId
+        payload &&
+        typeof payload === 'object' &&
+        !Array.isArray(payload) &&
+        (legacyUserMessage || completedUserMessage)
       ) {
         return true;
       }
