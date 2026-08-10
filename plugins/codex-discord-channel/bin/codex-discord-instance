@@ -250,7 +250,7 @@ while ((SECONDS <= deadline)); do
     recovery_stamps=()
     while true; do
       launch_generation=$(socket_generation)
-      launch_mtime_ms=$(date +%s%3N)
+      launch_mtime_ms=$("$node_bin" -e 'process.stdout.write(String(Date.now()))')
       current_lease_id=$(tr -d '\n' </proc/sys/kernel/random/uuid)
       begin_tui_lease "$current_lease_id" "$launch_mtime_ms"
       watcher_stop=$(mktemp "$state_dir/.tui-recovery-stop.XXXXXX")
