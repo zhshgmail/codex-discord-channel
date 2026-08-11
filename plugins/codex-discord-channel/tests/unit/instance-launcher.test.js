@@ -116,8 +116,12 @@ test('live process identity requires the selected OpenAI account and Discord sta
   ].join('\0'));
   assert.doesNotThrow(() => verifyLiveProcess(config, 12345, { readFileSync: () => matching }));
 
+  const expectedGeneration = 'generation-123';
   const generationIdentity = {
-    CODEX_DISCORD_LAUNCH_GENERATION: 'generation-123',
+    CODEX_HOME: config.codexHome,
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: config.paths.stateDir,
+    CODEX_DISCORD_LAUNCH_GENERATION: expectedGeneration,
     CODEX_DISCORD_LAUNCH_ROLE: 'app',
     CODEX_DISCORD_LAUNCH_INSTANCE: 'codex02',
     CODEX_DISCORD_LAUNCH_STATE_DIR: config.paths.stateDir,
@@ -132,10 +136,11 @@ test('live process identity requires the selected OpenAI account and Discord sta
   ].join('\0'));
   const matchingGenerationSupervisor = generationEnvironment();
   assert.doesNotThrow(() => verifyLiveProcess(config, 12345, {
+    expectedGeneration,
     readFileSync: () => matchingGenerationSupervisor,
   }));
   for (const [name, overrides] of [
-    ['generation', { CODEX_DISCORD_LAUNCH_GENERATION: '' }],
+    ['generation', { CODEX_DISCORD_LAUNCH_GENERATION: 'generation-456' }],
     ['role', { CODEX_DISCORD_LAUNCH_ROLE: 'tui' }],
     ['instance', { CODEX_DISCORD_LAUNCH_INSTANCE: 'codex01' }],
     ['state directory', { CODEX_DISCORD_LAUNCH_STATE_DIR: `${config.paths.stateDir}-other` }],
@@ -144,7 +149,10 @@ test('live process identity requires the selected OpenAI account and Discord sta
     ['endpoint', { CODEX_DISCORD_LAUNCH_ENDPOINT: `${config.paths.stateDir}/other.sock` }],
   ]) {
     assert.throws(
-      () => verifyLiveProcess(config, 12345, { readFileSync: () => generationEnvironment(overrides) }),
+      () => verifyLiveProcess(config, 12345, {
+        expectedGeneration,
+        readFileSync: () => generationEnvironment(overrides),
+      }),
       /does not match instance codex02/,
       name,
     );
@@ -196,12 +204,21 @@ test('TUI argument separator keeps runtime selection separate from Codex argumen
   });
 });
 
-test('live-check accepts exactly two PIDs beside the runtime selection', () => {
+test('live-check requires one expected generation and exactly two PIDs beside the runtime selection', () => {
   assert.deepEqual(parseLiveCheckArgs([
-    '--instance', 'codex02', '--pid', '100', '--state-dir', '/state/codex02', '--pid', '200',
+    '--instance', 'codex02', '--generation', 'generation-123', '--pid', '100',
+    '--state-dir', '/state/codex02', '--pid', '200',
   ]), {
+    generation: 'generation-123',
     runtimeArgs: ['--instance', 'codex02', '--state-dir', '/state/codex02'],
     pids: [100, 200],
   });
-  assert.throws(() => parseLiveCheckArgs(['--pid', '100']), /exactly two/);
+  assert.throws(
+    () => parseLiveCheckArgs(['--pid', '100', '--pid', '200']),
+    /exactly one --generation/,
+  );
+  assert.throws(
+    () => parseLiveCheckArgs(['--generation', 'generation-123', '--pid', '100']),
+    /exactly two/,
+  );
 });

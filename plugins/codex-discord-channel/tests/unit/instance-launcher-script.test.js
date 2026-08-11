@@ -273,7 +273,10 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.equal(trace.some((line) => line.startsWith('systemctl ')), false);
   assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.some((line) => line.startsWith(`node ${setup.fakeChannel} live-check `)));
+  assert.ok(trace.some((line) => (
+    line.startsWith(`node ${setup.fakeChannel} live-check `)
+    && / --generation [0-9a-f-]{36} /.test(line)
+  )));
   assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);

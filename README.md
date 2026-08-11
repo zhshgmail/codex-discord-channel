@@ -4,12 +4,12 @@ Standalone Codex plugin project for Discord session delivery. The plugin lives
 at `plugins/codex-discord-channel` and is exposed through the repository
 marketplace at `.agents/plugins/marketplace.json`.
 
-## v0.3.6 Team Install And Upgrade
+## v0.3.8 Team Install And Upgrade
 
-Team release: [v0.3.6](https://github.com/zhshgmail/codex-discord-channel/releases/tag/v0.3.6).
+Team release: [v0.3.8](https://github.com/zhshgmail/codex-discord-channel/releases/tag/v0.3.8).
 
 This is the current team-host rollout, not a claim of cross-host portability.
-The marketplace MCP manifest in v0.3.6 still pins the team's absolute Node
+The marketplace MCP manifest in v0.3.8 still pins the team's absolute Node
 path; a host with a different Node path needs a later manifest fix.
 
 One instance is one launcher-owned process tree: launcher, app-server, Discord
@@ -57,10 +57,10 @@ Install the pinned tag from an ordinary shell:
 
 ```bash
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.6
+  zhshgmail/codex-discord-channel --ref v0.3.8
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.6+codex.alias-isolated-runtime"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.8+codex.alias-isolated-runtime"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 ```
 
@@ -83,7 +83,7 @@ start `app-server`, `gateway`, a bare `codex --remote`, or a new systemd unit
 separately. The launcher supplies the correct `CODEX_HOME`, instance, state
 directory, socket, and installed activation root to every child.
 
-### Upgrade To v0.3.6
+### Upgrade To v0.3.8
 
 Upgrade one alias at a time:
 
@@ -101,15 +101,15 @@ CODEX_HOME="$ACCOUNT_HOME" codex plugin list --json
 CODEX_HOME="$ACCOUNT_HOME" codex plugin remove codex-discord-channel@personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace remove personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.6
+  zhshgmail/codex-discord-channel --ref v0.3.8
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.6+codex.alias-isolated-runtime"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.8+codex.alias-isolated-runtime"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 "$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" resume --last
 ```
 
-If the marketplace already points at `v0.3.6`, use
+If the marketplace already points at `v0.3.8`, use
 `codex plugin marketplace upgrade personal` instead of replacing it. Never
 install over a running alias: the installer may remove files used by that
 generation, and an open MCP transport cannot hot-reload the replacement.
@@ -360,7 +360,7 @@ Prerequisites:
 - one isolated `CODEX_HOME` and Discord state directory per alias.
 
 ```bash
-codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.6
+codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.8
 codex plugin add codex-discord-channel@personal
 ```
 
@@ -372,7 +372,7 @@ gateway/app-server worker therefore use committed self-contained bundles:
 `runtime/mcp-server.cjs` and `runtime/channel.cjs`. `npm ci` and
 `npm run build:runtime` are development steps, not installation requirements.
 
-For a review branch or pinned deployment, replace `v0.3.6` with the exact
+For a review branch or pinned deployment, replace `v0.3.8` with the exact
 branch, tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
 
