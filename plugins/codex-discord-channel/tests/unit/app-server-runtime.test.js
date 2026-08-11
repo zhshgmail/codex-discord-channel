@@ -120,13 +120,19 @@ test('app-server exec preserves only the exact launcher generation identity allo
     CODEX_DISCORD_LAUNCH_INSTANCE: 'codex02',
     CODEX_DISCORD_LAUNCH_STATE_DIR: config.paths.stateDir,
     CODEX_DISCORD_LAUNCH_CODEX_HOME: config.codexHome,
-    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/opt/codex-discord-channel/0.3.6',
+    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/opt/codex-discord-channel/0.3.7',
     CODEX_DISCORD_LAUNCH_ENDPOINT: path.join(config.paths.stateDir, 'app-server.sock'),
     CODEX_DISCORD_LAUNCH_ROLE: 'app',
   };
   Object.assign(config.env, expected, {
+    CODEX_APP_SERVER_SOCKET: 'must-be-scrubbed',
+    CODEX_APP_SERVER_URL: 'must-be-scrubbed',
+    CODEX_CWD: 'must-be-scrubbed',
     CODEX_DISCORD_DELIVERY_ACTIVATION_ID: 'must-be-scrubbed',
+    CODEX_DISCORD_LAUNCH_EXTRA: 'must-be-scrubbed',
     CODEX_DISCORD_UNRELATED_SECRET: 'must-be-scrubbed',
+    CODEX_SESSION_ID: 'must-be-scrubbed',
+    CODEX_THREAD_ID: 'must-be-scrubbed',
     CODEX_TARGET_THREAD_ID: 'must-be-scrubbed',
     CODEX_TURN_ID: 'must-be-scrubbed',
     CODEX_WAKE_TOKEN: 'must-be-scrubbed',
@@ -136,8 +142,14 @@ test('app-server exec preserves only the exact launcher generation identity allo
   const sanitized = sanitizedAppServerEnv(config);
   for (const [key, value] of Object.entries(expected)) assert.equal(sanitized[key], value, key);
   for (const key of [
+    'CODEX_APP_SERVER_SOCKET',
+    'CODEX_APP_SERVER_URL',
+    'CODEX_CWD',
     'CODEX_DISCORD_DELIVERY_ACTIVATION_ID',
+    'CODEX_DISCORD_LAUNCH_EXTRA',
     'CODEX_DISCORD_UNRELATED_SECRET',
+    'CODEX_SESSION_ID',
+    'CODEX_THREAD_ID',
     'CODEX_TARGET_THREAD_ID',
     'CODEX_TURN_ID',
     'CODEX_WAKE_TOKEN',

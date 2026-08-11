@@ -5,8 +5,8 @@ const path = require('node:path');
 const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
-const PACKAGE_VERSION = '0.3.6';
-const PLUGIN_VERSION_PREFIX = `${PACKAGE_VERSION}+codex.`;
+const PACKAGE_VERSION = '0.3.7';
+const PLUGIN_VERSION = `${PACKAGE_VERSION}+codex.alias-isolated-runtime`;
 
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(root, relativePath), 'utf8'));
@@ -37,24 +37,22 @@ function markdownSection(document, heading) {
 const manifest = readJson('.codex-plugin/plugin.json');
 const mcp = readJson('.mcp.json');
 const pkg = readJson('package.json');
+const packageLock = readJson('package-lock.json');
 const repoRoot = path.resolve(root, '..', '..');
 const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
 const pluginSkill = fs.readFileSync(path.join(root, 'skills', 'codex-discord-channel', 'SKILL.md'), 'utf8');
 const knownIssues = fs.readFileSync(path.join(repoRoot, 'docs', 'known-issues.md'), 'utf8');
 
 assert(manifest.name === 'codex-discord-channel', 'manifest name mismatch');
-assert(
-  typeof manifest.version === 'string' &&
-    manifest.version.startsWith(PLUGIN_VERSION_PREFIX) &&
-    /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(manifest.version.slice(PLUGIN_VERSION_PREFIX.length)),
-  'manifest version mismatch',
-);
+assert(manifest.version === PLUGIN_VERSION, 'manifest version mismatch');
 assert(manifest.mcpServers === './.mcp.json', 'manifest must point at .mcp.json');
 assert(
   mcp.mcpServers['codex-discord-channel']?.args?.[0] === './runtime/mcp-server.cjs',
   'MCP server must run the committed runtime bundle',
 );
 assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
+assert(packageLock.version === PACKAGE_VERSION, 'package-lock version mismatch');
+assert(packageLock.packages?.['']?.version === PACKAGE_VERSION, 'package-lock root version mismatch');
 assert(SERVER_VERSION === PACKAGE_VERSION, 'MCP server version mismatch');
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');
 for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
@@ -82,6 +80,14 @@ assert(fs.existsSync(path.join(root, 'runtime', 'channel.cjs')), 'missing worker
 assert(fs.existsSync(path.join(root, 'THIRD_PARTY_NOTICES.txt')), 'missing bundled dependency notices');
 assert(!fs.existsSync(path.join(root, '.env')), 'plugin root must not contain .env');
 assert(!readme.includes('## Start The Shared Runtime'), 'README must not prescribe split shared-runtime startup');
+assert(
+  readme.includes(`## v${PACKAGE_VERSION} Team Install And Upgrade`),
+  'README current release heading must match package version',
+);
+assert(
+  readme.includes(`--ref v${PACKAGE_VERSION}`) && readme.includes(`/${PLUGIN_VERSION}`),
+  'README install identities must match package and plugin versions',
+);
 assert(
   readme.includes('codex-discord-instance INSTANCE resume --last'),
   'README must prescribe the alias-owned launcher for production startup',

@@ -11,6 +11,7 @@ const pluginRoot = path.resolve(__dirname, '..', '..');
 const sourceLauncher = path.join(pluginRoot, 'bin', 'codex-discord-instance');
 const sourceGenerationHelper = path.join(pluginRoot, 'bin', 'codex-discord-generation');
 const sourceAppServerRuntime = path.join(pluginRoot, 'src', 'app-server-runtime.js');
+const sourceInstanceLauncher = path.join(pluginRoot, 'src', 'instance-launcher.js');
 
 function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
@@ -152,7 +153,23 @@ function record(role) {
   fs.appendFileSync(process.env.PROCESS_TRACE, JSON.stringify({ role, ...procInfo() }) + '\n');
 }
 const command = process.argv[2];
-if (command === 'tui-login-state' || command === 'tui-check' || command === 'live-check') process.exit(0);
+if (command === 'tui-login-state' || command === 'tui-check') process.exit(0);
+if (command === 'live-check') {
+  if (process.env.REAL_LIVE_CHECK !== '1') process.exit(0);
+  const stateDir = value('--state-dir');
+  const pids = process.argv.flatMap((item, index, argv) => item === '--pid' ? [Number(argv[index + 1])] : []);
+  const endpoint = 'unix://' + stateDir + '/app-server.sock';
+  const config = {
+    appServerUrl: endpoint,
+    codexHome: process.env.CODEX_HOME,
+    deliveryActivationId: require('node:path').resolve(__dirname, '..'),
+    paths: { instance: 'codex02', stateDir },
+  };
+  for (const pid of pids) {
+    require(process.env.SOURCE_INSTANCE_LAUNCHER).verifyLiveProcess(config, pid);
+  }
+  process.exit(0);
+}
 if (command === 'tui-recovery-target') {
   const action = process.argv[3];
   const stateDir = value('--state-dir');
@@ -339,6 +356,7 @@ function env(setup, overrides = {}) {
     NATIVE_LISTENER: setup.nativeListener,
     PROCESS_TRACE: setup.processTrace,
     SOURCE_APP_SERVER_RUNTIME: sourceAppServerRuntime,
+    SOURCE_INSTANCE_LAUNCHER: sourceInstanceLauncher,
     TUI_DESCENDANT: setup.tuiDescendant,
     TUI_EXIT_DELAY_MS: '100',
     ...overrides,
@@ -384,7 +402,7 @@ async function orphanReadyGeneration(setup, overrides = {}) {
 
 test('real launcher binds supervisor, Node wrapper, and native app-server to one generation', async (t) => {
   const setup = fixture(t);
-  const launcher = await readyLauncher(setup);
+  const launcher = await readyLauncher(setup, { REAL_LIVE_CHECK: '1' });
   const manifest = await waitFor(() => {
     if (!fs.existsSync(setup.manifestPath)) return null;
     const value = JSON.parse(fs.readFileSync(setup.manifestPath, 'utf8'));
@@ -444,6 +462,7 @@ test('SIGKILLed launcher generation is reclaimed on immediate relaunch with no d
     APP_WRAPPER_TERM: 'exit',
     CODEX_DISCORD_STOP_TIMEOUT_MS: '5000',
     NATIVE_IGNORE_TERM: '1',
+    REAL_LIVE_CHECK: '1',
   });
   await waitFor(() => fs.existsSync(setup.socketPath), 'app-server socket');
   const gateway = await waitFor(
@@ -458,7 +477,7 @@ test('SIGKILLed launcher generation is reclaimed on immediate relaunch with no d
 
   const relaunched = spawnSync(setup.launcher, ['codex02'], {
     encoding: 'utf8',
-    env: env(setup),
+    env: env(setup, { REAL_LIVE_CHECK: '1' }),
     timeout: 8000,
   });
 
@@ -638,7 +657,7 @@ test('a live launcher lock still rejects a second launcher without touching it',
 
 test('normal TUI exit terminates the app wrapper and its native listener', async (t) => {
   const setup = fixture(t);
-  const child = launch(setup);
+  const child = launch(setup, { REAL_LIVE_CHECK: '1' });
   await waitFor(() => recordedProcesses(setup).some((item) => item.role === 'native-listener'), 'native listener');
   const owned = recordedProcesses(setup);
   const result = await waitForExit(child);

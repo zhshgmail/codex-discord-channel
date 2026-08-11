@@ -529,7 +529,7 @@ class AppServerRpcClient extends EventEmitter {
         clientInfo: {
           name: 'codex-discord-channel',
           title: 'Discord Channel Gateway',
-          version: '0.3.6',
+          version: '0.3.7',
         },
         capabilities: {
           experimentalApi: true,

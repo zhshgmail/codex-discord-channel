@@ -147,6 +147,43 @@ test('live process identity requires the selected OpenAI account and Discord sta
   }));
 });
 
+test('live process identity accepts one exact launcher generation and rejects every identity mismatch', () => {
+  const config = instanceFixture();
+  const exactIdentity = {
+    CODEX_DISCORD_LAUNCH_GENERATION: 'generation-123',
+    CODEX_DISCORD_LAUNCH_INSTANCE: config.paths.instance,
+    CODEX_DISCORD_LAUNCH_STATE_DIR: config.paths.stateDir,
+    CODEX_DISCORD_LAUNCH_CODEX_HOME: config.codexHome,
+    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: config.deliveryActivationId,
+    CODEX_DISCORD_LAUNCH_ENDPOINT: config.appServerUrl.replace(/^unix:\/\//, ''),
+    CODEX_DISCORD_LAUNCH_ROLE: 'app',
+  };
+  const procEnvironment = (overrides = {}) => Buffer.from([
+    ...Object.entries({ ...exactIdentity, ...overrides })
+      .map(([key, value]) => `${key}=${value}`),
+    '',
+  ].join('\0'));
+
+  assert.doesNotThrow(() => verifyLiveProcess(config, 12345, {
+    readFileSync: () => procEnvironment(),
+  }));
+  for (const [name, overrides] of [
+    ['generation', { CODEX_DISCORD_LAUNCH_GENERATION: '' }],
+    ['instance', { CODEX_DISCORD_LAUNCH_INSTANCE: 'codex01' }],
+    ['state directory', { CODEX_DISCORD_LAUNCH_STATE_DIR: `${config.paths.stateDir}-other` }],
+    ['Codex home', { CODEX_DISCORD_LAUNCH_CODEX_HOME: `${config.codexHome}-other` }],
+    ['plugin root', { CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: `${config.deliveryActivationId}-other` }],
+    ['endpoint', { CODEX_DISCORD_LAUNCH_ENDPOINT: `${config.paths.stateDir}/other.sock` }],
+    ['role', { CODEX_DISCORD_LAUNCH_ROLE: 'tui' }],
+  ]) {
+    assert.throws(
+      () => verifyLiveProcess(config, 12345, { readFileSync: () => procEnvironment(overrides) }),
+      /does not match instance codex02/,
+      name,
+    );
+  }
+});
+
 test('TUI argument separator keeps runtime selection separate from Codex arguments', () => {
   assert.deepEqual(parseTuiArgs([
     '--instance',

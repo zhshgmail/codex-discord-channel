@@ -3660,7 +3660,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.6"
+              version: "0.3.7"
             },
             capabilities: {
               experimentalApi: !0,
@@ -95246,7 +95246,7 @@ var require_instance_launcher = __commonJS({
         let separator = entry.indexOf("=");
         return separator === -1 ? [entry, ""] : [entry.slice(0, separator), entry.slice(separator + 1)];
       }));
-      if (!(env.CODEX_HOME !== config.codexHome || env.DISCORD_INSTANCE !== config.paths.instance || path.resolve(env.DISCORD_CONFIG_DIR || "") !== path.resolve(config.paths.stateDir))) return;
+      if (!(env.CODEX_HOME !== config.codexHome || env.DISCORD_INSTANCE !== config.paths.instance || path.resolve(env.DISCORD_CONFIG_DIR || "") !== path.resolve(config.paths.stateDir)) || !!(env.CODEX_DISCORD_LAUNCH_GENERATION && ["app", "gateway"].includes(env.CODEX_DISCORD_LAUNCH_ROLE) && env.CODEX_DISCORD_LAUNCH_INSTANCE === config.paths.instance && path.resolve(env.CODEX_DISCORD_LAUNCH_STATE_DIR || "") === path.resolve(config.paths.stateDir) && path.resolve(env.CODEX_DISCORD_LAUNCH_CODEX_HOME || "") === path.resolve(config.codexHome) && path.resolve(env.CODEX_DISCORD_LAUNCH_PLUGIN_ROOT || "") === path.resolve(config.deliveryActivationId) && env.CODEX_DISCORD_LAUNCH_ENDPOINT === config.appServerUrl.replace(/^unix:\/\//, ""))) return;
       let argv = [];
       try {
         argv = readFileSync(`/proc/${pid}/cmdline`).toString("utf8").split("\0").filter(Boolean);
@@ -95468,7 +95468,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.6", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.7", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

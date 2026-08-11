@@ -988,6 +988,24 @@ test('host reports available status after reconnect initialization completes', a
   });
 });
 
+test('app-server initialize advertises the v0.3.7 release identity', async (t) => {
+  let initialize;
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    initialize = request;
+    return {};
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { WebSocket });
+  t.after(() => host.destroy());
+
+  await host.client.ensureConnected();
+  assert.equal(initialize.method, 'initialize');
+  assert.deepEqual(initialize.params.clientInfo, {
+    name: 'codex-discord-channel',
+    title: 'Discord Channel Gateway',
+    version: '0.3.7',
+  });
+});
+
 test('websocket close autonomously reconnects and emits reconnect without later traffic', async (t) => {
   const timers = createManualTimers();
   const { WebSocket, sockets } = createFakeWebSocket(async (request) => {
