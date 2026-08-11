@@ -116,6 +116,40 @@ test('live process identity requires the selected OpenAI account and Discord sta
   ].join('\0'));
   assert.doesNotThrow(() => verifyLiveProcess(config, 12345, { readFileSync: () => matching }));
 
+  const generationIdentity = {
+    CODEX_DISCORD_LAUNCH_GENERATION: 'generation-123',
+    CODEX_DISCORD_LAUNCH_ROLE: 'app',
+    CODEX_DISCORD_LAUNCH_INSTANCE: 'codex02',
+    CODEX_DISCORD_LAUNCH_STATE_DIR: config.paths.stateDir,
+    CODEX_DISCORD_LAUNCH_CODEX_HOME: config.codexHome,
+    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: config.deliveryActivationId,
+    CODEX_DISCORD_LAUNCH_ENDPOINT: `${config.paths.stateDir}/app-server.sock`,
+  };
+  const generationEnvironment = (overrides = {}) => Buffer.from([
+    ...Object.entries({ ...generationIdentity, ...overrides })
+      .map(([key, value]) => `${key}=${value}`),
+    '',
+  ].join('\0'));
+  const matchingGenerationSupervisor = generationEnvironment();
+  assert.doesNotThrow(() => verifyLiveProcess(config, 12345, {
+    readFileSync: () => matchingGenerationSupervisor,
+  }));
+  for (const [name, overrides] of [
+    ['generation', { CODEX_DISCORD_LAUNCH_GENERATION: '' }],
+    ['role', { CODEX_DISCORD_LAUNCH_ROLE: 'tui' }],
+    ['instance', { CODEX_DISCORD_LAUNCH_INSTANCE: 'codex01' }],
+    ['state directory', { CODEX_DISCORD_LAUNCH_STATE_DIR: `${config.paths.stateDir}-other` }],
+    ['Codex home', { CODEX_DISCORD_LAUNCH_CODEX_HOME: `${config.codexHome}-other` }],
+    ['plugin root', { CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: `${config.deliveryActivationId}-other` }],
+    ['endpoint', { CODEX_DISCORD_LAUNCH_ENDPOINT: `${config.paths.stateDir}/other.sock` }],
+  ]) {
+    assert.throws(
+      () => verifyLiveProcess(config, 12345, { readFileSync: () => generationEnvironment(overrides) }),
+      /does not match instance codex02/,
+      name,
+    );
+  }
+
   const wrongAccount = Buffer.from([
     'CODEX_HOME=/tmp/other-account',
     'DISCORD_INSTANCE=codex02',
