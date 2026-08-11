@@ -24,6 +24,7 @@ function fixture() {
   const childEnvTrace = path.join(home, 'child-env.log');
   const channelEnvTrace = path.join(home, 'channel-env.log');
   const loginMarker = path.join(home, 'login-complete');
+  const tuiActiveMarker = path.join(home, 'tui-active');
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
   const fakeChannel = path.join(pluginRuntimeDir, 'channel.cjs');
@@ -141,7 +142,10 @@ while True:
     '    while [[ ! -S $STATE_DIR/app-server.sock ]]; do sleep 0.01; done',
     '    exit 42',
     '  fi',
-    '  if [[ ${GATEWAY_EXIT_AFTER_START:-0} == 1 ]]; then sleep 0.2; exit 42; fi',
+    '  if [[ ${GATEWAY_EXIT_WHEN_TUI_ACTIVE:-0} == 1 ]]; then',
+    '    while [[ ! -e $TUI_ACTIVE_MARKER ]]; do sleep 0.01; done',
+    '    exit 42',
+    '  fi',
     '  trap \'exit 0\' TERM INT',
     '  while true; do sleep 0.1; done',
     'fi',
@@ -149,6 +153,7 @@ while True:
     '  env | LC_ALL=C sort | grep -E "^(DISCORD_|CODEX_DISCORD_|CODEX_APP_SERVER_URL=|CODEX_ACCOUNT_ENV_FILE=|CODEX_NETWORK_ENV_FILE=)" >>"$CHILD_ENV_TRACE" || true',
     'fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${TUI_STAY_ACTIVE:-0} == 1 ]]; then',
+    '  : >"$TUI_ACTIVE_MARKER"',
     '  trap \'exit 0\' TERM INT',
     '  while true; do sleep 0.1; done',
     'fi',
@@ -224,6 +229,7 @@ while True:
     stateDir,
     trace,
     tuiCount: path.join(home, 'tui-count'),
+    tuiActiveMarker,
   };
 }
 
@@ -247,6 +253,7 @@ function launchEnv(setup, overrides = {}) {
     THREAD_ID: '019f3763-d308-7871-bedc-e6489b02190e',
     TRACE: setup.trace,
     TUI_COUNT: setup.tuiCount,
+    TUI_ACTIVE_MARKER: setup.tuiActiveMarker,
     ...overrides,
   };
 }
@@ -412,7 +419,7 @@ test('worker exit fails the active TUI closed and cleans the owned socket', () =
   const setup = fixture();
   const result = spawnSync(setup.launcher, ['codex02'], {
     encoding: 'utf8',
-    env: launchEnv(setup, { GATEWAY_EXIT_AFTER_START: '1', TUI_STAY_ACTIVE: '1' }),
+    env: launchEnv(setup, { GATEWAY_EXIT_WHEN_TUI_ACTIVE: '1', TUI_STAY_ACTIVE: '1' }),
     timeout: 5000,
   });
   assert.equal(result.status, 75, result.stderr);

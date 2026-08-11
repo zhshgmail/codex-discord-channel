@@ -112,6 +112,7 @@ function fixture(t) {
   const channel = path.join(runtimeDir, 'channel.cjs');
   const codexWrapper = path.join(home, 'codex-wrapper.js');
   const nativeListener = path.join(home, 'native-listener.py');
+  const tuiDescendant = path.join(home, 'tui-descendant.py');
   const processTrace = path.join(home, 'processes.jsonl');
   const socketPath = path.join(stateDir, 'app-server.sock');
   const manifestPath = path.join(stateDir, 'instance-generation.json');
@@ -209,6 +210,9 @@ if (process.argv[2] === 'app-server') {
   setInterval(() => {}, 1000);
 } else if (process.argv.includes('--remote')) {
   record('tui');
+  if (process.env.TUI_LEAVE_DESCENDANT === '1') {
+    spawn('python3', [process.env.TUI_DESCENDANT], { env: process.env, stdio: 'ignore' });
+  }
   if (process.env.TUI_STAY_ACTIVE === '1') {
     const stop = () => process.exit(0);
     process.on('SIGTERM', stop);
@@ -221,6 +225,23 @@ if (process.argv[2] === 'app-server') {
 } else {
   process.exit(0);
 }
+`);
+
+  executable(tuiDescendant, String.raw`#!/usr/bin/env python3
+import json, os, signal, time
+def stop(_signum, _frame):
+    if os.environ.get('TUI_DESCENDANT_IGNORE_TERM') == '1':
+        return
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGHUP, stop)
+with open(os.environ['PROCESS_TRACE'], 'a', encoding='utf-8') as out:
+    stat = open('/proc/self/stat', encoding='utf-8').read()
+    tail = stat[stat.rfind(')') + 2:].split()
+    out.write(json.dumps({'role': 'tui-native-descendant', 'pid': os.getpid(), 'ppid': os.getppid(), 'pgid': os.getpgrp(), 'startTicks': tail[19]}) + '\n')
+while True:
+    time.sleep(0.1)
 `);
 
   executable(nativeListener, String.raw`#!/usr/bin/env python3
@@ -279,6 +300,7 @@ while True:
     processTrace,
     socketPath,
     stateDir,
+    tuiDescendant,
   };
   t.after(() => {
     killFixtureProcesses(setup);
@@ -299,6 +321,7 @@ function env(setup, overrides = {}) {
     HOME: setup.home,
     NATIVE_LISTENER: setup.nativeListener,
     PROCESS_TRACE: setup.processTrace,
+    TUI_DESCENDANT: setup.tuiDescendant,
     TUI_EXIT_DELAY_MS: '100',
     ...overrides,
   };
@@ -579,6 +602,31 @@ test('normal TUI exit terminates the app wrapper and its native listener', async
   assertRecordedDead(owned, `normal exit (${child.stderrText})`);
   assert.equal(fs.existsSync(setup.socketPath), false);
   assert.equal(fs.existsSync(setup.manifestPath), false);
+});
+
+test('TUI wrapper exit terminates a same-generation native descendant before identity is cleared', async (t) => {
+  const setup = fixture(t);
+  const child = launch(setup, {
+    TUI_DESCENDANT_IGNORE_TERM: '1',
+    TUI_LEAVE_DESCENDANT: '1',
+  });
+  const descendant = await waitFor(
+    () => recordedProcesses(setup).find((item) => item.role === 'tui-native-descendant'),
+    'TUI native descendant',
+  );
+  const result = await waitForExit(child);
+
+  assert.equal(result.code, 0, child.stderrText);
+  assertRecordedDead([descendant], 'normal TUI wrapper exit');
+  assert.equal(fs.existsSync(setup.socketPath), false);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+
+  const relaunched = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: env(setup),
+    timeout: 8000,
+  });
+  assert.equal(relaunched.status, 0, relaunched.stderr);
 });
 
 test('repeated TERM during delayed cleanup cannot interrupt descendant teardown', async (t) => {

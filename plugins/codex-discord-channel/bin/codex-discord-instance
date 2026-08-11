@@ -442,6 +442,9 @@ while ((SECONDS <= deadline)); do
         exit 75
       fi
       tui_status=$child_status
+      # wait -n reaps only the TUI group leader.  Keep its exact identity until
+      # the rest of that isolated generation group has also been terminated.
+      stop_worker_group tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
       tui_pid=''
       tui_start_ticks=''
       tui_pgid=''
