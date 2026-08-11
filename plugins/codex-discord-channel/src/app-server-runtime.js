@@ -3,6 +3,16 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+const LAUNCH_GENERATION_ENV_KEYS = new Set([
+  'CODEX_DISCORD_LAUNCH_GENERATION',
+  'CODEX_DISCORD_LAUNCH_INSTANCE',
+  'CODEX_DISCORD_LAUNCH_STATE_DIR',
+  'CODEX_DISCORD_LAUNCH_CODEX_HOME',
+  'CODEX_DISCORD_LAUNCH_PLUGIN_ROOT',
+  'CODEX_DISCORD_LAUNCH_ENDPOINT',
+  'CODEX_DISCORD_LAUNCH_ROLE',
+]);
+
 function canonicalPath(input) {
   let current = path.resolve(input);
   const suffix = [];
@@ -41,7 +51,7 @@ function sanitizedAppServerEnv(config) {
       key === 'CODEX_APP_SERVER_SOCKET' ||
       key === 'CODEX_CWD' ||
       key.startsWith('CODEX_TARGET_') ||
-      key.startsWith('CODEX_DISCORD_') ||
+      (key.startsWith('CODEX_DISCORD_') && !LAUNCH_GENERATION_ENV_KEYS.has(key)) ||
       key.startsWith('CODEX_TURN_') ||
       key.startsWith('CODEX_WAKE_') ||
       key.startsWith('CODEX_DENY_')

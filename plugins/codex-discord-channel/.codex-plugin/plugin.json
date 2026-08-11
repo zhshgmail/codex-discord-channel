@@ -1,6 +1,6 @@
 {
   "name": "codex-discord-channel",
-  "version": "0.3.6+codex.alias-isolated-runtime",
+  "version": "0.3.6+codex.alias-isolated-runtime.generation-env-repair.1",
   "description": "Claude-style Discord channel ownership for Codex sessions.",
   "author": {
     "name": "zhshgmail",

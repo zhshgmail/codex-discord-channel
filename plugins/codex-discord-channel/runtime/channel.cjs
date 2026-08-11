@@ -95126,7 +95126,15 @@ var require_owner_state = __commonJS({
 var require_app_server_runtime = __commonJS({
   "src/app-server-runtime.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path");
+    var fs = require("node:fs"), path = require("node:path"), LAUNCH_GENERATION_ENV_KEYS = /* @__PURE__ */ new Set([
+      "CODEX_DISCORD_LAUNCH_GENERATION",
+      "CODEX_DISCORD_LAUNCH_INSTANCE",
+      "CODEX_DISCORD_LAUNCH_STATE_DIR",
+      "CODEX_DISCORD_LAUNCH_CODEX_HOME",
+      "CODEX_DISCORD_LAUNCH_PLUGIN_ROOT",
+      "CODEX_DISCORD_LAUNCH_ENDPOINT",
+      "CODEX_DISCORD_LAUNCH_ROLE"
+    ]);
     function canonicalPath(input) {
       let current = path.resolve(input), suffix = [];
       for (; !fs.existsSync(current); ) {
@@ -95148,7 +95156,7 @@ var require_app_server_runtime = __commonJS({
     function sanitizedAppServerEnv(config) {
       let env = { ...config.env };
       for (let key of Object.keys(env))
-        key.startsWith("DISCORD_") && delete env[key], (key === "CODEX_THREAD_ID" || key === "CODEX_SESSION_ID" || key === "CODEX_APP_SERVER_URL" || key === "CODEX_APP_SERVER_SOCKET" || key === "CODEX_CWD" || key.startsWith("CODEX_TARGET_") || key.startsWith("CODEX_DISCORD_") || key.startsWith("CODEX_TURN_") || key.startsWith("CODEX_WAKE_") || key.startsWith("CODEX_DENY_")) && delete env[key];
+        key.startsWith("DISCORD_") && delete env[key], (key === "CODEX_THREAD_ID" || key === "CODEX_SESSION_ID" || key === "CODEX_APP_SERVER_URL" || key === "CODEX_APP_SERVER_SOCKET" || key === "CODEX_CWD" || key.startsWith("CODEX_TARGET_") || key.startsWith("CODEX_DISCORD_") && !LAUNCH_GENERATION_ENV_KEYS.has(key) || key.startsWith("CODEX_TURN_") || key.startsWith("CODEX_WAKE_") || key.startsWith("CODEX_DENY_")) && delete env[key];
       return env;
     }
     function buildAppServerLaunch(config) {

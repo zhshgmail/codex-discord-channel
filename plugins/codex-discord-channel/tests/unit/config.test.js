@@ -8,7 +8,7 @@ const test = require('node:test');
 const { loadConfig, loadEnvFile } = require('../../src/config');
 
 const pluginRoot = path.resolve(__dirname, '..', '..');
-const releasePluginVersion = '0.3.6+codex.alias-isolated-runtime';
+const releasePluginVersion = '0.3.6+codex.alias-isolated-runtime.generation-env-repair.1';
 
 test('loadEnvFile does not override existing environment values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-config-'));

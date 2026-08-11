@@ -6,7 +6,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { buildAppServerLaunch, instanceDoctor, runAppServer } = require('../../src/app-server-runtime');
+const {
+  buildAppServerLaunch,
+  instanceDoctor,
+  runAppServer,
+  sanitizedAppServerEnv,
+} = require('../../src/app-server-runtime');
 const { loadConfig } = require('../../src/config');
 const { parseRuntimeArgs } = require('../../bin/codex-discord-channel');
 
@@ -105,6 +110,39 @@ test('app-server launch strips Discord and stale target controls from its child 
   assert.equal(Object.hasOwn(launch.env, 'CODEX_APP_SERVER_URL'), false);
   assert.equal(launch.env.DISCORD_INSTANCE, 'codex02');
   assert.equal(launch.env.DISCORD_CONFIG_DIR, config.paths.stateDir);
+});
+
+test('app-server exec preserves only the exact launcher generation identity allowlist', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-app-server-generation-env-'));
+  const config = createInstance(root, 'codex02', '.codex-account-02', '22222222222222222');
+  const expected = {
+    CODEX_DISCORD_LAUNCH_GENERATION: 'generation-123',
+    CODEX_DISCORD_LAUNCH_INSTANCE: 'codex02',
+    CODEX_DISCORD_LAUNCH_STATE_DIR: config.paths.stateDir,
+    CODEX_DISCORD_LAUNCH_CODEX_HOME: config.codexHome,
+    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/opt/codex-discord-channel/0.3.6',
+    CODEX_DISCORD_LAUNCH_ENDPOINT: path.join(config.paths.stateDir, 'app-server.sock'),
+    CODEX_DISCORD_LAUNCH_ROLE: 'app',
+  };
+  Object.assign(config.env, expected, {
+    CODEX_DISCORD_DELIVERY_ACTIVATION_ID: 'must-be-scrubbed',
+    CODEX_DISCORD_UNRELATED_SECRET: 'must-be-scrubbed',
+    CODEX_TARGET_THREAD_ID: 'must-be-scrubbed',
+    CODEX_TURN_ID: 'must-be-scrubbed',
+    CODEX_WAKE_TOKEN: 'must-be-scrubbed',
+    CODEX_DENY_REASON: 'must-be-scrubbed',
+  });
+
+  const sanitized = sanitizedAppServerEnv(config);
+  for (const [key, value] of Object.entries(expected)) assert.equal(sanitized[key], value, key);
+  for (const key of [
+    'CODEX_DISCORD_DELIVERY_ACTIVATION_ID',
+    'CODEX_DISCORD_UNRELATED_SECRET',
+    'CODEX_TARGET_THREAD_ID',
+    'CODEX_TURN_ID',
+    'CODEX_WAKE_TOKEN',
+    'CODEX_DENY_REASON',
+  ]) assert.equal(Object.hasOwn(sanitized, key), false, key);
 });
 
 test('runtime arguments provide an immutable worker instance selection', () => {

@@ -10,6 +10,7 @@ const test = require('node:test');
 const pluginRoot = path.resolve(__dirname, '..', '..');
 const sourceLauncher = path.join(pluginRoot, 'bin', 'codex-discord-instance');
 const sourceGenerationHelper = path.join(pluginRoot, 'bin', 'codex-discord-generation');
+const sourceAppServerRuntime = path.join(pluginRoot, 'src', 'app-server-runtime.js');
 
 function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
@@ -33,6 +34,14 @@ function proc(pid) {
 function alive(pid) {
   const state = proc(pid)?.state;
   return Boolean(state && state !== 'Z');
+}
+
+function processEnv(pid) {
+  return Object.fromEntries(fs.readFileSync(`/proc/${pid}/environ`).toString('utf8')
+    .split('\0').filter(Boolean).map((entry) => {
+      const separator = entry.indexOf('=');
+      return [entry.slice(0, separator), entry.slice(separator + 1)];
+    }));
 }
 
 async function waitFor(predicate, description, timeoutMs = 5000) {
@@ -163,13 +172,21 @@ if (command === 'gateway') {
   record('channel-wrapper');
   const stateDir = value('--state-dir');
   const endpoint = 'unix://' + stateDir + '/app-server.sock';
-  process.execve(process.execPath, [
-    process.execPath,
-    process.env.FIXTURE_CODEX_BIN,
-    'app-server',
-    '--listen',
-    endpoint,
-  ], process.env);
+  require(process.env.SOURCE_APP_SERVER_RUNTIME).runAppServer({
+    accountHomeSource: 'account_env',
+    appServerUrl: endpoint,
+    codexHome: process.env.CODEX_HOME,
+    env: {
+      ...process.env,
+      CODEX_BIN: process.env.FIXTURE_CODEX_BIN,
+      NODE_BIN: process.execPath,
+    },
+    paths: {
+      accountEnvPath: stateDir + '/account.env',
+      instance: 'codex02',
+      stateDir,
+    },
+  });
 } else {
   process.exit(2);
 }
@@ -321,6 +338,7 @@ function env(setup, overrides = {}) {
     HOME: setup.home,
     NATIVE_LISTENER: setup.nativeListener,
     PROCESS_TRACE: setup.processTrace,
+    SOURCE_APP_SERVER_RUNTIME: sourceAppServerRuntime,
     TUI_DESCENDANT: setup.tuiDescendant,
     TUI_EXIT_DELAY_MS: '100',
     ...overrides,
@@ -363,6 +381,33 @@ async function orphanReadyGeneration(setup, overrides = {}) {
   await waitForExit(launcher);
   return { manifest: JSON.parse(fs.readFileSync(setup.manifestPath, 'utf8')), records };
 }
+
+test('real launcher binds supervisor, Node wrapper, and native app-server to one generation', async (t) => {
+  const setup = fixture(t);
+  const launcher = await readyLauncher(setup);
+  const manifest = await waitFor(() => {
+    if (!fs.existsSync(setup.manifestPath)) return null;
+    const value = JSON.parse(fs.readFileSync(setup.manifestPath, 'utf8'));
+    return value.endpoint?.ino ? value : null;
+  }, 'ready generation manifest');
+  const records = recordedProcesses(setup);
+  const appWrapper = records.find((item) => item.role === 'app-wrapper');
+  const nativeListener = records.find((item) => item.role === 'native-listener');
+  assert.ok(appWrapper);
+  assert.ok(nativeListener);
+  for (const pid of [manifest.app.pid, appWrapper.pid, nativeListener.pid]) {
+    const observed = processEnv(pid);
+    assert.equal(observed.CODEX_DISCORD_LAUNCH_GENERATION, manifest.nonce, `PID ${pid}`);
+    assert.equal(observed.CODEX_DISCORD_LAUNCH_INSTANCE, manifest.instance, `PID ${pid}`);
+    assert.equal(observed.CODEX_DISCORD_LAUNCH_STATE_DIR, manifest.stateDir, `PID ${pid}`);
+    assert.equal(observed.CODEX_DISCORD_LAUNCH_CODEX_HOME, manifest.codexHome, `PID ${pid}`);
+    assert.equal(observed.CODEX_DISCORD_LAUNCH_PLUGIN_ROOT, manifest.pluginRoot, `PID ${pid}`);
+    assert.equal(observed.CODEX_DISCORD_LAUNCH_ENDPOINT, manifest.socketPath, `PID ${pid}`);
+    assert.equal(observed.CODEX_DISCORD_LAUNCH_ROLE, 'app', `PID ${pid}`);
+  }
+  process.kill(launcher.pid, 'SIGTERM');
+  await waitForExit(launcher);
+});
 
 function bindForeignListener(setup) {
   const child = spawn('python3', ['-c', String.raw`
