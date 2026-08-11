@@ -35,6 +35,8 @@ const OTHER_DELIVERY_THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190f';
 const ACTIVE_TURN_A = '019f3763-d308-7871-bedc-e6489b021910';
 const ACTIVE_TURN_B = '019f3763-d308-7871-bedc-e6489b021911';
 const ACTIVE_TURN_C = '019f3763-d308-7871-bedc-e6489b021912';
+const GOAL_CONTINUATION_TURN = 'aff9a9a4-3fe1-49a0-a80b-45396b6d5341';
+const NEXT_GOAL_CONTINUATION_TURN = 'e8d49570-dde4-4a4f-a334-bfd3df379e98';
 
 function sessionMeta(threadId = DELIVERY_THREAD_ID) {
   return { type: 'session_meta', payload: { id: threadId } };
@@ -3117,7 +3119,69 @@ test('trusted local A-to-B active-turn mismatch retries once as one exact-readba
   );
 });
 
-test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven root', async (t) => {
+test('trusted local top-level-to-goal-continuation mismatch retries the UUIDv4 turn once', async (t) => {
+  const requests = [];
+  let accepted = false;
+  const clientUserMessageId = 'discord:c1:m-goal-continuation-rebind';
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    requests.push(request);
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return activeThread(
+        DELIVERY_THREAD_ID,
+        ACTIVE_TURN_A,
+        accepted ? [{ type: 'userMessage', clientId: clientUserMessageId }] : [],
+      );
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_A) {
+      return {
+        error: activeTurnMismatchError(ACTIVE_TURN_A, GOAL_CONTINUATION_TURN),
+      };
+    }
+    if (
+      request.method === 'turn/steer' &&
+      request.params.expectedTurnId === GOAL_CONTINUATION_TURN
+    ) {
+      accepted = true;
+      return { turnId: GOAL_CONTINUATION_TURN };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { WebSocket },
+  );
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.activeTurnId, ACTIVE_TURN_A);
+  const params = {
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId,
+    input: [{ type: 'text', text: 'deliver during automatic goal continuation' }],
+  };
+
+  assert.deepEqual(
+    await host.startTurn(params, target),
+    { turnId: GOAL_CONTINUATION_TURN },
+  );
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientUserMessageId), true);
+  const steerRequests = requests.filter((request) => request.method === 'turn/steer');
+  assert.deepEqual(
+    steerRequests.map((request) => request.params.expectedTurnId),
+    [ACTIVE_TURN_A, GOAL_CONTINUATION_TURN],
+  );
+  assert.deepEqual(
+    new Set(steerRequests.map((request) => request.params.clientUserMessageId)),
+    new Set([clientUserMessageId]),
+  );
+});
+
+test('v7-to-v4-to-v4 mismatch stops after two rejects and retains the latest goal turn', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-rebind-cap-'));
   const requests = [];
   const { WebSocket } = createFakeWebSocket(async (request) => {
@@ -3130,10 +3194,18 @@ test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven r
       return activeThread(DELIVERY_THREAD_ID, ACTIVE_TURN_A);
     }
     if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_A) {
-      return { error: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B) };
+      return { error: activeTurnMismatchError(ACTIVE_TURN_A, GOAL_CONTINUATION_TURN) };
     }
-    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_B) {
-      return { error: activeTurnMismatchError(ACTIVE_TURN_B, ACTIVE_TURN_C) };
+    if (
+      request.method === 'turn/steer' &&
+      request.params.expectedTurnId === GOAL_CONTINUATION_TURN
+    ) {
+      return {
+        error: activeTurnMismatchError(
+          GOAL_CONTINUATION_TURN,
+          NEXT_GOAL_CONTINUATION_TURN,
+        ),
+      };
     }
     throw new Error(`unexpected method ${request.method}`);
   });
@@ -3161,9 +3233,9 @@ test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven r
   assert.equal(steerRequests.length, 2);
   assert.deepEqual(
     steerRequests.map((request) => request.params.expectedTurnId),
-    [ACTIVE_TURN_A, ACTIVE_TURN_B],
+    [ACTIVE_TURN_A, GOAL_CONTINUATION_TURN],
   );
-  assert.equal(host.activeTurnIds.get(DELIVERY_THREAD_ID), ACTIVE_TURN_C);
+  assert.equal(host.activeTurnIds.get(DELIVERY_THREAD_ID), NEXT_GOAL_CONTINUATION_TURN);
   assert.equal(
     host.activeTurnProvenance.get(DELIVERY_THREAD_ID),
     'trusted_local_app_server_rejection',
@@ -3174,7 +3246,7 @@ test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven r
 
   const readsBefore = requests.filter((request) => request.method === 'thread/read').length;
   const nextTarget = await host.resolveTarget();
-  assert.equal(nextTarget.activeTurnId, ACTIVE_TURN_C);
+  assert.equal(nextTarget.activeTurnId, NEXT_GOAL_CONTINUATION_TURN);
   assert.equal(
     requests.filter((request) => request.method === 'thread/read').length,
     readsBefore,

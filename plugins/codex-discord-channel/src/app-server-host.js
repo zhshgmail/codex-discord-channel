@@ -23,7 +23,10 @@ const MAX_LIFECYCLE_PROOF_DELAY_MS = 250;
 const DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]);
 const TARGET_CHECKPOINT_VERSION = 3;
 const CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// Top-level app-server turns use UUIDv7, while automatic goal continuations
+// currently use UUIDv4. Both identities come from the same trusted local
+// app-server rejection and must remain eligible for the bounded exact-ID rebind.
+const CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
 
 function parseTargetCheckpoint(raw) {
