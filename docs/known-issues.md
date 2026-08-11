@@ -280,7 +280,7 @@ An immediate same-alias launch then reports `already has an app-server socket`.
 
 ### Source-Level Recovery
 
-Post-v0.3.5 source builds persist one atomic alias-local generation manifest.
+v0.3.6 and later persist one atomic alias-local generation manifest.
 It binds a nonce to the instance, state directory, account home, installed
 plugin root, launcher PID/start ticks, isolated app process-group
 PID/start-ticks/PGID, and ready socket device/inode. Long-lived children close

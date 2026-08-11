@@ -7,6 +7,9 @@ const path = require('node:path');
 const test = require('node:test');
 const { loadConfig, loadEnvFile } = require('../../src/config');
 
+const pluginRoot = path.resolve(__dirname, '..', '..');
+const releasePluginVersion = '0.3.6+codex.alias-isolated-runtime';
+
 test('loadEnvFile does not override existing environment values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-config-'));
   const envFile = path.join(dir, '.env');
@@ -152,13 +155,22 @@ test('installed MCP recovers its account binding from plugin cache cwd when Code
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const codexHome = path.join(home, '.codex-account-02');
   const stateDir = path.join(home, '.codex', 'channels', 'discord', 'codex02');
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(pluginRoot, '.codex-plugin', 'plugin.json'),
+    'utf8',
+  ));
+  assert.equal(
+    manifest.version,
+    releasePluginVersion,
+    'marketplace cache identity must name the v0.3.6 plugin release',
+  );
   const pluginCwd = path.join(
     codexHome,
     'plugins',
     'cache',
     'personal',
     'codex-discord-channel',
-    '0.3.5+codex.alias-isolated-runtime',
+    manifest.version,
   );
   fs.mkdirSync(pluginCwd, { recursive: true });
   fs.writeFileSync(path.join(codexHome, 'discord-instance.env'), [
@@ -186,7 +198,7 @@ test('installed MCP without its account binding cannot fall into a global legacy
     'cache',
     'personal',
     'codex-discord-channel',
-    '0.3.5+codex.alias-isolated-runtime',
+    releasePluginVersion,
   );
   const legacyStateDir = path.join(home, '.codex', 'channels', 'discord', 'codex01');
   fs.mkdirSync(pluginCwd, { recursive: true });
