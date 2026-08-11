@@ -27,7 +27,9 @@ function fixture() {
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
   const fakeChannel = path.join(pluginRuntimeDir, 'channel.cjs');
+  const socketOwner = path.join(binDir, 'socket-owner.py');
   const launcher = path.join(pluginBinDir, 'codex-discord-instance');
+  const generationHelper = path.join(pluginBinDir, 'codex-discord-generation');
   const codexHome = path.join(home, '.codex-account-02');
   fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
@@ -36,10 +38,58 @@ function fixture() {
   fs.mkdirSync(codexHome, { recursive: true });
   fs.copyFileSync(sourceLauncher, launcher);
   fs.chmodSync(launcher, 0o700);
+  fs.copyFileSync(path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-generation'), generationHelper);
+  fs.chmodSync(generationHelper, 0o700);
   fs.writeFileSync(fakeCodex, '// fixture\n');
   fs.writeFileSync(fakeChannel, '// fixture\n');
+  executable(socketOwner, String.raw`#!/usr/bin/env python3
+import os, signal, socket, sys, time
+
+path = sys.argv[1]
+replace_marker = path + '.replace'
+sock = None
+
+def bind():
+    global sock
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    sock.listen(1)
+
+def stop(_signum, _frame):
+    global sock
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if os.environ.get('APP_CREATES_SOCKET_ON_TERM') == '1' and sock is None:
+        bind()
+        time.sleep(0.15)
+    if sock is not None:
+        sock.close()
+    if os.environ.get('APP_LEAVES_SOCKET') != '1' and os.environ.get('APP_CREATES_SOCKET_ON_TERM') != '1':
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+if os.environ.get('APP_CREATES_SOCKET_ON_TERM') != '1':
+    bind()
+while True:
+    if os.path.exists(replace_marker):
+        os.unlink(replace_marker)
+        if sock is not None:
+            sock.close()
+        bind()
+    time.sleep(0.01)
+`);
   executable(fakeNode, [
     '#!/usr/bin/env bash',
+    'if [[ $1 == "$GENERATION_HELPER" ]]; then exec "$REAL_NODE_BIN" "$@"; fi',
     'if [[ $1 == -e && $2 == \'process.stdout.write(String(Date.now()))\' ]]; then',
     '  printf "%s" "$FAKE_NODE_NOW_MS"',
     '  exit 0',
@@ -83,26 +133,10 @@ function fixture() {
     'fi',
     'printf "node %s\\n" "$*" >>"$TRACE"',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == app-server ]]; then',
-    '  if [[ ${APP_CREATES_SOCKET_ON_TERM:-0} == 1 ]]; then',
-    '    trap \'python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()" "$STATE_DIR/app-server.sock"; exit 0\' TERM INT',
-    '    while true; do sleep 0.1; done',
-    '  fi',
-    '  rm -f "$STATE_DIR/app-server.sock"',
-    '  python3 - "$STATE_DIR/app-server.sock" <<\'PY\'',
-    'import socket, sys',
-    'sock = socket.socket(socket.AF_UNIX)',
-    'sock.bind(sys.argv[1])',
-    'sock.close()',
-    'PY',
-    '  if [[ ${APP_LEAVES_SOCKET:-0} == 1 ]]; then',
-    '    trap \'exit 0\' TERM INT',
-    '  else',
-    '    trap \'rm -f "$STATE_DIR/app-server.sock"; exit 0\' TERM INT',
-    '  fi',
-    '  while true; do sleep 0.1; done',
+    '  exec python3 "$SOCKET_OWNER" "$STATE_DIR/app-server.sock"',
     'fi',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == gateway ]]; then',
-    '  if [[ ${GATEWAY_EXIT_IMMEDIATELY:-0} == 1 ]]; then exit 42; fi',
+    '  if [[ ${GATEWAY_EXIT_IMMEDIATELY:-0} == 1 ]]; then sleep 0.1; exit 42; fi',
     '  if [[ ${GATEWAY_EXIT_WHEN_SOCKET_EXISTS:-0} == 1 ]]; then',
     '    while [[ ! -S $STATE_DIR/app-server.sock ]]; do sleep 0.01; done',
     '    exit 42',
@@ -131,14 +165,13 @@ function fixture() {
     '  printf "%s\\n" "$count" >"$TUI_COUNT"',
     '  if ((count == 1)); then',
     '    printf "{\\"version\\":1,\\"threadId\\":\\"%s\\",\\"status\\":\\"active\\",\\"activeTurnId\\":\\"turn-1\\",\\"loadedThreadIds\\":[\\"%s\\"]}\\n" "$THREAD_ID" "$THREAD_ID" >"$STATE_DIR/app-server-target.json"',
-    '    sleep 0.4',
-    '    rm -f "$STATE_DIR/app-server.sock"',
-    '    python3 - "$STATE_DIR/app-server.sock" <<\'PY\'',
-    'import socket, sys',
-    'sock = socket.socket(socket.AF_UNIX)',
-    'sock.bind(sys.argv[1])',
-    'sock.close()',
-    'PY',
+    '    before=$(stat -Lc "%d:%i" "$STATE_DIR/app-server.sock")',
+    '    : >"$STATE_DIR/app-server.sock.replace"',
+    '    for _attempt in {1..100}; do',
+    '      after=$(stat -Lc "%d:%i" "$STATE_DIR/app-server.sock" 2>/dev/null || true)',
+    '      [[ -n $after && $after != "$before" ]] && break',
+    '      sleep 0.01',
+    '    done',
     '    exit 71',
     '  fi',
     'fi',
@@ -182,10 +215,12 @@ function fixture() {
     codexHome,
     fakeChannel,
     fakeCodex,
+    generationHelper,
     home,
     launcher,
     loginMarker,
     pluginRoot,
+    socketOwner,
     stateDir,
     trace,
     tuiCount: path.join(home, 'tui-count'),
@@ -202,9 +237,12 @@ function launchEnv(setup, overrides = {}) {
     CHANNEL_ENV_TRACE: setup.channelEnvTrace,
     FAKE_CHANNEL_BIN: setup.fakeChannel,
     FAKE_CODEX_BIN: setup.fakeCodex,
+    GENERATION_HELPER: setup.generationHelper,
     HOME: setup.home,
     LOGIN_MARKER: setup.loginMarker,
     PATH: `${setup.binDir}:${process.env.PATH}`,
+    REAL_NODE_BIN: process.execPath,
+    SOCKET_OWNER: setup.socketOwner,
     STATE_DIR: setup.stateDir,
     THREAD_ID: '019f3763-d308-7871-bedc-e6489b02190e',
     TRACE: setup.trace,
@@ -481,8 +519,17 @@ test('Codex child receives only the explicit Discord instance allowlist', () => 
     }),
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(fs.readFileSync(setup.childEnvTrace, 'utf8').trim().split('\n'), [
+  const childEnvironment = fs.readFileSync(setup.childEnvTrace, 'utf8').trim().split('\n');
+  const generationEntry = childEnvironment.find((entry) => entry.startsWith('CODEX_DISCORD_LAUNCH_GENERATION='));
+  assert.match(generationEntry, /^CODEX_DISCORD_LAUNCH_GENERATION=[0-9a-f-]{36}$/);
+  assert.deepEqual(childEnvironment.filter((entry) => entry !== generationEntry), [
     `CODEX_DISCORD_DELIVERY_ACTIVATION_ID=${setup.pluginRoot}`,
+    `CODEX_DISCORD_LAUNCH_CODEX_HOME=${setup.codexHome}`,
+    `CODEX_DISCORD_LAUNCH_ENDPOINT=${setup.stateDir}/app-server.sock`,
+    'CODEX_DISCORD_LAUNCH_INSTANCE=codex02',
+    `CODEX_DISCORD_LAUNCH_PLUGIN_ROOT=${setup.pluginRoot}`,
+    'CODEX_DISCORD_LAUNCH_ROLE=tui',
+    `CODEX_DISCORD_LAUNCH_STATE_DIR=${setup.stateDir}`,
     `DISCORD_CONFIG_DIR=${setup.stateDir}`,
     'DISCORD_INSTANCE=codex02',
   ]);

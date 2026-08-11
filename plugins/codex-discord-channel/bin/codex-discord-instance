@@ -49,7 +49,10 @@ codex_home=$(read_account_value CODEX_HOME)
 launcher_path=$(readlink -f "${BASH_SOURCE[0]}")
 plugin_root=$(dirname "$(dirname "$launcher_path")")
 channel_bin="$plugin_root/runtime/channel.cjs"
-if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin ]]; then
+generation_bin="$plugin_root/bin/codex-discord-generation"
+setsid_bin=$(command -v setsid 2>/dev/null || true)
+if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin \
+  || ! -f $generation_bin || -z $setsid_bin || ! -x $setsid_bin ]]; then
   echo "Instance executable paths are unavailable for $instance" >&2
   exit 1
 fi
@@ -112,6 +115,11 @@ if [[ ! $recovery_timeout_seconds =~ ^[0-9]+$ ]] \
   echo "CODEX_DISCORD_RECOVERY_TIMEOUT_SECONDS must be an integer from 1 to 300" >&2
   exit 2
 fi
+stop_timeout_ms=${CODEX_DISCORD_STOP_TIMEOUT_MS:-5000}
+if [[ ! $stop_timeout_ms =~ ^[0-9]+$ ]] || ((stop_timeout_ms < 50 || stop_timeout_ms > 30000)); then
+  echo "CODEX_DISCORD_STOP_TIMEOUT_MS must be an integer from 50 to 30000" >&2
+  exit 2
+fi
 
 socket_generation() {
   [[ -S $socket ]] || return 1
@@ -140,14 +148,20 @@ read_recovery_target() {
 watcher_pid=''
 watcher_stop=''
 app_pid=''
+app_start_ticks=''
+app_pgid=''
 gateway_pid=''
+gateway_start_ticks=''
+gateway_pgid=''
 tui_pid=''
-socket_owned=0
-launcher_lock_owned=0
-socket_absence_proven=0
+tui_start_ticks=''
+tui_pgid=''
 launcher_pid=$$
 launcher_start_ticks=$(awk '{print $22}' "/proc/$launcher_pid/stat")
 current_lease_id=''
+launch_generation=''
+generation_manifest="$state_dir/instance-generation.json"
+generation_command=("$node_bin" "$generation_bin")
 stop_watcher() {
   if [[ -n $watcher_stop ]]; then
     : >"$watcher_stop"
@@ -161,18 +175,96 @@ stop_watcher() {
   watcher_pid=''
   watcher_stop=''
 }
-stop_worker() {
+generation_identity_args() {
+  printf '%s\0' \
+    --manifest "$generation_manifest" \
+    --instance "$instance" \
+    --state-dir "$state_dir" \
+    --codex-home "$codex_home" \
+    --plugin-root "$plugin_root" \
+    --socket "$socket" \
+    --node-bin "$node_bin" \
+    --codex-bin "$codex_bin" \
+    --channel-bin "$channel_bin" \
+    --generation-bin "$generation_bin"
+}
+run_generation() {
+  local action=$1
+  shift
+  local identity_args=()
+  while IFS= read -r -d '' value; do identity_args+=("$value"); done < <(generation_identity_args)
+  if [[ -n ${launcher_lock_fd-} ]]; then
+    (
+      exec {launcher_lock_fd}>&-
+      exec "${generation_command[@]}" "$action" "${identity_args[@]}" "$@"
+    )
+  else
+    "${generation_command[@]}" "$action" "${identity_args[@]}" "$@"
+  fi
+}
+record_worker_group() {
   local pid=$1
-  [[ -n $pid ]] || return 0
-  if worker_running "$pid"; then
-    kill -TERM "$pid" 2>/dev/null || true
-    local stop_deadline=$((SECONDS + 5))
-    while worker_running "$pid" && ((SECONDS < stop_deadline)); do
-      sleep 0.05
-    done
-    if worker_running "$pid"; then
-      kill -KILL "$pid" 2>/dev/null || true
+  local identity=''
+  local attempt
+  for ((attempt = 0; attempt < 100; attempt += 1)); do
+    identity=$(awk '{print $5 " " $22}' "/proc/$pid/stat" 2>/dev/null || true)
+    [[ -n $identity ]] && break
+    sleep 0.01
+  done
+  [[ -n $identity ]] || return 1
+  local pgid start_ticks
+  read -r pgid start_ticks <<<"$identity"
+  [[ $pgid == "$pid" ]] || return 1
+  printf '%s %s\n' "$start_ticks" "$pgid"
+}
+group_state() {
+  local role=$1
+  local pid=$2
+  local start_ticks=$3
+  local pgid=$4
+  run_generation group-state \
+    --nonce "$launch_generation" \
+    --role "$role" \
+    --leader-pid "$pid" \
+    --leader-start-ticks "$start_ticks" \
+    --pgid "$pgid" >/dev/null
+}
+stop_worker_group() {
+  local role=$1
+  local pid=$2
+  local start_ticks=$3
+  local pgid=$4
+  [[ -n $pid && -n $start_ticks && -n $pgid ]] || return 0
+  local state_status=0
+  set +e
+  group_state "$role" "$pid" "$start_ticks" "$pgid"
+  state_status=$?
+  set -e
+  if ((state_status == 10)); then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+  if ((state_status != 0)); then
+    echo "Refusing to stop unverified $role process group $pgid" >&2
+    return 0
+  fi
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  local attempts=$(((stop_timeout_ms + 49) / 50))
+  local attempt
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    set +e
+    group_state "$role" "$pid" "$start_ticks" "$pgid"
+    state_status=$?
+    set -e
+    ((state_status == 10)) && break
+    if ((state_status != 0)); then
+      echo "Refusing to continue stopping changed $role process group $pgid" >&2
+      break
     fi
+    sleep 0.05
+  done
+  if ((state_status == 0)); then
+    kill -KILL -- "-$pgid" 2>/dev/null || true
   fi
   wait "$pid" 2>/dev/null || true
 }
@@ -185,56 +277,95 @@ worker_running() {
 }
 cleanup_launcher() {
   local status=$?
-  local may_remove_socket=0
+  # Cleanup must be idempotent against repeated terminal signals.  Mask them
+  # before removing EXIT ownership so no second signal can strand descendants.
+  trap '' INT TERM HUP
   trap - EXIT
   stop_watcher
   if [[ -n $current_lease_id ]]; then
     "${channel_command[@]}" tui-recovery-target clear-owned "$current_lease_id" \
       "${runtime_args[@]}" >/dev/null 2>&1 || true
   fi
-  stop_worker "$tui_pid"
-  stop_worker "$gateway_pid"
-  if ((launcher_lock_owned == 1 && socket_absence_proven == 1)) && [[ -n $app_pid ]]; then
-    may_remove_socket=1
-  fi
-  stop_worker "$app_pid"
-  if ((socket_owned == 1 || may_remove_socket == 1)); then
-    rm -f "$socket"
+  stop_worker_group tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
+  stop_worker_group gateway "$gateway_pid" "$gateway_start_ticks" "$gateway_pgid"
+  stop_worker_group app "$app_pid" "$app_start_ticks" "$app_pgid"
+  if [[ -n $launch_generation ]]; then
+    run_generation finish-owned --nonce "$launch_generation" >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
 trap cleanup_launcher EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 exec {launcher_lock_fd}>"$lock_file"
 if ! flock -n "$launcher_lock_fd"; then
   echo "Discord instance $instance already has an active launcher" >&2
   exit 73
 fi
-launcher_lock_owned=1
-if [[ -e $socket ]]; then
+set +e
+run_generation prepare --timeout-ms "$stop_timeout_ms" >/dev/null
+prepare_status=$?
+set -e
+if ((prepare_status != 0)); then
   echo "Discord instance $instance already has an app-server socket; stop the legacy service before relaunching" >&2
   exit 73
 fi
-socket_absence_proven=1
+if [[ -e $socket || -e $generation_manifest ]]; then
+  echo "Discord instance $instance has ambiguous launcher state" >&2
+  exit 73
+fi
+launch_generation=$(tr -d '\n' </proc/sys/kernel/random/uuid)
+generation_env=(
+  CODEX_DISCORD_LAUNCH_GENERATION="$launch_generation"
+  CODEX_DISCORD_LAUNCH_INSTANCE="$instance"
+  CODEX_DISCORD_LAUNCH_STATE_DIR="$state_dir"
+  CODEX_DISCORD_LAUNCH_CODEX_HOME="$codex_home"
+  CODEX_DISCORD_LAUNCH_PLUGIN_ROOT="$plugin_root"
+  CODEX_DISCORD_LAUNCH_ENDPOINT="$socket"
+)
 
 umask 077
-"${channel_command[@]}" app-server "${runtime_args[@]}" \
-  >>"$state_dir/app-server.log" 2>&1 &
+(
+  exec {launcher_lock_fd}>&-
+  exec "$setsid_bin" env "${generation_env[@]}" CODEX_DISCORD_LAUNCH_ROLE=app \
+    "${generation_command[@]}" supervise \
+    --manifest "$generation_manifest" \
+    --nonce "$launch_generation" \
+    --instance "$instance" \
+    --state-dir "$state_dir" \
+    --codex-home "$codex_home" \
+    --plugin-root "$plugin_root" \
+    --socket "$socket" \
+    --node-bin "$node_bin" \
+    --codex-bin "$codex_bin" \
+    --channel-bin "$channel_bin" \
+    --generation-bin "$generation_bin" \
+    --launcher-pid "$launcher_pid" \
+    --launcher-start-ticks "$launcher_start_ticks" \
+    -- "${channel_command[@]}" app-server "${runtime_args[@]}"
+) >>"$state_dir/app-server.log" 2>&1 &
 app_pid=$!
-"${channel_command[@]}" gateway "${runtime_args[@]}" \
-  >>"$state_dir/session-gateway.log" 2>&1 &
+if ! read -r app_start_ticks app_pgid < <(record_worker_group "$app_pid"); then
+  echo "Discord app-server generation for $instance did not isolate its process group" >&2
+  exit 1
+fi
+(
+  exec {launcher_lock_fd}>&-
+  exec "$setsid_bin" env "${generation_env[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
+    "${channel_command[@]}" gateway "${runtime_args[@]}"
+) >>"$state_dir/session-gateway.log" 2>&1 &
 gateway_pid=$!
+if ! read -r gateway_start_ticks gateway_pgid < <(record_worker_group "$gateway_pid"); then
+  echo "Discord gateway for $instance did not isolate its process group" >&2
+  exit 1
+fi
 
 deadline=$((SECONDS + timeout_seconds))
 while ((SECONDS <= deadline)); do
-  # The socket was proven absent after this launcher acquired the instance lock.
-  # Any socket observed after its app-server child starts belongs to this launch,
-  # even if the sibling gateway fails before the full live-check can complete.
-  if [[ -S $socket ]]; then
-    socket_owned=1
-  fi
+  # Readiness requires the manifest's exact app group to own the only listener;
+  # observing a pathname alone never grants cleanup authority.
   if ! worker_running "$app_pid"; then
     echo "Discord app-server for $instance exited during startup; see $state_dir/app-server.log" >&2
     exit 1
@@ -244,18 +375,23 @@ while ((SECONDS <= deadline)); do
     exit 1
   fi
   if [[ -S $socket ]]; then
+    if ! run_generation ready --nonce "$launch_generation" >/dev/null 2>&1; then
+      sleep 0.05
+      continue
+    fi
     "${channel_command[@]}" live-check "${runtime_args[@]}" \
       --pid "$app_pid" --pid "$gateway_pid" >/dev/null
     codex_args=("$@")
     recovery_stamps=()
     while true; do
-      launch_generation=$(socket_generation)
+      tui_socket_generation=$(socket_generation)
       launch_mtime_ms=$("$node_bin" -e 'process.stdout.write(String(Date.now()))')
       current_lease_id=$(tr -d '\n' </proc/sys/kernel/random/uuid)
       begin_tui_lease "$current_lease_id" "$launch_mtime_ms"
       watcher_stop=$(mktemp "$state_dir/.tui-recovery-stop.XXXXXX")
       rm -f "$watcher_stop"
       (
+        exec {launcher_lock_fd}>&-
         while [[ ! -e $watcher_stop ]] && kill -0 "$launcher_pid" 2>/dev/null; do
           snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
           sleep 0.2
@@ -264,19 +400,28 @@ while ((SECONDS <= deadline)); do
       watcher_pid=$!
 
       set +e
-      env \
-        "${child_env_unsets[@]}" \
-        -u CODEX_THREAD_ID \
-        -u CODEX_SESSION_ID \
-        -u CODEX_TARGET_THREAD_ID \
-        -u CODEX_APP_SERVER_SOCKET \
-        CODEX_HOME="$codex_home" \
-        DISCORD_INSTANCE="$instance" \
-        DISCORD_CONFIG_DIR="$state_dir" \
-        CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
-        "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}" \
-        <&0 >&1 2>&2 &
+      (
+        exec {launcher_lock_fd}>&-
+        exec "$setsid_bin" env \
+          "${child_env_unsets[@]}" \
+          -u CODEX_THREAD_ID \
+          -u CODEX_SESSION_ID \
+          -u CODEX_TARGET_THREAD_ID \
+          -u CODEX_APP_SERVER_SOCKET \
+          CODEX_HOME="$codex_home" \
+          DISCORD_INSTANCE="$instance" \
+          DISCORD_CONFIG_DIR="$state_dir" \
+          CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
+          "${generation_env[@]}" \
+          CODEX_DISCORD_LAUNCH_ROLE=tui \
+          "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}" \
+          <&0 >&1 2>&2
+      ) &
       tui_pid=$!
+      if ! read -r tui_start_ticks tui_pgid < <(record_worker_group "$tui_pid"); then
+        echo "Discord TUI for $instance did not isolate its process group" >&2
+        exit 1
+      fi
       completed_pid=''
       wait -n -p completed_pid "$tui_pid" "$app_pid" "$gateway_pid"
       child_status=$?
@@ -289,13 +434,17 @@ while ((SECONDS <= deadline)); do
         elif [[ $completed_pid == "$app_pid" ]]; then
           app_pid=''
         fi
-        stop_worker "$tui_pid"
+        stop_worker_group tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
         tui_pid=''
+        tui_start_ticks=''
+        tui_pgid=''
         echo "Discord $failed_worker for $instance exited while the TUI was active" >&2
         exit 75
       fi
       tui_status=$child_status
       tui_pid=''
+      tui_start_ticks=''
+      tui_pgid=''
       stop_watcher
       snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
 
@@ -306,7 +455,7 @@ while ((SECONDS <= deadline)); do
       fi
 
       current_generation=$(socket_generation 2>/dev/null || true)
-      if [[ -n $current_generation && $current_generation == "$launch_generation" ]]; then
+      if [[ -n $current_generation && $current_generation == "$tui_socket_generation" ]]; then
         exit "$tui_status"
       fi
 
@@ -314,12 +463,15 @@ while ((SECONDS <= deadline)); do
       next_generation=''
       while ((SECONDS <= recovery_deadline)); do
         next_generation=$(socket_generation 2>/dev/null || true)
-        if [[ -n $next_generation && $next_generation != "$launch_generation" ]]; then
+        if [[ -n $next_generation && $next_generation != "$tui_socket_generation" ]]; then
           break
         fi
         sleep 0.1
       done
-      if [[ -z $next_generation || $next_generation == "$launch_generation" ]]; then
+      if [[ -z $next_generation || $next_generation == "$tui_socket_generation" ]]; then
+        exit "$tui_status"
+      fi
+      if ! run_generation update-endpoint --nonce "$launch_generation" >/dev/null 2>&1; then
         exit "$tui_status"
       fi
 

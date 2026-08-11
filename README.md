@@ -127,6 +127,12 @@ generation, and an open MCP transport cannot hot-reload the replacement.
 - If its launcher is stuck, verify the exact absolute launcher path, instance,
   PID, start time, children, and state directory; send `TERM` only to that
   launcher PID and let its cleanup trap stop its children.
+- Post-v0.3.5 source builds also record one atomic alias-local launch generation.
+  If the launcher dies abnormally, an immediate same-alias relaunch may reclaim
+  only that exact dead generation: launcher and process-group identities,
+  generation environment, command lines, and the Unix-socket inode must all
+  still match. A missing, malformed, live, reused, or changed identity remains
+  fail-closed with status 73 and is left untouched.
 - Never use `pkill codex`, `pkill node`, `killall`, an unresolved stale PID,
   or another alias's process, socket, config, or queue.
 - The only relevant `systemctl --user disable --now` command is for a retired
@@ -165,6 +171,15 @@ the launcher has failed its nonblocking lock acquisition and exits with status
 73. This normally means another process still owns that instance; the lock
 file's mere existence is not the proof. Do not delete the lock, socket, queue,
 or PID files, and do not start a second receiver.
+
+Post-v0.3.5 source builds distinguish this live-lock case from an exact orphan
+left by an abnormally killed launcher. Under the alias lock, the latter is
+stopped as one isolated process group with a bounded TERM-to-KILL sequence; the
+socket is unlinked only if its device and inode still match the atomic
+generation manifest. The relaunch then continues normally. Legacy sockets with
+no manifest and any PID, PGID, command, environment, listener-count, or inode
+mismatch still produce the existing status-73 refusal and are never deleted or
+signalled automatically.
 
 ```bash
 INSTANCE=codex02

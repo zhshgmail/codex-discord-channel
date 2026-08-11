@@ -123,6 +123,15 @@ migration and acceptance boundary. User-visible failure signatures and
 diagnostic steps are recorded in
 [Known Issues And Operational Boundaries](../../docs/known-issues.md).
 
+The launcher owns an atomic `instance-generation.json` beside its alias lock.
+It is an exact recovery authority, not a stale-PID hint: instance paths,
+launcher and app process identity, isolated group, generation environment,
+command line, listener count, and socket inode must all match before a dead
+generation can be reclaimed. Ambiguous or legacy state remains fail-closed and
+is not modified. Normal and recovery teardown both target only the verified
+process groups, with bounded TERM-to-KILL cleanup and inode-checked socket
+removal.
+
 ## Checks
 
 ```bash

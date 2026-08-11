@@ -1,0 +1,607 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+
+const MANIFEST_VERSION = 1;
+const MAX_MANIFEST_BYTES = 64 * 1024;
+const ALLOWED_ROLES = new Set(['app', 'gateway', 'tui']);
+
+class Refusal extends Error {
+  constructor(message) {
+    super(message);
+    this.code = 'generation_refused';
+  }
+}
+
+function refuse(message) {
+  throw new Refusal(message);
+}
+
+function parseProcStat(text) {
+  const closing = text.lastIndexOf(')');
+  if (closing < 0) refuse('malformed proc stat');
+  const tail = text.slice(closing + 2).trim().split(/\s+/);
+  if (tail.length < 20) refuse('truncated proc stat');
+  return {
+    state: tail[0],
+    ppid: Number(tail[1]),
+    pgid: Number(tail[2]),
+    session: Number(tail[3]),
+    startTicks: tail[19],
+  };
+}
+
+function readProcess(pid, { strict = true } = {}) {
+  try {
+    const stat = parseProcStat(fs.readFileSync(`/proc/${pid}/stat`, 'utf8'));
+    if (!stat.state || stat.state === 'Z') return null;
+    const argv = fs.readFileSync(`/proc/${pid}/cmdline`).toString('utf8').split('\0').filter(Boolean);
+    const entries = fs.readFileSync(`/proc/${pid}/environ`).toString('utf8').split('\0').filter(Boolean);
+    const env = Object.fromEntries(entries.map((entry) => {
+      const separator = entry.indexOf('=');
+      return separator === -1
+        ? [entry, '']
+        : [entry.slice(0, separator), entry.slice(separator + 1)];
+    }));
+    return { argv, env, pid, ...stat };
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return null;
+    if (!strict && (error?.code === 'EACCES' || error?.code === 'EPERM')) return null;
+    refuse(`cannot read process identity for PID ${pid}`);
+  }
+}
+
+function listProcesses() {
+  const processes = [];
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(name)) continue;
+    const processInfo = readProcess(Number(name), { strict: false });
+    if (processInfo) processes.push(processInfo);
+  }
+  return processes;
+}
+
+function socketIdentity(socketPath) {
+  try {
+    const stat = fs.lstatSync(socketPath, { bigint: true });
+    if (!stat.isSocket()) refuse('endpoint path is not a Unix socket');
+    return { dev: String(stat.dev), ino: String(stat.ino), path: socketPath };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function syncDirectory(directory) {
+  const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+function atomicWriteJson(file, value, { requireAbsent = false } = {}) {
+  const directory = path.dirname(file);
+  const temporary = path.join(
+    directory,
+    `.${path.basename(file)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`,
+  );
+  let fd;
+  try {
+    if (requireAbsent && fs.existsSync(file)) refuse('generation manifest already exists');
+    fd = fs.openSync(temporary, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    fs.writeFileSync(fd, `${JSON.stringify(value)}\n`);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    if (requireAbsent && fs.existsSync(file)) refuse('generation manifest appeared concurrently');
+    fs.renameSync(temporary, file);
+    syncDirectory(directory);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function safeReadManifest(file) {
+  let before;
+  try {
+    before = fs.lstatSync(file, { bigint: true });
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!before.isFile() || before.isSymbolicLink()) refuse('generation manifest is not a regular file');
+  if (before.size > BigInt(MAX_MANIFEST_BYTES)) refuse('generation manifest is oversized');
+  if (typeof process.getuid === 'function' && before.uid !== BigInt(process.getuid())) {
+    refuse('generation manifest has a foreign owner');
+  }
+  if ((before.mode & 0o022n) !== 0n) refuse('generation manifest is group/world writable');
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | noFollow);
+  let raw;
+  try {
+    const opened = fs.fstatSync(fd, { bigint: true });
+    if (opened.dev !== before.dev || opened.ino !== before.ino) refuse('generation manifest changed while opening');
+    raw = fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+  let manifest;
+  try { manifest = JSON.parse(raw); } catch { refuse('generation manifest is malformed'); }
+  validateManifestShape(manifest);
+  return { manifest, raw };
+}
+
+function exactKeys(value, keys, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) refuse(`${label} is not an object`);
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    refuse(`${label} has an unexpected schema`);
+  }
+}
+
+function positivePid(value, label) {
+  if (!Number.isSafeInteger(value) || value <= 1) refuse(`${label} is invalid`);
+}
+
+function numericString(value, label) {
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) refuse(`${label} is invalid`);
+}
+
+function absoluteString(value, label) {
+  if (typeof value !== 'string' || !path.isAbsolute(value)) refuse(`${label} is not absolute`);
+}
+
+function validateManifestShape(manifest) {
+  exactKeys(manifest, [
+    'app', 'channelBin', 'codexBin', 'codexHome', 'endpoint', 'generationBin',
+    'instance', 'launcher', 'nodeBin', 'nonce', 'pluginRoot', 'socketPath', 'stateDir', 'version',
+  ], 'generation manifest');
+  if (manifest.version !== MANIFEST_VERSION) refuse('generation manifest version is unsupported');
+  if (typeof manifest.instance !== 'string' || !manifest.instance) refuse('manifest instance is invalid');
+  if (typeof manifest.nonce !== 'string' || !/^[0-9a-f-]{32,64}$/i.test(manifest.nonce)) {
+    refuse('manifest nonce is invalid');
+  }
+  for (const key of [
+    'stateDir', 'codexHome', 'pluginRoot', 'socketPath', 'nodeBin', 'codexBin', 'channelBin', 'generationBin',
+  ]) {
+    absoluteString(manifest[key], `manifest ${key}`);
+  }
+  exactKeys(manifest.launcher, ['pid', 'startTicks'], 'launcher identity');
+  positivePid(manifest.launcher.pid, 'launcher PID');
+  numericString(manifest.launcher.startTicks, 'launcher start ticks');
+  exactKeys(manifest.app, ['argv', 'pgid', 'pid', 'startTicks'], 'app identity');
+  positivePid(manifest.app.pid, 'app PID');
+  positivePid(manifest.app.pgid, 'app PGID');
+  numericString(manifest.app.startTicks, 'app start ticks');
+  if (!Array.isArray(manifest.app.argv) || manifest.app.argv.length === 0
+    || manifest.app.argv.some((entry) => typeof entry !== 'string' || entry.length === 0)) {
+    refuse('app argv identity is invalid');
+  }
+  if (manifest.app.pid !== manifest.app.pgid) refuse('app process is not its process-group leader');
+  if (manifest.endpoint !== null) {
+    exactKeys(manifest.endpoint, ['dev', 'ino', 'path'], 'endpoint identity');
+    absoluteString(manifest.endpoint.path, 'endpoint path');
+    numericString(manifest.endpoint.dev, 'endpoint device');
+    numericString(manifest.endpoint.ino, 'endpoint inode');
+  }
+}
+
+function parseOptions(argv) {
+  const options = {};
+  let index = 0;
+  for (; index < argv.length; index += 1) {
+    if (argv[index] === '--') break;
+    const key = argv[index];
+    if (!key.startsWith('--') || index + 1 >= argv.length) refuse(`invalid option ${key}`);
+    if (Object.hasOwn(options, key)) refuse(`duplicate option ${key}`);
+    options[key] = argv[index + 1];
+    index += 1;
+  }
+  return { command: index < argv.length ? argv.slice(index + 1) : [], options };
+}
+
+function required(options, key) {
+  const value = options[`--${key}`];
+  if (!value) refuse(`--${key} is required`);
+  return value;
+}
+
+function expectedIdentity(options) {
+  return {
+    channelBin: required(options, 'channel-bin'),
+    codexBin: required(options, 'codex-bin'),
+    codexHome: required(options, 'codex-home'),
+    generationBin: required(options, 'generation-bin'),
+    instance: required(options, 'instance'),
+    manifestPath: required(options, 'manifest'),
+    nodeBin: required(options, 'node-bin'),
+    pluginRoot: required(options, 'plugin-root'),
+    socketPath: required(options, 'socket'),
+    stateDir: required(options, 'state-dir'),
+  };
+}
+
+function assertManifestIdentity(manifest, expected) {
+  const fields = [
+    'channelBin', 'codexBin', 'codexHome', 'generationBin', 'instance', 'nodeBin',
+    'pluginRoot', 'socketPath', 'stateDir',
+  ];
+  for (const field of fields) {
+    if (manifest[field] !== expected[field]) refuse(`manifest ${field} does not match this launcher`);
+  }
+  if (manifest.endpoint && manifest.endpoint.path !== expected.socketPath) {
+    refuse('manifest endpoint does not match this launcher');
+  }
+}
+
+function identityEnvMatches(processInfo, manifest, role) {
+  return processInfo.env.CODEX_DISCORD_LAUNCH_GENERATION === manifest.nonce
+    && processInfo.env.CODEX_DISCORD_LAUNCH_ROLE === role
+    && processInfo.env.CODEX_DISCORD_LAUNCH_INSTANCE === manifest.instance
+    && processInfo.env.CODEX_DISCORD_LAUNCH_STATE_DIR === manifest.stateDir
+    && processInfo.env.CODEX_DISCORD_LAUNCH_CODEX_HOME === manifest.codexHome
+    && processInfo.env.CODEX_DISCORD_LAUNCH_PLUGIN_ROOT === manifest.pluginRoot
+    && processInfo.env.CODEX_DISCORD_LAUNCH_ENDPOINT === manifest.socketPath;
+}
+
+function hasExactSequence(argv, sequence) {
+  if (sequence.length === 0 || sequence.length > argv.length) return false;
+  for (let index = 0; index <= argv.length - sequence.length; index += 1) {
+    if (sequence.every((value, offset) => argv[index + offset] === value)) return true;
+  }
+  return false;
+}
+
+function leaderArgvMatches(processInfo, manifest, role) {
+  if (role === 'app') {
+    return processInfo.argv.length === manifest.app.argv.length
+      && processInfo.argv.every((value, index) => value === manifest.app.argv[index]);
+  }
+  if (role === 'gateway') {
+    return hasExactSequence(processInfo.argv, [manifest.channelBin, 'gateway'])
+      && hasExactSequence(processInfo.argv, ['--instance', manifest.instance])
+      && hasExactSequence(processInfo.argv, ['--state-dir', manifest.stateDir]);
+  }
+  if (role === 'tui') {
+    return hasExactSequence(processInfo.argv, [manifest.codexBin, '--remote', `unix://${manifest.socketPath}`]);
+  }
+  return false;
+}
+
+function processIdentityState(identity) {
+  const current = readProcess(identity.pid);
+  if (!current) return 'dead';
+  return current.startTicks === identity.startTicks ? 'exact' : 'reused';
+}
+
+function matchingGenerationGroups(manifest, processes = listProcesses(), { allowMissingLeaders = false } = {}) {
+  const matching = processes.filter((item) => item.env.CODEX_DISCORD_LAUNCH_GENERATION === manifest.nonce);
+  const groups = new Map();
+  for (const item of matching) {
+    const role = item.env.CODEX_DISCORD_LAUNCH_ROLE;
+    if (!ALLOWED_ROLES.has(role)) refuse(`generation process ${item.pid} has an invalid role`);
+    if (!groups.has(item.pgid)) groups.set(item.pgid, { members: [], role });
+    const group = groups.get(item.pgid);
+    if (group.role !== role) refuse(`generation process group ${item.pgid} has mixed roles`);
+    group.members.push(item);
+  }
+  for (const [pgid, group] of groups) {
+    const allMembers = processes.filter((item) => item.pgid === pgid);
+    if (allMembers.length !== group.members.length) refuse(`process group ${pgid} contains a foreign member`);
+    for (const member of allMembers) {
+      if (!identityEnvMatches(member, manifest, group.role)) {
+        refuse(`process group ${pgid} identity does not match the manifest`);
+      }
+    }
+    const leader = allMembers.find((item) => item.pid === pgid);
+    if (!leader && !allowMissingLeaders) refuse(`process group ${pgid} has no verifiable leader`);
+    if (leader && !leaderArgvMatches(leader, manifest, group.role)) {
+      refuse(`process group ${pgid} leader argv does not match role ${group.role}`);
+    }
+  }
+  const appGroups = [...groups.entries()].filter(([, group]) => group.role === 'app');
+  if (appGroups.length > 1 || (appGroups.length === 1 && appGroups[0][0] !== manifest.app.pgid)) {
+    refuse('live app process group does not match the recorded PGID');
+  }
+  return groups;
+}
+
+function unixSocketRecords(socketPath) {
+  const matches = [];
+  const lines = fs.readFileSync('/proc/net/unix', 'utf8').split('\n').slice(1);
+  for (const line of lines) {
+    const match = line.match(/^\S+:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)(?:\s+(.*))?$/);
+    if (match && match[2] === socketPath) matches.push({ inode: match[1] });
+  }
+  return matches;
+}
+
+function processOwnsSocket(processInfo, socketInode) {
+  let entries;
+  try { entries = fs.readdirSync(`/proc/${processInfo.pid}/fd`); } catch { return false; }
+  return entries.some((entry) => {
+    try { return fs.readlinkSync(`/proc/${processInfo.pid}/fd/${entry}`) === `socket:[${socketInode}]`; } catch { return false; }
+  });
+}
+
+function validateReadyEndpoint(manifest, groups) {
+  if (!manifest.endpoint) refuse('recorded generation never published a ready endpoint');
+  const current = socketIdentity(manifest.endpoint.path);
+  if (!current || current.dev !== manifest.endpoint.dev || current.ino !== manifest.endpoint.ino) {
+    refuse('app-server socket inode no longer matches the recorded generation');
+  }
+  const records = unixSocketRecords(manifest.endpoint.path);
+  if (records.length !== 1) refuse('app-server endpoint has zero or multiple live listeners');
+  const app = groups.get(manifest.app.pgid);
+  if (!app || app.role !== 'app') refuse('recorded app process group is not live');
+  if (!app.members.some((item) => processOwnsSocket(item, records[0].inode))) {
+    refuse('app-server listener is not owned by the recorded app process group');
+  }
+  return current;
+}
+
+function validateAppLeader(manifest) {
+  const state = processIdentityState(manifest.app);
+  if (state === 'reused') refuse('recorded app PID has been reused');
+  if (state === 'exact') {
+    const leader = readProcess(manifest.app.pid);
+    if (leader.pgid !== manifest.app.pgid || leader.session !== manifest.app.pgid) {
+      refuse('recorded app process has the wrong PGID/session');
+    }
+  }
+  return state;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function terminateGroups(manifest, groups, timeoutMs) {
+  const ordered = [...groups.entries()].sort((left, right) => {
+    const order = { tui: 0, gateway: 1, app: 2 };
+    return order[left[1].role] - order[right[1].role];
+  });
+  for (const [pgid] of ordered) {
+    try { process.kill(-pgid, 'SIGTERM'); } catch (error) { if (error?.code !== 'ESRCH') throw error; }
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const remaining = matchingGenerationGroups(manifest, listProcesses(), { allowMissingLeaders: true });
+    if (remaining.size === 0) return;
+    await sleep(20);
+  }
+  const remaining = matchingGenerationGroups(manifest, listProcesses(), { allowMissingLeaders: true });
+  for (const [pgid] of remaining) {
+    try { process.kill(-pgid, 'SIGKILL'); } catch (error) { if (error?.code !== 'ESRCH') throw error; }
+  }
+  const killDeadline = Date.now() + Math.max(500, timeoutMs);
+  while (Date.now() <= killDeadline) {
+    if (matchingGenerationGroups(manifest, listProcesses(), { allowMissingLeaders: true }).size === 0) return;
+    await sleep(20);
+  }
+  refuse('recorded process groups survived SIGKILL');
+}
+
+function unlinkSocketCas(endpoint) {
+  const current = socketIdentity(endpoint.path);
+  if (!current || current.dev !== endpoint.dev || current.ino !== endpoint.ino) {
+    refuse('app-server socket changed before unlink');
+  }
+  fs.unlinkSync(endpoint.path);
+  syncDirectory(path.dirname(endpoint.path));
+}
+
+function clearManifestCas(manifestPath, expectedRaw) {
+  const current = safeReadManifest(manifestPath);
+  if (!current || current.raw !== expectedRaw) refuse('generation manifest changed before cleanup');
+  fs.unlinkSync(manifestPath);
+  syncDirectory(path.dirname(manifestPath));
+}
+
+async function prepare(options) {
+  const expected = expectedIdentity(options);
+  const record = safeReadManifest(expected.manifestPath);
+  const socket = socketIdentity(expected.socketPath);
+  if (!record) {
+    if (socket) refuse('app-server socket has no generation manifest');
+    return { status: 'clean' };
+  }
+  const { manifest, raw } = record;
+  assertManifestIdentity(manifest, expected);
+  const launcherState = processIdentityState(manifest.launcher);
+  if (launcherState === 'exact') refuse('recorded launcher is still live');
+  if (launcherState === 'reused') refuse('recorded launcher PID has been reused');
+  const appState = validateAppLeader(manifest);
+  const groups = matchingGenerationGroups(
+    manifest,
+    listProcesses(),
+    { allowMissingLeaders: appState === 'dead' },
+  );
+  if (appState === 'exact' || groups.has(manifest.app.pgid)) {
+    validateReadyEndpoint(manifest, groups);
+    await terminateGroups(manifest, groups, Number(options['--timeout-ms'] || 5000));
+  } else if (groups.size !== 0) {
+    refuse('recorded app leader is dead but generation descendants remain');
+  } else if (socket) {
+    if (!manifest.endpoint || socket.dev !== manifest.endpoint.dev || socket.ino !== manifest.endpoint.ino) {
+      refuse('stale socket does not match the recorded generation');
+    }
+    if (unixSocketRecords(expected.socketPath).length !== 0) refuse('socket has a live foreign listener');
+  }
+  if (manifest.endpoint && socketIdentity(manifest.endpoint.path)) unlinkSocketCas(manifest.endpoint);
+  clearManifestCas(expected.manifestPath, raw);
+  return { status: 'reclaimed', nonce: manifest.nonce };
+}
+
+function manifestForSupervisor(options) {
+  const expected = expectedIdentity(options);
+  const launcherPid = Number(required(options, 'launcher-pid'));
+  const launcherStartTicks = required(options, 'launcher-start-ticks');
+  const nonce = required(options, 'nonce');
+  positivePid(launcherPid, 'launcher PID');
+  numericString(launcherStartTicks, 'launcher start ticks');
+  const self = readProcess(process.pid);
+  if (!self || self.pgid !== process.pid || self.session !== process.pid) {
+    refuse('app supervisor is not an isolated session/process-group leader');
+  }
+  return {
+    app: { argv: self.argv, pgid: self.pgid, pid: process.pid, startTicks: self.startTicks },
+    channelBin: expected.channelBin,
+    codexBin: expected.codexBin,
+    codexHome: expected.codexHome,
+    endpoint: null,
+    generationBin: expected.generationBin,
+    instance: expected.instance,
+    launcher: { pid: launcherPid, startTicks: launcherStartTicks },
+    nodeBin: expected.nodeBin,
+    nonce,
+    pluginRoot: expected.pluginRoot,
+    socketPath: expected.socketPath,
+    stateDir: expected.stateDir,
+    version: MANIFEST_VERSION,
+  };
+}
+
+function publishEndpoint(manifestPath, nonce, socketPath) {
+  const record = safeReadManifest(manifestPath);
+  if (!record || record.manifest.nonce !== nonce) refuse('generation manifest ownership changed');
+  const endpoint = socketIdentity(socketPath);
+  if (!endpoint) return false;
+  const groups = matchingGenerationGroups(record.manifest);
+  const records = unixSocketRecords(socketPath);
+  const app = groups.get(record.manifest.app.pgid);
+  if (records.length !== 1 || !app || app.role !== 'app'
+    || !app.members.some((item) => processOwnsSocket(item, records[0].inode))) {
+    return false;
+  }
+  atomicWriteJson(manifestPath, { ...record.manifest, endpoint });
+  return true;
+}
+
+async function supervise(options, command) {
+  if (command.length === 0) refuse('supervise requires a child command');
+  const expected = expectedIdentity(options);
+  const manifest = manifestForSupervisor(options);
+  atomicWriteJson(expected.manifestPath, manifest, { requireAbsent: true });
+  const child = spawn(command[0], command.slice(1), { env: process.env, stdio: 'inherit' });
+  let endpointPublished = false;
+  const capture = () => {
+    if (endpointPublished) return;
+    try { endpointPublished = publishEndpoint(expected.manifestPath, manifest.nonce, expected.socketPath); } catch {}
+  };
+  const timer = setInterval(capture, 20);
+  capture();
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => {
+      try { child.kill(signal); } catch {}
+    });
+  }
+  const result = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+  clearInterval(timer);
+  capture();
+  if (result.signal) process.kill(process.pid, result.signal);
+  return result.code ?? 1;
+}
+
+function manifestMatchesOwned(options, { allowDeadLauncher = false } = {}) {
+  const expected = expectedIdentity(options);
+  const record = safeReadManifest(expected.manifestPath);
+  if (!record) refuse('generation manifest is missing');
+  assertManifestIdentity(record.manifest, expected);
+  if (record.manifest.nonce !== required(options, 'nonce')) refuse('generation nonce does not match');
+  const launcherState = processIdentityState(record.manifest.launcher);
+  if (launcherState !== 'exact' && !(allowDeadLauncher && launcherState === 'dead')) {
+    refuse('launcher identity does not own this generation');
+  }
+  return { expected, ...record };
+}
+
+function ready(options) {
+  const { manifest } = manifestMatchesOwned(options);
+  const app = readProcess(manifest.app.pid);
+  if (!app || app.startTicks !== manifest.app.startTicks || app.pgid !== manifest.app.pgid) {
+    refuse('app supervisor identity is not live');
+  }
+  if (!manifest.endpoint) refuse('app endpoint is not ready');
+  validateReadyEndpoint(manifest, matchingGenerationGroups(manifest));
+  process.stdout.write(`${JSON.stringify(manifest.app)}\n`);
+}
+
+function updateEndpoint(options) {
+  const { expected, manifest } = manifestMatchesOwned(options);
+  publishEndpoint(expected.manifestPath, manifest.nonce, expected.socketPath);
+}
+
+function groupState(options) {
+  const { manifest } = manifestMatchesOwned(options, { allowDeadLauncher: true });
+  const role = required(options, 'role');
+  if (!ALLOWED_ROLES.has(role)) refuse('invalid group role');
+  const pgid = Number(required(options, 'pgid'));
+  const leaderPid = Number(required(options, 'leader-pid'));
+  const leaderStartTicks = required(options, 'leader-start-ticks');
+  positivePid(pgid, 'group PGID');
+  positivePid(leaderPid, 'group leader PID');
+  numericString(leaderStartTicks, 'group leader start ticks');
+  if (pgid !== leaderPid) refuse('worker is not its process-group leader');
+  const all = listProcesses().filter((item) => item.pgid === pgid);
+  if (all.length === 0) {
+    process.exitCode = 10;
+    return;
+  }
+  for (const item of all) {
+    if (!identityEnvMatches(item, manifest, role)) refuse(`process group ${pgid} contains a foreign member`);
+  }
+  const leader = all.find((item) => item.pid === leaderPid);
+  if (leader && leader.startTicks !== leaderStartTicks) refuse('worker leader PID was reused');
+  if (leader && !leaderArgvMatches(leader, manifest, role)) refuse('worker leader argv does not match its role');
+}
+
+function finishOwned(options) {
+  const { expected, manifest, raw } = manifestMatchesOwned(options);
+  const groups = matchingGenerationGroups(manifest);
+  if (groups.size !== 0) refuse('generation still has live process groups');
+  if (manifest.endpoint && socketIdentity(manifest.endpoint.path)) unlinkSocketCas(manifest.endpoint);
+  else if (socketIdentity(expected.socketPath)) refuse('unrecorded socket remains after generation stop');
+  clearManifestCas(expected.manifestPath, raw);
+}
+
+async function main() {
+  const [action, ...tail] = process.argv.slice(2);
+  const { command, options } = parseOptions(tail);
+  if (action === 'prepare') {
+    process.stdout.write(`${JSON.stringify(await prepare(options))}\n`);
+  } else if (action === 'supervise') {
+    process.exitCode = await supervise(options, command);
+  } else if (action === 'ready') {
+    ready(options);
+  } else if (action === 'update-endpoint') {
+    updateEndpoint(options);
+  } else if (action === 'group-state') {
+    groupState(options);
+  } else if (action === 'finish-owned') {
+    finishOwned(options);
+  } else {
+    refuse('action must be prepare, supervise, ready, update-endpoint, group-state, or finish-owned');
+  }
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    process.stderr.write(`generation reclaim refused: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(error?.code === 'generation_refused' ? 73 : 1);
+  });
+}
+
+module.exports = {
+  atomicWriteJson,
+  parseProcStat,
+  prepare,
+  safeReadManifest,
+  socketIdentity,
+};

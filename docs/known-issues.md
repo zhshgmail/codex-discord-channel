@@ -270,6 +270,35 @@ Verify `session-gateway.pid` before investigating model behavior. Exactly one
 effective receiver generation may accept Discord events. Keep the retired
 `discord-codex-bridge` service disabled so it cannot compete for the bot.
 
+## Abnormal Launcher Death Leaves A Socket That Blocks Relaunch
+
+### Symptom
+
+After the visible TUI or its launcher is killed abnormally, the shell launcher
+has released its flock but a Node wrapper or native app-server listener remains.
+An immediate same-alias launch then reports `already has an app-server socket`.
+
+### Source-Level Recovery
+
+Post-v0.3.5 source builds persist one atomic alias-local generation manifest.
+It binds a nonce to the instance, state directory, account home, installed
+plugin root, launcher PID/start ticks, isolated app process-group
+PID/start-ticks/PGID, and ready socket device/inode. Long-lived children close
+the launcher flock descriptor, so a new launcher can acquire the lock after an
+abnormal launcher death.
+
+While holding that lock, a relaunch automatically reclaims only an exact dead
+generation whose live group members still match the recorded generation,
+roles, command lines, environment, endpoint, and single listener. Teardown is
+TERM, bounded wait, then KILL of the exact isolated groups. Socket unlink and
+manifest removal use identity checks so a replaced socket cannot be deleted.
+Normal cleanup masks repeated INT, TERM, and HUP before stopping the same groups.
+
+Missing or malformed manifests, a live or reused launcher PID, a wrong or
+reused app identity, a foreign group member or listener, multiple listeners,
+and socket-inode replacement all retain status 73 and touch nothing. Do not
+turn those refusals into manual socket deletion; verify the exact owner first.
+
 ## Installed Plugin Changes Do Not Appear In An Existing Session
 
 An already-open MCP transport does not hot-load replaced plugin code. Exit the
