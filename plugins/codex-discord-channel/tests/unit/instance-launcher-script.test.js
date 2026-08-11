@@ -40,6 +40,10 @@ function fixture() {
   fs.writeFileSync(fakeChannel, '// fixture\n');
   executable(fakeNode, [
     '#!/usr/bin/env bash',
+    'if [[ $1 == -e && $2 == \'process.stdout.write(String(Date.now()))\' ]]; then',
+    '  printf "%s" "$FAKE_NODE_NOW_MS"',
+    '  exit 0',
+    'fi',
     'if [[ $1 == "$FAKE_CHANNEL_BIN" ]]; then',
     '  state_activation=$(awk -F= \'$1 == "CODEX_DISCORD_DELIVERY_ACTIVATION_ID" { print substr($0, index($0, "=") + 1) }\' "$STATE_DIR/.env")',
     '  effective_activation=${CODEX_DISCORD_DELIVERY_ACTIVATION_ID:-$state_activation}',
@@ -48,6 +52,7 @@ function fixture() {
     'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
     '    begin)',
+    '      printf "recovery-begin %s\\n" "$7" >>"$TRACE"',
     '      printf "{\\"version\\":3,\\"leaseId\\":\\"%s\\",\\"supervisorPid\\":%s,\\"supervisorStartTicks\\":\\"%s\\",\\"startedAtMs\\":%s,\\"phase\\":\\"launching\\"}\\n" "$6" "$4" "$5" "$7" >"$STATE_DIR/tui-recovery-target.json"',
     '      exit 0',
     '      ;;',
@@ -143,6 +148,15 @@ function fixture() {
     '  exit 72',
     'fi',
     'exit 0',
+    '',
+  ].join('\n'));
+  executable(path.join(binDir, 'date'), [
+    '#!/usr/bin/env bash',
+    'if [[ $# == 1 && $1 == +%s%3N && -n ${FAKE_DATE_NOW_MS:-} ]]; then',
+    '  printf "%s\\n" "$FAKE_DATE_NOW_MS"',
+    '  exit 0',
+    'fi',
+    'exec /usr/bin/date "$@"',
     '',
   ].join('\n'));
   executable(path.join(binDir, 'systemctl'), [
@@ -422,6 +436,23 @@ test('shell launcher resumes the exact captured thread after app-server replacem
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
+});
+
+test('recovery begin receives milliseconds from the configured Node clock', () => {
+  const setup = fixture();
+  const nodeNowMs = '1770000123456';
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      FAKE_DATE_NOW_MS: '1770000123456789012',
+      FAKE_NODE_NOW_MS: nodeNowMs,
+    }),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const recoveryBegins = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.startsWith('recovery-begin '));
+  assert.deepEqual(recoveryBegins, [`recovery-begin ${nodeNowMs}`]);
 });
 
 test('shell launcher clears the supervised TUI lease on every launcher exit', () => {
