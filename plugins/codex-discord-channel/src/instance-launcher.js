@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { sanitizedAppServerEnv } = require('./app-server-runtime');
 const { loadEnvFile } = require('./config');
+const { execveWithEagainRetry } = require('../lib/transient-launch');
 
 const ACCOUNT_BINDING_KEYS = new Set(['DISCORD_INSTANCE', 'DISCORD_CONFIG_DIR']);
 
@@ -120,9 +121,11 @@ function buildTuiLaunch(config, codexArgs = [], dependencies = {}) {
 
 function runTui(config, codexArgs = [], dependencies = {}) {
   const launch = buildTuiLaunch(config, codexArgs, dependencies);
-  const execve = dependencies.execve || process.execve;
-  if (typeof execve !== 'function') throw new Error('Node 22.15 or newer is required for process.execve');
-  return execve(launch.command, [launch.command, ...launch.args], launch.env);
+  return execveWithEagainRetry({
+    ...launch,
+    stage: 'tui-native-exec',
+    stateDir: config.paths.stateDir,
+  }, dependencies);
 }
 
 module.exports = {

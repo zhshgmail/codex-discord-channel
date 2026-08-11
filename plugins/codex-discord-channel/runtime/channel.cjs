@@ -3660,7 +3660,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.8"
+              version: "0.3.9"
             },
             capabilities: {
               experimentalApi: !0,
@@ -95122,11 +95122,192 @@ var require_owner_state = __commonJS({
   }
 });
 
+// lib/transient-launch.js
+var require_transient_launch = __commonJS({
+  "lib/transient-launch.js"(exports2, module2) {
+    "use strict";
+    var crypto = require("node:crypto"), fs = require("node:fs"), path = require("node:path"), { spawn: nodeSpawn } = require("node:child_process"), INCIDENT_VERSION = 1, RETRY_DELAY_MS = 100, VALID_STAGES = /* @__PURE__ */ new Set([
+      "app-supervisor-spawn",
+      "app-native-exec",
+      "gateway-spawn",
+      "tui-spawn",
+      "tui-native-exec"
+    ]);
+    function isEagain(error) {
+      return error?.code === "EAGAIN" || error?.errno === 11 || error?.errno === -11;
+    }
+    function argvSha256(command, args) {
+      let hash = crypto.createHash("sha256");
+      for (let value of [command, ...args])
+        hash.update(String(value)), hash.update("\0");
+      return hash.digest("hex");
+    }
+    function integerFromFile(file) {
+      try {
+        let value = fs.readFileSync(file, "utf8").trim();
+        return /^\d+$/.test(value) ? value : null;
+      } catch {
+        return null;
+      }
+    }
+    function resourceSnapshot() {
+      let memory = {};
+      try {
+        for (let line of fs.readFileSync("/proc/meminfo", "utf8").split(`
+`)) {
+          let match = line.match(/^(MemAvailable|MemFree|SwapFree|Committed_AS):\s+(\d+)\s+kB$/);
+          match && (memory[match[1]] = match[2]);
+        }
+      } catch {
+      }
+      let processCount = null;
+      try {
+        processCount = String(fs.readdirSync("/proc").filter((name) => /^\d+$/.test(name)).length);
+      } catch {
+      }
+      let loadAverage = null;
+      try {
+        loadAverage = fs.readFileSync("/proc/loadavg", "utf8").trim().split(/\s+/).slice(0, 3);
+      } catch {
+      }
+      let cgroupPidsCurrent = null, cgroupPidsMax = null;
+      try {
+        let unified = fs.readFileSync("/proc/self/cgroup", "utf8").split(`
+`).find((line) => line.startsWith("0::"));
+        if (unified) {
+          let relative = unified.slice(3).replace(/^\/+/, ""), base = path.join("/sys/fs/cgroup", relative);
+          cgroupPidsCurrent = integerFromFile(path.join(base, "pids.current"));
+          try {
+            cgroupPidsMax = fs.readFileSync(path.join(base, "pids.max"), "utf8").trim();
+          } catch {
+          }
+        }
+      } catch {
+      }
+      return {
+        cgroupPidsCurrent,
+        cgroupPidsMax,
+        loadAverage,
+        memoryKb: memory,
+        pid: process.pid,
+        processCount,
+        threadsMax: integerFromFile("/proc/sys/kernel/threads-max")
+      };
+    }
+    function errorIdentity(error) {
+      return {
+        code: typeof error?.code == "string" ? error.code : null,
+        errno: Number.isInteger(error?.errno) ? error.errno : null,
+        syscall: typeof error?.syscall == "string" ? error.syscall : null
+      };
+    }
+    function validateStage(stage) {
+      if (!VALID_STAGES.has(stage)) throw new Error(`unsupported launch stage: ${stage}`);
+    }
+    function appendIncident(stateDir, incident) {
+      if (!path.isAbsolute(stateDir)) throw new Error("launch incident state directory must be absolute");
+      let file = path.join(stateDir, "startup-incidents.jsonl"), noFollow = fs.constants.O_NOFOLLOW || 0, fd = fs.openSync(
+        file,
+        fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | noFollow,
+        384
+      );
+      try {
+        let stat = fs.fstatSync(fd, { bigint: !0 });
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("launch incident journal is not regular");
+        if (typeof process.getuid == "function" && stat.uid !== BigInt(process.getuid()))
+          throw new Error("launch incident journal has a foreign owner");
+        if ((stat.mode & 0o077n) !== 0n || stat.nlink !== 1n)
+          throw new Error("launch incident journal has unsafe metadata");
+        fs.writeFileSync(fd, `${JSON.stringify(incident)}
+`), fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+    function incidentFor(options, error, attempt, action) {
+      return {
+        action,
+        argvSha256: argvSha256(options.command, options.args),
+        attempt,
+        error: errorIdentity(error),
+        generation: typeof options.env?.CODEX_DISCORD_LAUNCH_GENERATION == "string" ? options.env.CODEX_DISCORD_LAUNCH_GENERATION : null,
+        instance: typeof options.env?.CODEX_DISCORD_LAUNCH_INSTANCE == "string" ? options.env.CODEX_DISCORD_LAUNCH_INSTANCE : null,
+        resource: resourceSnapshot(),
+        role: typeof options.env?.CODEX_DISCORD_LAUNCH_ROLE == "string" ? options.env.CODEX_DISCORD_LAUNCH_ROLE : null,
+        stage: options.stage,
+        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+        version: INCIDENT_VERSION
+      };
+    }
+    function recordIncident(options, error, attempt, action, dependencies) {
+      let incident = incidentFor(options, error, attempt, action);
+      typeof dependencies.recordLaunchIncident == "function" ? dependencies.recordLaunchIncident(incident) : appendIncident(options.stateDir, incident);
+    }
+    function sleepSync(ms) {
+      let shared = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(shared, 0, 0, ms);
+    }
+    function execveWithEagainRetry(options, dependencies = {}) {
+      validateStage(options.stage);
+      let execve = dependencies.execve || process.execve;
+      if (typeof execve != "function") {
+        let error = new Error("Node 22.15 or newer is required for process.execve");
+        throw error.code = "node_execve_required", error;
+      }
+      let wait = dependencies.sleepSync || sleepSync;
+      for (let attempt = 1; attempt <= 2; attempt += 1)
+        try {
+          return execve(options.command, [options.command, ...options.args], options.env);
+        } catch (error) {
+          if (!isEagain(error)) throw error;
+          let action = attempt === 1 ? "retry" : "abort";
+          if (recordIncident(options, error, attempt, action, dependencies), action === "abort") throw error;
+          wait(RETRY_DELAY_MS);
+        }
+      throw new Error("unreachable exec retry state");
+    }
+    function waitForSpawn(child) {
+      return new Promise((resolve, reject) => {
+        let onError = (error) => {
+          child.off("spawn", onSpawn), reject(error);
+        }, onSpawn = () => {
+          child.off("error", onError), resolve(child);
+        };
+        child.once("error", onError), child.once("spawn", onSpawn);
+      });
+    }
+    async function spawnWithEagainRetry(options, dependencies = {}) {
+      validateStage(options.stage);
+      let spawn = dependencies.spawn || nodeSpawn, delay = dependencies.delay || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        let child;
+        try {
+          return child = spawn(options.command, options.args, { env: options.env, stdio: options.stdio }), await waitForSpawn(child);
+        } catch (error) {
+          if (!isEagain(error)) throw error;
+          let action = attempt === 1 ? "retry" : "abort";
+          if (recordIncident(options, error, attempt, action, dependencies), action === "abort") throw error;
+          await delay(RETRY_DELAY_MS);
+        }
+      }
+      throw new Error("unreachable spawn retry state");
+    }
+    module2.exports = {
+      appendIncident,
+      argvSha256,
+      execveWithEagainRetry,
+      isEagain,
+      resourceSnapshot,
+      spawnWithEagainRetry
+    };
+  }
+});
+
 // src/app-server-runtime.js
 var require_app_server_runtime = __commonJS({
   "src/app-server-runtime.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), LAUNCH_GENERATION_ENV_KEYS = /* @__PURE__ */ new Set([
+    var fs = require("node:fs"), path = require("node:path"), { execveWithEagainRetry } = require_transient_launch(), LAUNCH_GENERATION_ENV_KEYS = /* @__PURE__ */ new Set([
       "CODEX_DISCORD_LAUNCH_GENERATION",
       "CODEX_DISCORD_LAUNCH_INSTANCE",
       "CODEX_DISCORD_LAUNCH_STATE_DIR",
@@ -95185,12 +95366,12 @@ var require_app_server_runtime = __commonJS({
       };
     }
     function runAppServer2(config, dependencies = {}) {
-      let launch = buildAppServerLaunch(config), execve = dependencies.execve || process.execve;
-      if (typeof execve != "function") {
-        let error = new Error("Node 22.15 or newer is required for process.execve");
-        throw error.code = "node_execve_required", error;
-      }
-      return execve(launch.command, [launch.command, ...launch.args], launch.env);
+      let launch = buildAppServerLaunch(config);
+      return execveWithEagainRetry({
+        ...launch,
+        stage: "app-native-exec",
+        stateDir: config.paths.stateDir
+      }, dependencies);
     }
     function instanceDoctor2(config) {
       return {
@@ -95223,7 +95404,7 @@ var require_app_server_runtime = __commonJS({
 var require_instance_launcher = __commonJS({
   "src/instance-launcher.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), { sanitizedAppServerEnv } = require_app_server_runtime(), { loadEnvFile } = require_config(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]);
+    var fs = require("node:fs"), path = require("node:path"), { sanitizedAppServerEnv } = require_app_server_runtime(), { loadEnvFile } = require_config(), { execveWithEagainRetry } = require_transient_launch(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]);
     function verifyAccountBinding(config) {
       let binding = {};
       if (!loadEnvFile(config.paths.accountBindingPath, binding, {
@@ -95292,9 +95473,12 @@ var require_instance_launcher = __commonJS({
       };
     }
     function runTui2(config, codexArgs = [], dependencies = {}) {
-      let launch = buildTuiLaunch(config, codexArgs, dependencies), execve = dependencies.execve || process.execve;
-      if (typeof execve != "function") throw new Error("Node 22.15 or newer is required for process.execve");
-      return execve(launch.command, [launch.command, ...launch.args], launch.env);
+      let launch = buildTuiLaunch(config, codexArgs, dependencies);
+      return execveWithEagainRetry({
+        ...launch,
+        stage: "tui-native-exec",
+        stateDir: config.paths.stateDir
+      }, dependencies);
     }
     module2.exports = {
       buildTuiLaunch,
@@ -95471,7 +95655,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.8", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.9", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

@@ -73,6 +73,35 @@ test('TUI launcher replaces itself with matching Codex after the shell startup b
   assert.equal(Object.hasOwn(launched.env, 'DISCORD_BOT_TOKEN'), false);
 });
 
+test('TUI native exec retries one audited EAGAIN and then succeeds', () => {
+  const config = instanceFixture();
+  let attempts = 0;
+  const incidents = [];
+  const result = runTui(config, ['resume', '--last'], {
+    execve() {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error('Resource temporarily unavailable');
+        error.code = 'EAGAIN';
+        error.errno = -11;
+        error.syscall = 'execve';
+        throw error;
+      }
+      return 'execve-after-retry';
+    },
+    recordLaunchIncident(incident) { incidents.push(incident); },
+    sleepSync() {},
+  });
+
+  assert.equal(result, 'execve-after-retry');
+  assert.equal(attempts, 2);
+  assert.equal(incidents.length, 1);
+  assert.equal(incidents[0].stage, 'tui-native-exec');
+  assert.equal(incidents[0].error.code, 'EAGAIN');
+  assert.equal(incidents[0].action, 'retry');
+  assert.match(incidents[0].argvSha256, /^[0-9a-f]{64}$/);
+});
+
 test('launcher rejects an OpenAI account that is not logged in', () => {
   const config = instanceFixture();
   fs.unlinkSync(path.join(config.codexHome, 'auth.json'));

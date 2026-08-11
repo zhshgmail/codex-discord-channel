@@ -1,6 +1,6 @@
 {
   "name": "codex-discord-channel",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Claude-style Discord channel ownership for Codex sessions.",
   "license": "MIT",
   "repository": {
@@ -24,7 +24,7 @@
     "build": "npm run build:runtime",
     "build:runtime": "node scripts/build-runtime.js",
     "build:check": "node scripts/build-runtime.js --check",
-    "syntax": "bash -n bin/codex-discord-instance && node --check bin/codex-discord-channel && node --check bin/codex-discord-generation && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js && node --check runtime/*.cjs",
+    "syntax": "bash -n bin/codex-discord-instance && node --check bin/codex-discord-channel && node --check bin/codex-discord-generation && node --check lib/*.js && node --check src/*.js && node --check scripts/*.js && node --check tests/unit/*.test.js && node --check runtime/*.cjs",
     "test": "node --test tests/unit/*.test.js",
     "smoke": "node scripts/smoke.js",
     "import:bridge": "node scripts/import-bridge-state.js",

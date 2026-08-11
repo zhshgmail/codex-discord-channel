@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { execveWithEagainRetry } = require('../lib/transient-launch');
 
 const LAUNCH_GENERATION_ENV_KEYS = new Set([
   'CODEX_DISCORD_LAUNCH_GENERATION',
@@ -95,13 +96,11 @@ function buildAppServerLaunch(config) {
 
 function runAppServer(config, dependencies = {}) {
   const launch = buildAppServerLaunch(config);
-  const execve = dependencies.execve || process.execve;
-  if (typeof execve !== 'function') {
-    const error = new Error('Node 22.15 or newer is required for process.execve');
-    error.code = 'node_execve_required';
-    throw error;
-  }
-  return execve(launch.command, [launch.command, ...launch.args], launch.env);
+  return execveWithEagainRetry({
+    ...launch,
+    stage: 'app-native-exec',
+    stateDir: config.paths.stateDir,
+  }, dependencies);
 }
 
 function instanceDoctor(config) {

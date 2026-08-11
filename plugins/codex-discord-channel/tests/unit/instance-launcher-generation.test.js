@@ -115,6 +115,7 @@ function fixture(t) {
   const plugin = path.join(home, 'plugin');
   const binDir = path.join(plugin, 'bin');
   const runtimeDir = path.join(plugin, 'runtime');
+  const libraryDir = path.join(plugin, 'lib');
   const codexHome = path.join(home, '.codex-account-02');
   const launcher = path.join(binDir, 'codex-discord-instance');
   const generationHelper = path.join(binDir, 'codex-discord-generation');
@@ -128,12 +129,17 @@ function fixture(t) {
   fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.mkdirSync(libraryDir, { recursive: true });
   fs.mkdirSync(codexHome, { recursive: true });
   fs.copyFileSync(sourceLauncher, launcher);
   fs.chmodSync(launcher, 0o700);
   if (fs.existsSync(sourceGenerationHelper)) {
     fs.copyFileSync(sourceGenerationHelper, generationHelper);
     fs.chmodSync(generationHelper, 0o700);
+    fs.copyFileSync(
+      path.join(pluginRoot, 'lib', 'transient-launch.js'),
+      path.join(libraryDir, 'transient-launch.js'),
+    );
   }
 
   executable(channel, String.raw`#!/usr/bin/env node

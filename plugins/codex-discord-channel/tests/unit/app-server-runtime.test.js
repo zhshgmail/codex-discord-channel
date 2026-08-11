@@ -86,6 +86,37 @@ test('runAppServer replaces itself with Codex under the isolated environment', (
   assert.equal(observed.env.DISCORD_CONFIG_DIR, config.paths.stateDir);
 });
 
+test('app-server native exec retries one audited EAGAIN and then succeeds', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-app-server-eagain-'));
+  const config = createInstance(root, 'codex02', '.codex-account-02', '22222222222222222');
+  let attempts = 0;
+  const incidents = [];
+
+  const result = runAppServer(config, {
+    execve() {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error('Resource temporarily unavailable');
+        error.code = 'EAGAIN';
+        error.errno = -11;
+        error.syscall = 'execve';
+        throw error;
+      }
+      return 'execve-after-retry';
+    },
+    recordLaunchIncident(incident) { incidents.push(incident); },
+    sleepSync() {},
+  });
+
+  assert.equal(result, 'execve-after-retry');
+  assert.equal(attempts, 2);
+  assert.equal(incidents.length, 1);
+  assert.equal(incidents[0].stage, 'app-native-exec');
+  assert.equal(incidents[0].error.code, 'EAGAIN');
+  assert.equal(incidents[0].action, 'retry');
+  assert.match(incidents[0].argvSha256, /^[0-9a-f]{64}$/);
+});
+
 test('instance doctor reports account and Discord state separation without secrets', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-instance-doctor-'));
   const config = createInstance(root, 'codex02', '.codex-account-02', '22222222222222222');
@@ -120,7 +151,7 @@ test('actual app-server exec preserves exactly seven launcher identity keys and 
     CODEX_DISCORD_LAUNCH_INSTANCE: 'codex02',
     CODEX_DISCORD_LAUNCH_STATE_DIR: config.paths.stateDir,
     CODEX_DISCORD_LAUNCH_CODEX_HOME: config.codexHome,
-    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/opt/codex-discord-channel/0.3.8',
+    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/opt/codex-discord-channel/0.3.9',
     CODEX_DISCORD_LAUNCH_ENDPOINT: path.join(config.paths.stateDir, 'app-server.sock'),
     CODEX_DISCORD_LAUNCH_ROLE: 'app',
   };

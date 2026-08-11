@@ -4,12 +4,12 @@ Standalone Codex plugin project for Discord session delivery. The plugin lives
 at `plugins/codex-discord-channel` and is exposed through the repository
 marketplace at `.agents/plugins/marketplace.json`.
 
-## v0.3.8 Team Install And Upgrade
+## v0.3.9 Team Install And Upgrade
 
-Team release: [v0.3.8](https://github.com/zhshgmail/codex-discord-channel/releases/tag/v0.3.8).
+Team release: [v0.3.9](https://github.com/zhshgmail/codex-discord-channel/releases/tag/v0.3.9).
 
 This is the current team-host rollout, not a claim of cross-host portability.
-The marketplace MCP manifest in v0.3.8 still pins the team's absolute Node
+The marketplace MCP manifest in v0.3.9 still pins the team's absolute Node
 path; a host with a different Node path needs a later manifest fix.
 
 One instance is one launcher-owned process tree: launcher, app-server, Discord
@@ -57,10 +57,10 @@ Install the pinned tag from an ordinary shell:
 
 ```bash
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.8
+  zhshgmail/codex-discord-channel --ref v0.3.9
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.8+codex.alias-isolated-runtime"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.9+codex.alias-isolated-runtime"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 ```
 
@@ -83,7 +83,7 @@ start `app-server`, `gateway`, a bare `codex --remote`, or a new systemd unit
 separately. The launcher supplies the correct `CODEX_HOME`, instance, state
 directory, socket, and installed activation root to every child.
 
-### Upgrade To v0.3.8
+### Upgrade To v0.3.9
 
 Upgrade one alias at a time:
 
@@ -101,15 +101,15 @@ CODEX_HOME="$ACCOUNT_HOME" codex plugin list --json
 CODEX_HOME="$ACCOUNT_HOME" codex plugin remove codex-discord-channel@personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace remove personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.8
+  zhshgmail/codex-discord-channel --ref v0.3.9
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.8+codex.alias-isolated-runtime"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.9+codex.alias-isolated-runtime"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 "$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" resume --last
 ```
 
-If the marketplace already points at `v0.3.8`, use
+If the marketplace already points at `v0.3.9`, use
 `codex plugin marketplace upgrade personal` instead of replacing it. Never
 install over a running alias: the installer may remove files used by that
 generation, and an open MCP transport cannot hot-reload the replacement.
@@ -360,7 +360,7 @@ Prerequisites:
 - one isolated `CODEX_HOME` and Discord state directory per alias.
 
 ```bash
-codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.8
+codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.9
 codex plugin add codex-discord-channel@personal
 ```
 
@@ -372,7 +372,7 @@ gateway/app-server worker therefore use committed self-contained bundles:
 `runtime/mcp-server.cjs` and `runtime/channel.cjs`. `npm ci` and
 `npm run build:runtime` are development steps, not installation requirements.
 
-For a review branch or pinned deployment, replace `v0.3.8` with the exact
+For a review branch or pinned deployment, replace `v0.3.9` with the exact
 branch, tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
 
@@ -684,6 +684,7 @@ $HOME/.codex/channels/discord/codex01/gateway-health.json
 $HOME/.codex/channels/discord/codex01/pending-delivery.json
 $HOME/.codex/channels/discord/codex01/reply-receipts/
 $HOME/.codex/channels/discord/codex01/app-server.sock
+$HOME/.codex/channels/discord/codex01/startup-incidents.jsonl
 ```
 
 Do not commit `.env` or print Discord tokens.
@@ -707,6 +708,7 @@ file both reach the fallback; inspect the command exit code separately.
 | `node: command not found` in a noninteractive shell | `NODE_BIN` in `account.env` | Use an absolute Node 22+ path. |
 | An old versioned launcher path reports `No such file or directory` immediately after upgrade | `alias INSTANCE` and `type -a INSTANCE` in the current shell | Reload the shell configuration with `source ~/.bashrc`; verify the alias names the installed version before retrying. Do not reinstall merely to repair an in-memory alias. |
 | `Discord instance INSTANCE already has an active launcher` | Exact launcher process plus the holder of `instance-launcher.lock` | Return to the existing visible TUI. If it is unreachable, establish a safe maintenance boundary, `TERM` only the verified launcher PID, wait for its children/socket to disappear, then relaunch in the intended visible terminal. Never delete the lock or start a second receiver. |
+| `Resource temporarily unavailable (os error 11)` during startup | `startup-incidents.jsonl` stage, argv digest, errno, generation, process count, cgroup pids, and memory snapshot | The launcher retries exactly once only for `EAGAIN`. If the second attempt fails, preserve the incident journal and relaunch normally after the resource condition clears; never delete the generation manifest or socket by hand. |
 | Plugin code changed but tools/behavior did not | Age of the Codex thread and installed runtime path | Exit the selected alias first; from an ordinary shell install the intended revision, update its alias path, then relaunch it with `codex-discord-instance INSTANCE resume --last`. A closed MCP transport cannot hot-reload. |
 | `guild_mention_required` | `access.json` `requireMention`, bot user id, `mentionPatterns`, and reply audience | Correct the exact user/role mention pattern. Do not edit `owner.json` or legacy `state.json` as a workaround. |
 | `guild_channel_not_enabled` in a thread | Runtime revision, thread parent id, and the parent entry in `access.json` | Upgrade past `0.2.1+git.92d5d37cc13b` and enable the parent channel. New threads inherit parent policy automatically. |

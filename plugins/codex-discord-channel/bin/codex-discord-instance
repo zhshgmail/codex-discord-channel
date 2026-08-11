@@ -367,7 +367,21 @@ if ! read -r app_start_ticks app_pgid < <(record_worker_group "$app_pid"); then
 fi
 (
   exec {launcher_lock_fd}>&-
-  exec "$setsid_bin" "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
+  exec "$setsid_bin" env "${generation_env[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
+    "${generation_command[@]}" worker-supervise \
+    --manifest "$generation_manifest" \
+    --nonce "$launch_generation" \
+    --role gateway \
+    --instance "$instance" \
+    --state-dir "$state_dir" \
+    --codex-home "$codex_home" \
+    --plugin-root "$plugin_root" \
+    --socket "$socket" \
+    --node-bin "$node_bin" \
+    --codex-bin "$codex_bin" \
+    --channel-bin "$channel_bin" \
+    --generation-bin "$generation_bin" \
+    -- "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
     "$node_bin" "$channel_bin" gateway "${runtime_args[@]}"
 ) >>"$state_dir/session-gateway.log" 2>&1 &
 gateway_pid=$!
@@ -417,7 +431,21 @@ while ((SECONDS <= deadline)); do
       set +e
       (
         exec {launcher_lock_fd}>&-
-        exec "$setsid_bin" env \
+        exec "$setsid_bin" env "${generation_env[@]}" CODEX_DISCORD_LAUNCH_ROLE=tui \
+          "${generation_command[@]}" worker-supervise \
+          --manifest "$generation_manifest" \
+          --nonce "$launch_generation" \
+          --role tui \
+          --instance "$instance" \
+          --state-dir "$state_dir" \
+          --codex-home "$codex_home" \
+          --plugin-root "$plugin_root" \
+          --socket "$socket" \
+          --node-bin "$node_bin" \
+          --codex-bin "$codex_bin" \
+          --channel-bin "$channel_bin" \
+          --generation-bin "$generation_bin" \
+          -- env \
           "${child_env_unsets[@]}" \
           -u CODEX_THREAD_ID \
           -u CODEX_SESSION_ID \

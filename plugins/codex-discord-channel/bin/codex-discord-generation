@@ -3,7 +3,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+const { spawnWithEagainRetry } = require('../lib/transient-launch');
 
 const MANIFEST_VERSION = 1;
 const MAX_MANIFEST_BYTES = 64 * 1024;
@@ -261,12 +261,16 @@ function leaderArgvMatches(processInfo, manifest, role) {
       && processInfo.argv.every((value, index) => value === manifest.app.argv[index]);
   }
   if (role === 'gateway') {
-    return hasExactSequence(processInfo.argv, [manifest.channelBin, 'gateway'])
+    return hasExactSequence(processInfo.argv, [manifest.generationBin, 'worker-supervise'])
+      && hasExactSequence(processInfo.argv, ['--role', 'gateway'])
+      && hasExactSequence(processInfo.argv, [manifest.channelBin, 'gateway'])
       && hasExactSequence(processInfo.argv, ['--instance', manifest.instance])
       && hasExactSequence(processInfo.argv, ['--state-dir', manifest.stateDir]);
   }
   if (role === 'tui') {
-    return hasExactSequence(processInfo.argv, [manifest.codexBin, '--remote', `unix://${manifest.socketPath}`]);
+    return hasExactSequence(processInfo.argv, [manifest.generationBin, 'worker-supervise'])
+      && hasExactSequence(processInfo.argv, ['--role', 'tui'])
+      && hasExactSequence(processInfo.argv, [manifest.codexBin, '--remote', `unix://${manifest.socketPath}`]);
   }
   return false;
 }
@@ -486,7 +490,20 @@ async function supervise(options, command) {
   const expected = expectedIdentity(options);
   const manifest = manifestForSupervisor(options);
   atomicWriteJson(expected.manifestPath, manifest, { requireAbsent: true });
-  const child = spawn(command[0], command.slice(1), { env: process.env, stdio: 'inherit' });
+  let child;
+  try {
+    child = await spawnWithEagainRetry({
+      args: command.slice(1),
+      command: command[0],
+      env: process.env,
+      stage: 'app-supervisor-spawn',
+      stateDir: expected.stateDir,
+      stdio: 'inherit',
+    });
+  } catch (error) {
+    clearManifestCas(expected.manifestPath, `${JSON.stringify(manifest)}\n`);
+    throw error;
+  }
   let endpointPublished = false;
   const capture = () => {
     if (endpointPublished) return;
@@ -494,10 +511,13 @@ async function supervise(options, command) {
   };
   const timer = setInterval(capture, 20);
   capture();
+  const signalHandlers = new Map();
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-    process.on(signal, () => {
+    const handler = () => {
       try { child.kill(signal); } catch {}
-    });
+    };
+    signalHandlers.set(signal, handler);
+    process.on(signal, handler);
   }
   const result = await new Promise((resolve, reject) => {
     child.once('error', reject);
@@ -505,6 +525,51 @@ async function supervise(options, command) {
   });
   clearInterval(timer);
   capture();
+  for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+  if (result.signal) process.kill(process.pid, result.signal);
+  return result.code ?? 1;
+}
+
+async function workerSupervise(options, command) {
+  if (command.length === 0) refuse('worker-supervise requires a child command');
+  const expected = expectedIdentity(options);
+  const role = required(options, 'role');
+  if (!['gateway', 'tui'].includes(role)) refuse('worker-supervise role is invalid');
+  const nonce = required(options, 'nonce');
+  const self = readProcess(process.pid);
+  if (!self || self.pgid !== process.pid || self.session !== process.pid) {
+    refuse(`${role} supervisor is not an isolated session/process-group leader`);
+  }
+  const identity = {
+    codexHome: expected.codexHome,
+    instance: expected.instance,
+    nonce,
+    pluginRoot: expected.pluginRoot,
+    socketPath: expected.socketPath,
+    stateDir: expected.stateDir,
+  };
+  if (!identityEnvMatches(self, identity, role)) refuse(`${role} supervisor environment is invalid`);
+  const child = await spawnWithEagainRetry({
+    args: command.slice(1),
+    command: command[0],
+    env: process.env,
+    stage: `${role}-spawn`,
+    stateDir: expected.stateDir,
+    stdio: 'inherit',
+  });
+  const signalHandlers = new Map();
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    const handler = () => {
+      try { child.kill(signal); } catch {}
+    };
+    signalHandlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+  const result = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+  for (const [signal, handler] of signalHandlers) process.off(signal, handler);
   if (result.signal) process.kill(process.pid, result.signal);
   return result.code ?? 1;
 }
@@ -578,6 +643,8 @@ async function main() {
     process.stdout.write(`${JSON.stringify(await prepare(options))}\n`);
   } else if (action === 'supervise') {
     process.exitCode = await supervise(options, command);
+  } else if (action === 'worker-supervise') {
+    process.exitCode = await workerSupervise(options, command);
   } else if (action === 'ready') {
     ready(options);
   } else if (action === 'update-endpoint') {
@@ -587,7 +654,7 @@ async function main() {
   } else if (action === 'finish-owned') {
     finishOwned(options);
   } else {
-    refuse('action must be prepare, supervise, ready, update-endpoint, group-state, or finish-owned');
+    refuse('action must be prepare, supervise, worker-supervise, ready, update-endpoint, group-state, or finish-owned');
   }
 }
 

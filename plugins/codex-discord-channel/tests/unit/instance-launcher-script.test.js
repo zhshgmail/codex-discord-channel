@@ -20,6 +20,7 @@ function fixture() {
   const pluginBinDir = path.join(home, 'plugin', 'bin');
   const pluginRoot = path.join(home, 'plugin');
   const pluginRuntimeDir = path.join(home, 'plugin', 'runtime');
+  const pluginLibraryDir = path.join(home, 'plugin', 'lib');
   const trace = path.join(home, 'trace.log');
   const childEnvTrace = path.join(home, 'child-env.log');
   const channelEnvTrace = path.join(home, 'channel-env.log');
@@ -36,11 +37,16 @@ function fixture() {
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(pluginBinDir, { recursive: true });
   fs.mkdirSync(pluginRuntimeDir, { recursive: true });
+  fs.mkdirSync(pluginLibraryDir, { recursive: true });
   fs.mkdirSync(codexHome, { recursive: true });
   fs.copyFileSync(sourceLauncher, launcher);
   fs.chmodSync(launcher, 0o700);
   fs.copyFileSync(path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-generation'), generationHelper);
   fs.chmodSync(generationHelper, 0o700);
+  fs.copyFileSync(
+    path.resolve(__dirname, '..', '..', 'lib', 'transient-launch.js'),
+    path.join(pluginLibraryDir, 'transient-launch.js'),
+  );
   fs.writeFileSync(fakeCodex, '// fixture\n');
   fs.writeFileSync(fakeChannel, '// fixture\n');
   executable(socketOwner, String.raw`#!/usr/bin/env python3
