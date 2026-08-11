@@ -384,7 +384,15 @@ async function orphanReadyGeneration(setup, overrides = {}) {
 
 test('real launcher binds supervisor, Node wrapper, and native app-server to one generation', async (t) => {
   const setup = fixture(t);
-  const launcher = await readyLauncher(setup);
+  const launcher = await readyLauncher(setup, {
+    CODEX_DISCORD_LAUNCH_GENERATION: 'stale-generation',
+    CODEX_DISCORD_LAUNCH_ROLE: 'tui',
+    CODEX_DISCORD_LAUNCH_INSTANCE: 'stale-instance',
+    CODEX_DISCORD_LAUNCH_STATE_DIR: '/tmp/stale-state',
+    CODEX_DISCORD_LAUNCH_CODEX_HOME: '/tmp/stale-codex-home',
+    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/tmp/stale-plugin-root',
+    CODEX_DISCORD_LAUNCH_ENDPOINT: '/tmp/stale-app-server.sock',
+  });
   const manifest = await waitFor(() => {
     if (!fs.existsSync(setup.manifestPath)) return null;
     const value = JSON.parse(fs.readFileSync(setup.manifestPath, 'utf8'));

@@ -325,6 +325,19 @@ generation_env=(
   CODEX_DISCORD_LAUNCH_PLUGIN_ROOT="$plugin_root"
   CODEX_DISCORD_LAUNCH_ENDPOINT="$socket"
 )
+generation_channel_command=(
+  env
+  "${child_env_unsets[@]}"
+  -u CODEX_THREAD_ID
+  -u CODEX_SESSION_ID
+  -u CODEX_TARGET_THREAD_ID
+  -u CODEX_APP_SERVER_SOCKET
+  CODEX_HOME="$codex_home"
+  DISCORD_INSTANCE="$instance"
+  DISCORD_CONFIG_DIR="$state_dir"
+  CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root"
+  "${generation_env[@]}"
+)
 
 umask 077
 (
@@ -344,7 +357,8 @@ umask 077
     --generation-bin "$generation_bin" \
     --launcher-pid "$launcher_pid" \
     --launcher-start-ticks "$launcher_start_ticks" \
-    -- "${channel_command[@]}" app-server "${runtime_args[@]}"
+    -- "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=app \
+    "$node_bin" "$channel_bin" app-server "${runtime_args[@]}"
 ) >>"$state_dir/app-server.log" 2>&1 &
 app_pid=$!
 if ! read -r app_start_ticks app_pgid < <(record_worker_group "$app_pid"); then
@@ -353,8 +367,8 @@ if ! read -r app_start_ticks app_pgid < <(record_worker_group "$app_pid"); then
 fi
 (
   exec {launcher_lock_fd}>&-
-  exec "$setsid_bin" env "${generation_env[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
-    "${channel_command[@]}" gateway "${runtime_args[@]}"
+  exec "$setsid_bin" "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
+    "$node_bin" "$channel_bin" gateway "${runtime_args[@]}"
 ) >>"$state_dir/session-gateway.log" 2>&1 &
 gateway_pid=$!
 if ! read -r gateway_start_ticks gateway_pgid < <(record_worker_group "$gateway_pid"); then
