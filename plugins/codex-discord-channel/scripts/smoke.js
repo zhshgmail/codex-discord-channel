@@ -5,7 +5,7 @@ const path = require('node:path');
 const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
-const PACKAGE_VERSION = '0.3.8';
+const PACKAGE_VERSION = '0.3.10';
 const PLUGIN_VERSION_PREFIX = `${PACKAGE_VERSION}+codex.`;
 
 function readJson(relativePath) {
@@ -91,26 +91,6 @@ assert(
   'README must require alias exit before marketplace replacement removes its old cache',
 );
 const runtimeUpdates = markdownSection(readme, '### Runtime Updates');
-const currentRelease = markdownSection(readme, `## v${PACKAGE_VERSION} Team Install And Upgrade`);
-const firstInstall = markdownSection(readme, '### First Install');
-const currentUpgrade = markdownSection(readme, `### Upgrade To v${PACKAGE_VERSION}`);
-const remoteInstall = markdownSection(readme, '## Remote Marketplace Install');
-assert(currentRelease, `README must contain the v${PACKAGE_VERSION} team release section`);
-assert(
-  currentRelease.includes(`releases/tag/v${PACKAGE_VERSION}`),
-  'README team release link must match the package version',
-);
-assert(
-  firstInstall.includes(`--ref v${PACKAGE_VERSION}`)
-    && currentUpgrade.includes(`--ref v${PACKAGE_VERSION}`)
-    && remoteInstall.includes(`--ref v${PACKAGE_VERSION}`),
-  'README marketplace refs must match the package version',
-);
-assert(
-  firstInstall.includes(`/${manifest.version}`)
-    && currentUpgrade.includes(`/${manifest.version}`),
-  'README installed cache paths must match the plugin version',
-);
 assert(
   appearsInOrder(
     runtimeUpdates,

@@ -394,7 +394,6 @@ while ((SECONDS <= deadline)); do
       continue
     fi
     "${channel_command[@]}" live-check "${runtime_args[@]}" \
-      --generation "$launch_generation" \
       --pid "$app_pid" --pid "$gateway_pid" >/dev/null
     codex_args=("$@")
     recovery_stamps=()

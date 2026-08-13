@@ -89,6 +89,7 @@ function buildAppServerLaunch(config) {
       CODEX_HOME: config.codexHome,
       DISCORD_INSTANCE: config.paths.instance,
       DISCORD_CONFIG_DIR: config.paths.stateDir,
+      CODEX_DISCORD_APP_SERVER_URL: config.appServerUrl,
     },
   };
 }

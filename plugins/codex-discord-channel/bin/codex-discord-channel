@@ -29,7 +29,7 @@ function usage() {
     '  codex-discord-channel app-server [--instance ID --state-dir PATH]',
     '  codex-discord-channel instance-doctor [--instance ID --state-dir PATH]',
     '  codex-discord-channel tui-check [--instance ID --state-dir PATH]',
-    '  codex-discord-channel live-check [--instance ID --state-dir PATH] --generation ID --pid PID --pid PID',
+    '  codex-discord-channel live-check [--instance ID --state-dir PATH] --pid PID --pid PID',
     '  codex-discord-channel tui [--instance ID --state-dir PATH] [-- CODEX_ARGS...]',
     '  codex-discord-channel tui-recovery-target ACTION [ACTION_ARGS...] [--instance ID --state-dir PATH]',
     '  codex-discord-channel send [--channel CHANNEL_ID] [--reply-to MESSAGE_ID] [--followup]',
@@ -49,27 +49,18 @@ function parseTuiArgs(argv) {
 function parseLiveCheckArgs(argv) {
   const runtimeArgs = [];
   const pids = [];
-  let generation;
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === '--pid') {
       const pid = Number(argv[index + 1]);
       if (!Number.isSafeInteger(pid)) throw new Error('--pid requires an integer');
       pids.push(pid);
       index += 1;
-    } else if (argv[index] === '--generation') {
-      const value = String(argv[index + 1] || '');
-      if (!value || generation !== undefined) {
-        throw new Error('live-check requires exactly one --generation value');
-      }
-      generation = value;
-      index += 1;
     } else {
       runtimeArgs.push(argv[index]);
     }
   }
-  if (!generation) throw new Error('live-check requires exactly one --generation value');
   if (pids.length !== 2) throw new Error('live-check requires exactly two --pid values');
-  return { generation, pids, runtimeArgs };
+  return { pids, runtimeArgs };
 }
 
 function parseRuntimeArgs(argv) {
@@ -306,9 +297,7 @@ async function main() {
     const args = parseLiveCheckArgs(rest);
     const config = loadRuntimeConfig(args.runtimeArgs);
     const { verifyLiveProcess } = require('../src/instance-launcher');
-    for (const pid of args.pids) {
-      verifyLiveProcess(config, pid, { expectedGeneration: args.generation });
-    }
+    for (const pid of args.pids) verifyLiveProcess(config, pid);
     return;
   }
   if (command === 'tui') {

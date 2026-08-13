@@ -35,28 +35,22 @@ function verifyLiveProcess(config, pid, dependencies = {}) {
     const separator = entry.indexOf('=');
     return separator === -1 ? [entry, ''] : [entry.slice(0, separator), entry.slice(separator + 1)];
   }));
-  const hasGenerationIdentity = Object.keys(env)
-    .some((key) => key.startsWith('CODEX_DISCORD_LAUNCH_'));
-  if (hasGenerationIdentity) {
-    const generationIdentityMatches = Boolean(
-      dependencies.expectedGeneration
-      && env.CODEX_DISCORD_LAUNCH_GENERATION === dependencies.expectedGeneration
-      && ['app', 'gateway'].includes(env.CODEX_DISCORD_LAUNCH_ROLE)
-      && env.CODEX_DISCORD_LAUNCH_INSTANCE === config.paths.instance
-      && path.resolve(env.CODEX_DISCORD_LAUNCH_STATE_DIR || '') === path.resolve(config.paths.stateDir)
-      && path.resolve(env.CODEX_DISCORD_LAUNCH_CODEX_HOME || '') === path.resolve(config.codexHome)
-      && path.resolve(env.CODEX_DISCORD_LAUNCH_PLUGIN_ROOT || '') === path.resolve(config.deliveryActivationId)
-      && env.CODEX_DISCORD_LAUNCH_ENDPOINT === config.appServerUrl.replace(/^unix:\/\//, '')
-    );
-    if (generationIdentityMatches) return;
-    throw new Error(`Live service PID ${pid} does not match instance ${config.paths.instance}`);
-  }
   const explicitIdentityMatches = (
     env.CODEX_HOME !== config.codexHome
     || env.DISCORD_INSTANCE !== config.paths.instance
     || path.resolve(env.DISCORD_CONFIG_DIR || '') !== path.resolve(config.paths.stateDir)
   ) === false;
   if (explicitIdentityMatches) return;
+  const generationIdentityMatches = Boolean(
+    env.CODEX_DISCORD_LAUNCH_GENERATION
+    && ['app', 'gateway'].includes(env.CODEX_DISCORD_LAUNCH_ROLE)
+    && env.CODEX_DISCORD_LAUNCH_INSTANCE === config.paths.instance
+    && path.resolve(env.CODEX_DISCORD_LAUNCH_STATE_DIR || '') === path.resolve(config.paths.stateDir)
+    && path.resolve(env.CODEX_DISCORD_LAUNCH_CODEX_HOME || '') === path.resolve(config.codexHome)
+    && path.resolve(env.CODEX_DISCORD_LAUNCH_PLUGIN_ROOT || '') === path.resolve(config.deliveryActivationId)
+    && env.CODEX_DISCORD_LAUNCH_ENDPOINT === config.appServerUrl.replace(/^unix:\/\//, '')
+  );
+  if (generationIdentityMatches) return;
 
   let argv = [];
   try {
