@@ -202,12 +202,16 @@ run_generation() {
     "${generation_command[@]}" "$action" "${identity_args[@]}" "$@"
   fi
 }
+recorded_worker_start_ticks=''
+recorded_worker_pgid=''
 record_worker_group() {
   local pid=$1
   local identity=''
   local expected_start_ticks=''
   local pgid start_ticks
   local attempt
+  recorded_worker_start_ticks=''
+  recorded_worker_pgid=''
   for ((attempt = 0; attempt < 100; attempt += 1)); do
     identity=$(awk '{print $5 " " $22}' "/proc/$pid/stat" 2>/dev/null || true)
     if [[ -z $identity ]]; then
@@ -221,18 +225,77 @@ record_worker_group() {
     read -r pgid start_ticks <<<"$identity"
     if [[ -z $expected_start_ticks ]]; then
       expected_start_ticks=$start_ticks
+      recorded_worker_start_ticks=$start_ticks
+      recorded_worker_pgid=$pgid
     elif [[ $start_ticks != "$expected_start_ticks" ]]; then
       echo "worker_group_start_ticks_drift pid=$pid expected=$expected_start_ticks actual=$start_ticks" >&2
       return 11
+    else
+      recorded_worker_pgid=$pgid
     fi
     if [[ $pgid == "$pid" ]]; then
-      printf '%s %s\n' "$start_ticks" "$pgid"
       return 0
     fi
     sleep 0.01
   done
   echo "worker_group_isolation_timeout pid=$pid start_ticks=${expected_start_ticks:-unobserved}" >&2
   return 12
+}
+pending_worker_state() {
+  local pid=$1
+  local expected_start_ticks=$2
+  local identity actual_pgid actual_start_ticks
+  identity=$(awk '{print $5 " " $22}' "/proc/$pid/stat" 2>/dev/null || true)
+  [[ -n $identity ]] || return 10
+  read -r actual_pgid actual_start_ticks <<<"$identity"
+  [[ $actual_start_ticks == "$expected_start_ticks" ]] || return 11
+  printf '%s\n' "$actual_pgid"
+}
+stop_pending_worker() {
+  local role=$1
+  local pid=$2
+  local start_ticks=$3
+  local last_pgid=$4
+  [[ -n $pid && -n $start_ticks && -n $last_pgid ]] || return 0
+  local state_status=0
+  local actual_pgid=''
+  set +e
+  actual_pgid=$(pending_worker_state "$pid" "$start_ticks")
+  state_status=$?
+  set -e
+  if ((state_status == 10)); then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+  if ((state_status != 0)); then
+    echo "Refusing to stop changed pending $role pid $pid" >&2
+    return 0
+  fi
+  kill -TERM -- "$pid" 2>/dev/null || true
+  local attempts=$(((stop_timeout_ms + 49) / 50))
+  local attempt
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    set +e
+    actual_pgid=$(pending_worker_state "$pid" "$start_ticks")
+    state_status=$?
+    set -e
+    ((state_status == 10)) && break
+    if ((state_status != 0)); then
+      echo "Refusing to continue stopping changed pending $role pid $pid" >&2
+      break
+    fi
+    sleep 0.05
+  done
+  if ((state_status == 0)); then
+    set +e
+    actual_pgid=$(pending_worker_state "$pid" "$start_ticks")
+    state_status=$?
+    set -e
+    if ((state_status == 0)); then
+      kill -KILL -- "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
 }
 group_state() {
   local role=$1
@@ -285,6 +348,18 @@ stop_worker_group() {
   fi
   wait "$pid" 2>/dev/null || true
 }
+stop_worker() {
+  local role=$1
+  local pid=$2
+  local start_ticks=$3
+  local pgid=$4
+  [[ -n $pid && -n $start_ticks && -n $pgid ]] || return 0
+  if [[ $pgid == "$pid" ]]; then
+    stop_worker_group "$role" "$pid" "$start_ticks" "$pgid"
+  else
+    stop_pending_worker "$role" "$pid" "$start_ticks" "$pgid"
+  fi
+}
 worker_running() {
   local pid=$1
   local state
@@ -303,9 +378,9 @@ cleanup_launcher() {
     "${channel_command[@]}" tui-recovery-target clear-owned "$current_lease_id" \
       "${runtime_args[@]}" >/dev/null 2>&1 || true
   fi
-  stop_worker_group tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
-  stop_worker_group gateway "$gateway_pid" "$gateway_start_ticks" "$gateway_pgid"
-  stop_worker_group app "$app_pid" "$app_start_ticks" "$app_pgid"
+  stop_worker tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
+  stop_worker gateway "$gateway_pid" "$gateway_start_ticks" "$gateway_pgid"
+  stop_worker app "$app_pid" "$app_start_ticks" "$app_pgid"
   if [[ -n $launch_generation ]]; then
     run_generation finish-owned --nonce "$launch_generation" >/dev/null 2>&1 || true
   fi
@@ -378,20 +453,28 @@ umask 077
     "$node_bin" "$channel_bin" app-server "${runtime_args[@]}"
 ) >>"$state_dir/app-server.log" 2>&1 &
 app_pid=$!
-if ! read -r app_start_ticks app_pgid < <(record_worker_group "$app_pid"); then
+if ! record_worker_group "$app_pid"; then
+  app_start_ticks=$recorded_worker_start_ticks
+  app_pgid=$recorded_worker_pgid
   echo "Discord app-server generation for $instance did not isolate its process group" >&2
   exit 1
 fi
+app_start_ticks=$recorded_worker_start_ticks
+app_pgid=$recorded_worker_pgid
 (
   exec {launcher_lock_fd}>&-
   exec "$setsid_bin" "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
     "$node_bin" "$channel_bin" gateway "${runtime_args[@]}"
 ) >>"$state_dir/session-gateway.log" 2>&1 &
 gateway_pid=$!
-if ! read -r gateway_start_ticks gateway_pgid < <(record_worker_group "$gateway_pid"); then
+if ! record_worker_group "$gateway_pid"; then
+  gateway_start_ticks=$recorded_worker_start_ticks
+  gateway_pgid=$recorded_worker_pgid
   echo "Discord gateway for $instance did not isolate its process group" >&2
   exit 1
 fi
+gateway_start_ticks=$recorded_worker_start_ticks
+gateway_pgid=$recorded_worker_pgid
 
 deadline=$((SECONDS + timeout_seconds))
 while ((SECONDS <= deadline)); do
@@ -449,10 +532,14 @@ while ((SECONDS <= deadline)); do
           <&0 >&1 2>&2
       ) &
       tui_pid=$!
-      if ! read -r tui_start_ticks tui_pgid < <(record_worker_group "$tui_pid"); then
+      if ! record_worker_group "$tui_pid"; then
+        tui_start_ticks=$recorded_worker_start_ticks
+        tui_pgid=$recorded_worker_pgid
         echo "Discord TUI for $instance did not isolate its process group" >&2
         exit 1
       fi
+      tui_start_ticks=$recorded_worker_start_ticks
+      tui_pgid=$recorded_worker_pgid
       completed_pid=''
       wait -n -p completed_pid "$tui_pid" "$app_pid" "$gateway_pid"
       child_status=$?

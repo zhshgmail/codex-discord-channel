@@ -557,8 +557,7 @@ test('worker process-group isolation bound expiry fails closed without extending
   });
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, /worker_group_isolation_timeout/);
-  fs.writeFileSync(timeoutRelease, 'release\n');
-  spawnSync('/usr/bin/sleep', ['0.1']);
+  assert.equal(fs.existsSync(timeoutRelease), false);
   for (const line of fs.readFileSync(setup.setsidTrace, 'utf8').trim().split('\n')) {
     const [pid, startTicks] = line.split(' ');
     let current = null;
