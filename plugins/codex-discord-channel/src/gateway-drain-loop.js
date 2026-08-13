@@ -33,6 +33,9 @@ function startGatewayDrainLoop({
   if (typeof delivery?.refreshTargetCheckpoint !== 'function') {
     throw new Error('Discord gateway delivery cannot refresh the TUI recovery target.');
   }
+  const flushOutbound = typeof delivery?.flushOutbound === 'function'
+    ? (options) => delivery.flushOutbound(options)
+    : async () => ({ status: 'idle', reason: 'outbound_empty', deliveredCount: 0 });
 
   const baseDelayMs = positiveDelay(config?.deliveryDrainIntervalMs, DEFAULT_DRAIN_INTERVAL_MS);
   const maxBackoffMs = Math.max(
@@ -100,8 +103,22 @@ function startGatewayDrainLoop({
         generation += 1;
         return baseDelayMs;
       }
+      const outbound = await flushOutbound({
+        verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps),
+      });
+      if (!checkOwnership(config, receiverOwnership, deps)?.active) {
+        stopped = true;
+        generation += 1;
+        return baseDelayMs;
+      }
       retryDelayMs = baseDelayMs;
-      await report({ status: 'idle', reason: 'queue_empty', deliveredCount: 0, queueDepth: 0 });
+      const result = outbound?.reason === 'outbound_empty'
+        ? { status: 'idle', reason: 'queue_empty', deliveredCount: 0, queueDepth: 0 }
+        : { ...outbound, queueDepth: 0 };
+      await report(result);
+      if (result?.status === 'failed') {
+        return increaseBackoff();
+      }
       return baseDelayMs;
     }
     if (!Number.isInteger(status.deliveryQueueDepth) || status.deliveryQueueDepth < 0) {
@@ -117,9 +134,28 @@ function startGatewayDrainLoop({
       return increaseBackoff();
     }
 
-    const result = await delivery.flush({
+    const inbound = await delivery.flush({
       verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps),
     });
+    if (
+      inbound?.status === 'queued' &&
+      ['gateway_generation_changed', 'gateway_receiver_missing'].includes(inbound?.reason)
+    ) {
+      stopped = true;
+      generation += 1;
+      return baseDelayMs;
+    }
+    if (!checkOwnership(config, receiverOwnership, deps)?.active) {
+      stopped = true;
+      generation += 1;
+      return baseDelayMs;
+    }
+    const outbound = await flushOutbound({
+      verifyReceiverOwnership: () => checkOwnership(config, receiverOwnership, deps),
+    });
+    const result = ['outbound_empty', 'assistant_final_waiting'].includes(outbound?.reason)
+      ? inbound
+      : outbound;
     if (
       result?.status === 'queued' &&
       ['gateway_generation_changed', 'gateway_receiver_missing'].includes(result?.reason)
@@ -134,7 +170,13 @@ function startGatewayDrainLoop({
       return baseDelayMs;
     }
     await report(result);
-    if (result?.status === 'queued' || result?.status === 'failed') {
+    if (
+      result?.status === 'failed' ||
+      (result?.status === 'queued' && ![
+        'assistant_final_waiting',
+        'outbound_ready',
+      ].includes(result?.reason))
+    ) {
       return increaseBackoff();
     }
     retryDelayMs = baseDelayMs;

@@ -6,7 +6,7 @@ const { createAppServerHost } = require('./app-server-host');
 const { isProcessAlive } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
-const DELIVERY_QUEUE_VERSION = 3;
+const DELIVERY_QUEUE_VERSION = 4;
 const DELIVERY_IN_PROGRESS = 'structured_delivery_in_progress';
 const DELIVERY_ACK_UNCERTAIN = 'structured_ack_uncertain';
 const STALE_DELIVERY_ACTIVATION = 'stale_delivery_activation';
@@ -264,7 +264,7 @@ function readDeliveryQueue(config = {}, deps = {}) {
   } catch {
     throw new Error(DELIVERY_QUEUE_ERROR_MESSAGE);
   }
-  if (![1, 2, DELIVERY_QUEUE_VERSION].includes(parsed?.version) || !Array.isArray(parsed.items)) {
+  if (![1, 2, 3, DELIVERY_QUEUE_VERSION].includes(parsed?.version) || !Array.isArray(parsed.items)) {
     throw new Error(`Invalid Discord delivery queue: ${file}`);
   }
   return {
@@ -332,10 +332,29 @@ function writeDeliveryQueue(queue, config = {}, deps = {}) {
   const file = getDeliveryQueuePath(config);
   if (!file) throw new Error('Discord delivery queue path is not configured.');
   const fsImpl = deps.fs || fs;
-  fsImpl.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const directory = path.dirname(file);
+  fsImpl.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fsImpl.writeFileSync(temp, `${JSON.stringify(queue, null, 2)}\n`, { mode: 0o600 });
-  fsImpl.renameSync(temp, file);
+  let descriptor;
+  let directoryDescriptor;
+  try {
+    fsImpl.writeFileSync(temp, `${JSON.stringify(queue, null, 2)}\n`, { mode: 0o600 });
+    descriptor = fsImpl.openSync(temp, 'r');
+    fsImpl.fsyncSync(descriptor);
+    fsImpl.closeSync(descriptor);
+    descriptor = undefined;
+    fsImpl.renameSync(temp, file);
+    directoryDescriptor = fsImpl.openSync(directory, 'r');
+    fsImpl.fsyncSync(directoryDescriptor);
+    fsImpl.closeSync(directoryDescriptor);
+    directoryDescriptor = undefined;
+  } finally {
+    if (descriptor !== undefined) fsImpl.closeSync(descriptor);
+    if (directoryDescriptor !== undefined) fsImpl.closeSync(directoryDescriptor);
+    try {
+      fsImpl.rmSync(temp, { force: true });
+    } catch {}
+  }
 }
 
 function sameDiscordIdentity(left, right) {
@@ -545,7 +564,34 @@ function setQueueBlock(queue, reason, details, config, deps) {
   writeDeliveryQueue(queue, config, deps);
 }
 
-function completedQueue(queue, next) {
+function completedRecord(next, binding = {}, deps = {}) {
+  const record = {
+    channelId: next.normalized.channelId,
+    messageId: next.normalized.messageId,
+    completedAt: new Date(currentTimeMs(deps)).toISOString(),
+  };
+  const exactBinding = {
+    threadId: String(binding.threadId || ''),
+    turnId: String(binding.turnId || ''),
+    clientUserMessageId: String(binding.clientUserMessageId || ''),
+  };
+  if (!exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId) {
+    return record;
+  }
+  record.source = {
+    channelId: next.normalized.channelId,
+    messageId: next.normalized.messageId,
+  };
+  record.delivery = exactBinding;
+  record.outbound = {
+    status: 'waiting',
+    channelId: next.normalized.channelId,
+    sourceMessageId: next.normalized.messageId,
+  };
+  return record;
+}
+
+function completedQueue(queue, next, binding = {}, deps = {}) {
   return {
     version: DELIVERY_QUEUE_VERSION,
     activation: queue.activation,
@@ -553,11 +599,7 @@ function completedQueue(queue, next) {
     uncertain: queue.uncertain,
     completed: [
       ...queue.completed,
-      {
-        channelId: next.normalized.channelId,
-        messageId: next.normalized.messageId,
-        completedAt: new Date().toISOString(),
-      },
+      completedRecord(next, binding, deps),
     ],
     archived: queue.archived,
     blocked: null,
@@ -593,6 +635,7 @@ function moveQueueHeadToUncertain(queue, config, deps, details = {}) {
     threadId: details.threadId || item.delivery?.threadId || '',
     clientUserMessageId: details.clientUserMessageId ||
       item.delivery?.clientUserMessageId || '',
+    turnId: details.turnId || item.delivery?.turnId || '',
     error: details.error || item.delivery?.error || '',
   };
   queue.uncertain.push(item);
@@ -676,11 +719,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         if (receiverRejected) return { receiverRejected, queue };
         if (alreadyAccepted) {
           queue.uncertain.shift();
-          queue.completed.push({
-            channelId: uncertain.normalized.channelId,
-            messageId: uncertain.normalized.messageId,
-            completedAt: new Date(currentTimeMs(deps)).toISOString(),
-          });
+          queue.completed.push(completedRecord(uncertain, uncertain.delivery, deps));
           writeDeliveryQueue(queue, config, deps);
           return { completed: true, queueDepth: queue.items.length + queue.uncertain.length };
         }
@@ -753,7 +792,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next);
+        const updated = completedQueue(queue, next, snapshot.blocked, deps);
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: pendingQueueDepth(updated) };
       });
@@ -931,6 +970,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         messageId: next.normalized.messageId,
         threadId: target.threadId,
         clientUserMessageId: params.clientUserMessageId,
+        turnId: target.status === 'active' ? target.activeTurnId : '',
         error: error instanceof Error ? error.message : String(error),
       };
       let blocked;
@@ -981,6 +1021,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       }
     } catch {}
     if (!persistedUserItem) {
+      const turnId = response?.turn?.id || response?.turnId || (
+        target.status === 'active' ? target.activeTurnId : ''
+      );
       const unverified = await deferCurrentHead(
         config,
         deps,
@@ -989,6 +1032,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId,
           error: 'Structured turn was acknowledged but its user item was not observed.',
         },
         verifyReceiverOwnership,
@@ -1008,6 +1052,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
     }
 
     try {
+      const turnId = response?.turn?.id || response?.turnId || (
+        target.status === 'active' ? target.activeTurnId : ''
+      );
       const committed = await withDeliveryQueueLock(config, deps, () => {
         const queue = readDeliveryQueue(config, deps);
         if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
@@ -1016,6 +1063,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
               messageId: next.normalized.messageId,
               threadId: target.threadId,
               clientUserMessageId: params.clientUserMessageId,
+              turnId,
               error: 'Structured delivery checkpoint changed before commit.',
             });
             writeDeliveryQueue(queue, config, deps);
@@ -1027,7 +1075,11 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next);
+        const updated = completedQueue(queue, next, {
+          threadId: target.threadId,
+          turnId,
+          clientUserMessageId: params.clientUserMessageId,
+        }, deps);
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length + updated.uncertain.length };
       });
@@ -1061,6 +1113,9 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           messageId: next.normalized.messageId,
           threadId: target.threadId,
           clientUserMessageId: params.clientUserMessageId,
+          turnId: response?.turn?.id || response?.turnId || (
+            target.status === 'active' ? target.activeTurnId : ''
+          ),
           error: error instanceof Error ? error.message : String(error),
         }, verifyReceiverOwnership);
       } catch {}
@@ -1074,6 +1129,188 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       };
     }
   }
+}
+
+function automaticOutboundRecord(record) {
+  if (
+    record?.source?.channelId !== record?.channelId ||
+    record?.source?.messageId !== record?.messageId ||
+    record?.outbound?.channelId !== record?.channelId ||
+    record?.outbound?.sourceMessageId !== record?.messageId ||
+    typeof record?.delivery?.threadId !== 'string' || !record.delivery.threadId ||
+    typeof record?.delivery?.turnId !== 'string' || !record.delivery.turnId ||
+    typeof record?.delivery?.clientUserMessageId !== 'string' || !record.delivery.clientUserMessageId
+  ) {
+    return false;
+  }
+  return ['waiting', 'ready'].includes(record.outbound.status);
+}
+
+function sameCompletedSource(left, right) {
+  return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
+}
+
+function nextAutomaticOutbound(queue) {
+  const ready = queue.completed.find((record) => (
+    automaticOutboundRecord(record) && record.outbound.status === 'ready'
+  ));
+  if (ready) return ready;
+  return queue.completed
+    .filter((record) => automaticOutboundRecord(record))
+    .sort((left, right) => {
+      const countDelta = (Number(left.outbound.checkCount) || 0) -
+        (Number(right.outbound.checkCount) || 0);
+      if (countDelta !== 0) return countDelta;
+      return (timestampMs(left.outbound.lastCheckedAt) || 0) -
+        (timestampMs(right.outbound.lastCheckedAt) || 0);
+    })[0] || null;
+}
+
+async function flushAutomaticOutbound(config, logger, deps, host, options = {}) {
+  const inspection = await withDeliveryQueueLock(config, deps, () => {
+    const queue = readDeliveryQueue(config, deps);
+    const receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
+    if (receiverRejected) return { queue, receiverRejected };
+    return { queue, record: nextAutomaticOutbound(queue) };
+  });
+  if (inspection.receiverRejected) {
+    return receiverRejectedResult(inspection.queue, inspection.receiverRejected);
+  }
+  const record = inspection.record;
+  if (!record) {
+    return { status: 'idle', reason: 'outbound_empty', deliveredCount: 0 };
+  }
+
+  if (record.outbound.status === 'waiting') {
+    if (typeof host.readAssistantFinal !== 'function') {
+      return { status: 'queued', reason: 'assistant_final_waiting', deliveredCount: 0 };
+    }
+    let final;
+    try {
+      final = await host.readAssistantFinal(record.delivery.threadId, record.delivery.turnId);
+    } catch (error) {
+      return {
+        status: 'failed',
+        reason: error?.code || 'assistant_final_read_failed',
+        deliveredCount: 0,
+      };
+    }
+    if (
+      !final ||
+      final.threadId !== record.delivery.threadId ||
+      final.turnId !== record.delivery.turnId ||
+      typeof final.itemId !== 'string' || !final.itemId ||
+      typeof final.text !== 'string' || !final.text.trim()
+    ) {
+      await withDeliveryQueueLock(config, deps, () => {
+        const queue = readDeliveryQueue(config, deps);
+        const current = queue.completed.find((entry) => sameCompletedSource(entry, record));
+        if (current?.outbound?.status === 'waiting') {
+          current.outbound.checkCount = Math.max(0, Number(current.outbound.checkCount) || 0) + 1;
+          current.outbound.lastCheckedAt = new Date(currentTimeMs(deps)).toISOString();
+          writeDeliveryQueue(queue, config, deps);
+        }
+      });
+      return { status: 'queued', reason: 'assistant_final_waiting', deliveredCount: 0 };
+    }
+    const prepared = await withDeliveryQueueLock(config, deps, () => {
+      const queue = readDeliveryQueue(config, deps);
+      const receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
+      if (receiverRejected) return { queue, receiverRejected };
+      const current = queue.completed.find((entry) => sameCompletedSource(entry, record));
+      if (!current || !automaticOutboundRecord(current)) return { retry: true, queue };
+      if (current.outbound.status !== 'waiting') return { retry: true, queue };
+      if (
+        current.delivery.threadId !== final.threadId ||
+        current.delivery.turnId !== final.turnId
+      ) {
+        return { retry: true, queue };
+      }
+      current.outbound = {
+        ...current.outbound,
+        status: 'ready',
+        itemId: final.itemId,
+        text: final.text,
+        readyAt: new Date(currentTimeMs(deps)).toISOString(),
+      };
+      writeDeliveryQueue(queue, config, deps);
+      return { prepared: true, queue };
+    });
+    if (prepared.receiverRejected) {
+      return receiverRejectedResult(prepared.queue, prepared.receiverRejected);
+    }
+    if (!prepared.prepared) {
+      return { status: 'queued', reason: 'outbound_checkpoint_changed', deliveredCount: 0 };
+    }
+    return { status: 'queued', reason: 'outbound_ready', deliveredCount: 0 };
+  }
+
+  if (typeof deps.sendAutomaticReply !== 'function') {
+    return { status: 'failed', reason: 'outbound_sender_unavailable', deliveredCount: 0 };
+  }
+  let sent;
+  try {
+    sent = await deps.sendAutomaticReply({
+      channelId: record.channelId,
+      replyTo: record.messageId,
+      content: record.outbound.text,
+    });
+  } catch (error) {
+    logger('ERROR', 'Guarded automatic Discord reply is not confirmed', {
+      channelId: record.channelId,
+      messageId: record.messageId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      status: 'failed',
+      reason: error?.code || 'outbound_reply_unconfirmed',
+      deliveredCount: 0,
+    };
+  }
+  if (
+    sent?.channelId !== record.channelId ||
+    sent?.sourceMessageId !== record.messageId ||
+    typeof sent?.messageId !== 'string' || !sent.messageId
+  ) {
+    return { status: 'failed', reason: 'outbound_reply_unconfirmed', deliveredCount: 0 };
+  }
+  const confirmed = await withDeliveryQueueLock(config, deps, () => {
+    const queue = readDeliveryQueue(config, deps);
+    const receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
+    if (receiverRejected) return { queue, receiverRejected };
+    const current = queue.completed.find((entry) => sameCompletedSource(entry, record));
+    if (
+      !current || current.outbound?.status !== 'ready' ||
+      current.delivery?.threadId !== record.delivery.threadId ||
+      current.delivery?.turnId !== record.delivery.turnId ||
+      current.outbound?.itemId !== record.outbound.itemId ||
+      current.outbound?.text !== record.outbound.text
+    ) {
+      return { changed: true, queue };
+    }
+    current.outbound = {
+      ...current.outbound,
+      status: 'confirmed',
+      outboundMessageId: sent.messageId,
+      confirmedAt: new Date(currentTimeMs(deps)).toISOString(),
+    };
+    writeDeliveryQueue(queue, config, deps);
+    return { confirmed: true, queue };
+  });
+  if (confirmed.receiverRejected) {
+    return receiverRejectedResult(confirmed.queue, confirmed.receiverRejected);
+  }
+  if (!confirmed.confirmed) {
+    return { status: 'failed', reason: 'outbound_checkpoint_changed', deliveredCount: 0 };
+  }
+  return {
+    status: 'delivered',
+    reason: 'outbound_confirmed',
+    deliveredCount: 1,
+    channelId: record.channelId,
+    sourceMessageId: record.messageId,
+    messageId: sent.messageId,
+  };
 }
 
 function inboundContext(normalized) {
@@ -1137,6 +1374,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   let unsubscribeActive = null;
   let unsubscribeReconnect = null;
   let unsubscribeThreadClosed = null;
+  let unsubscribeAssistantFinal = null;
   let startupDrain = Promise.resolve();
   let receiverVerification = null;
   let receiverActivated = false;
@@ -1228,6 +1466,18 @@ function createDelivery(config, logger = () => {}, deps = {}) {
         updateLeaseWake(result[DELIVERY_LEASE_RETRY_AT]);
         return result;
       });
+    },
+    flushOutbound(options = {}) {
+      if (config.deliveryMode === 'off') {
+        return Promise.resolve({ status: 'unsupported', reason: 'delivery_disabled' });
+      }
+      return serializeDrain(() => flushAutomaticOutbound(
+        config,
+        logger,
+        deps,
+        host,
+        options,
+      ));
     },
     coordinateReceiverOwnership(operation) {
       const coordinate = async () => {
@@ -1368,6 +1618,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (typeof unsubscribeActive === 'function') unsubscribeActive();
       if (typeof unsubscribeReconnect === 'function') unsubscribeReconnect();
       if (typeof unsubscribeThreadClosed === 'function') unsubscribeThreadClosed();
+      if (typeof unsubscribeAssistantFinal === 'function') unsubscribeAssistantFinal();
       clearLeaseWake();
       if (typeof host.destroy === 'function') host.destroy();
     },
@@ -1379,7 +1630,12 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     if (!receiverActivated || typeof verifyReceiverOwnership !== 'function') {
       return Promise.resolve({ status: 'idle', reason: 'receiver_inactive' });
     }
-    const operation = delivery.flush({ verifyReceiverOwnership });
+    const operation = delivery.flush({ verifyReceiverOwnership }).then(async (inbound) => {
+      const outbound = await delivery.flushOutbound({ verifyReceiverOwnership });
+      return ['outbound_empty', 'assistant_final_waiting'].includes(outbound.reason)
+        ? inbound
+        : outbound;
+    });
     if (options.propagateErrors) return operation;
     return operation.catch((error) => {
       logger('ERROR', 'Failed to drain Discord delivery queue automatically', {
@@ -1403,6 +1659,9 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     : null;
   unsubscribeThreadClosed = typeof host.onThreadClosed === 'function'
     ? host.onThreadClosed(() => drainAutonomously('thread_closed'))
+    : null;
+  unsubscribeAssistantFinal = typeof host.onAssistantFinal === 'function'
+    ? host.onAssistantFinal(() => drainAutonomously('assistant_final'))
     : null;
   return delivery;
 }

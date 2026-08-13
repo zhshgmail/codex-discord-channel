@@ -395,7 +395,7 @@ test('activation archives stale backlog before target resolution and delivers a 
   assert.equal(targetResolutions, 0);
   assert.deepEqual(requests, []);
   const activated = readQueue(dir);
-  assert.equal(activated.version, 3);
+  assert.equal(activated.version, 4);
   assert.deepEqual(activated.items, []);
   assert.deepEqual(activated.completed, []);
   assert.deepEqual(activated.activation, {
