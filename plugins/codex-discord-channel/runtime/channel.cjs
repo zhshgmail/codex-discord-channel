@@ -5589,17 +5589,29 @@ ${normalized.content}${attachmentText}
     function sameCompletedSource(left, right) {
       return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
     }
+    function automaticOutboundWorkCount(record) {
+      return record?.outbound?.status === "ready" ? Math.max(0, Number(record.outbound.sendAttemptCount) || 0) : Math.max(0, Number(record?.outbound?.checkCount) || 0);
+    }
+    function automaticOutboundLastWorkAt(record) {
+      return record?.outbound?.status === "ready" ? timestampMs(record.outbound.lastSendAttemptAt) : timestampMs(record?.outbound?.lastCheckedAt);
+    }
     function nextAutomaticOutbound(queue) {
-      let ready = queue.completed.find((record) => automaticOutboundRecord(record) && record.outbound.status === "ready");
-      return ready || queue.completed.filter((record) => automaticOutboundRecord(record)).sort((left, right) => {
-        let countDelta = (Number(left.outbound.checkCount) || 0) - (Number(right.outbound.checkCount) || 0);
-        return countDelta !== 0 ? countDelta : (timestampMs(left.outbound.lastCheckedAt) || 0) - (timestampMs(right.outbound.lastCheckedAt) || 0);
+      return queue.completed.filter((record) => automaticOutboundRecord(record)).sort((left, right) => {
+        let countDelta = automaticOutboundWorkCount(left) - automaticOutboundWorkCount(right);
+        return countDelta !== 0 ? countDelta : automaticOutboundLastWorkAt(left) - automaticOutboundLastWorkAt(right);
       })[0] || null;
+    }
+    function automaticReplyIsConfirmed(sent, record) {
+      return sent?.channelId !== record.channelId || sent?.sourceMessageId !== record.messageId || typeof sent?.messageId != "string" || !sent.messageId || sent.receiptStatus != null && sent.receiptStatus !== "confirmed" ? !1 : sent.duplicateSuppressed === !1 ? !0 : sent.duplicateSuppressed === !0 && sent.receiptStatus === "confirmed" && sent.reason === "source_message_already_replied";
     }
     async function flushAutomaticOutbound(config, logger, deps, host, options = {}) {
       let inspection = await withDeliveryQueueLock(config, deps, () => {
         let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
-        return receiverRejected ? { queue, receiverRejected } : { queue, record: nextAutomaticOutbound(queue) };
+        if (receiverRejected) return { queue, receiverRejected };
+        let record2 = nextAutomaticOutbound(queue);
+        if (!record2) return { queue, record: null };
+        let timestamp = new Date(currentTimeMs(deps)).toISOString();
+        return record2.outbound.status === "ready" ? (record2.outbound.sendAttemptCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastSendAttemptAt = timestamp) : (record2.outbound.checkCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastCheckedAt = timestamp), writeDeliveryQueue(queue, config, deps), { queue, record: record2 };
       });
       if (inspection.receiverRejected)
         return receiverRejectedResult(inspection.queue, inspection.receiverRejected);
@@ -5620,10 +5632,7 @@ ${normalized.content}${attachmentText}
           };
         }
         if (!final || final.threadId !== record.delivery.threadId || final.turnId !== record.delivery.turnId || typeof final.itemId != "string" || !final.itemId || typeof final.text != "string" || !final.text.trim())
-          return await withDeliveryQueueLock(config, deps, () => {
-            let queue = readDeliveryQueue(config, deps), current = queue.completed.find((entry) => sameCompletedSource(entry, record));
-            current?.outbound?.status === "waiting" && (current.outbound.checkCount = Math.max(0, Number(current.outbound.checkCount) || 0) + 1, current.outbound.lastCheckedAt = new Date(currentTimeMs(deps)).toISOString(), writeDeliveryQueue(queue, config, deps));
-          }), { status: "queued", reason: "assistant_final_waiting", deliveredCount: 0 };
+          return { status: "queued", reason: "assistant_final_waiting", deliveredCount: 0 };
         let prepared = await withDeliveryQueueLock(config, deps, () => {
           let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
           if (receiverRejected) return { queue, receiverRejected };
@@ -5658,7 +5667,7 @@ ${normalized.content}${attachmentText}
           deliveredCount: 0
         };
       }
-      if (sent?.channelId !== record.channelId || sent?.sourceMessageId !== record.messageId || typeof sent?.messageId != "string" || !sent.messageId)
+      if (!automaticReplyIsConfirmed(sent, record))
         return { status: "failed", reason: "outbound_reply_unconfirmed", deliveredCount: 0 };
       let confirmed = await withDeliveryQueueLock(config, deps, () => {
         let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);

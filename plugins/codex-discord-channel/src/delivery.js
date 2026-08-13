@@ -1150,20 +1150,41 @@ function sameCompletedSource(left, right) {
   return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
 }
 
+function automaticOutboundWorkCount(record) {
+  return record?.outbound?.status === 'ready'
+    ? Math.max(0, Number(record.outbound.sendAttemptCount) || 0)
+    : Math.max(0, Number(record?.outbound?.checkCount) || 0);
+}
+
+function automaticOutboundLastWorkAt(record) {
+  return record?.outbound?.status === 'ready'
+    ? timestampMs(record.outbound.lastSendAttemptAt)
+    : timestampMs(record?.outbound?.lastCheckedAt);
+}
+
 function nextAutomaticOutbound(queue) {
-  const ready = queue.completed.find((record) => (
-    automaticOutboundRecord(record) && record.outbound.status === 'ready'
-  ));
-  if (ready) return ready;
   return queue.completed
     .filter((record) => automaticOutboundRecord(record))
     .sort((left, right) => {
-      const countDelta = (Number(left.outbound.checkCount) || 0) -
-        (Number(right.outbound.checkCount) || 0);
+      const countDelta = automaticOutboundWorkCount(left) - automaticOutboundWorkCount(right);
       if (countDelta !== 0) return countDelta;
-      return (timestampMs(left.outbound.lastCheckedAt) || 0) -
-        (timestampMs(right.outbound.lastCheckedAt) || 0);
+      return automaticOutboundLastWorkAt(left) - automaticOutboundLastWorkAt(right);
     })[0] || null;
+}
+
+function automaticReplyIsConfirmed(sent, record) {
+  if (
+    sent?.channelId !== record.channelId ||
+    sent?.sourceMessageId !== record.messageId ||
+    typeof sent?.messageId !== 'string' || !sent.messageId
+  ) {
+    return false;
+  }
+  if (sent.receiptStatus != null && sent.receiptStatus !== 'confirmed') return false;
+  if (sent.duplicateSuppressed === false) return true;
+  return sent.duplicateSuppressed === true &&
+    sent.receiptStatus === 'confirmed' &&
+    sent.reason === 'source_message_already_replied';
 }
 
 async function flushAutomaticOutbound(config, logger, deps, host, options = {}) {
@@ -1171,7 +1192,18 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
     const queue = readDeliveryQueue(config, deps);
     const receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
     if (receiverRejected) return { queue, receiverRejected };
-    return { queue, record: nextAutomaticOutbound(queue) };
+    const record = nextAutomaticOutbound(queue);
+    if (!record) return { queue, record: null };
+    const timestamp = new Date(currentTimeMs(deps)).toISOString();
+    if (record.outbound.status === 'ready') {
+      record.outbound.sendAttemptCount = automaticOutboundWorkCount(record) + 1;
+      record.outbound.lastSendAttemptAt = timestamp;
+    } else {
+      record.outbound.checkCount = automaticOutboundWorkCount(record) + 1;
+      record.outbound.lastCheckedAt = timestamp;
+    }
+    writeDeliveryQueue(queue, config, deps);
+    return { queue, record };
   });
   if (inspection.receiverRejected) {
     return receiverRejectedResult(inspection.queue, inspection.receiverRejected);
@@ -1202,15 +1234,6 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
       typeof final.itemId !== 'string' || !final.itemId ||
       typeof final.text !== 'string' || !final.text.trim()
     ) {
-      await withDeliveryQueueLock(config, deps, () => {
-        const queue = readDeliveryQueue(config, deps);
-        const current = queue.completed.find((entry) => sameCompletedSource(entry, record));
-        if (current?.outbound?.status === 'waiting') {
-          current.outbound.checkCount = Math.max(0, Number(current.outbound.checkCount) || 0) + 1;
-          current.outbound.lastCheckedAt = new Date(currentTimeMs(deps)).toISOString();
-          writeDeliveryQueue(queue, config, deps);
-        }
-      });
       return { status: 'queued', reason: 'assistant_final_waiting', deliveredCount: 0 };
     }
     const prepared = await withDeliveryQueueLock(config, deps, () => {
@@ -1267,11 +1290,7 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
       deliveredCount: 0,
     };
   }
-  if (
-    sent?.channelId !== record.channelId ||
-    sent?.sourceMessageId !== record.messageId ||
-    typeof sent?.messageId !== 'string' || !sent.messageId
-  ) {
+  if (!automaticReplyIsConfirmed(sent, record)) {
     return { status: 'failed', reason: 'outbound_reply_unconfirmed', deliveredCount: 0 };
   }
   const confirmed = await withDeliveryQueueLock(config, deps, () => {

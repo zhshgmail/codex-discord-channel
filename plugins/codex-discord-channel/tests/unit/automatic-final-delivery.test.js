@@ -87,6 +87,41 @@ function readQueue(dir) {
   return JSON.parse(fs.readFileSync(path.join(dir, 'pending-delivery.json'), 'utf8'));
 }
 
+function readyRecord(index) {
+  return {
+    channelId: 'channel-1',
+    messageId: `source-${index}`,
+    completedAt: '2026-08-13T00:00:00.000Z',
+    source: { channelId: 'channel-1', messageId: `source-${index}` },
+    delivery: {
+      threadId: `thread-${index}`,
+      turnId: `turn-${index}`,
+      clientUserMessageId: `discord:channel-1:source-${index}`,
+    },
+    outbound: {
+      status: 'ready',
+      channelId: 'channel-1',
+      sourceMessageId: `source-${index}`,
+      itemId: `final-${index}`,
+      text: `answer-${index}`,
+      readyAt: '2026-08-13T00:00:01.000Z',
+    },
+  };
+}
+
+function writeReadyQueue(dir, records) {
+  const config = configAt(dir);
+  fs.writeFileSync(config.paths.deliveryQueuePath, `${JSON.stringify({
+    version: 4,
+    activation: { id: config.deliveryActivationId, activatedAt: '2026-08-13T00:00:00.000Z' },
+    items: [],
+    uncertain: [],
+    completed: records,
+    archived: [],
+    blocked: null,
+  }, null, 2)}\n`);
+}
+
 test('accepted source durably binds exact thread and turn with outbound waiting', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-binding-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -420,4 +455,140 @@ test('automatic sender delegates exact source and content to existing guarded pr
   assert.equal(typeof calls[0].sender, 'function');
   assert.equal(typeof calls[0].confirmer, 'function');
   assert.equal(typeof calls[0].reconciler, 'function');
+});
+
+test('returned message id without exact readback never confirms automatic outbound', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-false-confirm-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = configAt(dir);
+  writeReadyQueue(dir, [readyRecord(1)]);
+
+  let posts = 0;
+  let exactReadbacks = 0;
+  const automaticSender = createAutomaticReplySender(config, {}, {
+    async prepareDiscordMessageSend() { return { prepared: true }; },
+    async sendDiscordMessage() {
+      posts += 1;
+      return { channelId: 'channel-1', messageId: 'discord-out-1' };
+    },
+    async confirmDiscordMessage() {
+      exactReadbacks += 1;
+      throw new Error('exact readback unavailable');
+    },
+    async reconcileDiscordMessage() {
+      exactReadbacks += 1;
+      return { found: false };
+    },
+  });
+  const delivery = createDelivery(config, () => {}, {
+    structuredHost: hostForTurn(),
+    sendAutomaticReply: automaticSender,
+  });
+  t.after(() => delivery.destroy());
+
+  const first = await delivery.flushOutbound();
+  const second = await delivery.flushOutbound();
+  const receiptName = fs.readdirSync(config.paths.replyReceiptDir)
+    .find((name) => name.endsWith('.json'));
+  const receipt = JSON.parse(fs.readFileSync(
+    path.join(config.paths.replyReceiptDir, receiptName),
+    'utf8',
+  ));
+  assert.deepEqual({
+    firstReason: first.reason,
+    secondReason: second.reason,
+    queueStatus: readQueue(dir).completed[0].outbound.status,
+    guardedReceiptStatus: receipt.status,
+    posts,
+    exactReadbacks,
+  }, {
+    firstReason: 'outbound_reply_unconfirmed',
+    secondReason: 'outbound_reply_unconfirmed',
+    queueStatus: 'ready',
+    guardedReceiptStatus: 'uncertain',
+    posts: 1,
+    exactReadbacks: 2,
+  });
+});
+
+test('one failing ready outbound does not starve the next exact source', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-ready-fair-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = configAt(dir);
+  writeReadyQueue(dir, [readyRecord(1), readyRecord(2)]);
+  const attempts = [];
+  const deps = {
+    structuredHost: hostForTurn(),
+    async sendAutomaticReply(args) {
+      attempts.push(args.replyTo);
+      if (args.replyTo === 'source-1') throw new Error('source-1 remains unavailable');
+      return {
+        channelId: args.channelId,
+        sourceMessageId: args.replyTo,
+        messageId: 'discord-out-2',
+        duplicateSuppressed: false,
+      };
+    },
+  };
+  const firstProcess = createDelivery(config, () => {}, deps);
+  await firstProcess.flushOutbound();
+  firstProcess.destroy();
+  assert.equal(readQueue(dir).completed[0].outbound.sendAttemptCount, 1);
+
+  const restarted = createDelivery(config, () => {}, deps);
+  t.after(() => restarted.destroy());
+  await restarted.flushOutbound();
+  assert.deepEqual(attempts, ['source-1', 'source-2']);
+});
+
+test('only exact guarded confirmation outcomes can terminally confirm outbound', async (t) => {
+  const cases = [
+    {
+      name: 'explicit uncertain direct result',
+      sent: { duplicateSuppressed: false, receiptStatus: 'uncertain' },
+      expected: 'outbound_reply_unconfirmed',
+    },
+    {
+      name: 'suppressed in-progress result',
+      sent: {
+        duplicateSuppressed: true,
+        receiptStatus: 'in_flight',
+        reason: 'source_message_reply_in_progress',
+      },
+      expected: 'outbound_reply_unconfirmed',
+    },
+    {
+      name: 'suppressed already-confirmed receipt',
+      sent: {
+        duplicateSuppressed: true,
+        receiptStatus: 'confirmed',
+        reason: 'source_message_already_replied',
+      },
+      expected: 'outbound_confirmed',
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-confirm-contract-'));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      writeReadyQueue(dir, [readyRecord(1)]);
+      const delivery = createDelivery(configAt(dir), () => {}, {
+        structuredHost: hostForTurn(),
+        async sendAutomaticReply(args) {
+          return {
+            channelId: args.channelId,
+            sourceMessageId: args.replyTo,
+            messageId: 'discord-out-1',
+            ...scenario.sent,
+          };
+        },
+      });
+      t.after(() => delivery.destroy());
+      assert.equal((await delivery.flushOutbound()).reason, scenario.expected);
+      assert.equal(
+        readQueue(dir).completed[0].outbound.status,
+        scenario.expected === 'outbound_confirmed' ? 'confirmed' : 'ready',
+      );
+    });
+  }
 });
