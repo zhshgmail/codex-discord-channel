@@ -363,6 +363,10 @@ async function readyLauncher(setup, overrides = {}) {
     () => recordedProcesses(setup).some((item) => item.role === 'native-listener'),
     'native listener process',
   );
+  await waitFor(
+    () => recordedProcesses(setup).some((item) => item.role === 'gateway'),
+    'gateway process',
+  );
   return child;
 }
 

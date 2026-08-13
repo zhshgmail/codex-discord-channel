@@ -205,17 +205,34 @@ run_generation() {
 record_worker_group() {
   local pid=$1
   local identity=''
+  local expected_start_ticks=''
+  local pgid start_ticks
   local attempt
   for ((attempt = 0; attempt < 100; attempt += 1)); do
     identity=$(awk '{print $5 " " $22}' "/proc/$pid/stat" 2>/dev/null || true)
-    [[ -n $identity ]] && break
+    if [[ -z $identity ]]; then
+      if [[ -n $expected_start_ticks ]]; then
+        echo "worker_group_pid_vanished pid=$pid" >&2
+        return 10
+      fi
+      sleep 0.01
+      continue
+    fi
+    read -r pgid start_ticks <<<"$identity"
+    if [[ -z $expected_start_ticks ]]; then
+      expected_start_ticks=$start_ticks
+    elif [[ $start_ticks != "$expected_start_ticks" ]]; then
+      echo "worker_group_start_ticks_drift pid=$pid expected=$expected_start_ticks actual=$start_ticks" >&2
+      return 11
+    fi
+    if [[ $pgid == "$pid" ]]; then
+      printf '%s %s\n' "$start_ticks" "$pgid"
+      return 0
+    fi
     sleep 0.01
   done
-  [[ -n $identity ]] || return 1
-  local pgid start_ticks
-  read -r pgid start_ticks <<<"$identity"
-  [[ $pgid == "$pid" ]] || return 1
-  printf '%s %s\n' "$start_ticks" "$pgid"
+  echo "worker_group_isolation_timeout pid=$pid start_ticks=${expected_start_ticks:-unobserved}" >&2
+  return 12
 }
 group_state() {
   local role=$1

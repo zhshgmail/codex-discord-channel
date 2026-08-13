@@ -185,6 +185,11 @@ while True:
     '  sleep 0.4',
     '  exit 72',
     'fi',
+    'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote ]]; then',
+    '  read -r tui_pgid tui_start_ticks < <(awk \'{print $5 " " $22}\' "/proc/$$/stat")',
+    '  printf "%s %s %s\\n" "$$" "$tui_pgid" "$tui_start_ticks" >>"$TUI_IDENTITY_TRACE"',
+    '  /usr/bin/sleep 0.1',
+    'fi',
     'exit 0',
     '',
   ].join('\n'));
@@ -201,6 +206,48 @@ while True:
     '#!/usr/bin/env bash',
     'printf "systemctl %s\\n" "$*" >>"$TRACE"',
     'exit 99',
+    '',
+  ].join('\n'));
+  executable(path.join(binDir, 'setsid'), [
+    '#!/usr/bin/env bash',
+    'stat_tail=$(awk \'{print $22}\' "/proc/$$/stat")',
+    'printf "%s %s\\n" "$$" "$stat_tail" >>"$SETSID_TRACE"',
+    'case ${SETSID_TEST_MODE:-pass} in',
+    '  delay) /usr/bin/sleep 0.05; exec /usr/bin/setsid "$@" ;;',
+    '  vanish) /usr/bin/sleep 0.05; exit 0 ;;',
+    '  drift) /usr/bin/sleep 0.20; exit 0 ;;',
+    '  timeout)',
+    '    while [[ ! -e ${SETSID_TIMEOUT_RELEASE:?} ]]; do /usr/bin/sleep 0.01; done',
+    '    exit 0',
+    '    ;;',
+    '  *) exec /usr/bin/setsid "$@" ;;',
+    'esac',
+    '',
+  ].join('\n'));
+  executable(path.join(binDir, 'awk'), [
+    '#!/usr/bin/env bash',
+    'if [[ ${WORKER_GROUP_TEST_START_TICKS_DRIFT:-0} == 1 && $# == 2',
+    '  && $1 == *\'$5 " " $22\'* && $2 == /proc/*/stat ]]; then',
+    '  output=$(/usr/bin/awk "$@")',
+    '  count=0',
+    '  [[ -f $WORKER_GROUP_TEST_AWK_COUNTER ]] && read -r count <"$WORKER_GROUP_TEST_AWK_COUNTER"',
+    '  count=$((count + 1))',
+    '  printf "%s\\n" "$count" >"$WORKER_GROUP_TEST_AWK_COUNTER"',
+    '  if ((count >= 2)); then',
+    '    read -r pgid start_ticks <<<"$output"',
+    '    printf "%s %s\\n" "$pgid" "$((start_ticks + 1))"',
+    '  else',
+    '    printf "%s\\n" "$output"',
+    '  fi',
+    '  exit 0',
+    'fi',
+    'exec /usr/bin/awk "$@"',
+    '',
+  ].join('\n'));
+  executable(path.join(binDir, 'sleep'), [
+    '#!/usr/bin/env bash',
+    'if [[ ${WORKER_GROUP_TEST_FAST_TIMEOUT:-0} == 1 && ${1:-} == 0.01 ]]; then exit 0; fi',
+    'exec /usr/bin/sleep "$@"',
     '',
   ].join('\n'));
   fs.writeFileSync(path.join(stateDir, 'account.env'), [
@@ -226,10 +273,12 @@ while True:
     loginMarker,
     pluginRoot,
     socketOwner,
+    setsidTrace: path.join(home, 'setsid-trace.log'),
     stateDir,
     trace,
     tuiCount: path.join(home, 'tui-count'),
     tuiActiveMarker,
+    tuiIdentityTrace: path.join(home, 'tui-identity-trace.log'),
   };
 }
 
@@ -249,11 +298,13 @@ function launchEnv(setup, overrides = {}) {
     PATH: `${setup.binDir}:${process.env.PATH}`,
     REAL_NODE_BIN: process.execPath,
     SOCKET_OWNER: setup.socketOwner,
+    SETSID_TRACE: setup.setsidTrace,
     STATE_DIR: setup.stateDir,
     THREAD_ID: '019f3763-d308-7871-bedc-e6489b02190e',
     TRACE: setup.trace,
     TUI_COUNT: setup.tuiCount,
     TUI_ACTIVE_MARKER: setup.tuiActiveMarker,
+    TUI_IDENTITY_TRACE: setup.tuiIdentityTrace,
     ...overrides,
   };
 }
@@ -427,20 +478,96 @@ test('worker exit fails the active TUI closed and cleans the owned socket', () =
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
 });
 
-test('startup failure cleans a socket created by the owned app-server child', () => {
+test('gateway failure around readiness fails closed and cleans the owned socket', () => {
   const setup = fixture();
   const result = spawnSync(setup.launcher, ['codex02'], {
     encoding: 'utf8',
     env: launchEnv(setup, { APP_LEAVES_SOCKET: '1', GATEWAY_EXIT_WHEN_SOCKET_EXISTS: '1' }),
     timeout: 5000,
   });
-  assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stderr, /gateway .* exited during startup/);
+  assert.ok([1, 75].includes(result.status), result.stderr);
+  assert.match(
+    result.stderr,
+    /gateway .* exited (?:during startup|while the TUI was active)/,
+  );
   assert.equal(
     fs.existsSync(path.join(setup.stateDir, 'app-server.sock')),
     false,
     'socket created after launcher ownership must be cleaned',
   );
+});
+
+test('launcher waits for the same worker PID to complete delayed setsid isolation', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, { SETSID_TEST_MODE: 'delay' }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /did not isolate its process group/);
+  const tuiIdentities = fs.readFileSync(setup.tuiIdentityTrace, 'utf8').trim().split('\n');
+  assert.equal(tuiIdentities.length, 1);
+  const [tuiPid, tuiPgid, tuiStartTicks] = tuiIdentities[0].split(' ');
+  assert.equal(tuiPgid, tuiPid);
+  const wrapperIdentities = fs.readFileSync(setup.setsidTrace, 'utf8').trim().split('\n');
+  assert.ok(
+    wrapperIdentities.includes(`${tuiPid} ${tuiStartTicks}`),
+    'setsid wrapper and isolated TUI must retain one PID/start-time identity',
+  );
+});
+
+test('worker disappearance during process-group isolation fails closed with a typed reason', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, { SETSID_TEST_MODE: 'vanish' }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /worker_group_pid_vanished/);
+});
+
+test('worker start-time drift during process-group isolation fails closed with a typed reason', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      SETSID_TEST_MODE: 'drift',
+      WORKER_GROUP_TEST_AWK_COUNTER: path.join(setup.home, 'worker-group-awk-count'),
+      WORKER_GROUP_TEST_START_TICKS_DRIFT: '1',
+    }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /worker_group_start_ticks_drift/);
+});
+
+test('worker process-group isolation bound expiry fails closed without extending startup timeout', () => {
+  const setup = fixture();
+  const timeoutRelease = path.join(setup.home, 'setsid-timeout-release');
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      SETSID_TEST_MODE: 'timeout',
+      SETSID_TIMEOUT_RELEASE: timeoutRelease,
+      WORKER_GROUP_TEST_FAST_TIMEOUT: '1',
+    }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /worker_group_isolation_timeout/);
+  fs.writeFileSync(timeoutRelease, 'release\n');
+  spawnSync('/usr/bin/sleep', ['0.1']);
+  for (const line of fs.readFileSync(setup.setsidTrace, 'utf8').trim().split('\n')) {
+    const [pid, startTicks] = line.split(' ');
+    let current = null;
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      current = stat.trim().split(/\s+/)[21];
+    } catch {}
+    assert.notEqual(current, startTicks, `setsid wrapper PID ${pid} survived bound expiry`);
+  }
 });
 
 test('cleanup removes an owned socket created after sibling startup failure', () => {
