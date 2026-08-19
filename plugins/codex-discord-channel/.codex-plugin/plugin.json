@@ -1,6 +1,6 @@
 {
   "name": "codex-discord-channel",
-  "version": "0.3.10+codex.alias-isolated-runtime-enter-foreground",
+  "version": "0.3.11",
   "description": "Claude-style Discord channel ownership for Codex sessions.",
   "author": {
     "name": "zhshgmail",

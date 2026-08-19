@@ -5,8 +5,7 @@ const path = require('node:path');
 const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
-const PACKAGE_VERSION = '0.3.10';
-const PLUGIN_VERSION_PREFIX = `${PACKAGE_VERSION}+codex.`;
+const PACKAGE_VERSION = '0.3.11';
 
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(root, relativePath), 'utf8'));
@@ -43,12 +42,7 @@ const pluginSkill = fs.readFileSync(path.join(root, 'skills', 'codex-discord-cha
 const knownIssues = fs.readFileSync(path.join(repoRoot, 'docs', 'known-issues.md'), 'utf8');
 
 assert(manifest.name === 'codex-discord-channel', 'manifest name mismatch');
-assert(
-  typeof manifest.version === 'string' &&
-    manifest.version.startsWith(PLUGIN_VERSION_PREFIX) &&
-    /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(manifest.version.slice(PLUGIN_VERSION_PREFIX.length)),
-  'manifest version mismatch',
-);
+assert(manifest.version === PACKAGE_VERSION, 'manifest version mismatch');
 assert(manifest.mcpServers === './.mcp.json', 'manifest must point at .mcp.json');
 assert(
   mcp.mcpServers['codex-discord-channel']?.args?.[0] === './runtime/mcp-server.cjs',
