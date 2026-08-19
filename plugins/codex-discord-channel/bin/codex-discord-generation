@@ -562,6 +562,43 @@ function groupState(options) {
   if (leader && !leaderArgvMatches(leader, manifest, role)) refuse('worker leader argv does not match its role');
 }
 
+function matchingRoleProcesses(manifest, role) {
+  return listProcesses().filter((item) => identityEnvMatches(item, manifest, role));
+}
+
+async function terminateRole(options) {
+  const { manifest } = manifestMatchesOwned(options);
+  const role = required(options, 'role');
+  if (!ALLOWED_ROLES.has(role)) refuse('invalid process role');
+  const leaderPid = Number(required(options, 'leader-pid'));
+  const leaderStartTicks = required(options, 'leader-start-ticks');
+  positivePid(leaderPid, 'role leader PID');
+  numericString(leaderStartTicks, 'role leader start ticks');
+  const leader = readProcess(leaderPid);
+  if (leader && leader.startTicks !== leaderStartTicks) refuse('role leader PID was reused');
+  if (leader && !identityEnvMatches(leader, manifest, role)) refuse('role leader identity does not match');
+
+  const signalMatching = (signal) => {
+    for (const item of matchingRoleProcesses(manifest, role)) {
+      try { process.kill(item.pid, signal); } catch (error) { if (error?.code !== 'ESRCH') throw error; }
+    }
+  };
+  signalMatching('SIGTERM');
+  const timeoutMs = Number(options['--timeout-ms'] || 5000);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    if (matchingRoleProcesses(manifest, role).length === 0) return;
+    await sleep(20);
+  }
+  signalMatching('SIGKILL');
+  const killDeadline = Date.now() + Math.max(500, timeoutMs);
+  while (Date.now() <= killDeadline) {
+    if (matchingRoleProcesses(manifest, role).length === 0) return;
+    await sleep(20);
+  }
+  refuse(`recorded ${role} processes survived SIGKILL`);
+}
+
 function finishOwned(options) {
   const { expected, manifest, raw } = manifestMatchesOwned(options);
   const groups = matchingGenerationGroups(manifest);
@@ -584,10 +621,12 @@ async function main() {
     updateEndpoint(options);
   } else if (action === 'group-state') {
     groupState(options);
+  } else if (action === 'terminate-role') {
+    await terminateRole(options);
   } else if (action === 'finish-owned') {
     finishOwned(options);
   } else {
-    refuse('action must be prepare, supervise, ready, update-endpoint, group-state, or finish-owned');
+    refuse('action must be prepare, supervise, ready, update-endpoint, group-state, terminate-role, or finish-owned');
   }
 }
 

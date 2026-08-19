@@ -24,6 +24,7 @@ function fixture() {
   const childEnvTrace = path.join(home, 'child-env.log');
   const channelEnvTrace = path.join(home, 'channel-env.log');
   const loginMarker = path.join(home, 'login-complete');
+  const ptyLauncher = path.join(binDir, 'pty-launcher');
   const tuiActiveMarker = path.join(home, 'tui-active');
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
@@ -186,8 +187,12 @@ while True:
     '  exit 72',
     'fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote ]]; then',
-    '  read -r tui_pgid tui_start_ticks < <(awk \'{print $5 " " $22}\' "/proc/$$/stat")',
-    '  printf "%s %s %s\\n" "$$" "$tui_pgid" "$tui_start_ticks" >>"$TUI_IDENTITY_TRACE"',
+    '  read -r tui_pgid tui_session tui_tty_nr tui_tpgid tui_start_ticks < <(awk \'{print $5 " " $6 " " $7 " " $8 " " $22}\' "/proc/$$/stat")',
+    '  printf "%s %s %s %s %s %s\\n" "$$" "$tui_pgid" "$tui_start_ticks" "$tui_session" "$tui_tty_nr" "$tui_tpgid" >>"$TUI_IDENTITY_TRACE"',
+    '  if [[ ${TUI_READ_LINE:-0} == 1 ]]; then',
+    '    IFS= read -r tui_input',
+    '    printf "%s\\n" "$tui_input" >"$TUI_INPUT_TRACE"',
+    '  fi',
     '  /usr/bin/sleep 0.1',
     'fi',
     'exit 0',
@@ -250,6 +255,11 @@ while True:
     'exec /usr/bin/sleep "$@"',
     '',
   ].join('\n'));
+  executable(ptyLauncher, [
+    '#!/usr/bin/env bash',
+    'exec "$LAUNCHER_UNDER_TEST" codex02',
+    '',
+  ].join('\n'));
   fs.writeFileSync(path.join(stateDir, 'account.env'), [
     `CODEX_HOME=${codexHome}`,
     `CODEX_BIN=${fakeCodex}`,
@@ -272,6 +282,7 @@ while True:
     launcher,
     loginMarker,
     pluginRoot,
+    ptyLauncher,
     socketOwner,
     setsidTrace: path.join(home, 'setsid-trace.log'),
     stateDir,
@@ -279,6 +290,7 @@ while True:
     tuiCount: path.join(home, 'tui-count'),
     tuiActiveMarker,
     tuiIdentityTrace: path.join(home, 'tui-identity-trace.log'),
+    tuiInputTrace: path.join(home, 'tui-input-trace.log'),
   };
 }
 
@@ -295,6 +307,7 @@ function launchEnv(setup, overrides = {}) {
     GENERATION_HELPER: setup.generationHelper,
     HOME: setup.home,
     LOGIN_MARKER: setup.loginMarker,
+    LAUNCHER_UNDER_TEST: setup.launcher,
     PATH: `${setup.binDir}:${process.env.PATH}`,
     REAL_NODE_BIN: process.execPath,
     SOCKET_OWNER: setup.socketOwner,
@@ -305,6 +318,7 @@ function launchEnv(setup, overrides = {}) {
     TUI_COUNT: setup.tuiCount,
     TUI_ACTIVE_MARKER: setup.tuiActiveMarker,
     TUI_IDENTITY_TRACE: setup.tuiIdentityTrace,
+    TUI_INPUT_TRACE: setup.tuiInputTrace,
     ...overrides,
   };
 }
@@ -497,7 +511,31 @@ test('gateway failure around readiness fails closed and cleans the owned socket'
   );
 });
 
-test('launcher waits for the same worker PID to complete delayed setsid isolation', () => {
+test('interactive TUI retains the foreground PTY and receives Enter', {
+  skip: process.platform !== 'linux' || !fs.existsSync('/usr/bin/script'),
+}, () => {
+  const setup = fixture();
+  const marker = 'foreground-enter-marker';
+  const result = spawnSync(
+    '/usr/bin/script',
+    ['-qefc', setup.ptyLauncher, '/dev/null'],
+    {
+      encoding: 'utf8',
+      env: launchEnv(setup, { TUI_READ_LINE: '1' }),
+      input: `${marker}\n`,
+      timeout: 5000,
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(setup.tuiInputTrace, 'utf8').trim(), marker);
+  const identity = fs.readFileSync(setup.tuiIdentityTrace, 'utf8').trim().split(' ');
+  const [, tuiPgid, , , tuiTtyNr, tuiTpgid] = identity;
+  assert.notEqual(tuiTtyNr, '0', 'interactive TUI must retain a controlling terminal');
+  assert.equal(tuiTpgid, tuiPgid, 'interactive TUI process group must own the terminal');
+});
+
+test('launcher isolates workers while keeping the TUI in the foreground process group', () => {
   const setup = fixture();
   const result = spawnSync(setup.launcher, ['codex02'], {
     encoding: 'utf8',
@@ -509,11 +547,12 @@ test('launcher waits for the same worker PID to complete delayed setsid isolatio
   const tuiIdentities = fs.readFileSync(setup.tuiIdentityTrace, 'utf8').trim().split('\n');
   assert.equal(tuiIdentities.length, 1);
   const [tuiPid, tuiPgid, tuiStartTicks] = tuiIdentities[0].split(' ');
-  assert.equal(tuiPgid, tuiPid);
+  assert.notEqual(tuiPgid, tuiPid);
   const wrapperIdentities = fs.readFileSync(setup.setsidTrace, 'utf8').trim().split('\n');
-  assert.ok(
+  assert.equal(
     wrapperIdentities.includes(`${tuiPid} ${tuiStartTicks}`),
-    'setsid wrapper and isolated TUI must retain one PID/start-time identity',
+    false,
+    'the interactive TUI must not pass through setsid',
   );
 });
 

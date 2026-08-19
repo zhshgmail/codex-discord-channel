@@ -206,6 +206,7 @@ recorded_worker_start_ticks=''
 recorded_worker_pgid=''
 record_worker_group() {
   local pid=$1
+  local require_group_leader=${2:-1}
   local identity=''
   local expected_start_ticks=''
   local pgid start_ticks
@@ -233,7 +234,7 @@ record_worker_group() {
     else
       recorded_worker_pgid=$pgid
     fi
-    if [[ $pgid == "$pid" ]]; then
+    if [[ $require_group_leader == 0 || $pgid == "$pid" ]]; then
       return 0
     fi
     sleep 0.01
@@ -360,6 +361,23 @@ stop_worker() {
     stop_pending_worker "$role" "$pid" "$start_ticks" "$pgid"
   fi
 }
+stop_tui_worker() {
+  local pid=$1
+  local start_ticks=$2
+  local pgid=$3
+  [[ -n $pid && -n $start_ticks && -n $pgid ]] || return 0
+  if ! run_generation terminate-role \
+    --nonce "$launch_generation" \
+    --role tui \
+    --leader-pid "$pid" \
+    --leader-start-ticks "$start_ticks" \
+    --timeout-ms "$stop_timeout_ms" >/dev/null; then
+    echo "Refusing generation-wide TUI cleanup; stopping only verified TUI pid $pid" >&2
+    stop_pending_worker tui "$pid" "$start_ticks" "$pgid"
+    return 0
+  fi
+  wait "$pid" 2>/dev/null || true
+}
 worker_running() {
   local pid=$1
   local state
@@ -378,7 +396,7 @@ cleanup_launcher() {
     "${channel_command[@]}" tui-recovery-target clear-owned "$current_lease_id" \
       "${runtime_args[@]}" >/dev/null 2>&1 || true
   fi
-  stop_worker tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
+  stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
   stop_worker gateway "$gateway_pid" "$gateway_start_ticks" "$gateway_pgid"
   stop_worker app "$app_pid" "$app_start_ticks" "$app_pgid"
   if [[ -n $launch_generation ]]; then
@@ -516,7 +534,7 @@ while ((SECONDS <= deadline)); do
       set +e
       (
         exec {launcher_lock_fd}>&-
-        exec "$setsid_bin" env \
+        exec env \
           "${child_env_unsets[@]}" \
           -u CODEX_THREAD_ID \
           -u CODEX_SESSION_ID \
@@ -528,14 +546,13 @@ while ((SECONDS <= deadline)); do
           CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
           "${generation_env[@]}" \
           CODEX_DISCORD_LAUNCH_ROLE=tui \
-          "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}" \
-          <&0 >&1 2>&2
-      ) &
+          "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}"
+      ) <&0 >&1 2>&2 &
       tui_pid=$!
-      if ! record_worker_group "$tui_pid"; then
+      if ! record_worker_group "$tui_pid" 0; then
         tui_start_ticks=$recorded_worker_start_ticks
         tui_pgid=$recorded_worker_pgid
-        echo "Discord TUI for $instance did not isolate its process group" >&2
+        echo "Discord TUI identity for $instance was unavailable" >&2
         exit 1
       fi
       tui_start_ticks=$recorded_worker_start_ticks
@@ -552,7 +569,7 @@ while ((SECONDS <= deadline)); do
         elif [[ $completed_pid == "$app_pid" ]]; then
           app_pid=''
         fi
-        stop_worker_group tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
+        stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
         tui_pid=''
         tui_start_ticks=''
         tui_pgid=''
@@ -560,9 +577,7 @@ while ((SECONDS <= deadline)); do
         exit 75
       fi
       tui_status=$child_status
-      # wait -n reaps only the TUI group leader.  Keep its exact identity until
-      # the rest of that isolated generation group has also been terminated.
-      stop_worker_group tui "$tui_pid" "$tui_start_ticks" "$tui_pgid"
+      stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
       tui_pid=''
       tui_start_ticks=''
       tui_pgid=''
