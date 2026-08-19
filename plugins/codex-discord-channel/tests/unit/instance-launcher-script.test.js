@@ -8,8 +8,6 @@ const path = require('node:path');
 const test = require('node:test');
 
 const sourceLauncher = path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-instance');
-const enterCompatTrace = '-c tui.keymap.composer.submit=["enter","ctrl-j","ctrl-m"] -c tui.keymap.editor.insert_newline=["shift-enter","alt-enter"]';
-
 function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
 }
@@ -112,6 +110,7 @@ while True:
     '    clear) rm -f "$STATE_DIR/tui-recovery-target.json"; exit 0 ;;',
     '    clear-owned) rm -f "$STATE_DIR/tui-recovery-target.json"; exit 0 ;;',
     '    snapshot)',
+    '      if [[ ${SNAPSHOT_RESET_TTY:-0} == 1 && -t 0 ]]; then stty sane; fi',
     '      if [[ -f $STATE_DIR/app-server-target.json ]]; then',
     '        python3 - "$STATE_DIR/tui-recovery-target.json" "$STATE_DIR/app-server-target.json" <<\'PY\'',
     'import json, sys',
@@ -190,6 +189,12 @@ while True:
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote ]]; then',
     '  read -r tui_pgid tui_session tui_tty_nr tui_tpgid tui_start_ticks < <(awk \'{print $5 " " $6 " " $7 " " $8 " " $22}\' "/proc/$$/stat")',
     '  printf "%s %s %s %s %s %s\\n" "$$" "$tui_pgid" "$tui_start_ticks" "$tui_session" "$tui_tty_nr" "$tui_tpgid" >>"$TUI_IDENTITY_TRACE"',
+    '  if [[ ${TUI_RAW_MODE_TEST:-0} == 1 ]]; then',
+    '    stty raw -echo',
+    '    sleep 0.35',
+    '    stty -a >"$TUI_MODE_TRACE"',
+    '    stty sane',
+    '  fi',
     '  if [[ ${TUI_READ_LINE:-0} == 1 ]]; then',
     '    IFS= read -r tui_input',
     '    printf "%s\\n" "$tui_input" >"$TUI_INPUT_TRACE"',
@@ -292,6 +297,7 @@ while True:
     tuiActiveMarker,
     tuiIdentityTrace: path.join(home, 'tui-identity-trace.log'),
     tuiInputTrace: path.join(home, 'tui-input-trace.log'),
+    tuiModeTrace: path.join(home, 'tui-mode-trace.log'),
   };
 }
 
@@ -320,6 +326,7 @@ function launchEnv(setup, overrides = {}) {
     TUI_ACTIVE_MARKER: setup.tuiActiveMarker,
     TUI_IDENTITY_TRACE: setup.tuiIdentityTrace,
     TUI_INPUT_TRACE: setup.tuiInputTrace,
+    TUI_MODE_TRACE: setup.tuiModeTrace,
     ...overrides,
   };
 }
@@ -340,7 +347,7 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.some((line) => line.startsWith(`node ${setup.fakeChannel} live-check `)));
-  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`));
+  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
   for (const entry of channelEnvironments) {
@@ -378,7 +385,7 @@ test('instance argument ignores Discord state inherited from another alias', () 
     `node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`,
   ));
   assert.ok(trace.includes(
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`,
   ));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
@@ -413,7 +420,7 @@ test('first-run TTY login succeeds before workers and the TUI start', () => {
   assert.equal(trace.some((line) => line.startsWith('systemctl ')), false);
   assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace}`));
+  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock`));
 });
 
 test('cancelled first-run TTY login starts neither worker nor TUI', () => {
@@ -522,7 +529,11 @@ test('interactive TUI retains the foreground PTY and receives Enter', {
     ['-qefc', setup.ptyLauncher, '/dev/null'],
     {
       encoding: 'utf8',
-      env: launchEnv(setup, { TUI_READ_LINE: '1' }),
+      env: launchEnv(setup, {
+        SNAPSHOT_RESET_TTY: '1',
+        TUI_RAW_MODE_TEST: '1',
+        TUI_READ_LINE: '1',
+      }),
       input: `${marker}\n`,
       timeout: 5000,
     },
@@ -530,6 +541,9 @@ test('interactive TUI retains the foreground PTY and receives Enter', {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.readFileSync(setup.tuiInputTrace, 'utf8').trim(), marker);
+  const terminalMode = fs.readFileSync(setup.tuiModeTrace, 'utf8');
+  assert.match(terminalMode, /(?:^|\s)-icanon(?:\s|$)/);
+  assert.match(terminalMode, /(?:^|\s)-echo(?:\s|$)/);
   const identity = fs.readFileSync(setup.tuiIdentityTrace, 'utf8').trim().split(' ');
   const [, tuiPgid, , , tuiTtyNr, tuiTpgid] = identity;
   assert.notEqual(tuiTtyNr, '0', 'interactive TUI must retain a controlling terminal');
@@ -643,8 +657,8 @@ test('shell launcher resumes the exact captured thread after app-server replacem
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume --last`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --last`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
 });
@@ -723,8 +737,8 @@ test('recovery inserts exact resume after preserving global flags when no resume
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
 });
 
@@ -750,8 +764,8 @@ test('recovery discards the original prompt instead of replaying it after resume
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
 });
 
@@ -772,6 +786,6 @@ test('recovery discards image prompt inputs instead of replaying them after resu
       .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
     assert.equal(tuiLaunches.length, 2);
     assert.equal(tuiLaunches[1],
-      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
+      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
   }
 });
