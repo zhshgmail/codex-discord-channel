@@ -95428,7 +95428,12 @@ var require_app_server_runtime = __commonJS({
 var require_instance_launcher = __commonJS({
   "src/instance-launcher.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), { sanitizedAppServerEnv } = require_app_server_runtime(), { loadEnvFile } = require_config(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]);
+    var fs = require("node:fs"), path = require("node:path"), { sanitizedAppServerEnv } = require_app_server_runtime(), { loadEnvFile } = require_config(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]), ENTER_KEYMAP_COMPAT_ARGS = [
+      "-c",
+      'tui.keymap.composer.submit=["enter","ctrl-m"]',
+      "-c",
+      'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]'
+    ];
     function verifyAccountBinding(config) {
       let binding = {};
       if (!loadEnvFile(config.paths.accountBindingPath, binding, {
@@ -95483,7 +95488,7 @@ var require_instance_launcher = __commonJS({
       let { codexBin, nodeBin } = requireInstanceReady(config, dependencies);
       return {
         command: nodeBin,
-        args: [codexBin, "--remote", config.appServerUrl, ...codexArgs],
+        args: [codexBin, "--remote", config.appServerUrl, ...ENTER_KEYMAP_COMPAT_ARGS, ...codexArgs],
         env: {
           ...sanitizedAppServerEnv(config),
           CODEX_HOME: config.codexHome,

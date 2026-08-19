@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const sourceLauncher = path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-instance');
+const enterCompatTrace = '-c tui.keymap.composer.submit=["enter","ctrl-m"] -c tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]';
 function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
 }
@@ -347,7 +348,7 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.some((line) => line.startsWith(`node ${setup.fakeChannel} live-check `)));
-  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`));
+  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
   for (const entry of channelEnvironments) {
@@ -385,7 +386,7 @@ test('instance argument ignores Discord state inherited from another alias', () 
     `node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`,
   ));
   assert.ok(trace.includes(
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`,
   ));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
@@ -420,7 +421,7 @@ test('first-run TTY login succeeds before workers and the TUI start', () => {
   assert.equal(trace.some((line) => line.startsWith('systemctl ')), false);
   assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
   assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock`));
+  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace}`));
 });
 
 test('cancelled first-run TTY login starts neither worker nor TUI', () => {
@@ -657,8 +658,8 @@ test('shell launcher resumes the exact captured thread after app-server replacem
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --last`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume --last`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
 });
@@ -737,8 +738,8 @@ test('recovery inserts exact resume after preserving global flags when no resume
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
 });
 
@@ -764,8 +765,8 @@ test('recovery discards the original prompt instead of replaying it after resume
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
 });
 
@@ -786,6 +787,6 @@ test('recovery discards image prompt inputs instead of replaying them after resu
       .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
     assert.equal(tuiLaunches.length, 2);
     assert.equal(tuiLaunches[1],
-      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
+      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
   }
 });
