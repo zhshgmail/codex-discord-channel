@@ -66,9 +66,9 @@ test('TUI launcher replaces itself with matching Codex after the shell startup b
     '--remote',
     config.appServerUrl,
     '-c',
-    'tui.keymap.composer.submit=["enter","ctrl-m"]',
+    'tui.keymap.composer.submit=["enter","ctrl-j","ctrl-m"]',
     '-c',
-    'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]',
+    'tui.keymap.editor.insert_newline=["shift-enter","alt-enter"]',
     'resume',
     'thread-2',
   ]);

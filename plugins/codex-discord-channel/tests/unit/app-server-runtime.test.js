@@ -120,7 +120,7 @@ test('app-server exec preserves only the exact launcher generation identity allo
     CODEX_DISCORD_LAUNCH_INSTANCE: 'codex02',
     CODEX_DISCORD_LAUNCH_STATE_DIR: config.paths.stateDir,
     CODEX_DISCORD_LAUNCH_CODEX_HOME: config.codexHome,
-    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/opt/codex-discord-channel/0.3.12',
+    CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/opt/codex-discord-channel/0.3.13',
     CODEX_DISCORD_LAUNCH_ENDPOINT: path.join(config.paths.stateDir, 'app-server.sock'),
     CODEX_DISCORD_LAUNCH_ROLE: 'app',
   };

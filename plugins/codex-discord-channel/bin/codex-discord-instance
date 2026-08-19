@@ -435,13 +435,13 @@ generation_env=(
   CODEX_DISCORD_LAUNCH_PLUGIN_ROOT="$plugin_root"
   CODEX_DISCORD_LAUNCH_ENDPOINT="$socket"
 )
-# Codex 0.148 can report a physical Enter as Ctrl-M on the supervised remote
-# TUI path.  Make both encodings submit, while preserving the actual newline
-# shortcuts.  User-supplied -c arguments follow these and can still override
-# the compatibility defaults.
+# Codex 0.148 can report a physical Enter as raw CR or LF on the supervised
+# remote TUI path.  Make both control encodings submit, while preserving
+# Shift/Alt+Enter for intentional newlines.  User-supplied -c arguments follow
+# these and can still override the compatibility defaults.
 codex_enter_compat_args=(
-  -c 'tui.keymap.composer.submit=["enter","ctrl-m"]'
-  -c 'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]'
+  -c 'tui.keymap.composer.submit=["enter","ctrl-j","ctrl-m"]'
+  -c 'tui.keymap.editor.insert_newline=["shift-enter","alt-enter"]'
 )
 generation_channel_command=(
   env

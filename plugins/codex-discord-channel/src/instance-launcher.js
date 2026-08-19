@@ -8,9 +8,9 @@ const { loadEnvFile } = require('./config');
 const ACCOUNT_BINDING_KEYS = new Set(['DISCORD_INSTANCE', 'DISCORD_CONFIG_DIR']);
 const ENTER_KEYMAP_COMPAT_ARGS = [
   '-c',
-  'tui.keymap.composer.submit=["enter","ctrl-m"]',
+  'tui.keymap.composer.submit=["enter","ctrl-j","ctrl-m"]',
   '-c',
-  'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]',
+  'tui.keymap.editor.insert_newline=["shift-enter","alt-enter"]',
 ];
 
 function verifyAccountBinding(config) {

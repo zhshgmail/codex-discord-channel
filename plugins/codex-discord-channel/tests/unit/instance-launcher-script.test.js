@@ -8,7 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const sourceLauncher = path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-instance');
-const enterCompatTrace = '-c tui.keymap.composer.submit=["enter","ctrl-m"] -c tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]';
+const enterCompatTrace = '-c tui.keymap.composer.submit=["enter","ctrl-j","ctrl-m"] -c tui.keymap.editor.insert_newline=["shift-enter","alt-enter"]';
 
 function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
