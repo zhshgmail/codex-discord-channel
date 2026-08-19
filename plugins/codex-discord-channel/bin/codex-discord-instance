@@ -435,6 +435,14 @@ generation_env=(
   CODEX_DISCORD_LAUNCH_PLUGIN_ROOT="$plugin_root"
   CODEX_DISCORD_LAUNCH_ENDPOINT="$socket"
 )
+# Codex 0.148 can report a physical Enter as Ctrl-M on the supervised remote
+# TUI path.  Make both encodings submit, while preserving the actual newline
+# shortcuts.  User-supplied -c arguments follow these and can still override
+# the compatibility defaults.
+codex_enter_compat_args=(
+  -c 'tui.keymap.composer.submit=["enter","ctrl-m"]'
+  -c 'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]'
+)
 generation_channel_command=(
   env
   "${child_env_unsets[@]}"
@@ -546,7 +554,8 @@ while ((SECONDS <= deadline)); do
           CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
           "${generation_env[@]}" \
           CODEX_DISCORD_LAUNCH_ROLE=tui \
-          "$node_bin" "$codex_bin" --remote "unix://$socket" "${codex_args[@]}"
+          "$node_bin" "$codex_bin" --remote "unix://$socket" \
+          "${codex_enter_compat_args[@]}" "${codex_args[@]}"
       ) <&0 >&1 2>&2 &
       tui_pid=$!
       if ! record_worker_group "$tui_pid" 0; then

@@ -6,6 +6,12 @@ const { sanitizedAppServerEnv } = require('./app-server-runtime');
 const { loadEnvFile } = require('./config');
 
 const ACCOUNT_BINDING_KEYS = new Set(['DISCORD_INSTANCE', 'DISCORD_CONFIG_DIR']);
+const ENTER_KEYMAP_COMPAT_ARGS = [
+  '-c',
+  'tui.keymap.composer.submit=["enter","ctrl-m"]',
+  '-c',
+  'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]',
+];
 
 function verifyAccountBinding(config) {
   const binding = {};
@@ -102,7 +108,7 @@ function buildTuiLaunch(config, codexArgs = [], dependencies = {}) {
   const { codexBin, nodeBin } = requireInstanceReady(config, dependencies);
   return {
     command: nodeBin,
-    args: [codexBin, '--remote', config.appServerUrl, ...codexArgs],
+    args: [codexBin, '--remote', config.appServerUrl, ...ENTER_KEYMAP_COMPAT_ARGS, ...codexArgs],
     env: {
       ...sanitizedAppServerEnv(config),
       CODEX_HOME: config.codexHome,

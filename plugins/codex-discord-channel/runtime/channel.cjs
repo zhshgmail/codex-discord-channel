@@ -3674,7 +3674,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.11"
+              version: "0.3.12"
             },
             capabilities: {
               experimentalApi: !0,
@@ -95428,7 +95428,12 @@ var require_app_server_runtime = __commonJS({
 var require_instance_launcher = __commonJS({
   "src/instance-launcher.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), { sanitizedAppServerEnv } = require_app_server_runtime(), { loadEnvFile } = require_config(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]);
+    var fs = require("node:fs"), path = require("node:path"), { sanitizedAppServerEnv } = require_app_server_runtime(), { loadEnvFile } = require_config(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]), ENTER_KEYMAP_COMPAT_ARGS = [
+      "-c",
+      'tui.keymap.composer.submit=["enter","ctrl-m"]',
+      "-c",
+      'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]'
+    ];
     function verifyAccountBinding(config) {
       let binding = {};
       if (!loadEnvFile(config.paths.accountBindingPath, binding, {
@@ -95483,7 +95488,7 @@ var require_instance_launcher = __commonJS({
       let { codexBin, nodeBin } = requireInstanceReady(config, dependencies);
       return {
         command: nodeBin,
-        args: [codexBin, "--remote", config.appServerUrl, ...codexArgs],
+        args: [codexBin, "--remote", config.appServerUrl, ...ENTER_KEYMAP_COMPAT_ARGS, ...codexArgs],
         env: {
           ...sanitizedAppServerEnv(config),
           CODEX_HOME: config.codexHome,
@@ -95672,7 +95677,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.11", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.12", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;
