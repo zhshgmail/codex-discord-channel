@@ -150,3 +150,79 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
   assert.equal(fs.existsSync(path.join(stateDir, 'owner.json')), true);
   assert.equal(fs.existsSync(path.join(home, '.codex')), false);
 });
+
+test('marketplace MCP binds to the Codex account that contains its installed plugin', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-marketplace-account-binding-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const home = path.join(root, 'home');
+  const primaryCodexHome = path.join(home, '.codex');
+  const secondCodexHome = path.join(root, 'codex-account-02');
+  const primaryState = path.join(root, 'state', 'codex01');
+  const secondState = path.join(root, 'state', 'codex02');
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(pluginRoot, '.codex-plugin', 'plugin.json'),
+    'utf8',
+  ));
+  const installedRoot = path.join(
+    secondCodexHome,
+    'plugins',
+    'cache',
+    'personal',
+    'codex-discord-channel',
+    manifest.version,
+  );
+
+  fs.mkdirSync(path.dirname(installedRoot), { recursive: true });
+  fs.cpSync(pluginRoot, installedRoot, {
+    recursive: true,
+    filter(source) {
+      return !['node_modules', '.env'].includes(path.basename(source));
+    },
+  });
+  for (const directory of [home, primaryCodexHome, secondCodexHome, primaryState, secondState]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+  fs.writeFileSync(
+    path.join(primaryCodexHome, 'discord-instance.env'),
+    `DISCORD_INSTANCE=codex01\nDISCORD_CONFIG_DIR=${primaryState}\n`,
+  );
+  fs.writeFileSync(
+    path.join(secondCodexHome, 'discord-instance.env'),
+    `DISCORD_INSTANCE=codex02\nDISCORD_CONFIG_DIR=${secondState}\n`,
+  );
+  for (const stateDir of [primaryState, secondState]) {
+    fs.writeFileSync(
+      path.join(stateDir, '.env'),
+      'DISCORD_CHANNEL_DISABLE_LOGIN=1\nCODEX_DISCORD_DELIVERY_MODE=off\n',
+    );
+  }
+
+  const mcp = JSON.parse(fs.readFileSync(path.join(installedRoot, '.mcp.json'), 'utf8'))
+    .mcpServers['codex-discord-channel'];
+  const requests = [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } },
+    {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'discord_channel_status', arguments: {} },
+    },
+  ];
+  const [, status] = await requestMcp(
+    process.execPath,
+    mcp.args,
+    {
+      cwd: installedRoot,
+      // Codex currently launches plugin MCPs with HOME but without the app-server's
+      // CODEX_HOME or DISCORD_* account binding.
+      env: { HOME: home, NODE_PATH: '' },
+    },
+    requests,
+  );
+
+  assert.equal(status.result.structuredContent.instance, 'codex02');
+  assert.equal(status.result.structuredContent.stateDir, secondState);
+  assert.equal(fs.existsSync(path.join(secondState, 'owner.json')), true);
+  assert.equal(fs.existsSync(path.join(primaryState, 'owner.json')), false);
+});

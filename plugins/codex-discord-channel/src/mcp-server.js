@@ -1,7 +1,9 @@
 'use strict';
 
+const path = require('node:path');
 const readline = require('node:readline');
 const { loadConfig } = require('./config');
+const { bindMcpToInstalledAccount } = require('./mcp-account-binding');
 const {
   createDelivery,
   readDeliveryQueueStatus,
@@ -306,7 +308,8 @@ async function handleRequest(context, message) {
 
 async function main() {
   const logger = makeLogger();
-  const config = loadConfig();
+  const pluginRoot = path.resolve(__dirname, '..');
+  const config = loadConfig(bindMcpToInstalledAccount(process.env, pluginRoot));
   claimOwner(config.paths.ownerPath, createOwner(config));
   const delivery = createDelivery(config, logger);
   const discordState = await startDiscordClient({ config, delivery, logger }).catch((error) => {
