@@ -68,7 +68,9 @@ confirmed or legacy-sent receipt is the already-visible reply, a pending receipt
 must reconcile before any new POST, and an unreadable or wrong-identity receipt
 fails the whole turn closed. The durable owner may POST only after every other
 same-turn source is proven to have no receipt. Separate turns retain separate
-per-source reply rights.
+per-source reply rights. The receipt barrier does not trust the queue's current
+outbound status: a pending receipt on a previously suppressed sibling is
+restored to guarded reconciliation before the owner becomes eligible.
 Every positive acknowledgement is read back from the exact thread by the
 echoed client user message id before completion. A response without a persisted
 user item remains `structured_ack_uncertain`, so the gateway does not report a

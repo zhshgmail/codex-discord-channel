@@ -6016,11 +6016,11 @@ ${normalized.content}${attachmentText}
           outboundReceiptObservation(record, config, deps)
         ]));
         if (records.some((record) => observations.get(record).state === "indeterminate") || confirmedTurnReply(records, observations)) continue;
-        let pendingReceipts = automatic.filter(
+        let pendingReceipts = records.filter(
           (record) => observations.get(record).state === "pending"
         );
         if (pendingReceipts.length > 0) {
-          candidates.push(...pendingReceipts);
+          candidates.push(...pendingReceipts.filter((record) => automaticOutboundRecord(record) || record.outbound.status === "suppressed"));
           continue;
         }
         let owners = exactTurnReplyOwners(queue, records[0].delivery);
@@ -6054,7 +6054,7 @@ ${normalized.content}${attachmentText}
       let record = inspection.record;
       if (!record)
         return { status: "idle", reason: "outbound_empty", deliveredCount: 0 };
-      if (record.outbound.status === "waiting") {
+      if (record.outbound.status === "waiting" || record.outbound.status === "suppressed") {
         if (typeof host.readAssistantFinal != "function")
           return { status: "queued", reason: "assistant_final_waiting", deliveredCount: 0 };
         let final;
@@ -6073,13 +6073,19 @@ ${normalized.content}${attachmentText}
           let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
           if (receiverRejected) return { queue, receiverRejected };
           let current = queue.completed.find((entry) => sameCompletedSource(entry, record));
-          return !current || !automaticOutboundRecord(current) ? { retry: !0, queue } : current.outbound.status !== "waiting" ? { retry: !0, queue } : current.delivery.threadId !== final.threadId || current.delivery.turnId !== final.turnId ? { retry: !0, queue } : (current.outbound = {
+          if (!current) return { retry: !0, queue };
+          let currentReceipt = outboundReceiptObservation(current, config, deps), suppressedReceiptRecovery = current.outbound.status === "suppressed" && currentReceipt.state === "pending";
+          return !automaticOutboundRecord(current) && !suppressedReceiptRecovery ? { retry: !0, queue } : ["waiting", "suppressed"].includes(current.outbound.status) ? current.delivery.threadId !== final.threadId || current.delivery.turnId !== final.turnId ? { retry: !0, queue } : (current.outbound = {
             ...current.outbound,
             status: "ready",
             itemId: final.itemId,
             text: final.text,
-            readyAt: new Date(currentTimeMs(deps)).toISOString()
-          }, writeDeliveryQueue(queue, config, deps), { prepared: !0, queue });
+            readyAt: new Date(currentTimeMs(deps)).toISOString(),
+            ...suppressedReceiptRecovery ? {
+              receiptRecovery: !0,
+              receiptRecoveryAt: new Date(currentTimeMs(deps)).toISOString()
+            } : {}
+          }, writeDeliveryQueue(queue, config, deps), { prepared: !0, queue }) : { retry: !0, queue };
         });
         return prepared.receiverRejected ? receiverRejectedResult(prepared.queue, prepared.receiverRejected) : prepared.prepared ? { status: "queued", reason: "outbound_ready", deliveredCount: 0 } : { status: "queued", reason: "outbound_checkpoint_changed", deliveredCount: 0 };
       }

@@ -1399,11 +1399,13 @@ function nextAutomaticOutbound(queue, config = {}, deps = {}) {
     ]));
     if (records.some((record) => observations.get(record).state === 'indeterminate')) continue;
     if (confirmedTurnReply(records, observations)) continue;
-    const pendingReceipts = automatic.filter(
+    const pendingReceipts = records.filter(
       (record) => observations.get(record).state === 'pending',
     );
     if (pendingReceipts.length > 0) {
-      candidates.push(...pendingReceipts);
+      candidates.push(...pendingReceipts.filter((record) => (
+        automaticOutboundRecord(record) || record.outbound.status === 'suppressed'
+      )));
       continue;
     }
     const owners = exactTurnReplyOwners(queue, records[0].delivery);
@@ -1467,7 +1469,7 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
     return { status: 'idle', reason: 'outbound_empty', deliveredCount: 0 };
   }
 
-  if (record.outbound.status === 'waiting') {
+  if (record.outbound.status === 'waiting' || record.outbound.status === 'suppressed') {
     if (typeof host.readAssistantFinal !== 'function') {
       return { status: 'queued', reason: 'assistant_final_waiting', deliveredCount: 0 };
     }
@@ -1495,8 +1497,16 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
       const receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
       if (receiverRejected) return { queue, receiverRejected };
       const current = queue.completed.find((entry) => sameCompletedSource(entry, record));
-      if (!current || !automaticOutboundRecord(current)) return { retry: true, queue };
-      if (current.outbound.status !== 'waiting') return { retry: true, queue };
+      if (!current) return { retry: true, queue };
+      const currentReceipt = outboundReceiptObservation(current, config, deps);
+      const suppressedReceiptRecovery = current.outbound.status === 'suppressed' &&
+        currentReceipt.state === 'pending';
+      if (!automaticOutboundRecord(current) && !suppressedReceiptRecovery) {
+        return { retry: true, queue };
+      }
+      if (!['waiting', 'suppressed'].includes(current.outbound.status)) {
+        return { retry: true, queue };
+      }
       if (
         current.delivery.threadId !== final.threadId ||
         current.delivery.turnId !== final.turnId
@@ -1509,6 +1519,10 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
         itemId: final.itemId,
         text: final.text,
         readyAt: new Date(currentTimeMs(deps)).toISOString(),
+        ...(suppressedReceiptRecovery ? {
+          receiptRecovery: true,
+          receiptRecoveryAt: new Date(currentTimeMs(deps)).toISOString(),
+        } : {}),
       };
       writeDeliveryQueue(queue, config, deps);
       return { prepared: true, queue };

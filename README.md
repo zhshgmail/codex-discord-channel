@@ -290,7 +290,10 @@ gate: a confirmed or sent receipt is the already-visible reply, a pending
 receipt is reconciled before any new POST, and an unreadable or wrong-identity
 receipt fails the whole turn closed. The durable owner may POST only after every
 other same-turn source is proven to have no receipt. Sources accepted into
-separate top-level turns keep independent per-source reply rights.
+separate top-level turns keep independent per-source reply rights. Receipt
+inspection is independent of the queue's current outbound status: a pending
+receipt on a previously suppressed sibling is restored to guarded
+reconciliation instead of letting the owner send around it.
 
 If the trusted local app-server rejects a steer with an exact canonical
 expected-to-current turn mismatch, the gateway rechecks the same connection,
