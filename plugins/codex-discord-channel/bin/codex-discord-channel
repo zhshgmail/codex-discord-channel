@@ -121,11 +121,12 @@ function readStdin() {
   });
 }
 
-async function sendGuardedReply(args, config, content, client, deps = {}) {
+async function sendGuardedReply(args, config, content, client, deps = {}, options = {}) {
   return (deps.sendDiscordReplyOnce || sendDiscordReplyOnce)({
     args,
     config,
     content,
+    reconciliationOnly: options.reconciliationOnly === true,
     preflight: (target, identity) => (deps.prepareDiscordMessageSend || prepareDiscordMessageSend)(
       client,
       { ...args, ...target, ...identity, content },
@@ -155,12 +156,13 @@ async function sendGuardedReply(args, config, content, client, deps = {}) {
 }
 
 function createAutomaticReplySender(config, client, deps = {}) {
-  return ({ channelId, replyTo, content }) => sendGuardedReply(
+  return ({ channelId, replyTo, content, reconciliationOnly = false }) => sendGuardedReply(
     { channelId, replyTo, followup: false },
     config,
     content,
     client,
     deps,
+    { reconciliationOnly },
   );
 }
 

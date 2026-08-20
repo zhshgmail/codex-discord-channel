@@ -70,7 +70,10 @@ fails the whole turn closed. The durable owner may POST only after every other
 same-turn source is proven to have no receipt. Separate turns retain separate
 per-source reply rights. The receipt barrier does not trust the queue's current
 outbound status: a pending receipt on a previously suppressed sibling is
-restored to guarded reconciliation before the owner becomes eligible.
+restored to guarded reconciliation before the owner becomes eligible. This
+recovery is reconciliation-only: an existing remote reply is confirmed, while
+proven absence releases the stale receipt and keeps the sibling suppressed so
+only the durable owner can POST. It never retries the POST as the sibling.
 Every positive acknowledgement is read back from the exact thread by the
 echoed client user message id before completion. A response without a persisted
 user item remains `structured_ack_uncertain`, so the gateway does not report a

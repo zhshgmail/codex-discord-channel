@@ -4611,6 +4611,22 @@ var require_reply_delivery = __commonJS({
         }
       };
     }
+    function provenAbsentResult(identity) {
+      return {
+        channelId: identity.channelId,
+        messageId: null,
+        sourceMessageId: identity.sourceMessageId,
+        duplicateSuppressed: !0,
+        reason: "source_message_reply_proven_absent",
+        receiptStatus: "absent",
+        receiptReleased: !0,
+        reconciliationProvenAbsent: !0
+      };
+    }
+    async function releaseProvenAbsentReply(config, state, identity, deps = {}) {
+      let released = await releaseReplyClaim(config, state, deps);
+      return released !== null ? suppressResult(identity, released, "source_message_reply_uncertain").result : provenAbsentResult(identity);
+    }
     async function beginReply(config, identity, content, deps = {}) {
       let file = receiptPath(config, identity.channelId, identity.sourceMessageId), digest = contentDigest(content), nonce = replyNonce(identity.channelId, identity.sourceMessageId);
       return withReceiptLock(file, config, deps, async () => {
@@ -4757,6 +4773,7 @@ var require_reply_delivery = __commonJS({
       sender,
       confirmer,
       reconciler,
+      reconciliationOnly = !1,
       deps = {}
     }) {
       let dispatch = replyDispatch(args, config);
@@ -4769,6 +4786,8 @@ var require_reply_delivery = __commonJS({
         sourceMessageId: dispatch.sourceMessageId
       }, state = await beginReply(config, identity, content, deps);
       if (state.mode === "suppress") return state.result;
+      if (reconciliationOnly === !0 && state.mode === "send")
+        return releaseProvenAbsentReply(config, state, identity, deps);
       if (state.mode === "send" && typeof confirmer != "function") {
         await releaseReplyClaim(config, state, deps);
         let error = new Error("Guarded Discord replies require exact readback confirmation.");
@@ -4806,6 +4825,8 @@ var require_reply_delivery = __commonJS({
           let uncertain = await markReplyUncertain(config, state, null, deps);
           return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
         }
+        if (reconciliationOnly === !0)
+          return releaseProvenAbsentReply(config, state, identity, deps);
         if (typeof confirmer != "function") {
           let uncertain = await markReplyUncertain(config, state, null, deps);
           return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
@@ -6039,6 +6060,9 @@ ${normalized.content}${attachmentText}
     function automaticReplyIsConfirmed(sent, record) {
       return sent?.channelId !== record.channelId || sent?.sourceMessageId !== record.messageId || typeof sent?.messageId != "string" || !sent.messageId || sent.receiptStatus != null && sent.receiptStatus !== "confirmed" ? !1 : sent.duplicateSuppressed === !1 ? !0 : sent.duplicateSuppressed === !0 && sent.receiptStatus === "confirmed" && sent.reason === "source_message_already_replied";
     }
+    function automaticReplyProvesReceiptAbsence(sent, record) {
+      return record.outbound.receiptRecovery === !0 && sent?.channelId === record.channelId && sent?.sourceMessageId === record.messageId && sent?.messageId === null && sent?.duplicateSuppressed === !0 && sent?.reason === "source_message_reply_proven_absent" && sent?.receiptStatus === "absent" && sent?.receiptReleased === !0 && sent?.reconciliationProvenAbsent === !0;
+    }
     async function flushAutomaticOutbound(config, logger, deps, host, options = {}) {
       let inspection = await withDeliveryQueueLock(config, deps, () => {
         let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
@@ -6096,7 +6120,8 @@ ${normalized.content}${attachmentText}
         sent = await deps.sendAutomaticReply({
           channelId: record.channelId,
           replyTo: record.messageId,
-          content: record.outbound.text
+          content: record.outbound.text,
+          ...record.outbound.receiptRecovery === !0 ? { reconciliationOnly: !0 } : {}
         });
       } catch (error) {
         return logger("ERROR", "Guarded automatic Discord reply is not confirmed", {
@@ -6108,6 +6133,20 @@ ${normalized.content}${attachmentText}
           reason: error?.code || "outbound_reply_unconfirmed",
           deliveredCount: 0
         };
+      }
+      if (automaticReplyProvesReceiptAbsence(sent, record)) {
+        let released = await withDeliveryQueueLock(config, deps, () => {
+          let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
+          if (receiverRejected) return { queue, receiverRejected };
+          let current = queue.completed.find((entry) => sameCompletedSource(entry, record));
+          return !current || current.outbound?.status !== "ready" || current.outbound?.receiptRecovery !== !0 || current.delivery?.threadId !== record.delivery.threadId || current.delivery?.turnId !== record.delivery.turnId || current.outbound?.itemId !== record.outbound.itemId || current.outbound?.text !== record.outbound.text || outboundReceiptObservation(current, config, deps).state !== "absent" ? { changed: !0, queue } : (current.outbound = {
+            ...current.outbound,
+            status: "suppressed",
+            reason: "turn_reply_receipt_proven_absent",
+            receiptRecoveryCompletedAt: new Date(currentTimeMs(deps)).toISOString()
+          }, reconcileTurnOutboundQueue(queue, config, deps), writeDeliveryQueue(queue, config, deps), { released: !0, queue });
+        });
+        return released.receiverRejected ? receiverRejectedResult(released.queue, released.receiverRejected) : released.released ? { status: "queued", reason: "outbound_receipt_released", deliveredCount: 0 } : { status: "queued", reason: "outbound_checkpoint_changed", deliveredCount: 0 };
       }
       if (!automaticReplyIsConfirmed(sent, record))
         return { status: "failed", reason: "outbound_reply_unconfirmed", deliveredCount: 0 };

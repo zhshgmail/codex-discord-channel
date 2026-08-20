@@ -678,6 +678,141 @@ test('restart revives a suppressed same-turn uncertain receipt for reconciliatio
   });
 });
 
+test('restart proves a cross-channel suppressed receipt absent before the durable owner alone POSTs', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-suppressed-absent-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = configAt(dir);
+  const owner = bindTurnOwner(readyRecord(1));
+  owner.outbound.text = 'one answer';
+  const uncertain = readyRecord(2);
+  uncertain.channelId = 'channel-2';
+  uncertain.source.channelId = 'channel-2';
+  uncertain.delivery.clientUserMessageId = 'discord:channel-2:source-2';
+  uncertain.outbound.channelId = 'channel-2';
+  uncertain.outbound.text = 'one answer';
+  uncertain.delivery.threadId = owner.delivery.threadId;
+  uncertain.delivery.turnId = owner.delivery.turnId;
+  const now = new Date().toISOString();
+  writeReplyReceipt(dir, uncertain, {
+    status: 'uncertain',
+    overrides: { claimedAt: now, updatedAt: now },
+  });
+  const receiptFile = receiptPath(config, uncertain.channelId, uncertain.messageId);
+  suppressOutbound(uncertain, owner);
+  writeReadyQueue(dir, [owner, uncertain]);
+  const host = hostForTurn();
+  host.readAssistantFinal = async () => ({
+    threadId: owner.delivery.threadId,
+    turnId: owner.delivery.turnId,
+    itemId: 'final-1',
+    text: 'one answer',
+  });
+  const posts = [];
+  const reconciliations = [];
+  const automaticSender = createAutomaticReplySender(config, {}, {
+    async prepareDiscordMessageSend(_client, args) { return { args }; },
+    async sendDiscordMessage(_client, args) {
+      posts.push({ channelId: args.channelId, replyTo: args.replyTo });
+      return { channelId: args.channelId, messageId: `posted-${args.replyTo}` };
+    },
+    async confirmDiscordMessage(_client, _args, _prepared, sent) { return sent; },
+    async reconcileDiscordMessage(_client, args) {
+      reconciliations.push({ channelId: args.channelId, replyTo: args.replyTo });
+      return { found: false };
+    },
+  });
+  const delivery = createDelivery(config, () => {}, {
+    structuredHost: host,
+    sendAutomaticReply: automaticSender,
+  });
+  t.after(() => delivery.destroy());
+
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_ready');
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_receipt_released');
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_confirmed');
+  assert.deepEqual(reconciliations, [{ channelId: 'channel-2', replyTo: 'source-2' }]);
+  assert.deepEqual(posts, [{ channelId: 'channel-1', replyTo: 'source-1' }]);
+  assert.equal(fs.existsSync(receiptFile), false);
+  const records = new Map(readQueue(dir).completed.map((record) => [record.messageId, record]));
+  assert.equal(records.get('source-1').outbound.status, 'confirmed');
+  assert.equal(records.get('source-1').outbound.outboundMessageId, 'posted-source-1');
+  assert.equal(records.get('source-2').outbound.status, 'suppressed');
+  assert.equal(records.get('source-2').outbound.reason, 'turn_reply_receipt_proven_absent');
+});
+
+test('restart drains multiple suppressed pending receipts before the durable owner POSTs once', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-multiple-pending-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = configAt(dir);
+  const owner = bindTurnOwner(readyRecord(1));
+  owner.outbound.text = 'one answer';
+  const siblings = [2, 3].map((index) => {
+    const record = readyRecord(index);
+    record.channelId = `channel-${index}`;
+    record.source.channelId = `channel-${index}`;
+    record.delivery.clientUserMessageId = `discord:channel-${index}:source-${index}`;
+    record.outbound.channelId = `channel-${index}`;
+    record.outbound.text = 'one answer';
+    record.delivery.threadId = owner.delivery.threadId;
+    record.delivery.turnId = owner.delivery.turnId;
+    const now = new Date().toISOString();
+    writeReplyReceipt(dir, record, {
+      status: 'uncertain',
+      overrides: { claimedAt: now, updatedAt: now },
+    });
+    suppressOutbound(record, owner);
+    return record;
+  });
+  writeReadyQueue(dir, [owner, ...siblings]);
+  const host = hostForTurn();
+  host.readAssistantFinal = async () => ({
+    threadId: owner.delivery.threadId,
+    turnId: owner.delivery.turnId,
+    itemId: 'final-1',
+    text: 'one answer',
+  });
+  const posts = [];
+  const reconciliations = [];
+  const automaticSender = createAutomaticReplySender(config, {}, {
+    async prepareDiscordMessageSend(_client, args) { return { args }; },
+    async sendDiscordMessage(_client, args) {
+      posts.push({ channelId: args.channelId, replyTo: args.replyTo });
+      return { channelId: args.channelId, messageId: `posted-${args.replyTo}` };
+    },
+    async confirmDiscordMessage(_client, _args, _prepared, sent) { return sent; },
+    async reconcileDiscordMessage(_client, args) {
+      reconciliations.push({ channelId: args.channelId, replyTo: args.replyTo });
+      return { found: false };
+    },
+  });
+  const delivery = createDelivery(config, () => {}, {
+    structuredHost: host,
+    sendAutomaticReply: automaticSender,
+  });
+  t.after(() => delivery.destroy());
+
+  const reasons = [];
+  for (let index = 0; index < 5; index += 1) {
+    reasons.push((await delivery.flushOutbound()).reason);
+  }
+  assert.deepEqual(reasons, [
+    'outbound_ready',
+    'outbound_receipt_released',
+    'outbound_ready',
+    'outbound_receipt_released',
+    'outbound_confirmed',
+  ]);
+  assert.deepEqual(reconciliations, [
+    { channelId: 'channel-2', replyTo: 'source-2' },
+    { channelId: 'channel-3', replyTo: 'source-3' },
+  ]);
+  assert.deepEqual(posts, [{ channelId: 'channel-1', replyTo: 'source-1' }]);
+  const records = new Map(readQueue(dir).completed.map((record) => [record.messageId, record]));
+  assert.equal(records.get('source-1').outbound.status, 'confirmed');
+  assert.equal(records.get('source-2').outbound.status, 'suppressed');
+  assert.equal(records.get('source-3').outbound.status, 'suppressed');
+});
+
 test('restart keeps a suppressed same-turn live in-flight receipt ahead of owner without POST', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-suppressed-in-flight-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

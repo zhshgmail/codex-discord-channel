@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const {
   beginReply,
+  receiptPath,
   sendDiscordReplyOnce: sendDiscordReplyOnceRaw,
 } = require('../../src/reply-delivery');
 
@@ -559,6 +560,49 @@ test('a stale uncertain receipt remains fail closed outside the nonce replay win
   assert.equal(sendCount, 1);
   assert.equal(retry.duplicateSuppressed, true);
   assert.equal(retry.reason, 'source_message_reply_uncertain');
+});
+
+test('reconciliation-only recovery releases a proven-absent receipt without a network send', async () => {
+  const { config } = fixture();
+  let sendCount = 0;
+  await assert.rejects(sendDiscordReplyOnce({
+    args: sourceArgs(),
+    config,
+    content: 'answer',
+    sender: async () => {
+      sendCount += 1;
+      throw new Error('uncertain');
+    },
+    deps: { now: () => 1_000 },
+  }));
+  const file = receiptPath(config, 'c1', 'm1');
+  assert.equal(fs.existsSync(file), true);
+
+  const recovered = await sendDiscordReplyOnce({
+    args: sourceArgs(),
+    config,
+    content: 'answer',
+    reconciliationOnly: true,
+    reconciler: async () => ({ found: false }),
+    sender: async () => {
+      sendCount += 1;
+      return { channelId: 'c1', messageId: 'must-not-send' };
+    },
+    deps: { now: () => 2_000 },
+  });
+
+  assert.equal(sendCount, 1);
+  assert.deepEqual(recovered, {
+    channelId: 'c1',
+    messageId: null,
+    sourceMessageId: 'm1',
+    duplicateSuppressed: true,
+    reason: 'source_message_reply_proven_absent',
+    receiptStatus: 'absent',
+    receiptReleased: true,
+    reconciliationProvenAbsent: true,
+  });
+  assert.equal(fs.existsSync(file), false);
 });
 
 test('a restart reclaims an abandoned in-flight receipt and retries with the same nonce', async () => {

@@ -1439,6 +1439,18 @@ function automaticReplyIsConfirmed(sent, record) {
     sent.reason === 'source_message_already_replied';
 }
 
+function automaticReplyProvesReceiptAbsence(sent, record) {
+  return record.outbound.receiptRecovery === true &&
+    sent?.channelId === record.channelId &&
+    sent?.sourceMessageId === record.messageId &&
+    sent?.messageId === null &&
+    sent?.duplicateSuppressed === true &&
+    sent?.reason === 'source_message_reply_proven_absent' &&
+    sent?.receiptStatus === 'absent' &&
+    sent?.receiptReleased === true &&
+    sent?.reconciliationProvenAbsent === true;
+}
+
 async function flushAutomaticOutbound(config, logger, deps, host, options = {}) {
   const inspection = await withDeliveryQueueLock(config, deps, () => {
     const queue = readDeliveryQueue(config, deps);
@@ -1545,6 +1557,7 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
       channelId: record.channelId,
       replyTo: record.messageId,
       content: record.outbound.text,
+      ...(record.outbound.receiptRecovery === true ? { reconciliationOnly: true } : {}),
     });
   } catch (error) {
     logger('ERROR', 'Guarded automatic Discord reply is not confirmed', {
@@ -1557,6 +1570,41 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
       reason: error?.code || 'outbound_reply_unconfirmed',
       deliveredCount: 0,
     };
+  }
+  if (automaticReplyProvesReceiptAbsence(sent, record)) {
+    const released = await withDeliveryQueueLock(config, deps, () => {
+      const queue = readDeliveryQueue(config, deps);
+      const receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
+      if (receiverRejected) return { queue, receiverRejected };
+      const current = queue.completed.find((entry) => sameCompletedSource(entry, record));
+      if (
+        !current || current.outbound?.status !== 'ready' ||
+        current.outbound?.receiptRecovery !== true ||
+        current.delivery?.threadId !== record.delivery.threadId ||
+        current.delivery?.turnId !== record.delivery.turnId ||
+        current.outbound?.itemId !== record.outbound.itemId ||
+        current.outbound?.text !== record.outbound.text ||
+        outboundReceiptObservation(current, config, deps).state !== 'absent'
+      ) {
+        return { changed: true, queue };
+      }
+      current.outbound = {
+        ...current.outbound,
+        status: 'suppressed',
+        reason: 'turn_reply_receipt_proven_absent',
+        receiptRecoveryCompletedAt: new Date(currentTimeMs(deps)).toISOString(),
+      };
+      reconcileTurnOutboundQueue(queue, config, deps);
+      writeDeliveryQueue(queue, config, deps);
+      return { released: true, queue };
+    });
+    if (released.receiverRejected) {
+      return receiverRejectedResult(released.queue, released.receiverRejected);
+    }
+    if (!released.released) {
+      return { status: 'queued', reason: 'outbound_checkpoint_changed', deliveredCount: 0 };
+    }
+    return { status: 'queued', reason: 'outbound_receipt_released', deliveredCount: 0 };
   }
   if (!automaticReplyIsConfirmed(sent, record)) {
     return { status: 'failed', reason: 'outbound_reply_unconfirmed', deliveredCount: 0 };

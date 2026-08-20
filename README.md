@@ -293,7 +293,11 @@ other same-turn source is proven to have no receipt. Sources accepted into
 separate top-level turns keep independent per-source reply rights. Receipt
 inspection is independent of the queue's current outbound status: a pending
 receipt on a previously suppressed sibling is restored to guarded
-reconciliation instead of letting the owner send around it.
+reconciliation instead of letting the owner send around it. That recovery is
+reconciliation-only: finding the remote reply confirms it; proving absence
+releases the stale receipt while the sibling remains suppressed, then the
+durable owner becomes the sole source allowed to POST. Recovery never POSTs as
+the sibling.
 
 If the trusted local app-server rejects a steer with an exact canonical
 expected-to-current turn mismatch, the gateway rechecks the same connection,
