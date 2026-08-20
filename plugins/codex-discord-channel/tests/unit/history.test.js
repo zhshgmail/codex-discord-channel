@@ -176,7 +176,26 @@ test('readDiscordHistory resolves only same-channel references present in the fe
     authorId: USER_ID,
     authorName: 'Alice',
   });
+  assert.equal(result.messages[0].replySourceMessageId, referenced.id);
+  assert.equal(result.messages[1].replySourceMessageId, null);
   assert.equal(result.messages[1].replyTo, null);
+});
+
+test('readDiscordHistory preserves a same-channel raw reply source outside the bounded page', async () => {
+  const parentId = '500000000000000001';
+  const reply = message('500000000000000003', {
+    reference: { channelId: CHANNEL_ID, messageId: parentId },
+  });
+  const fixture = historyFixture({ messages: [reply, message('500000000000000002')] });
+
+  const result = await readDiscordHistory({
+    args: { channelId: CHANNEL_ID, limit: 1 },
+    config: fixture.config,
+    client: fixture.client,
+  });
+
+  assert.equal(result.messages[0].replySourceMessageId, parentId);
+  assert.equal(result.messages[0].replyTo, null);
 });
 
 test('readDiscordHistory hides a reply reference authored by a denied sender', async () => {
@@ -200,6 +219,7 @@ test('readDiscordHistory hides a reply reference authored by a denied sender', a
   });
 
   assert.equal(result.messages.length, 1);
+  assert.equal(result.messages[0].replySourceMessageId, deniedReference.id);
   assert.equal(result.messages[0].replyTo, null);
 });
 
@@ -226,6 +246,7 @@ test('readDiscordHistory hides a reply reference authored by a denied bot', asyn
   });
 
   assert.equal(result.messages.length, 1);
+  assert.equal(result.messages[0].replySourceMessageId, deniedReference.id);
   assert.equal(result.messages[0].replyTo, null);
 });
 

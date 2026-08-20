@@ -106,7 +106,10 @@ item remains `structured_ack_uncertain` and must not be described as delivered.
 exclusive `before` message cursor, and `limit` from 1 to 25. Results are newest
 first. Guild history requires the exact enabled channel or thread; DM history
 requires the configured DM policy. The tool returns sanitized stable errors and
-bounded output.
+bounded output. `replySourceMessageId` preserves a same-channel raw Discord
+reply parent even when that parent is outside the page or cannot be enriched;
+`replyTo` contains author enrichment only when the referenced message passes
+history access filtering.
 
 ## Reply Once
 
@@ -126,7 +129,10 @@ stable nonce identity. A same-nonce retry is allowed only when no message id was
 returned and the bounded enforcement window is still open; nonce enforcement
 must deduplicate that replay. Otherwise uncertainty remains fail-closed.
 Confirmed replies suppress later automatic continuations. Use `followup: true`
-only when a second Discord message is intentionally required.
+only when a second Discord message is intentionally required, and supply the
+same exact `replyTo` plus a stable caller-chosen `followupKey`. Each tuple of
+channel, source message, and followup key has its own deterministic receipt and
+is delivered at most once.
 
 Do not answer a Discord-origin request through a generic Discord MCP sender.
 That path does not share this plugin's reply receipt and bypasses the one-source

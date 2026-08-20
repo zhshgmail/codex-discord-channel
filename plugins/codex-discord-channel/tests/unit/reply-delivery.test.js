@@ -14,7 +14,7 @@ const {
 const confirmSent = async (_target, _prepared, sent) => sent;
 
 function sendDiscordReplyOnce(options) {
-  if (options.args?.followup === true || Object.hasOwn(options, 'confirmer')) {
+  if (Object.hasOwn(options, 'confirmer')) {
     return sendDiscordReplyOnceRaw(options);
   }
   return sendDiscordReplyOnceRaw({ ...options, confirmer: confirmSent });
@@ -78,7 +78,9 @@ test('one exact source Discord message produces at most one guarded reply', asyn
 
   assert.equal(first.duplicateSuppressed, false);
   assert.equal(first.sourceMessageId, 'm1');
+  assert.equal(Object.hasOwn(first, 'followupKey'), false);
   assert.equal(second.duplicateSuppressed, true);
+  assert.equal(Object.hasOwn(second, 'followupKey'), false);
   assert.equal(second.reason, 'source_message_already_replied');
   assert.equal(second.messageId, 'out-1');
   assert.deepEqual(sends, [{ channelId: 'c1', replyTo: 'm1', usedLastInbound: false }]);
@@ -103,7 +105,7 @@ test('concurrent replies to one exact source acquire one durable claim', async (
   assert.equal(results.filter((item) => !item.duplicateSuppressed).length, 1);
 });
 
-test('explicit followup bypasses the one-reply guard', async () => {
+test('explicit followup has an independent deterministic exactly-once receipt', async () => {
   const { config } = fixture();
   const sends = [];
   const sender = async (target) => {
@@ -113,16 +115,70 @@ test('explicit followup bypasses the one-reply guard', async () => {
 
   await sendDiscordReplyOnce({ args: sourceArgs(), config, content: 'answer', sender });
   const followup = await sendDiscordReplyOnce({
-    args: { channelId: 'c1', followup: true },
+    args: { channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'status-1' },
     config,
     content: 'explicit followup',
     sender,
   });
+  const duplicate = await sendDiscordReplyOnce({
+    args: { channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'status-1' },
+    config,
+    content: 'explicit followup',
+    sender,
+  });
+  const independent = await sendDiscordReplyOnce({
+    args: { channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'status-2' },
+    config,
+    content: 'second explicit followup',
+    sender,
+  });
 
   assert.equal(followup.duplicateSuppressed, false);
-  assert.equal(followup.sourceMessageId, null);
-  assert.equal(sends.length, 2);
-  assert.equal(sends[1].replyTo, '');
+  assert.equal(followup.sourceMessageId, 'm1');
+  assert.equal(followup.followupKey, 'status-1');
+  assert.equal(duplicate.duplicateSuppressed, true);
+  assert.equal(duplicate.reason, 'source_message_followup_already_sent');
+  assert.equal(independent.duplicateSuppressed, false);
+  assert.equal(sends.length, 3);
+  assert.equal(sends[1].replyTo, 'm1');
+  assert.equal(sends[2].replyTo, 'm1');
+  assert.equal(fs.readdirSync(config.paths.replyReceiptDir).length, 3);
+});
+
+test('a followup key remains consumed even when later content differs', async () => {
+  const { config } = fixture();
+  let sendCount = 0;
+  const args = { channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'status-1' };
+  const sender = async () => {
+    sendCount += 1;
+    return { channelId: 'c1', messageId: 'out-followup' };
+  };
+
+  await sendDiscordReplyOnce({ args, config, content: 'first content', sender });
+  const changed = await sendDiscordReplyOnce({ args, config, content: 'changed content', sender });
+
+  assert.equal(sendCount, 1);
+  assert.equal(changed.duplicateSuppressed, true);
+  assert.equal(changed.reason, 'source_message_followup_already_sent');
+});
+
+test('explicit followup requires an exact source and bounded followup key', async () => {
+  const { config } = fixture();
+  let sendCount = 0;
+  const sender = async () => { sendCount += 1; };
+
+  for (const args of [
+    { channelId: 'c1', followup: true, followupKey: 'status-1' },
+    { channelId: 'c1', replyTo: 'm1', followup: true },
+    { channelId: 'c1', replyTo: 'm1', followup: true, followupKey: '' },
+    { channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'x'.repeat(129) },
+  ]) {
+    await assert.rejects(
+      sendDiscordReplyOnce({ args, config, content: 'followup', sender }),
+      /followup/i,
+    );
+  }
+  assert.equal(sendCount, 0);
 });
 
 test('a newer exact inbound source gets an independent reply receipt', async () => {
@@ -469,6 +525,82 @@ test('an uncertain acknowledgement reconciles the stable nonce without a second 
   assert.equal(retry.messageId, 'existing-message');
 });
 
+test('a no-id response survives transient reconciliation failure and retries the same nonce once', async () => {
+  const { config } = fixture();
+  let sendCount = 0;
+  let reconciliationCount = 0;
+  let firstNonce = '';
+  const args = sourceArgs();
+  const common = {
+    args,
+    config,
+    content: 'same answer',
+    preflight: async (_target, identity) => {
+      firstNonce ||= identity.nonce;
+      assert.equal(identity.nonce, firstNonce);
+      return { identity };
+    },
+    confirmer: confirmSent,
+    deps: { now: () => 20_000, pid: 222, isProcessAlive: () => false },
+  };
+
+  await assert.rejects(sendDiscordReplyOnceRaw({
+    ...common,
+    sender: async () => {
+      sendCount += 1;
+      const error = new Error('missing response identity');
+      error.code = 'reply_send_response_invalid';
+      throw error;
+    },
+  }), /missing response identity/);
+
+  await assert.rejects(sendDiscordReplyOnceRaw({
+    ...common,
+    reconciler: async () => {
+      reconciliationCount += 1;
+      const error = new Error('secret transport detail');
+      error.code = 'reply_reconciliation_failed';
+      throw error;
+    },
+    sender: async () => { throw new Error('must not send while reconciliation failed'); },
+  }), /secret transport detail/);
+
+  const receiptFile = path.join(
+    config.paths.replyReceiptDir,
+    fs.readdirSync(config.paths.replyReceiptDir)[0],
+  );
+  const uncertain = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+  assert.equal(uncertain.errorCode, 'reply_reconciliation_failed');
+  assert.equal(JSON.stringify(uncertain).includes('secret transport detail'), false);
+
+  const recovered = await sendDiscordReplyOnceRaw({
+    ...common,
+    reconciler: async () => {
+      reconciliationCount += 1;
+      return { found: false };
+    },
+    sender: async (_target, _prepared, identity) => {
+      sendCount += 1;
+      assert.equal(identity.nonce, firstNonce);
+      return { channelId: 'c1', messageId: 'after-transient-reconcile' };
+    },
+  });
+  const duplicate = await sendDiscordReplyOnceRaw({
+    ...common,
+    reconciler: async () => { throw new Error('confirmed follow-on must not reconcile'); },
+    sender: async () => { throw new Error('confirmed follow-on must not send'); },
+  });
+
+  assert.equal(reconciliationCount, 2);
+  assert.equal(sendCount, 2);
+  assert.equal(recovered.messageId, 'after-transient-reconcile');
+  assert.equal(duplicate.duplicateSuppressed, true);
+  assert.equal(duplicate.reason, 'source_message_already_replied');
+  const confirmed = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+  assert.equal(confirmed.status, 'confirmed');
+  assert.equal(confirmed.errorCode, null);
+});
+
 test('a returned message id stays fail closed when exact readback cannot be reconciled', async () => {
   const { config } = fixture();
   let sendCount = 0;
@@ -497,6 +629,7 @@ test('a returned message id stays fail closed when exact readback cannot be reco
   assert.equal(sendCount, 1);
   assert.equal(retry.duplicateSuppressed, true);
   assert.equal(retry.reason, 'source_message_reply_uncertain');
+  assert.equal(retry.operatorReconciliationRequired, true);
 });
 
 test('a restart confirms a returned message id by exact identity without resending', async () => {
@@ -597,6 +730,58 @@ test('a restart reclaims an abandoned in-flight receipt and retries with the sam
   assert.equal(sendCount, 1);
   assert.equal(recovered.messageId, 'after-restart');
   assert.equal(recovered.duplicateSuppressed, false);
+});
+
+test('a followup survives a post-write crash and restart without a duplicate send', async () => {
+  const { config } = fixture();
+  const identity = { channelId: 'c1', sourceMessageId: 'm1', followupKey: 'status-1' };
+  const original = await beginReply(config, identity, 'followup', {
+    pid: 111,
+    now: () => 10_000,
+    randomUUID: () => 'followup-before-crash',
+  });
+  assert.equal(original.mode, 'send');
+  assert.match(original.receipt.nonce, /^cdf-[0-9a-f]{21}$/);
+
+  let sendCount = 0;
+  const recovered = await sendDiscordReplyOnceRaw({
+    args: {
+      channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'status-1',
+    },
+    config,
+    content: 'followup',
+    preflight: async (_target, sendIdentity) => ({ sendIdentity }),
+    reconciler: async (_target, prepared, receipt) => {
+      assert.equal(prepared.sendIdentity.nonce, original.receipt.nonce);
+      assert.equal(receipt.followupKey, 'status-1');
+      return { found: true, channelId: 'c1', messageId: 'already-written' };
+    },
+    sender: async () => {
+      sendCount += 1;
+      throw new Error('must not duplicate post-write followup');
+    },
+    confirmer: confirmSent,
+    deps: {
+      pid: 222,
+      now: () => 11_000,
+      isProcessAlive: () => false,
+      randomUUID: () => 'followup-after-crash',
+    },
+  });
+  const duplicate = await sendDiscordReplyOnceRaw({
+    args: {
+      channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'status-1',
+    },
+    config,
+    content: 'followup',
+    sender: async () => { throw new Error('confirmed followup must not send'); },
+  });
+
+  assert.equal(sendCount, 0);
+  assert.equal(recovered.reconciled, true);
+  assert.equal(recovered.messageId, 'already-written');
+  assert.equal(recovered.followupKey, 'status-1');
+  assert.equal(duplicate.reason, 'source_message_followup_already_sent');
 });
 
 test('two processes sharing the receipt directory perform only one network send', async () => {

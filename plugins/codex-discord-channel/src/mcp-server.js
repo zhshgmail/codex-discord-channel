@@ -128,12 +128,22 @@ function toolList() {
             default: false,
             description: 'Explicitly allow an additional message after this source Discord message was already answered.',
           },
+          followupKey: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            pattern: '^[A-Za-z0-9._:-]+$',
+            description: 'Stable caller-chosen idempotency key for one explicit followup.',
+          },
         },
         required: ['channelId', 'content'],
         anyOf: [
-          { required: ['replyTo'] },
           {
-            required: ['followup'],
+            required: ['replyTo'],
+            not: { required: ['followup'] },
+          },
+          {
+            required: ['replyTo', 'followup', 'followupKey'],
             properties: { followup: { const: true } },
           },
         ],

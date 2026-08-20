@@ -28,18 +28,24 @@ function contentDigest(content) {
   return createHash('sha256').update(String(content), 'utf8').digest('hex');
 }
 
-function replyNonce(channelId, sourceMessageId) {
-  const digest = createHash('sha256')
-    .update(`discord-reply\0${channelId}\0${sourceMessageId}`, 'utf8')
-    .digest('hex');
-  return `cdr-${digest.slice(0, 21)}`;
+function normalizedFollowupKey(identity) {
+  return typeof identity?.followupKey === 'string' ? identity.followupKey : '';
 }
 
-function receiptPath(config, channelId, sourceMessageId) {
+function replyNonce(channelId, sourceMessageId, followupKey = '') {
+  const digest = createHash('sha256')
+    .update(followupKey
+      ? `discord-followup\0${channelId}\0${sourceMessageId}\0${followupKey}`
+      : `discord-reply\0${channelId}\0${sourceMessageId}`, 'utf8')
+    .digest('hex');
+  return `${followupKey ? 'cdf' : 'cdr'}-${digest.slice(0, 21)}`;
+}
+
+function receiptPath(config, channelId, sourceMessageId, followupKey = '') {
   const dir = config.paths?.replyReceiptDir || path.join(config.paths?.stateDir || '', 'reply-receipts');
   if (!dir) throw new Error('Discord reply receipt directory is not configured.');
   const key = createHash('sha256')
-    .update(`${channelId}\0${sourceMessageId}`, 'utf8')
+    .update(`${channelId}\0${sourceMessageId}${followupKey ? `\0followup\0${followupKey}` : ''}`, 'utf8')
     .digest('hex');
   return path.join(dir, `${key}.json`);
 }
@@ -48,9 +54,15 @@ function receiptIdentityMatches(config, file, receipt, identity, nonce) {
   if (receipt?.version !== RECEIPT_VERSION) return false;
   if (receipt.channelId !== identity.channelId) return false;
   if (receipt.sourceMessageId !== identity.sourceMessageId) return false;
+  if (normalizedFollowupKey(receipt) !== normalizedFollowupKey(identity)) return false;
   if (receipt.nonce !== nonce) return false;
   try {
-    return path.resolve(receiptPath(config, receipt.channelId, receipt.sourceMessageId))
+    return path.resolve(receiptPath(
+      config,
+      receipt.channelId,
+      receipt.sourceMessageId,
+      normalizedFollowupKey(receipt),
+    ))
       === path.resolve(file);
   } catch {
     return false;
@@ -233,6 +245,9 @@ function suppressResult(identity, receipt, reason) {
       channelId: identity.channelId,
       messageId: receipt?.outboundMessageId || null,
       sourceMessageId: identity.sourceMessageId,
+      ...(normalizedFollowupKey(identity)
+        ? { followupKey: normalizedFollowupKey(identity) }
+        : {}),
       duplicateSuppressed: true,
       reason,
       receiptStatus: receipt?.status || 'unreadable',
@@ -241,32 +256,55 @@ function suppressResult(identity, receipt, reason) {
 }
 
 async function beginReply(config, identity, content, deps = {}) {
-  const file = receiptPath(config, identity.channelId, identity.sourceMessageId);
+  const followupKey = normalizedFollowupKey(identity);
+  const file = receiptPath(config, identity.channelId, identity.sourceMessageId, followupKey);
   const digest = contentDigest(content);
-  const nonce = replyNonce(identity.channelId, identity.sourceMessageId);
+  const nonce = replyNonce(identity.channelId, identity.sourceMessageId, followupKey);
+  const reason = (primary, followup) => (followupKey ? followup : primary);
   return withReceiptLock(file, config, deps, async () => {
     const fsImpl = deps.fs || fs;
     const existing = readReceipt(file, fsImpl);
     if (!existing && fsImpl.existsSync(file)) {
-      return suppressResult(identity, null, 'source_message_reply_receipt_unreadable');
+      return suppressResult(identity, null, reason(
+        'source_message_reply_receipt_unreadable',
+        'source_message_followup_receipt_unreadable',
+      ));
     }
     if (existing?.version === 1) {
-      return suppressResult(identity, existing, 'source_message_reply_legacy_uncertain');
+      return suppressResult(identity, existing, reason(
+        'source_message_reply_legacy_uncertain',
+        'source_message_followup_legacy_uncertain',
+      ));
     }
     if (existing && !receiptIdentityMatches(config, file, existing, identity, nonce)) {
-      return suppressResult(identity, existing, 'source_message_reply_receipt_identity_mismatch');
+      return suppressResult(identity, existing, reason(
+        'source_message_reply_receipt_identity_mismatch',
+        'source_message_followup_receipt_identity_mismatch',
+      ));
     }
     if (receiptStatusIsConfirmed(existing)) {
-      return suppressResult(identity, existing, 'source_message_already_replied');
+      return suppressResult(identity, existing, reason(
+        'source_message_already_replied',
+        'source_message_followup_already_sent',
+      ));
     }
     if (existing && existing.contentSha256 !== digest) {
-      return suppressResult(identity, existing, 'source_message_reply_content_mismatch');
+      return suppressResult(identity, existing, reason(
+        'source_message_reply_content_mismatch',
+        'source_message_followup_content_mismatch',
+      ));
     }
     if (receiptHasPermanentNonceMismatch(existing)) {
-      return suppressResult(identity, existing, 'source_message_reply_nonce_mismatch');
+      return suppressResult(identity, existing, reason(
+        'source_message_reply_nonce_mismatch',
+        'source_message_followup_nonce_mismatch',
+      ));
     }
     if (existing?.status === 'in_flight' && receiptLeaseIsLive(existing, config, deps)) {
-      return suppressResult(identity, existing, 'source_message_reply_in_progress');
+      return suppressResult(identity, existing, reason(
+        'source_message_reply_in_progress',
+        'source_message_followup_in_progress',
+      ));
     }
 
     const id = operationId(deps);
@@ -291,6 +329,7 @@ async function beginReply(config, identity, content, deps = {}) {
       status: 'in_flight',
       channelId: identity.channelId,
       sourceMessageId: identity.sourceMessageId,
+      ...(followupKey ? { followupKey } : {}),
       contentSha256: digest,
       nonce,
       operationId: id,
@@ -310,6 +349,7 @@ async function transitionReply(config, state, deps, update) {
     if (
       current.channelId !== state.receipt.channelId
       || current.sourceMessageId !== state.receipt.sourceMessageId
+      || normalizedFollowupKey(current) !== normalizedFollowupKey(state.receipt)
       || current.nonce !== state.receipt.nonce
     ) return current;
     const next = update(current);
@@ -346,6 +386,7 @@ async function completeReply(config, state, sent, deps = {}) {
     completed?.status !== 'confirmed'
     || completed.channelId !== state.receipt.channelId
     || completed.sourceMessageId !== state.receipt.sourceMessageId
+    || normalizedFollowupKey(completed) !== normalizedFollowupKey(state.receipt)
     || completed.nonce !== state.receipt.nonce
     || completed.outboundMessageId !== messageId
   ) {
@@ -364,27 +405,38 @@ async function markReplyUncertain(config, state, error, deps = {}, sent = null) 
     sentAt: sent?.messageId ? nowIso(deps) : current.sentAt,
     uncertainAt: nowIso(deps),
     updatedAt: nowIso(deps),
-    errorCode: typeof error?.code === 'string' ? error.code : null,
+    errorCode: typeof error?.code === 'string'
+      ? error.code
+      : (sent?.messageId ? null : (current.errorCode || null)),
   }));
 }
 
 function replyDispatch(args, config) {
   const channelId = typeof args.channelId === 'string' ? args.channelId.trim() : '';
   const replyTo = typeof args.replyTo === 'string' ? args.replyTo.trim() : '';
+  const followupKey = typeof args.followupKey === 'string' ? args.followupKey.trim() : '';
   if (args.followup === true) {
-    if (!channelId) throw new Error('channelId is required for an explicit Discord followup.');
+    if (!channelId || !replyTo) {
+      throw new Error('channelId and replyTo are required for an explicit Discord followup.');
+    }
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(followupKey)) {
+      throw new Error('A 1-128 character stable followupKey is required for an explicit Discord followup.');
+    }
     return {
       target: { channelId, replyTo, usedLastInbound: false },
-      sourceMessageId: '',
-      guarded: false,
+      sourceMessageId: replyTo,
+      followupKey,
+      guarded: true,
     };
   }
+  if (followupKey) throw new Error('followupKey requires followup: true.');
   if (!channelId || !replyTo) {
     throw new Error('channelId and replyTo are required for a guarded Discord reply.');
   }
   return {
     target: { channelId, replyTo, usedLastInbound: false },
     sourceMessageId: replyTo,
+    followupKey: '',
     guarded: true,
   };
 }
@@ -418,6 +470,9 @@ async function sendAndConfirm({
     return {
       ...confirmed,
       sourceMessageId: state.receipt.sourceMessageId,
+      ...(normalizedFollowupKey(state.receipt)
+        ? { followupKey: normalizedFollowupKey(state.receipt) }
+        : {}),
       duplicateSuppressed: false,
     };
   } catch (error) {
@@ -441,16 +496,14 @@ async function sendDiscordReplyOnce({
   deps = {},
 }) {
   const dispatch = replyDispatch(args, config);
-  if (!dispatch.guarded) {
-    const prepared = typeof preflight === 'function' ? await preflight(dispatch.target, {}) : undefined;
-    const sent = await sender(dispatch.target, prepared, {});
-    return { ...sent, duplicateSuppressed: false, sourceMessageId: null };
-  }
-
   const identity = {
     channelId: dispatch.target.channelId,
     sourceMessageId: dispatch.sourceMessageId,
+    followupKey: dispatch.followupKey,
   };
+  const uncertainReason = normalizedFollowupKey(identity)
+    ? 'source_message_followup_uncertain'
+    : 'source_message_reply_uncertain';
   const state = await beginReply(config, identity, content, deps);
   if (state.mode === 'suppress') return state.result;
 
@@ -482,7 +535,7 @@ async function sendDiscordReplyOnce({
   if (state.mode === 'reconcile') {
     if (typeof reconciler !== 'function') {
       const uncertain = await markReplyUncertain(config, state, null, deps);
-      return suppressResult(identity, uncertain, 'source_message_reply_uncertain').result;
+      return suppressResult(identity, uncertain, uncertainReason).result;
     }
     let reconciliation;
     try {
@@ -497,17 +550,23 @@ async function sendDiscordReplyOnce({
         channelId: reconciliation.channelId || identity.channelId,
         messageId: reconciliation.messageId,
         sourceMessageId: identity.sourceMessageId,
+        ...(normalizedFollowupKey(identity)
+          ? { followupKey: normalizedFollowupKey(identity) }
+          : {}),
         duplicateSuppressed: false,
         reconciled: true,
       };
     }
     if (!replayWindowOpen(state.receipt, config, deps)) {
       const uncertain = await markReplyUncertain(config, state, null, deps);
-      return suppressResult(identity, uncertain, 'source_message_reply_uncertain').result;
+      return {
+        ...suppressResult(identity, uncertain, uncertainReason).result,
+        operatorReconciliationRequired: true,
+      };
     }
     if (typeof confirmer !== 'function') {
       const uncertain = await markReplyUncertain(config, state, null, deps);
-      return suppressResult(identity, uncertain, 'source_message_reply_uncertain').result;
+      return suppressResult(identity, uncertain, uncertainReason).result;
     }
   }
 

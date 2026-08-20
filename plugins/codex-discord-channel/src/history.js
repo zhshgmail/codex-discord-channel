@@ -78,6 +78,14 @@ function resolvedReply(message, state, target, fetchedById, botUserId) {
   };
 }
 
+function replySourceMessageId(message, target) {
+  const reference = message.reference;
+  if (!reference?.messageId) return null;
+  const referenceChannelId = String(reference.channelId || message.channelId || '');
+  if (referenceChannelId !== String(target.id || '')) return null;
+  return String(reference.messageId);
+}
+
 function normalizeHistoryMessage(message, state, target, fetchedById, botUserId) {
   let createdAt = '';
   if (message.createdAt instanceof Date) {
@@ -96,6 +104,7 @@ function normalizeHistoryMessage(message, state, target, fetchedById, botUserId)
     authorIsBot: Boolean(message.author?.bot),
     content: boundedString(message.content, MAX_CONTENT_LENGTH),
     attachments: normalizeAttachments(message.attachments),
+    replySourceMessageId: replySourceMessageId(message, target),
     replyTo: resolvedReply(message, state, target, fetchedById, botUserId),
   };
 }

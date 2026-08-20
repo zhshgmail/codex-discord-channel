@@ -122,6 +122,58 @@ test('stable reply confirmation rejects foreign message identity fields without 
   }
 });
 
+test('followup confirmation rejects the wrong parent content or bot author', async () => {
+  const args = {
+    channelId: 'c1', replyTo: 'm1', followup: true, followupKey: 'status-1',
+    content: 'followup', nonce: 'cdf-stable', enforceNonce: true,
+  };
+  const baseline = {
+    id: 'out-followup', channelId: 'c1', content: 'followup',
+    reference: { messageId: 'm1' }, author: { id: 'bot1' },
+  };
+  for (const mutation of [
+    { reference: { messageId: 'wrong-parent' } },
+    { content: 'wrong-content' },
+    { author: { id: 'wrong-bot' } },
+  ]) {
+    const channel = { messages: { async fetch() { return { ...baseline, ...mutation }; } } };
+    const client = { user: { id: 'bot1' }, channels: { async fetch() { return channel; } } };
+    await assert.rejects(
+      confirmDiscordMessage(
+        client,
+        args,
+        { channel },
+        { channelId: 'c1', messageId: 'out-followup' },
+      ),
+      (error) => error.code === 'reply_confirmation_mismatch',
+    );
+  }
+});
+
+test('send response without an id and recent-list failures expose only stable error categories', async () => {
+  const prepared = {
+    channel: {
+      async send() { return { channelId: 'c1' }; },
+      messages: { async fetch() { throw new Error('secret recent-list detail'); } },
+    },
+    payload: { content: 'answer', nonce: 'cdr-stable', enforceNonce: true },
+  };
+  await assert.rejects(
+    sendDiscordMessage({}, { channelId: 'c1', nonce: 'cdr-stable', enforceNonce: true }, prepared),
+    (error) => error.code === 'reply_send_response_invalid'
+      && !error.message.includes('secret recent-list detail'),
+  );
+
+  const client = { user: { id: 'bot1' } };
+  await assert.rejects(
+    reconcileDiscordMessage(client, {
+      channelId: 'c1', replyTo: 'm1', content: 'answer', nonce: 'cdr-stable', enforceNonce: true,
+    }, prepared, {}),
+    (error) => error.code === 'reply_reconciliation_failed'
+      && !error.message.includes('secret recent-list detail'),
+  );
+});
+
 test('reply reconciliation requires nonce source content channel and bot identity', async () => {
   const messages = new Map([
     ['wrong-source', {

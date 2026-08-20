@@ -117,17 +117,27 @@ test('history tool discovery exposes a strict bounded read-only schema', () => {
   });
 });
 
-test('send tool discovery requires an exact source or explicit followup', () => {
+test('send tool discovery requires an exact source and keys explicit followups', () => {
   const tool = toolList().find((item) => item.name === 'discord_channel_send');
 
   assert.deepEqual(tool.inputSchema.required, ['channelId', 'content']);
   assert.deepEqual(tool.inputSchema.anyOf, [
-    { required: ['replyTo'] },
     {
-      required: ['followup'],
+      required: ['replyTo'],
+      not: { required: ['followup'] },
+    },
+    {
+      required: ['replyTo', 'followup', 'followupKey'],
       properties: { followup: { const: true } },
     },
   ]);
+  assert.deepEqual(tool.inputSchema.properties.followupKey, {
+    type: 'string',
+    minLength: 1,
+    maxLength: 128,
+    pattern: '^[A-Za-z0-9._:-]+$',
+    description: 'Stable caller-chosen idempotency key for one explicit followup.',
+  });
 });
 
 test('history tool returns structured authorized history for explicit arguments', async () => {
