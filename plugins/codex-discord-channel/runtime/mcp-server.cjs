@@ -5055,7 +5055,27 @@ ${normalized.content}${attachmentText}
         ...details || {}
       }, writeDeliveryQueue(queue, config, deps);
     }
-    function completedRecord(next, binding = {}, deps = {}) {
+    function boundOutboundSource(record) {
+      return record?.source?.channelId !== record?.channelId || record?.source?.messageId !== record?.messageId || record?.outbound?.channelId !== record?.channelId || record?.outbound?.sourceMessageId !== record?.messageId || typeof record?.delivery?.threadId != "string" || !record.delivery.threadId || typeof record?.delivery?.turnId != "string" || !record.delivery.turnId || typeof record?.delivery?.clientUserMessageId != "string" || !record.delivery.clientUserMessageId ? !1 : ["waiting", "ready", "confirmed"].includes(record.outbound.status);
+    }
+    function sameCompletedTurn(left, right) {
+      return left?.delivery?.threadId === right?.threadId && left?.delivery?.turnId === right?.turnId;
+    }
+    function priorTurnReplyOwner(completed, binding) {
+      return completed.find((record) => boundOutboundSource(record) && sameCompletedTurn(record, binding)) || null;
+    }
+    function suppressedTurnOutbound(record, owner, deps = {}) {
+      return {
+        status: "suppressed",
+        channelId: record.channelId,
+        sourceMessageId: record.messageId,
+        reason: "turn_reply_owned_by_prior_source",
+        ownerChannelId: owner.channelId,
+        ownerSourceMessageId: owner.messageId,
+        suppressedAt: new Date(currentTimeMs(deps)).toISOString()
+      };
+    }
+    function completedRecord(next, binding = {}, deps = {}, completed = []) {
       let record = {
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId,
@@ -5065,14 +5085,18 @@ ${normalized.content}${attachmentText}
         turnId: String(binding.turnId || ""),
         clientUserMessageId: String(binding.clientUserMessageId || "")
       };
-      return !exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId || (record.source = {
+      if (!exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId)
+        return record;
+      record.source = {
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId
-      }, record.delivery = exactBinding, record.outbound = {
+      }, record.delivery = exactBinding;
+      let owner = priorTurnReplyOwner(completed, exactBinding);
+      return record.outbound = owner ? suppressedTurnOutbound(record, owner, deps) : {
         status: "waiting",
         channelId: next.normalized.channelId,
         sourceMessageId: next.normalized.messageId
-      }), record;
+      }, record;
     }
     function completedQueue(queue, next, binding = {}, deps = {}) {
       return {
@@ -5082,7 +5106,7 @@ ${normalized.content}${attachmentText}
         uncertain: queue.uncertain,
         completed: [
           ...queue.completed,
-          completedRecord(next, binding, deps)
+          completedRecord(next, binding, deps, queue.completed)
         ],
         archived: queue.archived,
         blocked: null
@@ -5168,7 +5192,12 @@ ${normalized.content}${attachmentText}
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
             if (receiverRejected) return { receiverRejected, queue };
             if (alreadyAccepted)
-              return queue.uncertain.shift(), queue.completed.push(completedRecord(uncertain, uncertain.delivery, deps)), writeDeliveryQueue(queue, config, deps), { completed: !0, queueDepth: queue.items.length + queue.uncertain.length };
+              return queue.uncertain.shift(), queue.completed.push(completedRecord(
+                uncertain,
+                uncertain.delivery,
+                deps,
+                queue.completed
+              )), writeDeliveryQueue(queue, config, deps), { completed: !0, queueDepth: queue.items.length + queue.uncertain.length };
             let retryAt = timestampMs(uncertain.delivery?.retryAt);
             return queue.uncertain.length > 1 && (queue.uncertain.push(queue.uncertain.shift()), writeDeliveryQueue(queue, config, deps)), { waiting: !0, retryAt, queue };
           });
@@ -5464,10 +5493,23 @@ ${normalized.content}${attachmentText}
       }
     }
     function automaticOutboundRecord(record) {
-      return record?.source?.channelId !== record?.channelId || record?.source?.messageId !== record?.messageId || record?.outbound?.channelId !== record?.channelId || record?.outbound?.sourceMessageId !== record?.messageId || typeof record?.delivery?.threadId != "string" || !record.delivery.threadId || typeof record?.delivery?.turnId != "string" || !record.delivery.turnId || typeof record?.delivery?.clientUserMessageId != "string" || !record.delivery.clientUserMessageId ? !1 : ["waiting", "ready"].includes(record.outbound.status);
+      return boundOutboundSource(record) && ["waiting", "ready"].includes(record.outbound.status);
     }
     function sameCompletedSource(left, right) {
       return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
+    }
+    function suppressPendingTurnFanout(queue, deps = {}) {
+      let owners = /* @__PURE__ */ new Map(), changed = !1;
+      for (let record of queue.completed) {
+        if (!boundOutboundSource(record)) continue;
+        let turnKey = JSON.stringify([record.delivery.threadId, record.delivery.turnId]), owner = owners.get(turnKey);
+        if (!owner) {
+          owners.set(turnKey, record);
+          continue;
+        }
+        ["waiting", "ready"].includes(record.outbound.status) && (record.outbound = suppressedTurnOutbound(record, owner, deps), changed = !0);
+      }
+      return changed;
     }
     function automaticOutboundWorkCount(record) {
       return record?.outbound?.status === "ready" ? Math.max(0, Number(record.outbound.sendAttemptCount) || 0) : Math.max(0, Number(record?.outbound?.checkCount) || 0);
@@ -5488,8 +5530,9 @@ ${normalized.content}${attachmentText}
       let inspection = await withDeliveryQueueLock(config, deps, () => {
         let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
         if (receiverRejected) return { queue, receiverRejected };
-        let record2 = nextAutomaticOutbound(queue);
-        if (!record2) return { queue, record: null };
+        let fanoutSuppressed = suppressPendingTurnFanout(queue, deps), record2 = nextAutomaticOutbound(queue);
+        if (!record2)
+          return fanoutSuppressed && writeDeliveryQueue(queue, config, deps), { queue, record: null };
         let timestamp = new Date(currentTimeMs(deps)).toISOString();
         return record2.outbound.status === "ready" ? (record2.outbound.sendAttemptCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastSendAttemptAt = timestamp) : (record2.outbound.checkCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastCheckedAt = timestamp), writeDeliveryQueue(queue, config, deps), { queue, record: record2 };
       });

@@ -279,6 +279,13 @@ boundary. Requests include a stable Discord client message id and untrusted
 Discord context, but omit model, reasoning effort, service tier, personality,
 sandbox, cwd, and approval overrides.
 
+One top-level turn owns at most one automatic Discord reply. When several
+Discord source envelopes are accepted into the same exact `(threadId, turnId)`,
+the first exact source bound to that turn owns its final response. Later sources
+remain durably completed but their automatic outbound work is suppressed with
+the owning source identity. Sources accepted into separate top-level turns keep
+independent per-source reply rights.
+
 If the trusted local app-server rejects a steer with an exact canonical
 expected-to-current turn mismatch, the gateway rechecks the same connection,
 thread revision, root, and TUI lease before retrying that one logical delivery

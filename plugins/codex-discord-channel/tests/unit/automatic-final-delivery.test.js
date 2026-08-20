@@ -228,6 +228,125 @@ test('waiting outbound recovers final and guarded confirmation without restartin
   assert.equal(completed.outbound.outboundMessageId, 'outbound-1');
 });
 
+test('one aggregated top-level turn arms one source reply instead of fanning one final to sixteen sources', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-one-turn-owner-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let resolveCount = 0;
+  const host = hostForTurn('turn-A');
+  host.resolveTarget = async () => {
+    resolveCount += 1;
+    return resolveCount === 1
+      ? { available: true, threadId: 'thread-A', status: 'idle' }
+      : {
+        available: true,
+        threadId: 'thread-A',
+        status: 'active',
+        activeTurnId: 'turn-A',
+      };
+  };
+  host.readAssistantFinal = async () => ({
+    threadId: 'thread-A', turnId: 'turn-A', itemId: 'final-1', text: 'one answer',
+  });
+  const sends = [];
+  const delivery = createDelivery(configAt(dir), () => {}, {
+    structuredHost: host,
+    async sendAutomaticReply(args) {
+      sends.push(args);
+      return {
+        channelId: args.channelId,
+        messageId: `outbound-${sends.length}`,
+        sourceMessageId: args.replyTo,
+        duplicateSuppressed: false,
+      };
+    },
+  });
+  t.after(() => delivery.destroy());
+
+  for (let index = 1; index <= 16; index += 1) {
+    assert.equal((await delivery.deliver(source(`source-${index}`))).status, 'delivered');
+  }
+  for (let index = 0; index < 40; index += 1) await delivery.flushOutbound();
+
+  assert.deepEqual(sends.map((entry) => entry.replyTo), ['source-1']);
+  const [owner, ...aggregated] = readQueue(dir).completed;
+  assert.equal(owner.outbound.status, 'confirmed');
+  assert.equal(aggregated.length, 15);
+  for (const record of aggregated) {
+    assert.equal(record.outbound.status, 'suppressed');
+    assert.equal(record.outbound.reason, 'turn_reply_owned_by_prior_source');
+    assert.equal(record.outbound.ownerSourceMessageId, 'source-1');
+  }
+});
+
+test('restart suppresses persisted pre-repair ready fanout before any second source POST', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-persisted-fanout-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = configAt(dir);
+  const owner = readyRecord(1);
+  const duplicate = readyRecord(2);
+  duplicate.delivery.threadId = owner.delivery.threadId;
+  duplicate.delivery.turnId = owner.delivery.turnId;
+  writeReadyQueue(dir, [owner, duplicate]);
+  const sends = [];
+  const delivery = createDelivery(config, () => {}, {
+    structuredHost: hostForTurn(),
+    async sendAutomaticReply(args) {
+      sends.push(args);
+      return {
+        channelId: args.channelId,
+        messageId: `outbound-${sends.length}`,
+        sourceMessageId: args.replyTo,
+        duplicateSuppressed: false,
+      };
+    },
+  });
+  t.after(() => delivery.destroy());
+
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_confirmed');
+  for (let index = 0; index < 4; index += 1) await delivery.flushOutbound();
+
+  assert.deepEqual(sends.map((entry) => entry.replyTo), ['source-1']);
+  const [confirmed, suppressed] = readQueue(dir).completed;
+  assert.equal(confirmed.outbound.status, 'confirmed');
+  assert.equal(suppressed.outbound.status, 'suppressed');
+  assert.equal(suppressed.outbound.ownerSourceMessageId, 'source-1');
+});
+
+test('separate top-level turns retain one automatic reply for each source', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-separate-turns-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let turn = 0;
+  const host = hostForTurn();
+  host.startTurn = async () => ({ turn: { id: `turn-${++turn}` } });
+  host.readAssistantFinal = async (_threadId, turnId) => ({
+    threadId: 'thread-A', turnId, itemId: `final-${turnId}`, text: `answer-${turnId}`,
+  });
+  const sends = [];
+  const delivery = createDelivery(configAt(dir), () => {}, {
+    structuredHost: host,
+    async sendAutomaticReply(args) {
+      sends.push(args);
+      return {
+        channelId: args.channelId,
+        messageId: `outbound-${sends.length}`,
+        sourceMessageId: args.replyTo,
+        duplicateSuppressed: false,
+      };
+    },
+  });
+  t.after(() => delivery.destroy());
+
+  assert.equal((await delivery.deliver(source('source-1'))).status, 'delivered');
+  assert.equal((await delivery.deliver(source('source-2'))).status, 'delivered');
+  for (let index = 0; index < 8; index += 1) await delivery.flushOutbound();
+
+  assert.deepEqual(sends.map((entry) => entry.replyTo), ['source-1', 'source-2']);
+  assert.deepEqual(
+    readQueue(dir).completed.map((entry) => entry.outbound.status),
+    ['confirmed', 'confirmed'],
+  );
+});
+
 test('gateway tick checks bounded outbound work even when inbound depth is zero', async () => {
   let scheduled;
   let outboundCalls = 0;
