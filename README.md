@@ -285,9 +285,12 @@ the first exact source durably bound to that turn owns its final response even
 if an earlier uncertain acknowledgement makes it complete later. Later sources
 remain durably completed but their automatic outbound work is suppressed with
 the owning source identity. Restart reconciliation preserves confirmed,
-uncertain, and legacy-sent per-source receipt facts; only a duplicate without a
-receipt may be suppressed. Sources accepted into separate top-level turns keep
-independent per-source reply rights.
+uncertain, in-flight, and legacy-sent per-source receipt facts as a turn-wide
+gate: a confirmed or sent receipt is the already-visible reply, a pending
+receipt is reconciled before any new POST, and an unreadable or wrong-identity
+receipt fails the whole turn closed. The durable owner may POST only after every
+other same-turn source is proven to have no receipt. Sources accepted into
+separate top-level turns keep independent per-source reply rights.
 
 If the trusted local app-server rejects a steer with an exact canonical
 expected-to-current turn mismatch, the gateway rechecks the same connection,

@@ -5935,23 +5935,29 @@ ${normalized.content}${attachmentText}
         confirmedAt: receipt.confirmedAt || receipt.sentAt || receipt.updatedAt || null
       }, !0);
     }
-    function blockUnprovenTurnOwner(record, deps = {}) {
+    function blockTurnOutbound(record, reason, deps = {}) {
       record.outbound = {
         ...record.outbound,
         status: "blocked",
-        reason: "turn_reply_owner_unproven",
+        reason,
         blockedAt: new Date(currentTimeMs(deps)).toISOString()
       };
     }
-    function reconcileTurnOutboundQueue(queue, config = {}, deps = {}) {
+    function completedTurnGroups(queue) {
       let groups = /* @__PURE__ */ new Map();
       for (let record of queue.completed) {
         if (!exactOutboundSource(record)) continue;
         let key = JSON.stringify([record.delivery.threadId, record.delivery.turnId]);
         groups.has(key) || groups.set(key, []), groups.get(key).push(record);
       }
+      return groups;
+    }
+    function confirmedTurnReply(records, observations) {
+      return records.find((record) => observations.get(record).state === "confirmed") || records.find((record) => record.outbound.status === "confirmed" && typeof record.outbound.outboundMessageId == "string" && record.outbound.outboundMessageId) || null;
+    }
+    function reconcileTurnOutboundQueue(queue, config = {}, deps = {}) {
       let changed = !1;
-      for (let records of groups.values()) {
+      for (let records of completedTurnGroups(queue).values()) {
         let binding = records[0].delivery, owners = exactTurnReplyOwners(queue, binding), owner = owners.length === 1 ? owners[0] : null, observations = new Map(records.map((record) => [
           record,
           outboundReceiptObservation(record, config, deps)
@@ -5960,22 +5966,36 @@ ${normalized.content}${attachmentText}
           let observation = observations.get(record);
           observation.state === "confirmed" && (changed = markReceiptConfirmed(record, observation.receipt) || changed);
         }
-        let receiptOwner = records.find((record) => observations.get(record).state !== "absent") || null;
+        if (records.some((record) => observations.get(record).state === "indeterminate")) {
+          for (let record of records)
+            ["waiting", "ready"].includes(record.outbound.status) && (blockTurnOutbound(record, "turn_reply_receipt_indeterminate", deps), changed = !0);
+          continue;
+        }
+        let confirmed = confirmedTurnReply(records, observations);
+        if (confirmed) {
+          for (let record of records)
+            ["waiting", "ready"].includes(record.outbound.status) && (record.outbound = {
+              ...suppressedTurnOutbound(record, confirmed, deps),
+              reason: "turn_reply_receipt_confirmed"
+            }, changed = !0);
+          continue;
+        }
+        let pendingReceipts = records.filter(
+          (record) => observations.get(record).state === "pending"
+        );
+        if (pendingReceipts.length > 0) {
+          for (let record of records)
+            ["waiting", "ready"].includes(record.outbound.status) && observations.get(record).state === "absent" && (owner && sameSourceIdentity(record, owner) || (record.outbound = suppressedTurnOutbound(record, owner || pendingReceipts[0], deps), changed = !0));
+          continue;
+        }
         for (let record of records)
-          if (!(!["waiting", "ready"].includes(record.outbound.status) || observations.get(record).state !== "absent")) {
+          if (["waiting", "ready"].includes(record.outbound.status)) {
             if (owner) {
               if (sameSourceIdentity(record, owner)) continue;
               record.outbound = suppressedTurnOutbound(record, owner, deps), changed = !0;
               continue;
             }
-            if (receiptOwner) {
-              record.outbound = {
-                ...suppressedTurnOutbound(record, receiptOwner, deps),
-                reason: "turn_reply_receipt_preexisting"
-              }, changed = !0;
-              continue;
-            }
-            records.length > 1 && (blockUnprovenTurnOwner(record, deps), changed = !0);
+            records.length > 1 && (blockTurnOutbound(record, "turn_reply_owner_unproven", deps), changed = !0);
           }
       }
       return changed;
@@ -5986,8 +6006,32 @@ ${normalized.content}${attachmentText}
     function automaticOutboundLastWorkAt(record) {
       return record?.outbound?.status === "ready" ? timestampMs(record.outbound.lastSendAttemptAt) : timestampMs(record?.outbound?.lastCheckedAt);
     }
-    function nextAutomaticOutbound(queue) {
-      return queue.completed.filter((record) => automaticOutboundRecord(record)).sort((left, right) => {
+    function nextAutomaticOutbound(queue, config = {}, deps = {}) {
+      let candidates = [];
+      for (let records of completedTurnGroups(queue).values()) {
+        let automatic = records.filter((record) => automaticOutboundRecord(record));
+        if (automatic.length === 0) continue;
+        let observations = new Map(records.map((record) => [
+          record,
+          outboundReceiptObservation(record, config, deps)
+        ]));
+        if (records.some((record) => observations.get(record).state === "indeterminate") || confirmedTurnReply(records, observations)) continue;
+        let pendingReceipts = automatic.filter(
+          (record) => observations.get(record).state === "pending"
+        );
+        if (pendingReceipts.length > 0) {
+          candidates.push(...pendingReceipts);
+          continue;
+        }
+        let owners = exactTurnReplyOwners(queue, records[0].delivery);
+        if (owners.length === 1) {
+          let owner = automatic.find((record) => sameSourceIdentity(record, owners[0]));
+          owner && candidates.push(owner);
+          continue;
+        }
+        records.length === 1 && candidates.push(automatic[0]);
+      }
+      return candidates.sort((left, right) => {
         let countDelta = automaticOutboundWorkCount(left) - automaticOutboundWorkCount(right);
         return countDelta !== 0 ? countDelta : automaticOutboundLastWorkAt(left) - automaticOutboundLastWorkAt(right);
       })[0] || null;
@@ -5999,7 +6043,7 @@ ${normalized.content}${attachmentText}
       let inspection = await withDeliveryQueueLock(config, deps, () => {
         let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
         if (receiverRejected) return { queue, receiverRejected };
-        let fanoutReconciled = reconcileTurnOutboundQueue(queue, config, deps), record2 = nextAutomaticOutbound(queue);
+        let fanoutReconciled = reconcileTurnOutboundQueue(queue, config, deps), record2 = nextAutomaticOutbound(queue, config, deps);
         if (!record2)
           return fanoutReconciled && writeDeliveryQueue(queue, config, deps), { queue, record: null };
         let timestamp = new Date(currentTimeMs(deps)).toISOString();
@@ -6070,7 +6114,7 @@ ${normalized.content}${attachmentText}
           status: "confirmed",
           outboundMessageId: sent.messageId,
           confirmedAt: new Date(currentTimeMs(deps)).toISOString()
-        }, writeDeliveryQueue(queue, config, deps), { confirmed: !0, queue });
+        }, reconcileTurnOutboundQueue(queue, config, deps), writeDeliveryQueue(queue, config, deps), { confirmed: !0, queue });
       });
       return confirmed.receiverRejected ? receiverRejectedResult(confirmed.queue, confirmed.receiverRejected) : confirmed.confirmed ? {
         status: "delivered",

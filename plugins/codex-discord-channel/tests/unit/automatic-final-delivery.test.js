@@ -137,6 +137,7 @@ function writeReplyReceipt(dir, record, {
   version = 2,
   status,
   outboundMessageId = null,
+  overrides = {},
 } = {}) {
   const config = configAt(dir);
   const receipt = {
@@ -151,6 +152,7 @@ function writeReplyReceipt(dir, record, {
     updatedAt: '2026-08-13T00:00:03.000Z',
     pid: process.pid,
     ...(outboundMessageId ? { outboundMessageId } : {}),
+    ...overrides,
   };
   const file = receiptPath(config, record.channelId, record.messageId);
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -411,36 +413,20 @@ test('restart suppresses persisted pre-repair ready fanout before any second sou
   assert.equal(suppressed.outbound.ownerSourceMessageId, 'source-1');
 });
 
-test('restart preserves confirmed uncertain and legacy-sent receipt truth and suppresses only no-receipt duplicates', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-receipt-aware-migration-'));
+test('restart treats a same-turn confirmed duplicate receipt as the one visible reply', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-confirmed-duplicate-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const owner = bindTurnOwner(readyRecord(1));
   const confirmed = readyRecord(2);
-  const uncertain = readyRecord(3);
-  const sent = readyRecord(4);
-  const noReceipt = readyRecord(5);
-  for (const record of [confirmed, uncertain, sent, noReceipt]) {
-    record.delivery.threadId = owner.delivery.threadId;
-    record.delivery.turnId = owner.delivery.turnId;
-  }
-  writeReadyQueue(dir, [owner, confirmed, uncertain, sent, noReceipt]);
+  confirmed.delivery.threadId = owner.delivery.threadId;
+  confirmed.delivery.turnId = owner.delivery.turnId;
+  writeReadyQueue(dir, [owner, confirmed]);
   writeReplyReceipt(dir, confirmed, {
     status: 'confirmed',
     outboundMessageId: 'discord-confirmed-2',
   });
-  writeReplyReceipt(dir, uncertain, {
-    status: 'uncertain',
-    outboundMessageId: 'discord-uncertain-3',
-  });
-  writeReplyReceipt(dir, sent, {
-    version: 1,
-    status: 'sent',
-    outboundMessageId: 'discord-sent-4',
-  });
-  const receiptBytesBefore = new Map([confirmed, uncertain, sent].map((record) => {
-    const file = receiptPath(configAt(dir), record.channelId, record.messageId);
-    return [record.messageId, fs.readFileSync(file)];
-  }));
+  const receiptFile = receiptPath(configAt(dir), confirmed.channelId, confirmed.messageId);
+  const receiptBytesBefore = fs.readFileSync(receiptFile);
   const sends = [];
   const delivery = createDelivery(configAt(dir), () => {}, {
     structuredHost: hostForTurn(),
@@ -456,10 +442,10 @@ test('restart preserves confirmed uncertain and legacy-sent receipt truth and su
   });
   t.after(() => delivery.destroy());
 
-  await delivery.flushOutbound();
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_empty');
 
   const records = new Map(readQueue(dir).completed.map((record) => [record.messageId, record]));
-  assert.equal(records.get('source-1').outbound.status, 'confirmed');
+  assert.equal(records.get('source-1').outbound.status, 'suppressed');
   assert.deepEqual({
     status: records.get('source-2').outbound.status,
     outboundMessageId: records.get('source-2').outbound.outboundMessageId,
@@ -467,43 +453,44 @@ test('restart preserves confirmed uncertain and legacy-sent receipt truth and su
     status: 'confirmed',
     outboundMessageId: 'discord-confirmed-2',
   });
-  assert.equal(records.get('source-3').outbound.status, 'ready');
+  assert.deepEqual(sends, []);
+  assert.deepEqual(fs.readFileSync(receiptFile), receiptBytesBefore);
+});
+
+test('restart preserves a legacy sent duplicate id and never POSTs the owner', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-legacy-sent-duplicate-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const owner = bindTurnOwner(readyRecord(1));
+  const sent = readyRecord(2);
+  sent.delivery.threadId = owner.delivery.threadId;
+  sent.delivery.turnId = owner.delivery.turnId;
+  writeReadyQueue(dir, [owner, sent]);
+  writeReplyReceipt(dir, sent, {
+    version: 1,
+    status: 'sent',
+    outboundMessageId: 'discord-sent-2',
+  });
+  const receiptFile = receiptPath(configAt(dir), sent.channelId, sent.messageId);
+  const receiptBytesBefore = fs.readFileSync(receiptFile);
+  let posts = 0;
+  const delivery = createDelivery(configAt(dir), () => {}, {
+    structuredHost: hostForTurn(),
+    async sendAutomaticReply() { posts += 1; },
+  });
+  t.after(() => delivery.destroy());
+
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_empty');
+  assert.equal(posts, 0);
+  const records = new Map(readQueue(dir).completed.map((record) => [record.messageId, record]));
+  assert.equal(records.get('source-1').outbound.status, 'suppressed');
   assert.deepEqual({
-    status: records.get('source-4').outbound.status,
-    outboundMessageId: records.get('source-4').outbound.outboundMessageId,
+    status: records.get('source-2').outbound.status,
+    outboundMessageId: records.get('source-2').outbound.outboundMessageId,
   }, {
     status: 'confirmed',
-    outboundMessageId: 'discord-sent-4',
+    outboundMessageId: 'discord-sent-2',
   });
-  assert.deepEqual({
-    status: records.get('source-5').outbound.status,
-    reason: records.get('source-5').outbound.reason,
-  }, {
-    status: 'suppressed',
-    reason: 'turn_reply_owned_by_prior_source',
-  });
-  assert.deepEqual(sends.map((entry) => entry.replyTo), ['source-1']);
-
-  const confirmedReceipt = JSON.parse(fs.readFileSync(
-    receiptPath(configAt(dir), confirmed.channelId, confirmed.messageId),
-    'utf8',
-  ));
-  const uncertainReceipt = JSON.parse(fs.readFileSync(
-    receiptPath(configAt(dir), uncertain.channelId, uncertain.messageId),
-    'utf8',
-  ));
-  const sentReceipt = JSON.parse(fs.readFileSync(
-    receiptPath(configAt(dir), sent.channelId, sent.messageId),
-    'utf8',
-  ));
-  assert.equal(confirmedReceipt.status, 'confirmed');
-  assert.equal(uncertainReceipt.status, 'uncertain');
-  assert.equal(sentReceipt.status, 'sent');
-  for (const record of [confirmed, uncertain, sent]) {
-    const file = receiptPath(configAt(dir), record.channelId, record.messageId);
-    assert.deepEqual(fs.readFileSync(file), receiptBytesBefore.get(record.messageId));
-  }
-  assert.equal(fs.existsSync(receiptPath(configAt(dir), noReceipt.channelId, noReceipt.messageId)), false);
+  assert.deepEqual(fs.readFileSync(receiptFile), receiptBytesBefore);
 });
 
 test('restart reconciles an uncertain receipt without a second POST before suppressing a no-receipt duplicate', async (t) => {
@@ -518,10 +505,6 @@ test('restart reconciles an uncertain receipt without a second POST before suppr
     record.delivery.turnId = owner.delivery.turnId;
   }
   writeReadyQueue(dir, [owner, uncertain, noReceipt]);
-  writeReplyReceipt(dir, owner, {
-    status: 'confirmed',
-    outboundMessageId: 'discord-confirmed-1',
-  });
   writeReplyReceipt(dir, uncertain, {
     status: 'uncertain',
     outboundMessageId: 'discord-uncertain-2',
@@ -556,7 +539,7 @@ test('restart reconciles an uncertain receipt without a second POST before suppr
   assert.equal(posts, 0);
   assert.equal(reconciliations, 1);
   const records = new Map(readQueue(dir).completed.map((record) => [record.messageId, record]));
-  assert.equal(records.get('source-1').outbound.status, 'confirmed');
+  assert.equal(records.get('source-1').outbound.status, 'suppressed');
   assert.equal(records.get('source-2').outbound.status, 'confirmed');
   assert.equal(records.get('source-3').outbound.status, 'suppressed');
   const receipt = JSON.parse(fs.readFileSync(
@@ -565,6 +548,105 @@ test('restart reconciles an uncertain receipt without a second POST before suppr
   ));
   assert.equal(receipt.status, 'confirmed');
   assert.equal(receipt.outboundMessageId, 'discord-uncertain-2');
+});
+
+test('restart waits on a live same-turn in-flight duplicate receipt without POSTing the owner', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-live-in-flight-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const owner = bindTurnOwner(readyRecord(1));
+  const inFlight = readyRecord(2);
+  inFlight.delivery.threadId = owner.delivery.threadId;
+  inFlight.delivery.turnId = owner.delivery.turnId;
+  writeReadyQueue(dir, [owner, inFlight]);
+  writeReplyReceipt(dir, inFlight, {
+    status: 'in_flight',
+    overrides: { updatedAt: new Date().toISOString(), pid: process.pid },
+  });
+  let posts = 0;
+  const automaticSender = createAutomaticReplySender(configAt(dir), {}, {
+    async prepareDiscordMessageSend() { return { prepared: true }; },
+    async sendDiscordMessage() {
+      posts += 1;
+      return { channelId: 'channel-1', messageId: 'unexpected-post' };
+    },
+    async confirmDiscordMessage() {
+      throw new Error('live in-flight receipt must not enter confirmation');
+    },
+    async reconcileDiscordMessage() {
+      throw new Error('live in-flight receipt must not be reclaimed');
+    },
+    isProcessAlive(pid) { return pid === process.pid; },
+  });
+  const delivery = createDelivery(configAt(dir), () => {}, {
+    structuredHost: hostForTurn(),
+    sendAutomaticReply: automaticSender,
+  });
+  t.after(() => delivery.destroy());
+
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_reply_unconfirmed');
+  assert.equal(posts, 0);
+  const records = new Map(readQueue(dir).completed.map((record) => [record.messageId, record]));
+  assert.equal(records.get('source-1').outbound.status, 'ready');
+  assert.equal(records.get('source-2').outbound.status, 'ready');
+});
+
+test('restart fails the whole turn closed on an unreadable duplicate receipt', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-unreadable-receipt-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const owner = bindTurnOwner(readyRecord(1));
+  const unreadable = readyRecord(2);
+  unreadable.delivery.threadId = owner.delivery.threadId;
+  unreadable.delivery.turnId = owner.delivery.turnId;
+  writeReadyQueue(dir, [owner, unreadable]);
+  const file = receiptPath(configAt(dir), unreadable.channelId, unreadable.messageId);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '{not-json\n');
+  let posts = 0;
+  const delivery = createDelivery(configAt(dir), () => {}, {
+    structuredHost: hostForTurn(),
+    async sendAutomaticReply() { posts += 1; },
+  });
+  t.after(() => delivery.destroy());
+
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_empty');
+  assert.equal(posts, 0);
+  assert.deepEqual(readQueue(dir).completed.map((record) => ({
+    status: record.outbound.status,
+    reason: record.outbound.reason,
+  })), [
+    { status: 'blocked', reason: 'turn_reply_receipt_indeterminate' },
+    { status: 'blocked', reason: 'turn_reply_receipt_indeterminate' },
+  ]);
+});
+
+test('restart fails the whole turn closed on a wrong-identity duplicate receipt', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-wrong-receipt-identity-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const owner = bindTurnOwner(readyRecord(1));
+  const wrongIdentity = readyRecord(2);
+  wrongIdentity.delivery.threadId = owner.delivery.threadId;
+  wrongIdentity.delivery.turnId = owner.delivery.turnId;
+  writeReadyQueue(dir, [owner, wrongIdentity]);
+  writeReplyReceipt(dir, wrongIdentity, {
+    status: 'uncertain',
+    overrides: { channelId: 'wrong-channel' },
+  });
+  let posts = 0;
+  const delivery = createDelivery(configAt(dir), () => {}, {
+    structuredHost: hostForTurn(),
+    async sendAutomaticReply() { posts += 1; },
+  });
+  t.after(() => delivery.destroy());
+
+  assert.equal((await delivery.flushOutbound()).reason, 'outbound_empty');
+  assert.equal(posts, 0);
+  assert.deepEqual(readQueue(dir).completed.map((record) => ({
+    status: record.outbound.status,
+    reason: record.outbound.reason,
+  })), [
+    { status: 'blocked', reason: 'turn_reply_receipt_indeterminate' },
+    { status: 'blocked', reason: 'turn_reply_receipt_indeterminate' },
+  ]);
 });
 
 test('restart without durable turn owner fails closed instead of choosing completed order', async (t) => {
