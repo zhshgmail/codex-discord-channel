@@ -60,9 +60,12 @@ Unknown active-turn identity remains `thread_busy`. Turn payloads omit model,
 reasoning effort, service tier, personality, cwd, sandbox, and approval
 overrides; Discord metadata is carried only in the sanitized text envelope.
 One top-level turn owns at most one automatic Discord reply. If multiple exact
-Discord sources enter the same `(threadId, turnId)`, the first bound source owns
-the final and later source records are durably marked suppressed with that
-owner identity. Separate turns retain separate per-source reply rights.
+Discord sources enter the same `(threadId, turnId)`, the first durably bound
+source owns the final even when acknowledgement uncertainty reorders completion.
+Later source records are durably marked suppressed with that owner identity.
+Restart reconciliation never rewrites a confirmed, uncertain, or legacy-sent
+per-source receipt as suppressed; suppression applies only to a no-receipt
+duplicate. Separate turns retain separate per-source reply rights.
 Every positive acknowledgement is read back from the exact thread by the
 echoed client user message id before completion. A response without a persisted
 user item remains `structured_ack_uncertain`, so the gateway does not report a

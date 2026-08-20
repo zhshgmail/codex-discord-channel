@@ -281,9 +281,12 @@ sandbox, cwd, and approval overrides.
 
 One top-level turn owns at most one automatic Discord reply. When several
 Discord source envelopes are accepted into the same exact `(threadId, turnId)`,
-the first exact source bound to that turn owns its final response. Later sources
+the first exact source durably bound to that turn owns its final response even
+if an earlier uncertain acknowledgement makes it complete later. Later sources
 remain durably completed but their automatic outbound work is suppressed with
-the owning source identity. Sources accepted into separate top-level turns keep
+the owning source identity. Restart reconciliation preserves confirmed,
+uncertain, and legacy-sent per-source receipt facts; only a duplicate without a
+receipt may be suppressed. Sources accepted into separate top-level turns keep
 independent per-source reply rights.
 
 If the trusted local app-server rejects a steer with an exact canonical

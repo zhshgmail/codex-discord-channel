@@ -3,6 +3,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createAppServerHost } = require('./app-server-host');
+const {
+  contentDigest,
+  readReceipt,
+  receiptPath,
+  replyNonce,
+} = require('./reply-delivery');
 const { isProcessAlive } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
@@ -564,7 +570,7 @@ function setQueueBlock(queue, reason, details, config, deps) {
   writeDeliveryQueue(queue, config, deps);
 }
 
-function boundOutboundSource(record) {
+function exactOutboundSource(record) {
   if (
     record?.source?.channelId !== record?.channelId ||
     record?.source?.messageId !== record?.messageId ||
@@ -576,7 +582,7 @@ function boundOutboundSource(record) {
   ) {
     return false;
   }
-  return ['waiting', 'ready', 'confirmed'].includes(record.outbound.status);
+  return true;
 }
 
 function sameCompletedTurn(left, right) {
@@ -584,25 +590,56 @@ function sameCompletedTurn(left, right) {
     left?.delivery?.turnId === right?.turnId;
 }
 
-function priorTurnReplyOwner(completed, binding) {
-  return completed.find((record) => (
-    boundOutboundSource(record) && sameCompletedTurn(record, binding)
-  )) || null;
+function sameSourceIdentity(left, right) {
+  const leftIdentity = left?.normalized || left;
+  const rightIdentity = right?.normalized || right;
+  return leftIdentity?.channelId === rightIdentity?.channelId &&
+    leftIdentity?.messageId === rightIdentity?.messageId;
+}
+
+function exactTurnReplyOwners(queue, binding) {
+  return [...queue.uncertain, ...queue.completed].filter((record) => (
+    record?.delivery?.turnReplyOwner === true && sameCompletedTurn(record, binding)
+  ));
+}
+
+function bindDurableTurnReplyOwner(queue, record, binding, deps = {}) {
+  if (
+    typeof binding?.threadId !== 'string' || !binding.threadId ||
+    typeof binding?.turnId !== 'string' || !binding.turnId
+  ) {
+    return binding;
+  }
+  const owners = exactTurnReplyOwners(queue, binding);
+  const ownsReply = binding.turnReplyOwner === true || (
+    owners.length === 0 && binding.turnReplyOwner !== false
+  );
+  const owner = owners.length === 1 ? owners[0] : null;
+  return {
+    ...binding,
+    turnReplyOwner: ownsReply || Boolean(owner && sameSourceIdentity(owner, record)),
+    turnReplyBoundAt: binding.turnReplyBoundAt || (
+      ownsReply
+        ? new Date(currentTimeMs(deps)).toISOString()
+        : (owner?.delivery?.turnReplyBoundAt || null)
+    ),
+  };
 }
 
 function suppressedTurnOutbound(record, owner, deps = {}) {
+  const ownerIdentity = owner?.normalized || owner;
   return {
     status: 'suppressed',
     channelId: record.channelId,
     sourceMessageId: record.messageId,
     reason: 'turn_reply_owned_by_prior_source',
-    ownerChannelId: owner.channelId,
-    ownerSourceMessageId: owner.messageId,
+    ownerChannelId: ownerIdentity.channelId,
+    ownerSourceMessageId: ownerIdentity.messageId,
     suppressedAt: new Date(currentTimeMs(deps)).toISOString(),
   };
 }
 
-function completedRecord(next, binding = {}, deps = {}, completed = []) {
+function completedRecord(next, binding = {}, deps = {}) {
   const record = {
     channelId: next.normalized.channelId,
     messageId: next.normalized.messageId,
@@ -612,6 +649,10 @@ function completedRecord(next, binding = {}, deps = {}, completed = []) {
     threadId: String(binding.threadId || ''),
     turnId: String(binding.turnId || ''),
     clientUserMessageId: String(binding.clientUserMessageId || ''),
+    turnReplyOwner: binding.turnReplyOwner === true,
+    turnReplyBoundAt: typeof binding.turnReplyBoundAt === 'string'
+      ? binding.turnReplyBoundAt
+      : null,
   };
   if (!exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId) {
     return record;
@@ -621,30 +662,30 @@ function completedRecord(next, binding = {}, deps = {}, completed = []) {
     messageId: next.normalized.messageId,
   };
   record.delivery = exactBinding;
-  const owner = priorTurnReplyOwner(completed, exactBinding);
-  record.outbound = owner
-    ? suppressedTurnOutbound(record, owner, deps)
-    : {
-      status: 'waiting',
-      channelId: next.normalized.channelId,
-      sourceMessageId: next.normalized.messageId,
-    };
+  record.outbound = {
+    status: 'waiting',
+    channelId: next.normalized.channelId,
+    sourceMessageId: next.normalized.messageId,
+  };
   return record;
 }
 
-function completedQueue(queue, next, binding = {}, deps = {}) {
-  return {
+function completedQueue(queue, next, binding = {}, config = {}, deps = {}) {
+  const durableBinding = bindDurableTurnReplyOwner(queue, next, binding, deps);
+  const updated = {
     version: DELIVERY_QUEUE_VERSION,
     activation: queue.activation,
     items: queue.items.slice(1),
     uncertain: queue.uncertain,
     completed: [
       ...queue.completed,
-      completedRecord(next, binding, deps, queue.completed),
+      completedRecord(next, durableBinding, deps),
     ],
     archived: queue.archived,
     blocked: null,
   };
+  reconcileTurnOutboundQueue(updated, config, deps);
+  return updated;
 }
 
 function uncertainRetryDelayMs(config, attemptCount) {
@@ -664,7 +705,7 @@ function moveQueueHeadToUncertain(queue, config, deps, details = {}) {
   const item = queue.items.shift();
   const attempts = Math.max(0, Number(item.delivery?.attempts) || 0) + 1;
   const deferredAtMs = currentTimeMs(deps);
-  item.delivery = {
+  item.delivery = bindDurableTurnReplyOwner(queue, item, {
     state: DELIVERY_ACK_UNCERTAIN,
     attempts,
     firstDeferredAt: item.delivery?.firstDeferredAt || new Date(deferredAtMs).toISOString(),
@@ -678,7 +719,9 @@ function moveQueueHeadToUncertain(queue, config, deps, details = {}) {
       item.delivery?.clientUserMessageId || '',
     turnId: details.turnId || item.delivery?.turnId || '',
     error: details.error || item.delivery?.error || '',
-  };
+    turnReplyOwner: item.delivery?.turnReplyOwner,
+    turnReplyBoundAt: item.delivery?.turnReplyBoundAt,
+  }, deps);
   queue.uncertain.push(item);
   queue.blocked = null;
   return item;
@@ -759,13 +802,13 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
         if (alreadyAccepted) {
-          queue.uncertain.shift();
+          const accepted = queue.uncertain.shift();
           queue.completed.push(completedRecord(
-            uncertain,
-            uncertain.delivery,
+            accepted,
+            bindDurableTurnReplyOwner(queue, accepted, accepted.delivery, deps),
             deps,
-            queue.completed,
           ));
+          reconcileTurnOutboundQueue(queue, config, deps);
           writeDeliveryQueue(queue, config, deps);
           return { completed: true, queueDepth: queue.items.length + queue.uncertain.length };
         }
@@ -838,7 +881,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
         }
         const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
         if (receiverRejected) return { receiverRejected, queue };
-        const updated = completedQueue(queue, next, snapshot.blocked, deps);
+        const updated = completedQueue(queue, next, snapshot.blocked, config, deps);
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: pendingQueueDepth(updated) };
       });
@@ -1125,7 +1168,7 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
           threadId: target.threadId,
           turnId,
           clientUserMessageId: params.clientUserMessageId,
-        }, deps);
+        }, config, deps);
         writeDeliveryQueue(updated, config, deps);
         return { queueDepth: updated.items.length + updated.uncertain.length };
       });
@@ -1178,27 +1221,118 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
 }
 
 function automaticOutboundRecord(record) {
-  return boundOutboundSource(record) && ['waiting', 'ready'].includes(record.outbound.status);
+  return exactOutboundSource(record) && ['waiting', 'ready'].includes(record.outbound.status);
 }
 
 function sameCompletedSource(left, right) {
   return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
 }
 
-function suppressPendingTurnFanout(queue, deps = {}) {
-  const owners = new Map();
-  let changed = false;
+function outboundReceiptObservation(record, config, deps = {}) {
+  const fsImpl = deps.fs || fs;
+  let file;
+  try {
+    file = receiptPath(config, record.channelId, record.messageId);
+  } catch {
+    return { state: 'indeterminate', receipt: null };
+  }
+  if (!fsImpl.existsSync(file)) return { state: 'absent', receipt: null };
+  const receipt = readReceipt(file, fsImpl);
+  if (
+    !receipt ||
+    receipt.channelId !== record.channelId ||
+    receipt.sourceMessageId !== record.messageId ||
+    (receipt.version === 2 && receipt.nonce !== replyNonce(record.channelId, record.messageId))
+  ) {
+    return { state: 'indeterminate', receipt };
+  }
+  const confirmed = (
+    receipt.status === 'confirmed' ||
+    (receipt.version === 1 && receipt.status === 'sent')
+  ) && typeof receipt.outboundMessageId === 'string' && receipt.outboundMessageId;
+  if (confirmed) return { state: 'confirmed', receipt };
+  if (
+    typeof record.outbound.text === 'string' &&
+    receipt.contentSha256 !== contentDigest(record.outbound.text)
+  ) {
+    return { state: 'indeterminate', receipt };
+  }
+  return { state: 'pending', receipt };
+}
+
+function markReceiptConfirmed(record, receipt) {
+  if (
+    record.outbound.status === 'confirmed' &&
+    record.outbound.outboundMessageId === receipt.outboundMessageId
+  ) {
+    return false;
+  }
+  record.outbound = {
+    ...record.outbound,
+    status: 'confirmed',
+    outboundMessageId: receipt.outboundMessageId,
+    confirmedAt: receipt.confirmedAt || receipt.sentAt || receipt.updatedAt || null,
+  };
+  return true;
+}
+
+function blockUnprovenTurnOwner(record, deps = {}) {
+  record.outbound = {
+    ...record.outbound,
+    status: 'blocked',
+    reason: 'turn_reply_owner_unproven',
+    blockedAt: new Date(currentTimeMs(deps)).toISOString(),
+  };
+}
+
+function reconcileTurnOutboundQueue(queue, config = {}, deps = {}) {
+  const groups = new Map();
   for (const record of queue.completed) {
-    if (!boundOutboundSource(record)) continue;
-    const turnKey = JSON.stringify([record.delivery.threadId, record.delivery.turnId]);
-    const owner = owners.get(turnKey);
-    if (!owner) {
-      owners.set(turnKey, record);
-      continue;
+    if (!exactOutboundSource(record)) continue;
+    const key = JSON.stringify([record.delivery.threadId, record.delivery.turnId]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(record);
+  }
+  let changed = false;
+
+  for (const records of groups.values()) {
+    const binding = records[0].delivery;
+    const owners = exactTurnReplyOwners(queue, binding);
+    const owner = owners.length === 1 ? owners[0] : null;
+    const observations = new Map(records.map((record) => [
+      record,
+      outboundReceiptObservation(record, config, deps),
+    ]));
+    for (const record of records) {
+      const observation = observations.get(record);
+      if (observation.state === 'confirmed') {
+        changed = markReceiptConfirmed(record, observation.receipt) || changed;
+      }
     }
-    if (!['waiting', 'ready'].includes(record.outbound.status)) continue;
-    record.outbound = suppressedTurnOutbound(record, owner, deps);
-    changed = true;
+    const receiptOwner = records.find((record) => observations.get(record).state !== 'absent') || null;
+    for (const record of records) {
+      if (!['waiting', 'ready'].includes(record.outbound.status)) continue;
+      const observation = observations.get(record);
+      if (observation.state !== 'absent') continue;
+      if (owner) {
+        if (sameSourceIdentity(record, owner)) continue;
+        record.outbound = suppressedTurnOutbound(record, owner, deps);
+        changed = true;
+        continue;
+      }
+      if (receiptOwner) {
+        record.outbound = {
+          ...suppressedTurnOutbound(record, receiptOwner, deps),
+          reason: 'turn_reply_receipt_preexisting',
+        };
+        changed = true;
+        continue;
+      }
+      if (records.length > 1) {
+        blockUnprovenTurnOwner(record, deps);
+        changed = true;
+      }
+    }
   }
   return changed;
 }
@@ -1245,10 +1379,10 @@ async function flushAutomaticOutbound(config, logger, deps, host, options = {}) 
     const queue = readDeliveryQueue(config, deps);
     const receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
     if (receiverRejected) return { queue, receiverRejected };
-    const fanoutSuppressed = suppressPendingTurnFanout(queue, deps);
+    const fanoutReconciled = reconcileTurnOutboundQueue(queue, config, deps);
     const record = nextAutomaticOutbound(queue);
     if (!record) {
-      if (fanoutSuppressed) writeDeliveryQueue(queue, config, deps);
+      if (fanoutReconciled) writeDeliveryQueue(queue, config, deps);
       return { queue, record: null };
     }
     const timestamp = new Date(currentTimeMs(deps)).toISOString();

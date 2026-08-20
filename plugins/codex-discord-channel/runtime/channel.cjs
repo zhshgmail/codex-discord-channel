@@ -4561,6 +4561,402 @@ var require_app_server_host = __commonJS({
   }
 });
 
+// src/reply-delivery.js
+var require_reply_delivery = __commonJS({
+  "src/reply-delivery.js"(exports2, module2) {
+    "use strict";
+    var { createHash, randomUUID } = require("node:crypto"), fs = require("node:fs"), path = require("node:path"), RECEIPT_VERSION = 2, DEFAULT_LOCK_TIMEOUT_MS = 6e4, DEFAULT_LOCK_RETRY_MS = 20, DEFAULT_LOCK_STALE_MS = 45e3, DEFAULT_LOCK_LIVE_LEASE_MS = 55e3, DEFAULT_IN_FLIGHT_LEASE_MS = 6e4, DEFAULT_NONCE_REPLAY_WINDOW_MS = 6e4;
+    function nowMs(deps = {}) {
+      return Number(typeof deps.now == "function" ? deps.now() : Date.now());
+    }
+    function nowIso(deps = {}) {
+      return new Date(nowMs(deps)).toISOString();
+    }
+    function currentPid(deps = {}) {
+      return Number(deps.pid) || process.pid;
+    }
+    function contentDigest(content) {
+      return createHash("sha256").update(String(content), "utf8").digest("hex");
+    }
+    function replyNonce(channelId, sourceMessageId) {
+      return `cdr-${createHash("sha256").update(`discord-reply\0${channelId}\0${sourceMessageId}`, "utf8").digest("hex").slice(0, 21)}`;
+    }
+    function receiptPath(config, channelId, sourceMessageId) {
+      let dir = config.paths?.replyReceiptDir || path.join(config.paths?.stateDir || "", "reply-receipts");
+      if (!dir) throw new Error("Discord reply receipt directory is not configured.");
+      let key = createHash("sha256").update(`${channelId}\0${sourceMessageId}`, "utf8").digest("hex");
+      return path.join(dir, `${key}.json`);
+    }
+    function receiptIdentityMatches(config, file, receipt, identity, nonce) {
+      if (receipt?.version !== RECEIPT_VERSION || receipt.channelId !== identity.channelId || receipt.sourceMessageId !== identity.sourceMessageId || receipt.nonce !== nonce) return !1;
+      try {
+        return path.resolve(receiptPath(config, receipt.channelId, receipt.sourceMessageId)) === path.resolve(file);
+      } catch {
+        return !1;
+      }
+    }
+    function readReceipt(file, fsImpl = fs) {
+      try {
+        let parsed = JSON.parse(fsImpl.readFileSync(file, "utf8")), validV1 = parsed?.version === 1 && typeof parsed.status == "string", validV2 = parsed?.version === RECEIPT_VERSION && ["in_flight", "uncertain", "confirmed"].includes(parsed.status);
+        return !validV1 && !validV2 ? null : parsed;
+      } catch (error) {
+        return error?.code === "ENOENT", null;
+      }
+    }
+    function fsyncDirectory(dir, fsImpl = fs) {
+      let fd = fsImpl.openSync(dir, "r");
+      try {
+        fsImpl.fsyncSync(fd);
+      } finally {
+        fsImpl.closeSync(fd);
+      }
+    }
+    function writeReceipt(file, receipt, deps = {}) {
+      let fsImpl = deps.fs || fs;
+      fsImpl.mkdirSync(path.dirname(file), { recursive: !0, mode: 448 });
+      let temp = `${file}.${currentPid(deps)}.${Date.now()}.tmp`, fd;
+      try {
+        fsImpl.writeFileSync(temp, `${JSON.stringify(receipt, null, 2)}
+`, { mode: 384 }), fd = fsImpl.openSync(temp, "r"), fsImpl.fsyncSync(fd), fsImpl.closeSync(fd), fd = void 0, fsImpl.renameSync(temp, file), fsyncDirectory(path.dirname(file), fsImpl);
+      } finally {
+        fd !== void 0 && fsImpl.closeSync(fd);
+        try {
+          fsImpl.rmSync(temp, { force: !0 });
+        } catch {
+        }
+      }
+    }
+    function isProcessAlive(pid) {
+      if (!Number.isInteger(pid) || pid <= 0) return !1;
+      try {
+        return process.kill(pid, 0), !0;
+      } catch (error) {
+        return error?.code === "EPERM";
+      }
+    }
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+    }
+    function lockOwner(lockPath, fsImpl) {
+      try {
+        let parsed = JSON.parse(fsImpl.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
+        return parsed && typeof parsed == "object" ? parsed : null;
+      } catch {
+        return null;
+      }
+    }
+    function removeLock(lockPath, fsImpl) {
+      fsImpl.rmSync(lockPath, { recursive: !0, force: !0 });
+    }
+    function reclaimStaleLock(lockPath, config, deps, fsImpl) {
+      let ageMs;
+      try {
+        ageMs = nowMs(deps) - fsImpl.statSync(lockPath).mtimeMs;
+      } catch (error) {
+        if (error?.code === "ENOENT") return !0;
+        throw error;
+      }
+      let staleMs = Number(config.replyReceiptLockStaleMs) || DEFAULT_LOCK_STALE_MS;
+      if (ageMs < staleMs) return !1;
+      let owner = lockOwner(lockPath, fsImpl), ownerAlive = (deps.isProcessAlive || isProcessAlive)(Number(owner?.pid) || 0), liveLeaseMs = Number(config.replyReceiptLockLiveLeaseMs) || DEFAULT_LOCK_LIVE_LEASE_MS;
+      if (ownerAlive && ageMs < liveLeaseMs) return !1;
+      let stalePath = `${lockPath}.stale.${currentPid(deps)}.${Date.now()}`;
+      try {
+        fsImpl.renameSync(lockPath, stalePath);
+      } catch (error) {
+        return error?.code === "ENOENT";
+      }
+      return removeLock(stalePath, fsImpl), !0;
+    }
+    async function acquireReceiptLock(file, config, deps = {}) {
+      let fsImpl = deps.fs || fs, lockPath = `${file}.lock`, timeoutMs = Number(config.replyReceiptLockTimeoutMs) || DEFAULT_LOCK_TIMEOUT_MS, retryMs = Number(config.replyReceiptLockRetryMs) || DEFAULT_LOCK_RETRY_MS, startedAt = nowMs(deps), token = `${currentPid(deps)}-${startedAt}-${Math.random().toString(16).slice(2)}`;
+      for (fsImpl.mkdirSync(path.dirname(lockPath), { recursive: !0, mode: 448 }); ; )
+        try {
+          fsImpl.mkdirSync(lockPath, { mode: 448 });
+          try {
+            fsImpl.writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({
+              pid: currentPid(deps),
+              token,
+              acquiredAt: nowIso(deps)
+            })}
+`, { mode: 384 });
+          } catch (error) {
+            throw removeLock(lockPath, fsImpl), error;
+          }
+          return () => {
+            try {
+              lockOwner(lockPath, fsImpl)?.token === token && removeLock(lockPath, fsImpl);
+            } catch {
+            }
+          };
+        } catch (error) {
+          if (error?.code !== "EEXIST") throw error;
+          if (reclaimStaleLock(lockPath, config, deps, fsImpl)) continue;
+          if (nowMs(deps) - startedAt >= timeoutMs)
+            throw new Error("Timed out waiting for Discord reply receipt lock.");
+          await (deps.sleep || sleep)(retryMs);
+        }
+    }
+    async function withReceiptLock(file, config, deps, operation) {
+      let release = await acquireReceiptLock(file, config, deps);
+      try {
+        return await operation();
+      } finally {
+        release();
+      }
+    }
+    function operationId(deps = {}) {
+      return typeof deps.randomUUID == "function" ? deps.randomUUID() : randomUUID();
+    }
+    function receiptStatusIsConfirmed(receipt) {
+      return receipt?.status === "confirmed" || receipt?.version === 1 && receipt?.status === "sent";
+    }
+    function receiptHasPermanentNonceMismatch(receipt) {
+      return receipt?.status === "uncertain" && receipt?.errorCode === "reply_send_response_nonce_mismatch" && typeof receipt?.outboundMessageId == "string" && receipt.outboundMessageId !== "";
+    }
+    function receiptLeaseIsLive(receipt, config, deps = {}) {
+      let timestamp = Date.parse(receipt?.updatedAt || receipt?.claimedAt || ""), ageMs = Number.isFinite(timestamp) ? Math.max(0, nowMs(deps) - timestamp) : 1 / 0, leaseMs = Number(config.replyReceiptInFlightLeaseMs) || DEFAULT_IN_FLIGHT_LEASE_MS;
+      return ageMs < leaseMs && (deps.isProcessAlive || isProcessAlive)(Number(receipt?.pid) || 0);
+    }
+    function suppressResult(identity, receipt, reason) {
+      return {
+        mode: "suppress",
+        result: {
+          channelId: identity.channelId,
+          messageId: receipt?.outboundMessageId || null,
+          sourceMessageId: identity.sourceMessageId,
+          duplicateSuppressed: !0,
+          reason,
+          receiptStatus: receipt?.status || "unreadable"
+        }
+      };
+    }
+    async function beginReply(config, identity, content, deps = {}) {
+      let file = receiptPath(config, identity.channelId, identity.sourceMessageId), digest = contentDigest(content), nonce = replyNonce(identity.channelId, identity.sourceMessageId);
+      return withReceiptLock(file, config, deps, async () => {
+        let fsImpl = deps.fs || fs, existing = readReceipt(file, fsImpl);
+        if (!existing && fsImpl.existsSync(file))
+          return suppressResult(identity, null, "source_message_reply_receipt_unreadable");
+        if (existing?.version === 1)
+          return suppressResult(identity, existing, "source_message_reply_legacy_uncertain");
+        if (existing && !receiptIdentityMatches(config, file, existing, identity, nonce))
+          return suppressResult(identity, existing, "source_message_reply_receipt_identity_mismatch");
+        if (receiptStatusIsConfirmed(existing))
+          return suppressResult(identity, existing, "source_message_already_replied");
+        if (existing && existing.contentSha256 !== digest)
+          return suppressResult(identity, existing, "source_message_reply_content_mismatch");
+        if (receiptHasPermanentNonceMismatch(existing))
+          return suppressResult(identity, existing, "source_message_reply_nonce_mismatch");
+        if (existing?.status === "in_flight" && receiptLeaseIsLive(existing, config, deps))
+          return suppressResult(identity, existing, "source_message_reply_in_progress");
+        let id = operationId(deps), timestamp = nowIso(deps);
+        if (existing) {
+          let receipt2 = {
+            ...existing,
+            version: RECEIPT_VERSION,
+            status: "in_flight",
+            nonce: existing.nonce || nonce,
+            operationId: id,
+            pid: currentPid(deps),
+            updatedAt: timestamp,
+            reconciliationStartedAt: timestamp
+          };
+          return writeReceipt(file, receipt2, deps), { mode: "reconcile", file, receipt: receipt2 };
+        }
+        let receipt = {
+          version: RECEIPT_VERSION,
+          status: "in_flight",
+          channelId: identity.channelId,
+          sourceMessageId: identity.sourceMessageId,
+          contentSha256: digest,
+          nonce,
+          operationId: id,
+          claimedAt: timestamp,
+          updatedAt: timestamp,
+          pid: currentPid(deps)
+        };
+        return writeReceipt(file, receipt, deps), { mode: "send", file, receipt };
+      });
+    }
+    async function transitionReply(config, state, deps, update) {
+      return withReceiptLock(state.file, config, deps, async () => {
+        let current = readReceipt(state.file, deps.fs || fs);
+        if (!current || current.operationId !== state.receipt.operationId || current.channelId !== state.receipt.channelId || current.sourceMessageId !== state.receipt.sourceMessageId || current.nonce !== state.receipt.nonce) return current;
+        let next = update(current);
+        return next === null ? ((deps.fs || fs).rmSync(state.file, { force: !0 }), fsyncDirectory(path.dirname(state.file), deps.fs || fs), null) : (writeReceipt(state.file, next, deps), next);
+      });
+    }
+    async function releaseReplyClaim(config, state, deps = {}) {
+      return transitionReply(config, state, deps, () => null);
+    }
+    async function completeReply(config, state, sent, deps = {}) {
+      let channelId = String(sent?.channelId || ""), messageId = String(sent?.messageId || "");
+      if (channelId !== state.receipt.channelId || !messageId) {
+        let error = new Error("Discord reply confirmation did not match the claimed source identity.");
+        throw error.code = "reply_confirmation_mismatch", error;
+      }
+      let completed = await transitionReply(config, state, deps, (current) => ({
+        ...current,
+        status: "confirmed",
+        outboundMessageId: messageId,
+        confirmedAt: nowIso(deps),
+        updatedAt: nowIso(deps)
+      }));
+      if (completed?.status !== "confirmed" || completed.channelId !== state.receipt.channelId || completed.sourceMessageId !== state.receipt.sourceMessageId || completed.nonce !== state.receipt.nonce || completed.outboundMessageId !== messageId) {
+        let error = new Error("Discord reply receipt changed before confirmation.");
+        throw error.code = "reply_receipt_changed", error;
+      }
+      return completed;
+    }
+    async function markReplyUncertain(config, state, error, deps = {}, sent = null) {
+      return transitionReply(config, state, deps, (current) => ({
+        ...current,
+        status: "uncertain",
+        outboundMessageId: sent?.messageId || current.outboundMessageId,
+        sentAt: sent?.messageId ? nowIso(deps) : current.sentAt,
+        uncertainAt: nowIso(deps),
+        updatedAt: nowIso(deps),
+        errorCode: typeof error?.code == "string" ? error.code : null
+      }));
+    }
+    function replyDispatch(args, config) {
+      let channelId = typeof args.channelId == "string" ? args.channelId.trim() : "", replyTo = typeof args.replyTo == "string" ? args.replyTo.trim() : "";
+      if (args.followup === !0) {
+        if (!channelId) throw new Error("channelId is required for an explicit Discord followup.");
+        return {
+          target: { channelId, replyTo, usedLastInbound: !1 },
+          sourceMessageId: "",
+          guarded: !1
+        };
+      }
+      if (!channelId || !replyTo)
+        throw new Error("channelId and replyTo are required for a guarded Discord reply.");
+      return {
+        target: { channelId, replyTo, usedLastInbound: !1 },
+        sourceMessageId: replyTo,
+        guarded: !0
+      };
+    }
+    function replayWindowOpen(receipt, config, deps = {}) {
+      if (receipt?.outboundMessageId) return !1;
+      let claimedAt = Date.parse(receipt?.claimedAt || "");
+      if (!Number.isFinite(claimedAt)) return !1;
+      let windowMs = Number(config.replyReceiptNonceReplayWindowMs) || DEFAULT_NONCE_REPLAY_WINDOW_MS;
+      return nowMs(deps) - claimedAt <= windowMs;
+    }
+    async function sendAndConfirm({
+      config,
+      state,
+      target,
+      prepared,
+      sender,
+      confirmer,
+      deps
+    }) {
+      try {
+        let sent = await sender(target, prepared, {
+          nonce: state.receipt.nonce,
+          enforceNonce: !0
+        });
+        await markReplyUncertain(config, state, null, deps, sent);
+        let confirmed = await confirmer(target, prepared, sent, state.receipt);
+        return await completeReply(config, state, confirmed, deps), {
+          ...confirmed,
+          sourceMessageId: state.receipt.sourceMessageId,
+          duplicateSuppressed: !1
+        };
+      } catch (error) {
+        throw error?.definitiveNoSend === !0 ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps, error?.replySendIdentity), error;
+      }
+    }
+    async function sendDiscordReplyOnce2({
+      args = {},
+      config,
+      content,
+      preflight,
+      sender,
+      confirmer,
+      reconciler,
+      deps = {}
+    }) {
+      let dispatch = replyDispatch(args, config);
+      if (!dispatch.guarded) {
+        let prepared2 = typeof preflight == "function" ? await preflight(dispatch.target, {}) : void 0;
+        return { ...await sender(dispatch.target, prepared2, {}), duplicateSuppressed: !1, sourceMessageId: null };
+      }
+      let identity = {
+        channelId: dispatch.target.channelId,
+        sourceMessageId: dispatch.sourceMessageId
+      }, state = await beginReply(config, identity, content, deps);
+      if (state.mode === "suppress") return state.result;
+      if (state.mode === "send" && typeof confirmer != "function") {
+        await releaseReplyClaim(config, state, deps);
+        let error = new Error("Guarded Discord replies require exact readback confirmation.");
+        throw error.code = "reply_confirmation_required", error;
+      }
+      let sendIdentity = {
+        nonce: state.receipt.nonce,
+        enforceNonce: !0
+      }, prepared;
+      try {
+        prepared = typeof preflight == "function" ? await preflight(dispatch.target, sendIdentity) : void 0;
+      } catch (error) {
+        throw state.mode === "send" ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps), error;
+      }
+      if (state.mode === "reconcile") {
+        if (typeof reconciler != "function") {
+          let uncertain = await markReplyUncertain(config, state, null, deps);
+          return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
+        }
+        let reconciliation;
+        try {
+          reconciliation = await reconciler(dispatch.target, prepared, state.receipt);
+        } catch (error) {
+          throw await markReplyUncertain(config, state, error, deps), error;
+        }
+        if (reconciliation?.found === !0 && reconciliation.messageId)
+          return await completeReply(config, state, reconciliation, deps), {
+            channelId: reconciliation.channelId || identity.channelId,
+            messageId: reconciliation.messageId,
+            sourceMessageId: identity.sourceMessageId,
+            duplicateSuppressed: !1,
+            reconciled: !0
+          };
+        if (!replayWindowOpen(state.receipt, config, deps)) {
+          let uncertain = await markReplyUncertain(config, state, null, deps);
+          return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
+        }
+        if (typeof confirmer != "function") {
+          let uncertain = await markReplyUncertain(config, state, null, deps);
+          return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
+        }
+      }
+      return sendAndConfirm({
+        config,
+        state,
+        target: dispatch.target,
+        prepared,
+        sender,
+        confirmer,
+        deps
+      });
+    }
+    module2.exports = {
+      acquireReceiptLock,
+      beginReply,
+      completeReply,
+      contentDigest,
+      markReplyUncertain,
+      readReceipt,
+      receiptPath,
+      releaseReplyClaim,
+      replyDispatch,
+      replyNonce,
+      sendDiscordReplyOnce: sendDiscordReplyOnce2
+    };
+  }
+});
+
 // src/receiver-state.js
 var require_receiver_state = __commonJS({
   "src/receiver-state.js"(exports2, module2) {
@@ -4796,7 +5192,12 @@ var require_receiver_state = __commonJS({
 var require_delivery = __commonJS({
   "src/delivery.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), { createAppServerHost } = require_app_server_host(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 4, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", STALE_DELIVERY_ACTIVATION = "stale_delivery_activation", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_BASE_MS = 5e3, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
+    var fs = require("node:fs"), path = require("node:path"), { createAppServerHost } = require_app_server_host(), {
+      contentDigest,
+      readReceipt,
+      receiptPath,
+      replyNonce
+    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 4, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", STALE_DELIVERY_ACTIVATION = "stale_delivery_activation", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_BASE_MS = 5e3, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
     function currentTimeMs(deps = {}) {
       let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
       return Number.isFinite(value) ? value : Date.now();
@@ -5175,27 +5576,42 @@ ${normalized.content}${attachmentText}
         ...details || {}
       }, writeDeliveryQueue(queue, config, deps);
     }
-    function boundOutboundSource(record) {
-      return record?.source?.channelId !== record?.channelId || record?.source?.messageId !== record?.messageId || record?.outbound?.channelId !== record?.channelId || record?.outbound?.sourceMessageId !== record?.messageId || typeof record?.delivery?.threadId != "string" || !record.delivery.threadId || typeof record?.delivery?.turnId != "string" || !record.delivery.turnId || typeof record?.delivery?.clientUserMessageId != "string" || !record.delivery.clientUserMessageId ? !1 : ["waiting", "ready", "confirmed"].includes(record.outbound.status);
+    function exactOutboundSource(record) {
+      return !(record?.source?.channelId !== record?.channelId || record?.source?.messageId !== record?.messageId || record?.outbound?.channelId !== record?.channelId || record?.outbound?.sourceMessageId !== record?.messageId || typeof record?.delivery?.threadId != "string" || !record.delivery.threadId || typeof record?.delivery?.turnId != "string" || !record.delivery.turnId || typeof record?.delivery?.clientUserMessageId != "string" || !record.delivery.clientUserMessageId);
     }
     function sameCompletedTurn(left, right) {
       return left?.delivery?.threadId === right?.threadId && left?.delivery?.turnId === right?.turnId;
     }
-    function priorTurnReplyOwner(completed, binding) {
-      return completed.find((record) => boundOutboundSource(record) && sameCompletedTurn(record, binding)) || null;
+    function sameSourceIdentity(left, right) {
+      let leftIdentity = left?.normalized || left, rightIdentity = right?.normalized || right;
+      return leftIdentity?.channelId === rightIdentity?.channelId && leftIdentity?.messageId === rightIdentity?.messageId;
+    }
+    function exactTurnReplyOwners(queue, binding) {
+      return [...queue.uncertain, ...queue.completed].filter((record) => record?.delivery?.turnReplyOwner === !0 && sameCompletedTurn(record, binding));
+    }
+    function bindDurableTurnReplyOwner(queue, record, binding, deps = {}) {
+      if (typeof binding?.threadId != "string" || !binding.threadId || typeof binding?.turnId != "string" || !binding.turnId)
+        return binding;
+      let owners = exactTurnReplyOwners(queue, binding), ownsReply = binding.turnReplyOwner === !0 || owners.length === 0 && binding.turnReplyOwner !== !1, owner = owners.length === 1 ? owners[0] : null;
+      return {
+        ...binding,
+        turnReplyOwner: ownsReply || !!(owner && sameSourceIdentity(owner, record)),
+        turnReplyBoundAt: binding.turnReplyBoundAt || (ownsReply ? new Date(currentTimeMs(deps)).toISOString() : owner?.delivery?.turnReplyBoundAt || null)
+      };
     }
     function suppressedTurnOutbound(record, owner, deps = {}) {
+      let ownerIdentity = owner?.normalized || owner;
       return {
         status: "suppressed",
         channelId: record.channelId,
         sourceMessageId: record.messageId,
         reason: "turn_reply_owned_by_prior_source",
-        ownerChannelId: owner.channelId,
-        ownerSourceMessageId: owner.messageId,
+        ownerChannelId: ownerIdentity.channelId,
+        ownerSourceMessageId: ownerIdentity.messageId,
         suppressedAt: new Date(currentTimeMs(deps)).toISOString()
       };
     }
-    function completedRecord(next, binding = {}, deps = {}, completed = []) {
+    function completedRecord(next, binding = {}, deps = {}) {
       let record = {
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId,
@@ -5203,34 +5619,33 @@ ${normalized.content}${attachmentText}
       }, exactBinding = {
         threadId: String(binding.threadId || ""),
         turnId: String(binding.turnId || ""),
-        clientUserMessageId: String(binding.clientUserMessageId || "")
+        clientUserMessageId: String(binding.clientUserMessageId || ""),
+        turnReplyOwner: binding.turnReplyOwner === !0,
+        turnReplyBoundAt: typeof binding.turnReplyBoundAt == "string" ? binding.turnReplyBoundAt : null
       };
-      if (!exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId)
-        return record;
-      record.source = {
+      return !exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId || (record.source = {
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId
-      }, record.delivery = exactBinding;
-      let owner = priorTurnReplyOwner(completed, exactBinding);
-      return record.outbound = owner ? suppressedTurnOutbound(record, owner, deps) : {
+      }, record.delivery = exactBinding, record.outbound = {
         status: "waiting",
         channelId: next.normalized.channelId,
         sourceMessageId: next.normalized.messageId
-      }, record;
+      }), record;
     }
-    function completedQueue(queue, next, binding = {}, deps = {}) {
-      return {
+    function completedQueue(queue, next, binding = {}, config = {}, deps = {}) {
+      let durableBinding = bindDurableTurnReplyOwner(queue, next, binding, deps), updated = {
         version: DELIVERY_QUEUE_VERSION,
         activation: queue.activation,
         items: queue.items.slice(1),
         uncertain: queue.uncertain,
         completed: [
           ...queue.completed,
-          completedRecord(next, binding, deps, queue.completed)
+          completedRecord(next, durableBinding, deps)
         ],
         archived: queue.archived,
         blocked: null
       };
+      return reconcileTurnOutboundQueue(updated, config, deps), updated;
     }
     function uncertainRetryDelayMs(config, attemptCount) {
       let base = Math.max(
@@ -5244,7 +5659,7 @@ ${normalized.content}${attachmentText}
     }
     function moveQueueHeadToUncertain(queue, config, deps, details = {}) {
       let item = queue.items.shift(), attempts = Math.max(0, Number(item.delivery?.attempts) || 0) + 1, deferredAtMs = currentTimeMs(deps);
-      return item.delivery = {
+      return item.delivery = bindDurableTurnReplyOwner(queue, item, {
         state: DELIVERY_ACK_UNCERTAIN,
         attempts,
         firstDeferredAt: item.delivery?.firstDeferredAt || new Date(deferredAtMs).toISOString(),
@@ -5256,8 +5671,10 @@ ${normalized.content}${attachmentText}
         threadId: details.threadId || item.delivery?.threadId || "",
         clientUserMessageId: details.clientUserMessageId || item.delivery?.clientUserMessageId || "",
         turnId: details.turnId || item.delivery?.turnId || "",
-        error: details.error || item.delivery?.error || ""
-      }, queue.uncertain.push(item), queue.blocked = null, item;
+        error: details.error || item.delivery?.error || "",
+        turnReplyOwner: item.delivery?.turnReplyOwner,
+        turnReplyBoundAt: item.delivery?.turnReplyBoundAt
+      }, deps), queue.uncertain.push(item), queue.blocked = null, item;
     }
     async function deferCurrentHead(config, deps, expected, details = {}, verifyReceiverOwnership = null) {
       return withDeliveryQueueLock(config, deps, () => {
@@ -5311,13 +5728,14 @@ ${normalized.content}${attachmentText}
               return { retry: !0 };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
             if (receiverRejected) return { receiverRejected, queue };
-            if (alreadyAccepted)
-              return queue.uncertain.shift(), queue.completed.push(completedRecord(
-                uncertain,
-                uncertain.delivery,
-                deps,
-                queue.completed
-              )), writeDeliveryQueue(queue, config, deps), { completed: !0, queueDepth: queue.items.length + queue.uncertain.length };
+            if (alreadyAccepted) {
+              let accepted = queue.uncertain.shift();
+              return queue.completed.push(completedRecord(
+                accepted,
+                bindDurableTurnReplyOwner(queue, accepted, accepted.delivery, deps),
+                deps
+              )), reconcileTurnOutboundQueue(queue, config, deps), writeDeliveryQueue(queue, config, deps), { completed: !0, queueDepth: queue.items.length + queue.uncertain.length };
+            }
             let retryAt = timestampMs(uncertain.delivery?.retryAt);
             return queue.uncertain.length > 1 && (queue.uncertain.push(queue.uncertain.shift()), writeDeliveryQueue(queue, config, deps)), { waiting: !0, retryAt, queue };
           });
@@ -5365,7 +5783,7 @@ ${normalized.content}${attachmentText}
               return { retry: !0 };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
             if (receiverRejected) return { receiverRejected, queue };
-            let updated = completedQueue(queue, next, snapshot.blocked, deps);
+            let updated = completedQueue(queue, next, snapshot.blocked, config, deps);
             return writeDeliveryQueue(updated, config, deps), { queueDepth: pendingQueueDepth(updated) };
           });
           if (reconciled.retry) continue;
@@ -5572,7 +5990,7 @@ ${normalized.content}${attachmentText}
               threadId: target.threadId,
               turnId,
               clientUserMessageId: params.clientUserMessageId
-            }, deps);
+            }, config, deps);
             return writeDeliveryQueue(updated, config, deps), { queueDepth: updated.items.length + updated.uncertain.length };
           });
           return activeDeliveryAttempts.delete(attemptId), committed.receiverRejected ? receiverRejectedResult(committed.queue, committed.receiverRejected) : committed.uncertain ? {
@@ -5613,21 +6031,72 @@ ${normalized.content}${attachmentText}
       }
     }
     function automaticOutboundRecord(record) {
-      return boundOutboundSource(record) && ["waiting", "ready"].includes(record.outbound.status);
+      return exactOutboundSource(record) && ["waiting", "ready"].includes(record.outbound.status);
     }
     function sameCompletedSource(left, right) {
       return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
     }
-    function suppressPendingTurnFanout(queue, deps = {}) {
-      let owners = /* @__PURE__ */ new Map(), changed = !1;
+    function outboundReceiptObservation(record, config, deps = {}) {
+      let fsImpl = deps.fs || fs, file;
+      try {
+        file = receiptPath(config, record.channelId, record.messageId);
+      } catch {
+        return { state: "indeterminate", receipt: null };
+      }
+      if (!fsImpl.existsSync(file)) return { state: "absent", receipt: null };
+      let receipt = readReceipt(file, fsImpl);
+      return !receipt || receipt.channelId !== record.channelId || receipt.sourceMessageId !== record.messageId || receipt.version === 2 && receipt.nonce !== replyNonce(record.channelId, record.messageId) ? { state: "indeterminate", receipt } : (receipt.status === "confirmed" || receipt.version === 1 && receipt.status === "sent") && typeof receipt.outboundMessageId == "string" && receipt.outboundMessageId ? { state: "confirmed", receipt } : typeof record.outbound.text == "string" && receipt.contentSha256 !== contentDigest(record.outbound.text) ? { state: "indeterminate", receipt } : { state: "pending", receipt };
+    }
+    function markReceiptConfirmed(record, receipt) {
+      return record.outbound.status === "confirmed" && record.outbound.outboundMessageId === receipt.outboundMessageId ? !1 : (record.outbound = {
+        ...record.outbound,
+        status: "confirmed",
+        outboundMessageId: receipt.outboundMessageId,
+        confirmedAt: receipt.confirmedAt || receipt.sentAt || receipt.updatedAt || null
+      }, !0);
+    }
+    function blockUnprovenTurnOwner(record, deps = {}) {
+      record.outbound = {
+        ...record.outbound,
+        status: "blocked",
+        reason: "turn_reply_owner_unproven",
+        blockedAt: new Date(currentTimeMs(deps)).toISOString()
+      };
+    }
+    function reconcileTurnOutboundQueue(queue, config = {}, deps = {}) {
+      let groups = /* @__PURE__ */ new Map();
       for (let record of queue.completed) {
-        if (!boundOutboundSource(record)) continue;
-        let turnKey = JSON.stringify([record.delivery.threadId, record.delivery.turnId]), owner = owners.get(turnKey);
-        if (!owner) {
-          owners.set(turnKey, record);
-          continue;
+        if (!exactOutboundSource(record)) continue;
+        let key = JSON.stringify([record.delivery.threadId, record.delivery.turnId]);
+        groups.has(key) || groups.set(key, []), groups.get(key).push(record);
+      }
+      let changed = !1;
+      for (let records of groups.values()) {
+        let binding = records[0].delivery, owners = exactTurnReplyOwners(queue, binding), owner = owners.length === 1 ? owners[0] : null, observations = new Map(records.map((record) => [
+          record,
+          outboundReceiptObservation(record, config, deps)
+        ]));
+        for (let record of records) {
+          let observation = observations.get(record);
+          observation.state === "confirmed" && (changed = markReceiptConfirmed(record, observation.receipt) || changed);
         }
-        ["waiting", "ready"].includes(record.outbound.status) && (record.outbound = suppressedTurnOutbound(record, owner, deps), changed = !0);
+        let receiptOwner = records.find((record) => observations.get(record).state !== "absent") || null;
+        for (let record of records)
+          if (!(!["waiting", "ready"].includes(record.outbound.status) || observations.get(record).state !== "absent")) {
+            if (owner) {
+              if (sameSourceIdentity(record, owner)) continue;
+              record.outbound = suppressedTurnOutbound(record, owner, deps), changed = !0;
+              continue;
+            }
+            if (receiptOwner) {
+              record.outbound = {
+                ...suppressedTurnOutbound(record, receiptOwner, deps),
+                reason: "turn_reply_receipt_preexisting"
+              }, changed = !0;
+              continue;
+            }
+            records.length > 1 && (blockUnprovenTurnOwner(record, deps), changed = !0);
+          }
       }
       return changed;
     }
@@ -5650,9 +6119,9 @@ ${normalized.content}${attachmentText}
       let inspection = await withDeliveryQueueLock(config, deps, () => {
         let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
         if (receiverRejected) return { queue, receiverRejected };
-        let fanoutSuppressed = suppressPendingTurnFanout(queue, deps), record2 = nextAutomaticOutbound(queue);
+        let fanoutReconciled = reconcileTurnOutboundQueue(queue, config, deps), record2 = nextAutomaticOutbound(queue);
         if (!record2)
-          return fanoutSuppressed && writeDeliveryQueue(queue, config, deps), { queue, record: null };
+          return fanoutReconciled && writeDeliveryQueue(queue, config, deps), { queue, record: null };
         let timestamp = new Date(currentTimeMs(deps)).toISOString();
         return record2.outbound.status === "ready" ? (record2.outbound.sendAttemptCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastSendAttemptAt = timestamp) : (record2.outbound.checkCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastCheckedAt = timestamp), writeDeliveryQueue(queue, config, deps), { queue, record: record2 };
       });
@@ -94787,402 +95256,6 @@ var require_gateway_health = __commonJS({
     module2.exports = {
       readGatewayHealthStatus,
       writeGatewayHealth: writeGatewayHealth2
-    };
-  }
-});
-
-// src/reply-delivery.js
-var require_reply_delivery = __commonJS({
-  "src/reply-delivery.js"(exports2, module2) {
-    "use strict";
-    var { createHash, randomUUID } = require("node:crypto"), fs = require("node:fs"), path = require("node:path"), RECEIPT_VERSION = 2, DEFAULT_LOCK_TIMEOUT_MS = 6e4, DEFAULT_LOCK_RETRY_MS = 20, DEFAULT_LOCK_STALE_MS = 45e3, DEFAULT_LOCK_LIVE_LEASE_MS = 55e3, DEFAULT_IN_FLIGHT_LEASE_MS = 6e4, DEFAULT_NONCE_REPLAY_WINDOW_MS = 6e4;
-    function nowMs(deps = {}) {
-      return Number(typeof deps.now == "function" ? deps.now() : Date.now());
-    }
-    function nowIso(deps = {}) {
-      return new Date(nowMs(deps)).toISOString();
-    }
-    function currentPid(deps = {}) {
-      return Number(deps.pid) || process.pid;
-    }
-    function contentDigest(content) {
-      return createHash("sha256").update(String(content), "utf8").digest("hex");
-    }
-    function replyNonce(channelId, sourceMessageId) {
-      return `cdr-${createHash("sha256").update(`discord-reply\0${channelId}\0${sourceMessageId}`, "utf8").digest("hex").slice(0, 21)}`;
-    }
-    function receiptPath(config, channelId, sourceMessageId) {
-      let dir = config.paths?.replyReceiptDir || path.join(config.paths?.stateDir || "", "reply-receipts");
-      if (!dir) throw new Error("Discord reply receipt directory is not configured.");
-      let key = createHash("sha256").update(`${channelId}\0${sourceMessageId}`, "utf8").digest("hex");
-      return path.join(dir, `${key}.json`);
-    }
-    function receiptIdentityMatches(config, file, receipt, identity, nonce) {
-      if (receipt?.version !== RECEIPT_VERSION || receipt.channelId !== identity.channelId || receipt.sourceMessageId !== identity.sourceMessageId || receipt.nonce !== nonce) return !1;
-      try {
-        return path.resolve(receiptPath(config, receipt.channelId, receipt.sourceMessageId)) === path.resolve(file);
-      } catch {
-        return !1;
-      }
-    }
-    function readReceipt(file, fsImpl = fs) {
-      try {
-        let parsed = JSON.parse(fsImpl.readFileSync(file, "utf8")), validV1 = parsed?.version === 1 && typeof parsed.status == "string", validV2 = parsed?.version === RECEIPT_VERSION && ["in_flight", "uncertain", "confirmed"].includes(parsed.status);
-        return !validV1 && !validV2 ? null : parsed;
-      } catch (error) {
-        return error?.code === "ENOENT", null;
-      }
-    }
-    function fsyncDirectory(dir, fsImpl = fs) {
-      let fd = fsImpl.openSync(dir, "r");
-      try {
-        fsImpl.fsyncSync(fd);
-      } finally {
-        fsImpl.closeSync(fd);
-      }
-    }
-    function writeReceipt(file, receipt, deps = {}) {
-      let fsImpl = deps.fs || fs;
-      fsImpl.mkdirSync(path.dirname(file), { recursive: !0, mode: 448 });
-      let temp = `${file}.${currentPid(deps)}.${Date.now()}.tmp`, fd;
-      try {
-        fsImpl.writeFileSync(temp, `${JSON.stringify(receipt, null, 2)}
-`, { mode: 384 }), fd = fsImpl.openSync(temp, "r"), fsImpl.fsyncSync(fd), fsImpl.closeSync(fd), fd = void 0, fsImpl.renameSync(temp, file), fsyncDirectory(path.dirname(file), fsImpl);
-      } finally {
-        fd !== void 0 && fsImpl.closeSync(fd);
-        try {
-          fsImpl.rmSync(temp, { force: !0 });
-        } catch {
-        }
-      }
-    }
-    function isProcessAlive(pid) {
-      if (!Number.isInteger(pid) || pid <= 0) return !1;
-      try {
-        return process.kill(pid, 0), !0;
-      } catch (error) {
-        return error?.code === "EPERM";
-      }
-    }
-    function sleep(ms) {
-      return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
-    }
-    function lockOwner(lockPath, fsImpl) {
-      try {
-        let parsed = JSON.parse(fsImpl.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
-        return parsed && typeof parsed == "object" ? parsed : null;
-      } catch {
-        return null;
-      }
-    }
-    function removeLock(lockPath, fsImpl) {
-      fsImpl.rmSync(lockPath, { recursive: !0, force: !0 });
-    }
-    function reclaimStaleLock(lockPath, config, deps, fsImpl) {
-      let ageMs;
-      try {
-        ageMs = nowMs(deps) - fsImpl.statSync(lockPath).mtimeMs;
-      } catch (error) {
-        if (error?.code === "ENOENT") return !0;
-        throw error;
-      }
-      let staleMs = Number(config.replyReceiptLockStaleMs) || DEFAULT_LOCK_STALE_MS;
-      if (ageMs < staleMs) return !1;
-      let owner = lockOwner(lockPath, fsImpl), ownerAlive = (deps.isProcessAlive || isProcessAlive)(Number(owner?.pid) || 0), liveLeaseMs = Number(config.replyReceiptLockLiveLeaseMs) || DEFAULT_LOCK_LIVE_LEASE_MS;
-      if (ownerAlive && ageMs < liveLeaseMs) return !1;
-      let stalePath = `${lockPath}.stale.${currentPid(deps)}.${Date.now()}`;
-      try {
-        fsImpl.renameSync(lockPath, stalePath);
-      } catch (error) {
-        return error?.code === "ENOENT";
-      }
-      return removeLock(stalePath, fsImpl), !0;
-    }
-    async function acquireReceiptLock(file, config, deps = {}) {
-      let fsImpl = deps.fs || fs, lockPath = `${file}.lock`, timeoutMs = Number(config.replyReceiptLockTimeoutMs) || DEFAULT_LOCK_TIMEOUT_MS, retryMs = Number(config.replyReceiptLockRetryMs) || DEFAULT_LOCK_RETRY_MS, startedAt = nowMs(deps), token = `${currentPid(deps)}-${startedAt}-${Math.random().toString(16).slice(2)}`;
-      for (fsImpl.mkdirSync(path.dirname(lockPath), { recursive: !0, mode: 448 }); ; )
-        try {
-          fsImpl.mkdirSync(lockPath, { mode: 448 });
-          try {
-            fsImpl.writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({
-              pid: currentPid(deps),
-              token,
-              acquiredAt: nowIso(deps)
-            })}
-`, { mode: 384 });
-          } catch (error) {
-            throw removeLock(lockPath, fsImpl), error;
-          }
-          return () => {
-            try {
-              lockOwner(lockPath, fsImpl)?.token === token && removeLock(lockPath, fsImpl);
-            } catch {
-            }
-          };
-        } catch (error) {
-          if (error?.code !== "EEXIST") throw error;
-          if (reclaimStaleLock(lockPath, config, deps, fsImpl)) continue;
-          if (nowMs(deps) - startedAt >= timeoutMs)
-            throw new Error("Timed out waiting for Discord reply receipt lock.");
-          await (deps.sleep || sleep)(retryMs);
-        }
-    }
-    async function withReceiptLock(file, config, deps, operation) {
-      let release = await acquireReceiptLock(file, config, deps);
-      try {
-        return await operation();
-      } finally {
-        release();
-      }
-    }
-    function operationId(deps = {}) {
-      return typeof deps.randomUUID == "function" ? deps.randomUUID() : randomUUID();
-    }
-    function receiptStatusIsConfirmed(receipt) {
-      return receipt?.status === "confirmed" || receipt?.version === 1 && receipt?.status === "sent";
-    }
-    function receiptHasPermanentNonceMismatch(receipt) {
-      return receipt?.status === "uncertain" && receipt?.errorCode === "reply_send_response_nonce_mismatch" && typeof receipt?.outboundMessageId == "string" && receipt.outboundMessageId !== "";
-    }
-    function receiptLeaseIsLive(receipt, config, deps = {}) {
-      let timestamp = Date.parse(receipt?.updatedAt || receipt?.claimedAt || ""), ageMs = Number.isFinite(timestamp) ? Math.max(0, nowMs(deps) - timestamp) : 1 / 0, leaseMs = Number(config.replyReceiptInFlightLeaseMs) || DEFAULT_IN_FLIGHT_LEASE_MS;
-      return ageMs < leaseMs && (deps.isProcessAlive || isProcessAlive)(Number(receipt?.pid) || 0);
-    }
-    function suppressResult(identity, receipt, reason) {
-      return {
-        mode: "suppress",
-        result: {
-          channelId: identity.channelId,
-          messageId: receipt?.outboundMessageId || null,
-          sourceMessageId: identity.sourceMessageId,
-          duplicateSuppressed: !0,
-          reason,
-          receiptStatus: receipt?.status || "unreadable"
-        }
-      };
-    }
-    async function beginReply(config, identity, content, deps = {}) {
-      let file = receiptPath(config, identity.channelId, identity.sourceMessageId), digest = contentDigest(content), nonce = replyNonce(identity.channelId, identity.sourceMessageId);
-      return withReceiptLock(file, config, deps, async () => {
-        let fsImpl = deps.fs || fs, existing = readReceipt(file, fsImpl);
-        if (!existing && fsImpl.existsSync(file))
-          return suppressResult(identity, null, "source_message_reply_receipt_unreadable");
-        if (existing?.version === 1)
-          return suppressResult(identity, existing, "source_message_reply_legacy_uncertain");
-        if (existing && !receiptIdentityMatches(config, file, existing, identity, nonce))
-          return suppressResult(identity, existing, "source_message_reply_receipt_identity_mismatch");
-        if (receiptStatusIsConfirmed(existing))
-          return suppressResult(identity, existing, "source_message_already_replied");
-        if (existing && existing.contentSha256 !== digest)
-          return suppressResult(identity, existing, "source_message_reply_content_mismatch");
-        if (receiptHasPermanentNonceMismatch(existing))
-          return suppressResult(identity, existing, "source_message_reply_nonce_mismatch");
-        if (existing?.status === "in_flight" && receiptLeaseIsLive(existing, config, deps))
-          return suppressResult(identity, existing, "source_message_reply_in_progress");
-        let id = operationId(deps), timestamp = nowIso(deps);
-        if (existing) {
-          let receipt2 = {
-            ...existing,
-            version: RECEIPT_VERSION,
-            status: "in_flight",
-            nonce: existing.nonce || nonce,
-            operationId: id,
-            pid: currentPid(deps),
-            updatedAt: timestamp,
-            reconciliationStartedAt: timestamp
-          };
-          return writeReceipt(file, receipt2, deps), { mode: "reconcile", file, receipt: receipt2 };
-        }
-        let receipt = {
-          version: RECEIPT_VERSION,
-          status: "in_flight",
-          channelId: identity.channelId,
-          sourceMessageId: identity.sourceMessageId,
-          contentSha256: digest,
-          nonce,
-          operationId: id,
-          claimedAt: timestamp,
-          updatedAt: timestamp,
-          pid: currentPid(deps)
-        };
-        return writeReceipt(file, receipt, deps), { mode: "send", file, receipt };
-      });
-    }
-    async function transitionReply(config, state, deps, update) {
-      return withReceiptLock(state.file, config, deps, async () => {
-        let current = readReceipt(state.file, deps.fs || fs);
-        if (!current || current.operationId !== state.receipt.operationId || current.channelId !== state.receipt.channelId || current.sourceMessageId !== state.receipt.sourceMessageId || current.nonce !== state.receipt.nonce) return current;
-        let next = update(current);
-        return next === null ? ((deps.fs || fs).rmSync(state.file, { force: !0 }), fsyncDirectory(path.dirname(state.file), deps.fs || fs), null) : (writeReceipt(state.file, next, deps), next);
-      });
-    }
-    async function releaseReplyClaim(config, state, deps = {}) {
-      return transitionReply(config, state, deps, () => null);
-    }
-    async function completeReply(config, state, sent, deps = {}) {
-      let channelId = String(sent?.channelId || ""), messageId = String(sent?.messageId || "");
-      if (channelId !== state.receipt.channelId || !messageId) {
-        let error = new Error("Discord reply confirmation did not match the claimed source identity.");
-        throw error.code = "reply_confirmation_mismatch", error;
-      }
-      let completed = await transitionReply(config, state, deps, (current) => ({
-        ...current,
-        status: "confirmed",
-        outboundMessageId: messageId,
-        confirmedAt: nowIso(deps),
-        updatedAt: nowIso(deps)
-      }));
-      if (completed?.status !== "confirmed" || completed.channelId !== state.receipt.channelId || completed.sourceMessageId !== state.receipt.sourceMessageId || completed.nonce !== state.receipt.nonce || completed.outboundMessageId !== messageId) {
-        let error = new Error("Discord reply receipt changed before confirmation.");
-        throw error.code = "reply_receipt_changed", error;
-      }
-      return completed;
-    }
-    async function markReplyUncertain(config, state, error, deps = {}, sent = null) {
-      return transitionReply(config, state, deps, (current) => ({
-        ...current,
-        status: "uncertain",
-        outboundMessageId: sent?.messageId || current.outboundMessageId,
-        sentAt: sent?.messageId ? nowIso(deps) : current.sentAt,
-        uncertainAt: nowIso(deps),
-        updatedAt: nowIso(deps),
-        errorCode: typeof error?.code == "string" ? error.code : null
-      }));
-    }
-    function replyDispatch(args, config) {
-      let channelId = typeof args.channelId == "string" ? args.channelId.trim() : "", replyTo = typeof args.replyTo == "string" ? args.replyTo.trim() : "";
-      if (args.followup === !0) {
-        if (!channelId) throw new Error("channelId is required for an explicit Discord followup.");
-        return {
-          target: { channelId, replyTo, usedLastInbound: !1 },
-          sourceMessageId: "",
-          guarded: !1
-        };
-      }
-      if (!channelId || !replyTo)
-        throw new Error("channelId and replyTo are required for a guarded Discord reply.");
-      return {
-        target: { channelId, replyTo, usedLastInbound: !1 },
-        sourceMessageId: replyTo,
-        guarded: !0
-      };
-    }
-    function replayWindowOpen(receipt, config, deps = {}) {
-      if (receipt?.outboundMessageId) return !1;
-      let claimedAt = Date.parse(receipt?.claimedAt || "");
-      if (!Number.isFinite(claimedAt)) return !1;
-      let windowMs = Number(config.replyReceiptNonceReplayWindowMs) || DEFAULT_NONCE_REPLAY_WINDOW_MS;
-      return nowMs(deps) - claimedAt <= windowMs;
-    }
-    async function sendAndConfirm({
-      config,
-      state,
-      target,
-      prepared,
-      sender,
-      confirmer,
-      deps
-    }) {
-      try {
-        let sent = await sender(target, prepared, {
-          nonce: state.receipt.nonce,
-          enforceNonce: !0
-        });
-        await markReplyUncertain(config, state, null, deps, sent);
-        let confirmed = await confirmer(target, prepared, sent, state.receipt);
-        return await completeReply(config, state, confirmed, deps), {
-          ...confirmed,
-          sourceMessageId: state.receipt.sourceMessageId,
-          duplicateSuppressed: !1
-        };
-      } catch (error) {
-        throw error?.definitiveNoSend === !0 ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps, error?.replySendIdentity), error;
-      }
-    }
-    async function sendDiscordReplyOnce2({
-      args = {},
-      config,
-      content,
-      preflight,
-      sender,
-      confirmer,
-      reconciler,
-      deps = {}
-    }) {
-      let dispatch = replyDispatch(args, config);
-      if (!dispatch.guarded) {
-        let prepared2 = typeof preflight == "function" ? await preflight(dispatch.target, {}) : void 0;
-        return { ...await sender(dispatch.target, prepared2, {}), duplicateSuppressed: !1, sourceMessageId: null };
-      }
-      let identity = {
-        channelId: dispatch.target.channelId,
-        sourceMessageId: dispatch.sourceMessageId
-      }, state = await beginReply(config, identity, content, deps);
-      if (state.mode === "suppress") return state.result;
-      if (state.mode === "send" && typeof confirmer != "function") {
-        await releaseReplyClaim(config, state, deps);
-        let error = new Error("Guarded Discord replies require exact readback confirmation.");
-        throw error.code = "reply_confirmation_required", error;
-      }
-      let sendIdentity = {
-        nonce: state.receipt.nonce,
-        enforceNonce: !0
-      }, prepared;
-      try {
-        prepared = typeof preflight == "function" ? await preflight(dispatch.target, sendIdentity) : void 0;
-      } catch (error) {
-        throw state.mode === "send" ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps), error;
-      }
-      if (state.mode === "reconcile") {
-        if (typeof reconciler != "function") {
-          let uncertain = await markReplyUncertain(config, state, null, deps);
-          return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
-        }
-        let reconciliation;
-        try {
-          reconciliation = await reconciler(dispatch.target, prepared, state.receipt);
-        } catch (error) {
-          throw await markReplyUncertain(config, state, error, deps), error;
-        }
-        if (reconciliation?.found === !0 && reconciliation.messageId)
-          return await completeReply(config, state, reconciliation, deps), {
-            channelId: reconciliation.channelId || identity.channelId,
-            messageId: reconciliation.messageId,
-            sourceMessageId: identity.sourceMessageId,
-            duplicateSuppressed: !1,
-            reconciled: !0
-          };
-        if (!replayWindowOpen(state.receipt, config, deps)) {
-          let uncertain = await markReplyUncertain(config, state, null, deps);
-          return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
-        }
-        if (typeof confirmer != "function") {
-          let uncertain = await markReplyUncertain(config, state, null, deps);
-          return suppressResult(identity, uncertain, "source_message_reply_uncertain").result;
-        }
-      }
-      return sendAndConfirm({
-        config,
-        state,
-        target: dispatch.target,
-        prepared,
-        sender,
-        confirmer,
-        deps
-      });
-    }
-    module2.exports = {
-      acquireReceiptLock,
-      beginReply,
-      completeReply,
-      contentDigest,
-      markReplyUncertain,
-      readReceipt,
-      receiptPath,
-      releaseReplyClaim,
-      replyDispatch,
-      replyNonce,
-      sendDiscordReplyOnce: sendDiscordReplyOnce2
     };
   }
 });
