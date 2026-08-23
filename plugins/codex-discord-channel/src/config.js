@@ -227,6 +227,10 @@ function loadConfig(inputEnv = process.env, options = {}) {
     appServerRequestTimeoutMs: parseInteger(env.CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS, 30000),
     deliveryDrainIntervalMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS, 1000),
     deliveryDrainMaxBackoffMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS, 30000),
+    automaticOutboundEnabled: parseBool(
+      env.CODEX_DISCORD_AUTOMATIC_OUTBOUND_ENABLED,
+      true,
+    ),
     deliveryUncertainRetryBaseMs: parseInteger(
       env.CODEX_DISCORD_UNCERTAIN_RETRY_BASE_MS,
       5000,

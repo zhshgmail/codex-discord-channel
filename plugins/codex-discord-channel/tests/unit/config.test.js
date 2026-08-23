@@ -8,7 +8,7 @@ const test = require('node:test');
 const { loadConfig, loadEnvFile } = require('../../src/config');
 
 const pluginRoot = path.resolve(__dirname, '..', '..');
-const releasePluginVersion = '0.3.14';
+const releasePluginVersion = '0.3.15';
 
 test('loadEnvFile does not override existing environment values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-config-'));
@@ -49,6 +49,7 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.ignoredDeliveryMode, null);
   assert.equal(config.deliveryDrainIntervalMs, 1000);
   assert.equal(config.deliveryDrainMaxBackoffMs, 30000);
+  assert.equal(config.automaticOutboundEnabled, true);
   assert.equal(config.deliveryUncertainRetryBaseMs, 5000);
   assert.equal(config.deliveryUncertainRetryMaxMs, 300000);
   assert.equal(config.gatewayHealthStaleMs, 180000);
@@ -56,6 +57,16 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.tuiLeaseStaleMs, 3000);
   assert.equal(config.messageContentIntent, true);
   assert.equal(config.cwd, '/workspace');
+});
+
+test('loadConfig can disable automatic Discord outbound without disabling inbound delivery', () => {
+  const config = loadConfig({
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    CODEX_DISCORD_AUTOMATIC_OUTBOUND_ENABLED: 'false',
+  });
+
+  assert.equal(config.automaticOutboundEnabled, false);
+  assert.equal(config.deliveryMode, 'app-server');
 });
 
 test('loadConfig can disable the privileged Message Content gateway intent', () => {
@@ -162,7 +173,7 @@ test('installed MCP recovers its account binding from plugin cache cwd when Code
   assert.equal(
     manifest.version,
     releasePluginVersion,
-    'marketplace cache identity must name the v0.3.14 plugin release',
+    'marketplace cache identity must name the v0.3.15 plugin release',
   );
   const pluginCwd = path.join(
     codexHome,

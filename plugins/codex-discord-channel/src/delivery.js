@@ -1807,6 +1807,13 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (config.deliveryMode === 'off') {
         return Promise.resolve({ status: 'unsupported', reason: 'delivery_disabled' });
       }
+      if (config.automaticOutboundEnabled === false) {
+        return Promise.resolve({
+          status: 'idle',
+          reason: 'automatic_outbound_disabled',
+          deliveredCount: 0,
+        });
+      }
       return serializeDrain(() => flushAutomaticOutbound(
         config,
         logger,

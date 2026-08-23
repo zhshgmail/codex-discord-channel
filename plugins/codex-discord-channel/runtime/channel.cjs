@@ -239,6 +239,10 @@ var require_config = __commonJS({
         appServerRequestTimeoutMs: parseInteger(env.CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS, 3e4),
         deliveryDrainIntervalMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS, 1e3),
         deliveryDrainMaxBackoffMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS, 3e4),
+        automaticOutboundEnabled: parseBool(
+          env.CODEX_DISCORD_AUTOMATIC_OUTBOUND_ENABLED,
+          !0
+        ),
         deliveryUncertainRetryBaseMs: parseInteger(
           env.CODEX_DISCORD_UNCERTAIN_RETRY_BASE_MS,
           5e3
@@ -3674,7 +3678,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.14"
+              version: "0.3.15"
             },
             capabilities: {
               experimentalApi: !0,
@@ -6398,7 +6402,11 @@ ${normalized.content}${attachmentText}
           });
         },
         flushOutbound(options = {}) {
-          return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : serializeDrain(() => flushAutomaticOutbound(
+          return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : config.automaticOutboundEnabled === !1 ? Promise.resolve({
+            status: "idle",
+            reason: "automatic_outbound_disabled",
+            deliveredCount: 0
+          }) : serializeDrain(() => flushAutomaticOutbound(
             config,
             logger,
             deps,
@@ -95379,7 +95387,7 @@ var require_gateway_drain_loop = __commonJS({
         throw new Error("Discord gateway delivery does not provide structured queue draining.");
       if (typeof delivery?.refreshTargetCheckpoint != "function")
         throw new Error("Discord gateway delivery cannot refresh the TUI recovery target.");
-      let flushOutbound = typeof delivery?.flushOutbound == "function" ? (options) => delivery.flushOutbound(options) : async () => ({ status: "idle", reason: "outbound_empty", deliveredCount: 0 }), baseDelayMs = positiveDelay(config?.deliveryDrainIntervalMs, DEFAULT_DRAIN_INTERVAL_MS), maxBackoffMs = Math.max(
+      let flushOutbound = config?.automaticOutboundEnabled !== !1 && typeof delivery?.flushOutbound == "function" ? (options) => delivery.flushOutbound(options) : async () => ({ status: "idle", reason: "outbound_empty", deliveredCount: 0 }), baseDelayMs = positiveDelay(config?.deliveryDrainIntervalMs, DEFAULT_DRAIN_INTERVAL_MS), maxBackoffMs = Math.max(
         baseDelayMs,
         positiveDelay(config?.deliveryDrainMaxBackoffMs, DEFAULT_DRAIN_MAX_BACKOFF_MS)
       ), scheduleTimeout = deps.setTimeout || setTimeout, cancelTimeout = deps.clearTimeout || clearTimeout, queueStatus = deps.readDeliveryQueueStatus || readDeliveryQueueStatus2, checkOwnership = deps.isCurrentReceiverOwnership || isCurrentReceiverOwnership2, report = async (result) => {
@@ -95882,7 +95890,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.14", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.15", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

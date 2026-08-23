@@ -281,6 +281,50 @@ test('waiting outbound recovers final and guarded confirmation without restartin
   assert.equal(completed.outbound.outboundMessageId, 'outbound-1');
 });
 
+test('inbound-only mode never sends automatic final replies from autonomous callbacks', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-inbound-only-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let assistantFinalListener = null;
+  const host = hostForTurn();
+  host.readAssistantFinal = async () => ({
+    threadId: 'thread-A', turnId: 'turn-A', itemId: 'final-1', text: 'done',
+  });
+  host.onAssistantFinal = (listener) => {
+    assistantFinalListener = listener;
+    return () => { assistantFinalListener = null; };
+  };
+  const sends = [];
+  const config = {
+    ...configAt(dir),
+    automaticOutboundEnabled: false,
+  };
+  const delivery = createDelivery(config, () => {}, {
+    structuredHost: host,
+    async sendAutomaticReply(args) {
+      sends.push(args);
+      return {
+        channelId: args.channelId,
+        messageId: 'unexpected-outbound',
+        sourceMessageId: args.replyTo,
+        duplicateSuppressed: false,
+      };
+    },
+  });
+  t.after(() => delivery.destroy());
+  await delivery.activateReceiver(() => ({ active: true }));
+  await delivery.deliver(source());
+
+  assert.equal(typeof assistantFinalListener, 'function');
+  await assistantFinalListener({
+    threadId: 'thread-A', turnId: 'turn-A', itemId: 'final-1', text: 'done',
+  });
+  assert.deepEqual(sends, []);
+  assert.deepEqual(await delivery.flushOutbound(), {
+    status: 'idle', reason: 'automatic_outbound_disabled', deliveredCount: 0,
+  });
+  assert.equal(readQueue(dir).completed[0].outbound.status, 'waiting');
+});
+
 test('one aggregated top-level turn arms one source reply instead of fanning one final to sixteen sources', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-auto-final-one-turn-owner-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));

@@ -238,6 +238,10 @@ var require_config = __commonJS({
         appServerRequestTimeoutMs: parseInteger(env.CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS, 3e4),
         deliveryDrainIntervalMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS, 1e3),
         deliveryDrainMaxBackoffMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS, 3e4),
+        automaticOutboundEnabled: parseBool(
+          env.CODEX_DISCORD_AUTOMATIC_OUTBOUND_ENABLED,
+          !0
+        ),
         deliveryUncertainRetryBaseMs: parseInteger(
           env.CODEX_DISCORD_UNCERTAIN_RETRY_BASE_MS,
           5e3
@@ -3554,7 +3558,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.14"
+              version: "0.3.15"
             },
             capabilities: {
               experimentalApi: !0,
@@ -6278,7 +6282,11 @@ ${normalized.content}${attachmentText}
           });
         },
         flushOutbound(options = {}) {
-          return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : serializeDrain(() => flushAutomaticOutbound(
+          return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : config.automaticOutboundEnabled === !1 ? Promise.resolve({
+            status: "idle",
+            reason: "automatic_outbound_disabled",
+            deliveredCount: 0
+          }) : serializeDrain(() => flushAutomaticOutbound(
             config,
             logger,
             deps,
@@ -95457,7 +95465,7 @@ var readline = require("node:readline"), { loadConfig } = require_config(), {
   reconcileDiscordMessage,
   sendDiscordMessage,
   startDiscordClient
-} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.14", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.15", MAX_TOOL_RESULT_BYTES = 64 * 1024;
 function makeLogger() {
   return (level, message, meta) => {
     let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

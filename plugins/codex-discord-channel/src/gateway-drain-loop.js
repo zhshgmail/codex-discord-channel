@@ -33,7 +33,8 @@ function startGatewayDrainLoop({
   if (typeof delivery?.refreshTargetCheckpoint !== 'function') {
     throw new Error('Discord gateway delivery cannot refresh the TUI recovery target.');
   }
-  const flushOutbound = typeof delivery?.flushOutbound === 'function'
+  const flushOutbound = config?.automaticOutboundEnabled !== false &&
+    typeof delivery?.flushOutbound === 'function'
     ? (options) => delivery.flushOutbound(options)
     : async () => ({ status: 'idle', reason: 'outbound_empty', deliveredCount: 0 });
 

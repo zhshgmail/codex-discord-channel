@@ -106,6 +106,12 @@ These legacy-named settings never authorize replaying `turn/start`.
 `CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS` controls the receiver heartbeat expiry
 (3 minutes by default).
 
+Set `CODEX_DISCORD_AUTOMATIC_OUTBOUND_ENABLED=false` for inbound-only emergency
+operation. The gateway continues to persist and inject inbound Discord messages
+and refresh the exact TUI target, but it does not inspect or send automatic
+assistant-final replies. Guarded explicit sends remain available through the MCP
+send tool.
+
 If the shared endpoint or exact current thread is unavailable, the queue stays
 persisted and status reports a stable reason such as
 `shared_app_server_socket_missing`, `shared_app_server_no_loaded_thread`, or
