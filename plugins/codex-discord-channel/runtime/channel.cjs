@@ -3401,6 +3401,9 @@ var require_app_server_host = __commonJS({
         "shared_app_server_socket_missing"
       ].includes(error?.code);
     }
+    function ephemeralIncludeTurnsUnsupported(error) {
+      return error?.code === "shared_app_server_request_rejected" && error?.rpcCode === -32600 && /ephemeral threads do not support includeTurns/i.test(String(error?.message || ""));
+    }
     function deliveryProofKey(threadId, clientUserMessageId) {
       return JSON.stringify([threadId, clientUserMessageId]);
     }
@@ -3678,7 +3681,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.15"
+              version: "0.3.16"
             },
             capabilities: {
               experimentalApi: !0,
@@ -3844,7 +3847,7 @@ var require_app_server_host = __commonJS({
             if (remoteIndex >= 0 && argv[remoteIndex + 1] === config.appServerUrl) return !0;
           }
           return !1;
-        }), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.activeTurnProvenance = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.emittedAssistantFinals = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
+        }), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.activeTurnProvenance = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.ephemeralThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.emittedAssistantFinals = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
           deps.lifecycleProofRetryDelaysMs
         );
         let fsPromises = deps.rolloutFsPromises || fs.promises, sessionsDir = rolloutSessionsDir(config, deps);
@@ -3867,7 +3870,7 @@ var require_app_server_host = __commonJS({
         this.timeoutRecoveryTarget = null, this.onNotification = (notification) => {
           if (notification?.method === "item/started" || notification?.method === "item/completed") {
             let threadId = notification.params?.threadId, turnId = notification.params?.turnId, item = notification.params?.item;
-            typeof threadId == "string" && threadId !== "" && item?.type === "userMessage" && typeof item.clientId == "string" && item.clientId !== "" && this.wakeDeliveryWaiters(threadId, item.clientId), notification.method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer" && typeof threadId == "string" && threadId !== "" && typeof turnId == "string" && turnId !== "" && typeof item.id == "string" && item.id !== "" && typeof item.text == "string" && item.text.trim() !== "" && this.emitAssistantFinal({ threadId, turnId, itemId: item.id, text: item.text });
+            typeof threadId == "string" && threadId !== "" && item?.type === "userMessage" && typeof item.clientId == "string" && item.clientId !== "" && (this.ephemeralThreadIds.has(threadId) && this.rememberVerifiedUserMessage(threadId, item.clientId), this.wakeDeliveryWaiters(threadId, item.clientId)), notification.method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer" && typeof threadId == "string" && threadId !== "" && typeof turnId == "string" && turnId !== "" && typeof item.id == "string" && item.id !== "" && typeof item.text == "string" && item.text.trim() !== "" && this.emitAssistantFinal({ threadId, turnId, itemId: item.id, text: item.text });
             return;
           }
           if (notification?.method === "thread/started") {
@@ -3903,7 +3906,7 @@ var require_app_server_host = __commonJS({
           if (notification?.method === "thread/closed") {
             let threadId = notification.params?.threadId;
             if (!threadId) return;
-            this.threadSelectionRevision += 1, this.loadedInventoryProven && this.knownLoadedThreadIds.delete(threadId), this.threadStatuses.delete(threadId), this.activeTurnIds.delete(threadId), this.activeTurnProvenance.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), this.currentThreadId === threadId && (this.observedTuiLeaseTarget?.threadId === threadId && (this.observedTuiLeaseTarget = null), this.loadedInventoryProven = !1, this.currentThreadId = "", this.invalidateTargetCheckpoint("current_thread_closed"), this.restoredTargetCheckpoint = null), this.wakeThreadDeliveryWaiters(threadId), this.emit("threadClosed", { threadId });
+            this.threadSelectionRevision += 1, this.loadedInventoryProven && this.knownLoadedThreadIds.delete(threadId), this.ephemeralThreadIds.delete(threadId), this.threadStatuses.delete(threadId), this.activeTurnIds.delete(threadId), this.activeTurnProvenance.delete(threadId), this.timeoutRecoveryTarget?.threadId === threadId && (this.timeoutRecoveryTarget = null), this.currentThreadId === threadId && (this.observedTuiLeaseTarget?.threadId === threadId && (this.observedTuiLeaseTarget = null), this.loadedInventoryProven = !1, this.currentThreadId = "", this.invalidateTargetCheckpoint("current_thread_closed"), this.restoredTargetCheckpoint = null), this.wakeThreadDeliveryWaiters(threadId), this.emit("threadClosed", { threadId });
           }
         }, this.onConnectionChanged = (event) => {
           if (this.threadSelectionRevision += 1, this.loadedInventoryProven = !1, this.lastStatus = this.client.status(), !this.lastStatus.available && this.lastStatus.reason === "shared_app_server_request_timeout") {
@@ -4165,7 +4168,10 @@ var require_app_server_host = __commonJS({
           let reason = "shared_app_server_no_loaded_thread";
           return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
         }
-        let loadedThreadIds = new Set(threadIds), trustedThreadIds = restoredTargetCheckpoint ? new Set(restoredTargetCheckpoint.loadedThreadIds) : provenLoadedThreadIds, validatedAddedResponses = /* @__PURE__ */ new Map(), targetInvalid = !!(restoredTargetCheckpoint && !loadedThreadIds.has(restoredTargetCheckpoint.threadId));
+        let loadedThreadIds = new Set(threadIds);
+        for (let ephemeralThreadId of this.ephemeralThreadIds)
+          loadedThreadIds.has(ephemeralThreadId) || this.ephemeralThreadIds.delete(ephemeralThreadId);
+        let trustedThreadIds = restoredTargetCheckpoint ? new Set(restoredTargetCheckpoint.loadedThreadIds) : provenLoadedThreadIds, validatedAddedResponses = /* @__PURE__ */ new Map(), targetInvalid = !!(restoredTargetCheckpoint && !loadedThreadIds.has(restoredTargetCheckpoint.threadId));
         if (trustedThreadIds.size > 0) {
           let addedThreadIds = threadIds.filter((threadId2) => !trustedThreadIds.has(threadId2)), addedParents = /* @__PURE__ */ new Map(), addedTopLevelThreadIds = /* @__PURE__ */ new Set();
           try {
@@ -4283,8 +4289,17 @@ var require_app_server_host = __commonJS({
               includeTurns: !0
             });
           } catch (error) {
-            let reason = error?.code || "shared_app_server_thread_unreadable";
-            return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+            if (ephemeralIncludeTurnsUnsupported(error))
+              try {
+                response = await requestForTarget("thread/read", { threadId });
+              } catch (fallbackError) {
+                let reason = fallbackError?.code || "shared_app_server_thread_unreadable";
+                return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+              }
+            else {
+              let reason = error?.code || "shared_app_server_thread_unreadable";
+              return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+            }
           }
         if (this.threadSelectionRevision !== threadSelectionRevision)
           return retryAfterRevision();
@@ -4304,7 +4319,7 @@ var require_app_server_host = __commonJS({
         if (this.requireTuiLease && matchingLease.record && (this.observedTuiLeaseTarget = {
           leaseId: matchingLease.record.leaseId,
           threadId: thread.id
-        }), this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, this.threadStatuses.set(thread.id, status), status === "active") {
+        }), this.knownLoadedThreadIds = new Set(threadIds), this.loadedInventoryProven = !0, this.currentThreadId = thread.id, thread.ephemeral === !0 && this.ephemeralThreadIds.add(thread.id), this.threadStatuses.set(thread.id, status), status === "active") {
           let latestInProgressTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1);
           latestInProgressTurnId ? (this.activeTurnIds.set(thread.id, latestInProgressTurnId), this.activeTurnProvenance.set(thread.id, "thread_read")) : (this.activeTurnIds.delete(thread.id), this.activeTurnProvenance.delete(thread.id));
         } else
@@ -4419,14 +4434,33 @@ var require_app_server_host = __commonJS({
       }
       async readDeliveredUserMessage(threadId, clientUserMessageId, signal = null) {
         let params = { threadId, includeTurns: !0 }, threadSelectionRevision, response;
-        if (typeof this.client.requestOnConnection == "function" ? (await this.client.ensureConnected(), threadSelectionRevision = this.threadSelectionRevision, response = (await this.client.requestOnConnection(
-          "thread/read",
-          params,
-          this.client.connectionGeneration,
-          null,
-          !1,
-          signal
-        )).result) : (threadSelectionRevision = this.threadSelectionRevision, response = await this.client.request("thread/read", params)), this.threadSelectionRevision !== threadSelectionRevision)
+        if (typeof this.client.requestOnConnection == "function") {
+          await this.client.ensureConnected(), threadSelectionRevision = this.threadSelectionRevision;
+          try {
+            response = (await this.client.requestOnConnection(
+              "thread/read",
+              params,
+              this.client.connectionGeneration,
+              null,
+              !1,
+              signal
+            )).result;
+          } catch (error) {
+            if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
+              return !1;
+            throw error;
+          }
+        } else {
+          threadSelectionRevision = this.threadSelectionRevision;
+          try {
+            response = await this.client.request("thread/read", params);
+          } catch (error) {
+            if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
+              return !1;
+            throw error;
+          }
+        }
+        if (this.threadSelectionRevision !== threadSelectionRevision)
           throw deliveryError(
             "The current app-server thread changed during delivery reconciliation.",
             "shared_app_server_thread_changed"
@@ -4437,10 +4471,18 @@ var require_app_server_host = __commonJS({
       async readAssistantFinal(threadId, turnId) {
         if (typeof threadId != "string" || threadId === "" || typeof turnId != "string" || turnId === "")
           return null;
-        let thread = (await this.client.request("thread/read", {
-          threadId,
-          includeTurns: !0
-        }))?.thread;
+        let response;
+        try {
+          response = await this.client.request("thread/read", {
+            threadId,
+            includeTurns: !0
+          });
+        } catch (error) {
+          if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
+            return null;
+          throw error;
+        }
+        let thread = response?.thread;
         if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
         let matches = thread.turns.filter((turn) => turn?.id === turnId);
         return matches.length !== 1 ? null : exactAssistantFinal(threadId, turnId, matches[0]);
@@ -95890,7 +95932,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.15", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.16", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

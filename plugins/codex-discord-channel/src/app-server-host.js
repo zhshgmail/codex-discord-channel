@@ -106,6 +106,12 @@ function reconnectableError(error) {
   ].includes(error?.code);
 }
 
+function ephemeralIncludeTurnsUnsupported(error) {
+  return error?.code === 'shared_app_server_request_rejected' &&
+    error?.rpcCode === -32600 &&
+    /ephemeral threads do not support includeTurns/i.test(String(error?.message || ''));
+}
+
 function deliveryProofKey(threadId, clientUserMessageId) {
   return JSON.stringify([threadId, clientUserMessageId]);
 }
@@ -561,7 +567,7 @@ class AppServerRpcClient extends EventEmitter {
         clientInfo: {
           name: 'codex-discord-channel',
           title: 'Discord Channel Gateway',
-          version: '0.3.15',
+          version: '0.3.16',
         },
         capabilities: {
           experimentalApi: true,
@@ -812,6 +818,7 @@ class AppServerHost extends EventEmitter {
     this.activeTurnIds = new Map();
     this.activeTurnProvenance = new Map();
     this.knownLoadedThreadIds = new Set();
+    this.ephemeralThreadIds = new Set();
     this.verifiedUserMessages = new Map();
     this.deliveryWaiters = new Map();
     this.emittedAssistantFinals = new Map();
@@ -868,6 +875,13 @@ class AppServerHost extends EventEmitter {
           typeof item.clientId === 'string' &&
           item.clientId !== ''
         ) {
+          // Codex 0.150+ TUI sessions can be ephemeral: thread/read with
+          // includeTurns is rejected and no durable rollout is available.
+          // The exact lifecycle event from the bound local app-server is the
+          // only live, visible-session acknowledgement for those threads.
+          if (this.ephemeralThreadIds.has(threadId)) {
+            this.rememberVerifiedUserMessage(threadId, item.clientId);
+          }
           this.wakeDeliveryWaiters(threadId, item.clientId);
         }
         if (
@@ -994,6 +1008,7 @@ class AppServerHost extends EventEmitter {
         if (!threadId) return;
         this.threadSelectionRevision += 1;
         if (this.loadedInventoryProven) this.knownLoadedThreadIds.delete(threadId);
+        this.ephemeralThreadIds.delete(threadId);
         this.threadStatuses.delete(threadId);
         this.activeTurnIds.delete(threadId);
         this.activeTurnProvenance.delete(threadId);
@@ -1459,6 +1474,11 @@ class AppServerHost extends EventEmitter {
       return { available: false, reason, status: 'unavailable' };
     }
     const loadedThreadIds = new Set(threadIds);
+    for (const ephemeralThreadId of this.ephemeralThreadIds) {
+      if (!loadedThreadIds.has(ephemeralThreadId)) {
+        this.ephemeralThreadIds.delete(ephemeralThreadId);
+      }
+    }
     const trustedThreadIds = restoredTargetCheckpoint
       ? new Set(restoredTargetCheckpoint.loadedThreadIds)
       : provenLoadedThreadIds;
@@ -1663,9 +1683,19 @@ class AppServerHost extends EventEmitter {
           includeTurns: true,
         });
       } catch (error) {
-        const reason = error?.code || 'shared_app_server_thread_unreadable';
-        this.lastStatus = { configured: true, available: false, reason };
-        return { available: false, reason, status: 'unavailable' };
+        if (ephemeralIncludeTurnsUnsupported(error)) {
+          try {
+            response = await requestForTarget('thread/read', { threadId });
+          } catch (fallbackError) {
+            const reason = fallbackError?.code || 'shared_app_server_thread_unreadable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          }
+        } else {
+          const reason = error?.code || 'shared_app_server_thread_unreadable';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
       }
     }
     if (this.threadSelectionRevision !== threadSelectionRevision) {
@@ -1696,6 +1726,11 @@ class AppServerHost extends EventEmitter {
     this.knownLoadedThreadIds = new Set(threadIds);
     this.loadedInventoryProven = true;
     this.currentThreadId = thread.id;
+    // Ephemeral lifecycle events are delivery proof only after this exact
+    // thread has passed status/topology checks and the TUI lease gate above.
+    // Remembering it earlier would let an unavailable or unleased thread
+    // authorize an otherwise unproven userMessage notification.
+    if (thread.ephemeral === true) this.ephemeralThreadIds.add(thread.id);
     this.threadStatuses.set(thread.id, status);
     if (status === 'active') {
       const latestInProgressTurnId = (Array.isArray(thread.turns) ? thread.turns : [])
@@ -1930,17 +1965,31 @@ class AppServerHost extends EventEmitter {
     if (typeof this.client.requestOnConnection === 'function') {
       await this.client.ensureConnected();
       threadSelectionRevision = this.threadSelectionRevision;
-      response = (await this.client.requestOnConnection(
-        'thread/read',
-        params,
-        this.client.connectionGeneration,
-        null,
-        false,
-        signal,
-      )).result;
+      try {
+        response = (await this.client.requestOnConnection(
+          'thread/read',
+          params,
+          this.client.connectionGeneration,
+          null,
+          false,
+          signal,
+        )).result;
+      } catch (error) {
+        if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
+          return false;
+        }
+        throw error;
+      }
     } else {
       threadSelectionRevision = this.threadSelectionRevision;
-      response = await this.client.request('thread/read', params);
+      try {
+        response = await this.client.request('thread/read', params);
+      } catch (error) {
+        if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
+          return false;
+        }
+        throw error;
+      }
     }
     if (this.threadSelectionRevision !== threadSelectionRevision) {
       throw deliveryError(
@@ -1964,10 +2013,18 @@ class AppServerHost extends EventEmitter {
     ) {
       return null;
     }
-    const response = await this.client.request('thread/read', {
-      threadId,
-      includeTurns: true,
-    });
+    let response;
+    try {
+      response = await this.client.request('thread/read', {
+        threadId,
+        includeTurns: true,
+      });
+    } catch (error) {
+      if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
+        return null;
+      }
+      throw error;
+    }
     const thread = response?.thread;
     if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
     const matches = thread.turns.filter((turn) => turn?.id === turnId);

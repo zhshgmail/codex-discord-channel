@@ -78,6 +78,14 @@ function activeTurnMismatchError(expectedTurnId, activeTurnId) {
   };
 }
 
+function ephemeralIncludeTurnsError() {
+  const error = new Error('ephemeral threads do not support includeTurns');
+  error.code = 'shared_app_server_request_rejected';
+  error.rpcCode = -32600;
+  error.deliveryOutcome = 'rejected';
+  return error;
+}
+
 function createRolloutFixture(t, records, options = {}) {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-rollout-proof-'));
   const sessionsDir = path.join(codexHome, 'sessions', '2026', '07', '31');
@@ -4272,6 +4280,199 @@ test('restart without a lifecycle signal recovers from exact local rollout proof
 
   assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
   assert.deepEqual(client.requests, []);
+});
+
+test('restored ephemeral target retries thread/read without includeTurns', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-ephemeral-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  await createDurableTarget(config, 'turn-before-ephemeral-restart');
+
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (params.includeTurns === true) throw ephemeralIncludeTurnsError();
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(config, () => {}, { client });
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.available, true);
+  assert.equal(target.threadId, 'thread-a');
+  assert.deepEqual(
+    client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params),
+    [
+      { threadId: 'thread-a', includeTurns: true },
+      { threadId: 'thread-a' },
+    ],
+  );
+});
+
+test('exact lifecycle signal proves delivery for a resolved ephemeral TUI thread', async (t) => {
+  const clientId = 'discord:c1:m-ephemeral-live-proof';
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.includeTurns === false) {
+      return {
+        thread: {
+          id: DELIVERY_THREAD_ID,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
+    client,
+    verifyRolloutDelivery: async () => false,
+  });
+  t.after(() => host.destroy());
+
+  assert.equal((await host.resolveTarget()).available, true);
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
+  assert.equal(
+    client.requests.filter((request) => request.method === 'thread/read').length,
+    1,
+  );
+});
+
+test('unavailable ephemeral thread cannot authorize lifecycle delivery proof', async (t) => {
+  const clientId = 'discord:c1:m-ephemeral-unavailable';
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'notLoaded' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
+    client,
+    verifyRolloutDelivery: async () => false,
+  });
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.available, false);
+  assert.equal(target.reason, 'shared_app_server_thread_unavailable');
+  assert.equal(host.ephemeralThreadIds.has(DELIVERY_THREAD_ID), false);
+
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
+});
+
+test('missing or stale TUI lease cannot authorize ephemeral lifecycle delivery proof', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-ephemeral-lease-proof-'));
+  const leasePath = path.join(stateDir, 'tui-recovery-target.json');
+  const now = Date.now();
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+    paths: { stateDir },
+    requireTuiLease: true,
+    tuiLeaseStaleMs: 3000,
+  }, () => {}, {
+    client,
+    hasRemoteTuiChild: () => true,
+    now: () => now,
+    readProcessStartTicks: () => '12345',
+    verifyRolloutDelivery: async () => false,
+  });
+  t.after(() => {
+    host.destroy();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const missingClientId = 'discord:c1:m-ephemeral-missing-lease';
+  const missing = await host.resolveTarget();
+  assert.equal(missing.reason, 'shared_app_server_tui_lease_missing');
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    missingClientId,
+  ));
+  assert.equal(host.ephemeralThreadIds.has(DELIVERY_THREAD_ID), false);
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, missingClientId), false);
+
+  fs.writeFileSync(leasePath, `${JSON.stringify({
+    version: 3,
+    leaseId: 'lease-ephemeral-stale-0001',
+    supervisorPid: 4242,
+    supervisorStartTicks: '12345',
+    startedAtMs: now - 4000,
+    phase: 'active',
+    threadId: DELIVERY_THREAD_ID,
+    loadedThreadIds: [DELIVERY_THREAD_ID],
+  })}\n`, { mode: 0o600 });
+  fs.utimesSync(leasePath, new Date(now - 4000), new Date(now - 4000));
+
+  const staleClientId = 'discord:c1:m-ephemeral-stale-lease';
+  const stale = await host.resolveTarget();
+  assert.equal(stale.reason, 'shared_app_server_tui_lease_stale');
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    staleClientId,
+  ));
+  assert.equal(host.ephemeralThreadIds.has(DELIVERY_THREAD_ID), false);
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, staleClientId), false);
 });
 
 test('hasDelivered falls back to exact structured thread/read after a missed notification', async () => {
