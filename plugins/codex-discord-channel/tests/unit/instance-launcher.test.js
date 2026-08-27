@@ -144,7 +144,6 @@ test('live process identity requires the selected OpenAI account and Discord sta
     ['instance', { CODEX_DISCORD_LAUNCH_INSTANCE: 'codex01' }],
     ['state directory', { CODEX_DISCORD_LAUNCH_STATE_DIR: `${config.paths.stateDir}-other` }],
     ['Codex home', { CODEX_DISCORD_LAUNCH_CODEX_HOME: `${config.codexHome}-other` }],
-    ['plugin root', { CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: `${config.deliveryActivationId}-other` }],
     ['endpoint', { CODEX_DISCORD_LAUNCH_ENDPOINT: `${config.paths.stateDir}/other.sock` }],
   ]) {
     assert.throws(
@@ -153,6 +152,11 @@ test('live process identity requires the selected OpenAI account and Discord sta
       name,
     );
   }
+  assert.doesNotThrow(() => verifyLiveProcess(config, 12345, {
+    readFileSync: () => generationEnvironment({
+      CODEX_DISCORD_LAUNCH_PLUGIN_ROOT: '/evicted/marketplace/cache',
+    }),
+  }));
 
   const wrongAccount = Buffer.from([
     'CODEX_HOME=/tmp/other-account',

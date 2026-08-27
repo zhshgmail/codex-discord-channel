@@ -52,7 +52,6 @@ function verifyLiveProcess(config, pid, dependencies = {}) {
     && env.CODEX_DISCORD_LAUNCH_INSTANCE === config.paths.instance
     && path.resolve(env.CODEX_DISCORD_LAUNCH_STATE_DIR || '') === path.resolve(config.paths.stateDir)
     && path.resolve(env.CODEX_DISCORD_LAUNCH_CODEX_HOME || '') === path.resolve(config.codexHome)
-    && path.resolve(env.CODEX_DISCORD_LAUNCH_PLUGIN_ROOT || '') === path.resolve(config.deliveryActivationId)
     && env.CODEX_DISCORD_LAUNCH_ENDPOINT === config.appServerUrl.replace(/^unix:\/\//, '')
   );
   if (generationIdentityMatches) return;

@@ -95225,7 +95225,7 @@ var require_instance_launcher = __commonJS({
         let separator = entry.indexOf("=");
         return separator === -1 ? [entry, ""] : [entry.slice(0, separator), entry.slice(separator + 1)];
       }));
-      if (!(env.CODEX_HOME !== config.codexHome || env.DISCORD_INSTANCE !== config.paths.instance || path.resolve(env.DISCORD_CONFIG_DIR || "") !== path.resolve(config.paths.stateDir)) || !!(env.CODEX_DISCORD_LAUNCH_GENERATION && ["app", "gateway"].includes(env.CODEX_DISCORD_LAUNCH_ROLE) && env.CODEX_DISCORD_LAUNCH_INSTANCE === config.paths.instance && path.resolve(env.CODEX_DISCORD_LAUNCH_STATE_DIR || "") === path.resolve(config.paths.stateDir) && path.resolve(env.CODEX_DISCORD_LAUNCH_CODEX_HOME || "") === path.resolve(config.codexHome) && path.resolve(env.CODEX_DISCORD_LAUNCH_PLUGIN_ROOT || "") === path.resolve(config.deliveryActivationId) && env.CODEX_DISCORD_LAUNCH_ENDPOINT === config.appServerUrl.replace(/^unix:\/\//, ""))) return;
+      if (!(env.CODEX_HOME !== config.codexHome || env.DISCORD_INSTANCE !== config.paths.instance || path.resolve(env.DISCORD_CONFIG_DIR || "") !== path.resolve(config.paths.stateDir)) || !!(env.CODEX_DISCORD_LAUNCH_GENERATION && ["app", "gateway"].includes(env.CODEX_DISCORD_LAUNCH_ROLE) && env.CODEX_DISCORD_LAUNCH_INSTANCE === config.paths.instance && path.resolve(env.CODEX_DISCORD_LAUNCH_STATE_DIR || "") === path.resolve(config.paths.stateDir) && path.resolve(env.CODEX_DISCORD_LAUNCH_CODEX_HOME || "") === path.resolve(config.codexHome) && env.CODEX_DISCORD_LAUNCH_ENDPOINT === config.appServerUrl.replace(/^unix:\/\//, ""))) return;
       let argv = [];
       try {
         argv = readFileSync(`/proc/${pid}/cmdline`).toString("utf8").split("\0").filter(Boolean);
