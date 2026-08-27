@@ -482,27 +482,21 @@ test('SIGKILLed launcher generation is reclaimed on immediate relaunch with no d
 
 test('cache eviction and version-path change cannot block exact orphan reclaim and relaunch', async (t) => {
   const setup = fixture(t);
-  const currentHelper = fs.readFileSync(sourceGenerationHelper, 'utf8');
-  const currentIdentityFields = "    'socketPath', 'stateDir',\n";
-  const legacyIdentityFields = "    'pluginRoot', 'socketPath', 'stateDir',\n";
-  const legacyHelper = currentHelper.replace(currentIdentityFields, legacyIdentityFields);
-  assert.notEqual(
-    legacyHelper,
-    currentHelper,
-    'fixture must recreate the old helper that bound reclaim to pluginRoot',
-  );
-  assert.equal(
-    legacyHelper.split(legacyIdentityFields).length - 1,
-    1,
-    'legacy pluginRoot assertion must be injected exactly once',
-  );
-  fs.writeFileSync(setup.generationHelper, legacyHelper, { mode: 0o700 });
-
   const { manifest, records } = await orphanReadyGeneration(setup, {
     APP_WRAPPER_TERM: 'exit',
   });
   assert.equal(manifest.pluginRoot, path.dirname(path.dirname(setup.launcher)));
   assert.equal(fs.existsSync(setup.socketPath), true, 'the orphan still owns the socket');
+
+  const staleHelperInvoked = path.join(setup.stateDir, 'stale-generation-helper-invoked');
+  executable(
+    path.join(setup.stateDir, 'generation-runtime', 'current', 'codex-discord-generation'),
+    String.raw`#!/usr/bin/env node
+'use strict';
+require('node:fs').writeFileSync(process.env.STALE_HELPER_INVOKED, 'invoked\n');
+process.exit(73);
+`,
+  );
 
   const replacementRoot = path.join(setup.home, 'plugin-next-version');
   const replacementLauncher = path.join(replacementRoot, 'bin', 'codex-discord-instance');
@@ -519,11 +513,16 @@ test('cache eviction and version-path change cannot block exact orphan reclaim a
 
   const relaunched = spawnSync(replacementLauncher, ['codex02'], {
     encoding: 'utf8',
-    env: env(setup),
+    env: env(setup, { STALE_HELPER_INVOKED: staleHelperInvoked }),
     timeout: 8000,
   });
 
   assert.equal(relaunched.status, 0, relaunched.stderr);
+  assert.equal(
+    fs.existsSync(staleHelperInvoked),
+    false,
+    'the replacement launcher must not execute the previous durable helper',
+  );
   assertRecordedDead(records, 'cross-version cache-path orphan reclaim');
   assert.equal(fs.existsSync(setup.socketPath), false);
   assert.equal(fs.existsSync(setup.manifestPath), false);
