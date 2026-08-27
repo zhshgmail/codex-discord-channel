@@ -184,4 +184,3 @@ sender or released CLI; never a generic webhook as proof.
 - Do not leave a repairer-launched TUI holding the user's alias slot.
 - Never claim fixed from tests alone; label source, installed, component-health,
   visible-TUI, and outbound-readback evidence separately.
-
