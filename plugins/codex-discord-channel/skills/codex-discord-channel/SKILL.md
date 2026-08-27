@@ -11,8 +11,10 @@ description: Use when inspecting or managing the Discord channel plugin, its per
   `$HOME/.codex/channels/discord/<instance>`.
 - The live receiver is selected by that state directory and
   `session-gateway.pid`.
-- `owner.json` is status and handoff metadata only. Never use its owner or
-  thread id as a per-message receive gate.
+- `owner.json` version 2 is stable instance and process metadata only. Its
+  fingerprint is derived from alias, canonical Codex account home, and
+  canonical private state directory. Never use Codex owner, session, thread,
+  or turn ids for instance identity, authentication, or receiver authority.
 - Accepted events are persisted in a cross-process locked FIFO and deduplicated
   by Discord channel and message id.
 - Inbound delivery uses only a shared app-server endpoint and a dynamically
@@ -67,6 +69,9 @@ thread, a busy thread, and uncertain structured acknowledgement.
 Top-level receiver and structured-delivery status comes only from the durable
 gateway health record. MCP-local Discord login is a separate diagnostic and is
 never receiver-health evidence.
+The legacy-named `discord_channel_claim_owner` tool only refreshes
+non-authoritative `owner.json` process metadata. Calling it grants no receiver,
+delivery, or reply authority.
 
 ## Alias-Owned Runtime Boundary
 
@@ -115,6 +120,12 @@ The exact top-level thread binding is durable across idle and active gateway
 restarts, but active turn ids are never persisted. Restart recovery rereads the
 bound thread before choosing start versus steer. `gateway-health.json` is the
 receiver truth; MCP-local login state is diagnostic only.
+
+Thread and turn ids in that flow are transient app-server routes, not instance
+or process identities. After an app-server socket generation replacement, the
+launcher uses the same stable alias/account/state and original workspace
+options with `resume --last`; a captured thread id cannot select or authorize
+the replacement TUI.
 
 ## History Reads
 

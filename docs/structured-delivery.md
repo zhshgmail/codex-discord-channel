@@ -14,6 +14,12 @@ unavailable while accepted messages remain persisted.
 
 ## Receiver Identity
 
+The stable instance identity is the normalized alias plus canonical Codex
+account home and private Discord state directory. Status exposes a deterministic
+fingerprint of that tuple. The fingerprint is diagnostic, not a bearer secret;
+authority still comes from the exact account binding and supervised local
+generation.
+
 The stable receiver identity is:
 
 1. the normalized Discord instance and its state directory; and
@@ -40,9 +46,10 @@ The first gateway logs in, proves queue persistence, arms its listener, and
 claims authority so accepted events can remain durable until app-server
 reconnection or restart delivery.
 
-`owner.json` remains useful for session status and handoff, but it never decides
-whether an individual gateway event is accepted. Thread and session ids may
-rotate while the same state directory, bot, and gateway continue operating.
+`owner.json` version 2 contains stable instance and process metadata, but it
+never decides whether an individual gateway event is accepted. It contains no
+Codex owner, thread, or session identity. Thread and session ids may rotate
+while the same state directory, bot, and gateway continue operating.
 
 The standalone gateway's periodic drain loop verifies this durable receiver
 authority on every nonempty-queue tick. A superseded receiver keeps checking
@@ -51,6 +58,10 @@ but it cannot resolve a target or submit a turn while another generation is
 effective.
 
 ## Target Resolution
+
+Thread and turn ids in this section are transient protocol addresses. They are
+never instance, account, owner, receiver, or process-generation identities and
+never authorize recovery.
 
 The app-server connection is initialized once and never supplies thread
 settings. Before a turn, the gateway reads the complete bounded
@@ -69,7 +80,7 @@ threads are never selected. Without a provable current thread, delivery fails
 closed.
 
 One exact top-level thread selection is checkpointed across a gateway process
-restart. The version-2 checkpoint stores only the stable thread id and its
+restart. The version-2 checkpoint stores only the current thread address and its
 proven loaded-thread inventory; it never persists an active turn id. After a
 restart the gateway rereads that exact thread and recovers its current idle,
 active, or system-error state before choosing `turn/start` or `turn/steer`.
@@ -229,6 +240,11 @@ The instance launcher owns the app-server and gateway as children of one TUI
 generation. Exiting the TUI stops both workers. No user service or global
 supervisor survives the alias, so a later marketplace launch cannot retain old
 business logic in an external process.
+
+If the app-server socket generation changes under the supervised launcher, the
+replacement TUI is selected by the same alias, account, state directory, and
+original workspace/global options, then `resume --last`. A checkpointed thread
+address never selects or authorizes that replacement TUI.
 
 ## Live Acceptance
 

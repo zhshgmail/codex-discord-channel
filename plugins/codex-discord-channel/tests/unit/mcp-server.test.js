@@ -335,6 +335,8 @@ test('status reports non-secret Discord startup diagnostics', async () => {
   assert.equal(result.structuredContent.deliveryBlockedReason, 'shared_app_server_socket_missing');
   assert.equal(result.structuredContent.deliveryBlockedAt, '2026-07-13T00:00:00.000Z');
   assert.equal(result.structuredContent.deliveryQueuePath, path.join(stateDir, 'pending-delivery.json'));
+  assert.deepEqual(result.structuredContent.thisInstanceIdentity, config.instanceIdentity);
+  assert.equal(Object.hasOwn(result.structuredContent, 'thisOwnerId'), false);
   assert.equal(result.content[0].text.includes('secret-token'), false);
   assert.equal(result.content[0].text.includes('127.0.0.1:8080'), false);
   assert.equal(result.content[0].text.includes('queued-secret-content'), false);

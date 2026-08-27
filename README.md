@@ -226,8 +226,10 @@ those symptoms by replaying the queue or killing unrelated processes.
   `session-gateway.pid` as the active receive gate. During a staged takeover
   from a legacy gateway, its unchanged PID/generation files remain intact and
   the current receiver CAS lives in `session-gateway.pid.v2`.
-- Keeps `owner.json` for status and handoff metadata only; thread or session ids
-  never gate individual Discord messages.
+- Keeps `owner.json` version 2 for stable instance and process metadata only.
+  Its diagnostic fingerprint comes from the normalized alias, canonical Codex
+  account home, and canonical private state directory; Codex owner, thread, and
+  session ids neither identify the instance nor gate messages.
 - Persists accepted messages in a cross-process locked, deduplicated ready FIFO
   plus a visible fail-closed reconciliation lane for uncertain acknowledgements.
 - Sends one queued message at a time through `turn/start` when idle or
@@ -269,6 +271,12 @@ threads and reads the current top-level thread status. A fresh endpoint must
 have one provable top-level TUI thread. After `/clear` or another thread
 rotation, the latest top-level `thread/started` notification becomes the
 current target even while an older subscribed thread is still loaded.
+
+Those thread and turn ids are transient app-server routing addresses. They are
+never account, instance, receiver, owner, process-generation, or restart
+authority. After an app-server socket replacement, the launcher retains the
+same stable alias/account/state and original workspace options and uses
+`resume --last`; it never resumes a checkpointed thread id.
 
 Each drain admits at most one FIFO item. An idle target uses `turn/start`; an
 active target with a notification-proven current turn uses `turn/steer` with an

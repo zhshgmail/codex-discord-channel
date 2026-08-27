@@ -124,6 +124,11 @@ receiver. Queue health is explicit as `idle`, `queued`, `blocked`, `degraded`,
 or `unreadable`; degraded status includes the oldest uncertain message id,
 attempt count, and retry time without exposing message content.
 
+Status and `owner.json` expose a diagnostic stable instance fingerprint derived
+only from the normalized alias, canonical Codex account home, and canonical
+private Discord state directory. Codex owner, session, thread, and turn ids are
+never instance identification or authorization inputs.
+
 When no live receiver exists, Discord login, durable queue readiness, and an
 armed listener are sufficient to claim reception; target delivery reconnects
 later. A live-receiver takeover also requires target readiness before its one
@@ -152,6 +157,11 @@ generation can be reclaimed. Ambiguous or legacy state remains fail-closed and
 is not modified. Normal and recovery teardown both target only the verified
 process groups, with bounded TERM-to-KILL cleanup and inode-checked socket
 removal.
+
+If the app-server socket generation changes, the replacement TUI preserves the
+same stable instance and original workspace/global options and invokes
+`resume --last`. The current thread id remains only a structured-delivery route
+and cannot select or authorize the replacement TUI.
 
 ## Checks
 

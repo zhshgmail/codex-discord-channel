@@ -395,27 +395,58 @@ test('generic Codex app-server endpoint cannot redirect a Discord instance', () 
   assert.equal(config.appServerUrl, `unix://${path.join(stateDir, 'app-server.sock')}`);
 });
 
-test('loadConfig uses Codex thread id as stable owner id', () => {
-  const config = loadConfig({
-    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
-    CODEX_THREAD_ID: 'thread-123',
+test('volatile Codex ids cannot change stable Discord instance identity', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const first = loadConfig({
+    HOME: home,
+    CODEX_THREAD_ID: 'thread-before-clear',
+    CODEX_SESSION_ID: 'session-before-restart',
+    CODEX_TARGET_THREAD_ID: 'target-before-restart',
+    CODEX_DISCORD_OWNER_ID: 'legacy-manual-owner',
   });
-  assert.equal(config.ownerId, 'thread-123');
+  const second = loadConfig({
+    HOME: home,
+    CODEX_THREAD_ID: 'thread-after-clear',
+    CODEX_SESSION_ID: 'session-after-restart',
+    CODEX_TARGET_THREAD_ID: 'target-after-restart',
+    CODEX_DISCORD_OWNER_ID: 'different-legacy-owner',
+  });
+
+  assert.deepEqual(second.instanceIdentity, first.instanceIdentity);
+  assert.match(first.instanceIdentity.fingerprint, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(Object.hasOwn(first, 'ownerId'), false);
 });
 
-test('explicit Discord owner id overrides Codex thread id', () => {
-  const config = loadConfig({
-    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
-    CODEX_DISCORD_OWNER_ID: 'manual-owner',
-    CODEX_THREAD_ID: 'thread-123',
+test('different account or state bindings have different stable instance identities', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
+  const first = loadConfig({
+    HOME: home,
+    CODEX_HOME: path.join(home, 'account-a'),
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: path.join(home, 'state-a'),
   });
-  assert.equal(config.ownerId, 'manual-owner');
+  const differentAccount = loadConfig({
+    HOME: home,
+    CODEX_HOME: path.join(home, 'account-b'),
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: path.join(home, 'state-a'),
+  });
+  const differentState = loadConfig({
+    HOME: home,
+    CODEX_HOME: path.join(home, 'account-a'),
+    DISCORD_INSTANCE: 'codex02',
+    DISCORD_CONFIG_DIR: path.join(home, 'state-b'),
+  });
+
+  assert.notEqual(first.instanceIdentity.fingerprint, differentAccount.instanceIdentity.fingerprint);
+  assert.notEqual(first.instanceIdentity.fingerprint, differentState.instanceIdentity.fingerprint);
 });
 
-test('loadConfig accepts explicit owner pid for session binding metadata', () => {
+test('volatile owner pid overrides cannot replace local process metadata', () => {
   const config = loadConfig({
     HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
     CODEX_DISCORD_OWNER_PID: '3547805',
+    CODEX_OWNER_PID: '3547806',
   });
-  assert.equal(config.pid, 3547805);
+  assert.equal(config.pid, process.pid);
 });

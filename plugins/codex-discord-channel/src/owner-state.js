@@ -14,9 +14,9 @@ function readJson(file) {
 
 function createOwner(config) {
   return {
-    version: 1,
+    version: 2,
     instance: config.paths.instance,
-    ownerId: config.ownerId,
+    instanceIdentity: config.instanceIdentity,
     pid: config.pid,
     hostname: config.hostname,
     cwd: config.cwd,
@@ -38,14 +38,19 @@ function readOwner(ownerPath) {
   return owner;
 }
 
-function isCurrentOwner(ownerPath, ownerId) {
+function isSameInstanceOwner(ownerPath, instanceIdentity) {
   const owner = readOwner(ownerPath);
-  return Boolean(owner && owner.ownerId === ownerId);
+  return Boolean(
+    owner
+    && owner.instanceIdentity?.version === 1
+    && instanceIdentity?.version === 1
+    && owner.instanceIdentity.fingerprint === instanceIdentity.fingerprint,
+  );
 }
 
 module.exports = {
   claimOwner,
   createOwner,
-  isCurrentOwner,
+  isSameInstanceOwner,
   readOwner,
 };

@@ -67,8 +67,12 @@ function createFixture(options = {}) {
     claimedAt: '2026-07-20T00:00:00.000Z',
     fallback: null,
   };
+  const instanceIdentity = options.instanceIdentity || {
+    version: 1,
+    fingerprint: `sha256:${'a'.repeat(64)}`,
+  };
   const config = {
-    ownerId: options.ownerId || 'session-before-compaction',
+    instanceIdentity,
     deliveryMode: 'app-server',
     automaticOutboundEnabled: options.automaticOutboundEnabled ?? true,
     appServerRequestTimeoutMs: 100,
@@ -83,7 +87,7 @@ function createFixture(options = {}) {
     },
   };
   fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(receiverOwnership)}\n`);
-  fs.writeFileSync(config.paths.ownerPath, `${JSON.stringify({ ownerId: config.ownerId })}\n`);
+  fs.writeFileSync(config.paths.ownerPath, `${JSON.stringify({ instanceIdentity, pid: 100 })}\n`);
 
   const requests = [];
   let targetAttempts = 0;
@@ -309,12 +313,12 @@ test('restart drains owner DM and group FIFO after session and thread binding ro
 
   fs.writeFileSync(
     first.config.paths.ownerPath,
-    `${JSON.stringify({ ownerId: 'session-after-compaction' })}\n`,
+    `${JSON.stringify({ instanceIdentity: first.config.instanceIdentity, pid: 200 })}\n`,
   );
   const second = createFixture({
     available: true,
     dir: first.dir,
-    ownerId: 'session-after-compaction',
+    instanceIdentity: first.config.instanceIdentity,
     threadId: 'thread-after-compaction',
   });
   const secondTimers = createManualTimers();

@@ -643,7 +643,7 @@ test('cleanup removes an owned socket created after sibling startup failure', ()
   );
 });
 
-test('shell launcher resumes the exact captured thread after app-server replacement', () => {
+test('shell launcher resumes the stable workspace without a captured thread id after app-server replacement', () => {
   const setup = fixture();
   const result = spawnSync(
     setup.launcher,
@@ -659,9 +659,10 @@ test('shell launcher resumes the exact captured thread after app-server replacem
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume --last`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume --last`,
   ]);
-  assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
+  assert.match(result.stderr, /resuming the last session in the stable launch workspace/);
+  assert.doesNotMatch(result.stderr, /019f3763-d308-7871-bedc-e6489b02190e/);
 });
 
 test('recovery begin receives milliseconds from the configured Node clock', () => {
@@ -723,11 +724,18 @@ test('Codex child receives only the explicit Discord instance allowlist', () => 
   ]);
 });
 
-test('recovery inserts exact resume after preserving global flags when no resume was supplied', () => {
+test('recovery inserts workspace-scoped resume last after preserving global flags', () => {
   const setup = fixture();
   const result = spawnSync(
     setup.launcher,
-    ['codex02', '--dangerously-bypass-approvals-and-sandbox', '--profile', 'review'],
+    [
+      'codex02',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--profile',
+      'review',
+      '-C',
+      setup.home,
+    ],
     {
       encoding: 'utf8',
       env: launchEnv(setup, { TRANSPORT_FAIL_ONCE: '1' }),
@@ -738,8 +746,8 @@ test('recovery inserts exact resume after preserving global flags when no resume
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review -C ${setup.home}`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review -C ${setup.home} resume --last`,
   ]);
 });
 
@@ -766,7 +774,7 @@ test('recovery discards the original prompt instead of replaying it after resume
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume --last`,
   ]);
 });
 
@@ -787,6 +795,6 @@ test('recovery discards image prompt inputs instead of replaying them after resu
       .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
     assert.equal(tuiLaunches.length, 2);
     assert.equal(tuiLaunches[1],
-      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
+      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --profile review resume --last`);
   }
 });

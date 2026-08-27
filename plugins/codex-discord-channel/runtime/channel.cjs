@@ -107,7 +107,7 @@ var require_paths = __commonJS({
 var require_config = __commonJS({
   "src/config.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { expandPath, resolvePaths } = require_paths(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]), ACCOUNT_ENV_KEYS = /* @__PURE__ */ new Set([
+    var fs = require("node:fs"), { createHash } = require("node:crypto"), os = require("node:os"), path = require("node:path"), { expandPath, resolvePaths } = require_paths(), ACCOUNT_BINDING_KEYS = /* @__PURE__ */ new Set(["DISCORD_INSTANCE", "DISCORD_CONFIG_DIR"]), ACCOUNT_ENV_KEYS = /* @__PURE__ */ new Set([
       "CODEX_HOME",
       "CODEX_BIN",
       "NODE_BIN",
@@ -137,6 +137,30 @@ var require_config = __commonJS({
     function inferCodexHomeFromPluginCache(cwd) {
       let resolvedCwd = path.resolve(String(cwd || "")), marker = `${path.sep}plugins${path.sep}cache${path.sep}`, markerIndex = resolvedCwd.lastIndexOf(marker);
       return markerIndex <= 0 ? "" : resolvedCwd.slice(0, markerIndex);
+    }
+    function canonicalIdentityPath(input) {
+      let current = path.resolve(String(input || "")), suffix = [];
+      for (; !fs.existsSync(current); ) {
+        let parent = path.dirname(current);
+        if (parent === current) break;
+        suffix.unshift(path.basename(current)), current = parent;
+      }
+      let resolved = fs.existsSync(current) ? fs.realpathSync.native(current) : current;
+      return path.join(resolved, ...suffix);
+    }
+    function createInstanceIdentity(instance, codexHome, stateDir) {
+      let binding = {
+        version: 1,
+        instance: String(instance),
+        codexHome: canonicalIdentityPath(codexHome),
+        stateDir: canonicalIdentityPath(stateDir)
+      }, digest = createHash("sha256").update(JSON.stringify([
+        binding.version,
+        binding.instance,
+        binding.codexHome,
+        binding.stateDir
+      ])).digest("hex");
+      return { ...binding, fingerprint: `sha256:${digest}` };
     }
     function loadEnvFile(file, env, options = {}) {
       if (!file || !fs.existsSync(file)) return !1;
@@ -207,13 +231,13 @@ var require_config = __commonJS({
         strict: !0
       }), envLoaded = options.loadDiscordEnv === !1 ? !1 : loadEnvFile(paths.envFile, env);
       paths = resolvePaths(env);
-      let token = env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || "", botUserId = env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || "", proxyUrl = env.DISCORD_PROXY_URL || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || "", cwd = env.CODEX_CWD || options.cwd || process.cwd(), ownerId = env.CODEX_DISCORD_OWNER_ID || env.CODEX_THREAD_ID || env.CODEX_SESSION_ID || env.CODEX_TARGET_THREAD_ID || `${os.hostname()}:${process.pid}:${Date.now()}`, requestedDeliveryMode = String(
+      let token = env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || "", botUserId = env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || "", proxyUrl = env.DISCORD_PROXY_URL || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || "", cwd = env.CODEX_CWD || options.cwd || process.cwd(), requestedDeliveryMode = String(
         env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || "app-server"
       ).toLowerCase(), deliveryMode = requestedDeliveryMode === "off" ? "off" : "app-server", appServerUrl = String(
         env.CODEX_DISCORD_APP_SERVER_URL || `unix://${paths.stateDir}/app-server.sock`
       ).trim(), deliveryActivationId = String(
         env.CODEX_DISCORD_DELIVERY_ACTIVATION_ID || ""
-      ).trim() || fs.realpathSync(path.resolve(__dirname, ".."));
+      ).trim() || fs.realpathSync(path.resolve(__dirname, "..")), codexHome = expandPath(env.CODEX_HOME || path.join(env.HOME || os.homedir(), ".codex"), env), instanceIdentity = createInstanceIdentity(paths.instance, codexHome, paths.stateDir);
       return {
         env,
         paths,
@@ -223,7 +247,8 @@ var require_config = __commonJS({
         accountEnvLoaded,
         networkEnvLoaded,
         accountHomeSource,
-        codexHome: expandPath(env.CODEX_HOME || path.join(env.HOME || os.homedir(), ".codex"), env),
+        codexHome,
+        instanceIdentity,
         token,
         tokenConfigured: token !== "",
         botUserId,
@@ -261,14 +286,15 @@ var require_config = __commonJS({
           parseInteger(env.CODEX_DISCORD_TUI_LEASE_STALE_MS, 3e3)
         ),
         parentPid: process.ppid,
-        ownerId,
         cwd,
         hostname: os.hostname(),
-        pid: parseInteger(env.CODEX_DISCORD_OWNER_PID || env.CODEX_OWNER_PID, process.pid),
+        pid: process.pid,
         startedAt: (/* @__PURE__ */ new Date()).toISOString()
       };
     }
     module2.exports = {
+      canonicalIdentityPath,
+      createInstanceIdentity,
       loadConfig: loadConfig2,
       loadEnvFile,
       parseInteger,
@@ -95549,9 +95575,9 @@ var require_owner_state = __commonJS({
     }
     function createOwner2(config) {
       return {
-        version: 1,
+        version: 2,
         instance: config.paths.instance,
-        ownerId: config.ownerId,
+        instanceIdentity: config.instanceIdentity,
         pid: config.pid,
         hostname: config.hostname,
         cwd: config.cwd,
@@ -95568,14 +95594,14 @@ var require_owner_state = __commonJS({
       let owner = readJson(ownerPath);
       return !owner || typeof owner != "object" ? null : owner;
     }
-    function isCurrentOwner(ownerPath, ownerId) {
+    function isSameInstanceOwner(ownerPath, instanceIdentity) {
       let owner = readOwner(ownerPath);
-      return !!(owner && owner.ownerId === ownerId);
+      return !!(owner && owner.instanceIdentity?.version === 1 && instanceIdentity?.version === 1 && owner.instanceIdentity.fingerprint === instanceIdentity.fingerprint);
     }
     module2.exports = {
       claimOwner: claimOwner2,
       createOwner: createOwner2,
-      isCurrentOwner,
+      isSameInstanceOwner,
       readOwner
     };
   }
@@ -95985,14 +96011,14 @@ var require_mcp_server = __commonJS({
         {
           name: "discord_channel_read_owner",
           title: "Read Discord Channel Owner",
-          description: "Read the active owner for this Discord bot instance.",
+          description: "Read non-authoritative stable instance and process metadata for this Discord bot.",
           inputSchema: { type: "object", properties: {} },
           annotations: { readOnlyHint: !0, destructiveHint: !1, idempotentHint: !0, openWorldHint: !1 }
         },
         {
           name: "discord_channel_claim_owner",
-          title: "Claim Discord Channel Owner",
-          description: "Claim this process as the active owner for the selected Discord bot instance.",
+          title: "Refresh Discord Instance Metadata",
+          description: "Refresh non-authoritative process metadata for the selected stable Discord instance.",
           inputSchema: { type: "object", properties: {} },
           annotations: { readOnlyHint: !1, destructiveHint: !0, idempotentHint: !0, openWorldHint: !1 }
         },
@@ -96108,7 +96134,7 @@ var require_mcp_server = __commonJS({
           mcpDiscordClientStarted: context.discordState.started,
           mcpDiscordClientReason: context.discordState.reason || null,
           currentOwner: owner,
-          thisOwnerId: context.config.ownerId
+          thisInstanceIdentity: context.config.instanceIdentity
         };
         return textResult(JSON.stringify(payload, null, 2), payload);
       }
@@ -96118,7 +96144,7 @@ var require_mcp_server = __commonJS({
       }
       if (name === "discord_channel_claim_owner") {
         let owner = context.claim();
-        return textResult(`Claimed Discord channel owner for instance ${owner.instance}.`, { owner });
+        return textResult(`Refreshed Discord instance metadata for ${owner.instance}.`, { owner });
       }
       if (name === "discord_channel_send") {
         let sent = await sendDiscordReplyOnce2({

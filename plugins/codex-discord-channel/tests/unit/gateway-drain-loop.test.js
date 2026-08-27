@@ -86,8 +86,12 @@ async function deliveryFixture(options = {}) {
     claimedAt: '2026-07-20T00:00:00.000Z',
     fallback: null,
   };
+  const instanceIdentity = {
+    version: 1,
+    fingerprint: `sha256:${'b'.repeat(64)}`,
+  };
   const config = {
-    ownerId: 'session-before-clear',
+    instanceIdentity,
     deliveryMode: 'app-server',
     appServerRequestTimeoutMs: 100,
     deliveryDrainIntervalMs: 10,
@@ -101,7 +105,7 @@ async function deliveryFixture(options = {}) {
     },
   };
   fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(receiverOwnership)}\n`);
-  fs.writeFileSync(config.paths.ownerPath, `${JSON.stringify({ ownerId: 'session-after-clear' })}\n`);
+  fs.writeFileSync(config.paths.ownerPath, `${JSON.stringify({ instanceIdentity, pid: 200 })}\n`);
 
   let available = Boolean(options.available);
   let releaseTurn = null;

@@ -80,14 +80,14 @@ function toolList() {
     {
       name: 'discord_channel_read_owner',
       title: 'Read Discord Channel Owner',
-      description: 'Read the active owner for this Discord bot instance.',
+      description: 'Read non-authoritative stable instance and process metadata for this Discord bot.',
       inputSchema: { type: 'object', properties: {} },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     {
       name: 'discord_channel_claim_owner',
-      title: 'Claim Discord Channel Owner',
-      description: 'Claim this process as the active owner for the selected Discord bot instance.',
+      title: 'Refresh Discord Instance Metadata',
+      description: 'Refresh non-authoritative process metadata for the selected stable Discord instance.',
       inputSchema: { type: 'object', properties: {} },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -215,7 +215,7 @@ async function callTool(context, name, args = {}) {
       mcpDiscordClientStarted: context.discordState.started,
       mcpDiscordClientReason: context.discordState.reason || null,
       currentOwner: owner,
-      thisOwnerId: context.config.ownerId,
+      thisInstanceIdentity: context.config.instanceIdentity,
     };
     return textResult(JSON.stringify(payload, null, 2), payload);
   }
@@ -227,7 +227,7 @@ async function callTool(context, name, args = {}) {
 
   if (name === 'discord_channel_claim_owner') {
     const owner = context.claim();
-    return textResult(`Claimed Discord channel owner for instance ${owner.instance}.`, { owner });
+    return textResult(`Refreshed Discord instance metadata for ${owner.instance}.`, { owner });
   }
 
   if (name === 'discord_channel_send') {

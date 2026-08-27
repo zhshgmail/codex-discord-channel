@@ -141,10 +141,6 @@ snapshot_recovery_target() {
     "${runtime_args[@]}" >/dev/null
 }
 
-read_recovery_target() {
-  "${channel_command[@]}" tui-recovery-target read "${runtime_args[@]}"
-}
-
 watcher_pid=''
 watcher_stop=''
 app_pid=''
@@ -560,7 +556,7 @@ while ((SECONDS <= deadline)); do
       if ! record_worker_group "$tui_pid" 0; then
         tui_start_ticks=$recorded_worker_start_ticks
         tui_pgid=$recorded_worker_pgid
-        echo "Discord TUI identity for $instance was unavailable" >&2
+        echo "Discord TUI process metadata for $instance was unavailable" >&2
         exit 1
       fi
       tui_start_ticks=$recorded_worker_start_ticks
@@ -619,14 +615,6 @@ while ((SECONDS <= deadline)); do
         exit "$tui_status"
       fi
 
-      set +e
-      recovery_thread=$(read_recovery_target 2>/dev/null)
-      recovery_target_status=$?
-      set -e
-      if ((recovery_target_status != 0)) || [[ -z $recovery_thread ]]; then
-        exit "$tui_status"
-      fi
-
       now_seconds=$(date +%s)
       retained_stamps=()
       for stamp in "${recovery_stamps[@]}"; do
@@ -681,9 +669,13 @@ while ((SECONDS <= deadline)); do
             ;;
         esac
       done
-      recovered_args+=(resume "$recovery_thread")
+      # Recovery is anchored by the launcher's exact instance/account/state
+      # binding and the original workspace/global options.  A Codex thread id
+      # is a volatile routing address and must never choose or authorize the
+      # replacement TUI.
+      recovered_args+=(resume --last)
       codex_args=("${recovered_args[@]}")
-      echo "App-server generation changed; resuming thread $recovery_thread." >&2
+      echo "App-server generation changed; resuming the last session in the stable launch workspace." >&2
     done
   fi
   sleep 0.1

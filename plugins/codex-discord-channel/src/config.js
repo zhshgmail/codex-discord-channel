@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const { createHash } = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 const { expandPath, resolvePaths } = require('./paths');
@@ -51,6 +52,37 @@ function inferCodexHomeFromPluginCache(cwd) {
   const markerIndex = resolvedCwd.lastIndexOf(marker);
   if (markerIndex <= 0) return '';
   return resolvedCwd.slice(0, markerIndex);
+}
+
+function canonicalIdentityPath(input) {
+  let current = path.resolve(String(input || ''));
+  const suffix = [];
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    suffix.unshift(path.basename(current));
+    current = parent;
+  }
+  const resolved = fs.existsSync(current) ? fs.realpathSync.native(current) : current;
+  return path.join(resolved, ...suffix);
+}
+
+function createInstanceIdentity(instance, codexHome, stateDir) {
+  const binding = {
+    version: 1,
+    instance: String(instance),
+    codexHome: canonicalIdentityPath(codexHome),
+    stateDir: canonicalIdentityPath(stateDir),
+  };
+  const digest = createHash('sha256')
+    .update(JSON.stringify([
+      binding.version,
+      binding.instance,
+      binding.codexHome,
+      binding.stateDir,
+    ]))
+    .digest('hex');
+  return { ...binding, fingerprint: `sha256:${digest}` };
 }
 
 function loadEnvFile(file, env, options = {}) {
@@ -182,12 +214,6 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.http_proxy ||
     '';
   const cwd = env.CODEX_CWD || options.cwd || process.cwd();
-  const ownerId =
-    env.CODEX_DISCORD_OWNER_ID ||
-    env.CODEX_THREAD_ID ||
-    env.CODEX_SESSION_ID ||
-    env.CODEX_TARGET_THREAD_ID ||
-    `${os.hostname()}:${process.pid}:${Date.now()}`;
   const requestedDeliveryMode = String(
     env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'app-server',
   ).toLowerCase();
@@ -199,6 +225,8 @@ function loadConfig(inputEnv = process.env, options = {}) {
   const deliveryActivationId = String(
     env.CODEX_DISCORD_DELIVERY_ACTIVATION_ID || '',
   ).trim() || fs.realpathSync(path.resolve(__dirname, '..'));
+  const codexHome = expandPath(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), env);
+  const instanceIdentity = createInstanceIdentity(paths.instance, codexHome, paths.stateDir);
 
   return {
     env,
@@ -209,7 +237,8 @@ function loadConfig(inputEnv = process.env, options = {}) {
     accountEnvLoaded,
     networkEnvLoaded,
     accountHomeSource,
-    codexHome: expandPath(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), env),
+    codexHome,
+    instanceIdentity,
     token,
     tokenConfigured: token !== '',
     botUserId,
@@ -249,15 +278,16 @@ function loadConfig(inputEnv = process.env, options = {}) {
       parseInteger(env.CODEX_DISCORD_TUI_LEASE_STALE_MS, 3000),
     ),
     parentPid: process.ppid,
-    ownerId,
     cwd,
     hostname: os.hostname(),
-    pid: parseInteger(env.CODEX_DISCORD_OWNER_PID || env.CODEX_OWNER_PID, process.pid),
+    pid: process.pid,
     startedAt: new Date().toISOString(),
   };
 }
 
 module.exports = {
+  canonicalIdentityPath,
+  createInstanceIdentity,
   loadConfig,
   loadEnvFile,
   parseInteger,

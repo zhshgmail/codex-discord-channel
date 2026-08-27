@@ -1,7 +1,7 @@
 {
   "name": "codex-discord-channel",
   "version": "0.3.16",
-  "description": "Claude-style Discord channel ownership for Codex sessions.",
+  "description": "Stable instance-scoped Discord delivery for Codex.",
   "license": "MIT",
   "repository": {
     "type": "git",

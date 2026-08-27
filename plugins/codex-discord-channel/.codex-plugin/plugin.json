@@ -1,7 +1,7 @@
 {
   "name": "codex-discord-channel",
   "version": "0.3.16",
-  "description": "Claude-style Discord channel ownership for Codex sessions.",
+  "description": "Stable instance-scoped Discord delivery for Codex.",
   "author": {
     "name": "zhshgmail",
     "url": "https://github.com/zhshgmail"
@@ -19,8 +19,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Discord Channel",
-    "shortDescription": "Bind a Discord bot instance to the active Codex session.",
-    "longDescription": "A session-local Discord channel plugin for Codex. It keeps one active owner per bot instance and persistently queues accepted inbound messages until delivery can be verified without unsafe terminal keystrokes.",
+    "shortDescription": "Bind Discord to a stable Codex instance boundary.",
+    "longDescription": "An instance-scoped Discord channel plugin for Codex. It authenticates local runtime generations by stable account and state bindings, and persistently queues accepted inbound messages until delivery can be verified without unsafe terminal keystrokes.",
     "developerName": "zhshgmail",
     "category": "Productivity",
     "capabilities": [
@@ -30,7 +30,7 @@
     ],
     "defaultPrompt": [
       "Use $codex-discord-channel to check Discord channel status.",
-      "Claim this Codex session as the Discord bot owner.",
+      "Refresh non-authoritative metadata for this stable Discord instance.",
       "Send a Discord reply from this Codex session."
     ]
   },
