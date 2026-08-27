@@ -53,13 +53,13 @@ source_generation_bin="$plugin_root/bin/codex-discord-generation"
 generation_runtime_dir="$state_dir/generation-runtime/current"
 channel_bin="$source_channel_bin"
 generation_bin="$source_generation_bin"
-# A previous launcher may have been SIGKILLed after its marketplace cache was
-# evicted.  Reclaim that generation using the durable helper paths recorded in
-# its manifest; fresh source bytes replace them only after prepare succeeds.
-if [[ -f $generation_runtime_dir/channel.cjs && -f $generation_runtime_dir/codex-discord-generation ]]; then
-  channel_bin="$generation_runtime_dir/channel.cjs"
-  generation_bin="$generation_runtime_dir/codex-discord-generation"
-fi
+# Cross-version recovery is interpreted by the helper shipped with this
+# launcher.  An older durable snapshot may enforce an obsolete identity policy
+# (for example, binding authority to its evicted marketplace path) and must not
+# decide whether the current launcher may reclaim the exact recorded
+# generation.  After prepare succeeds, fresh bytes are installed into the
+# durable snapshot so the live generation remains independent of cache
+# eviction.
 setsid_bin=$(command -v setsid 2>/dev/null || true)
 if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $source_channel_bin \
   || ! -f $source_generation_bin || -z $setsid_bin || ! -x $setsid_bin ]]; then

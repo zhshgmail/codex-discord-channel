@@ -237,6 +237,20 @@ function assertManifestIdentity(manifest, expected) {
   }
 }
 
+function assertReclaimAuthority(manifest, expected) {
+  // The durable state directory is the instance identity.  Executable and
+  // account-runtime paths describe the generation being reclaimed; they are
+  // expected to change across plugin upgrades and must not become authority
+  // gates for a later launcher using the same state directory.
+  const fields = ['instance', 'socketPath', 'stateDir'];
+  for (const field of fields) {
+    if (manifest[field] !== expected[field]) refuse(`manifest ${field} does not match this launcher`);
+  }
+  if (manifest.endpoint && manifest.endpoint.path !== expected.socketPath) {
+    refuse('manifest endpoint does not match this launcher');
+  }
+}
+
 function identityEnvMatches(processInfo, manifest, role) {
   return processInfo.env.CODEX_DISCORD_LAUNCH_GENERATION === manifest.nonce
     && processInfo.env.CODEX_DISCORD_LAUNCH_ROLE === role
@@ -410,7 +424,7 @@ async function prepare(options) {
     return { status: 'clean' };
   }
   const { manifest, raw } = record;
-  assertManifestIdentity(manifest, expected);
+  assertReclaimAuthority(manifest, expected);
   const launcherState = processIdentityState(manifest.launcher);
   if (launcherState === 'exact') refuse('recorded launcher is still live');
   if (launcherState === 'reused') refuse('recorded launcher PID has been reused');

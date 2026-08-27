@@ -482,6 +482,22 @@ test('SIGKILLed launcher generation is reclaimed on immediate relaunch with no d
 
 test('cache eviction and version-path change cannot block exact orphan reclaim and relaunch', async (t) => {
   const setup = fixture(t);
+  const currentHelper = fs.readFileSync(sourceGenerationHelper, 'utf8');
+  const currentIdentityFields = "    'socketPath', 'stateDir',\n";
+  const legacyIdentityFields = "    'pluginRoot', 'socketPath', 'stateDir',\n";
+  const legacyHelper = currentHelper.replace(currentIdentityFields, legacyIdentityFields);
+  assert.notEqual(
+    legacyHelper,
+    currentHelper,
+    'fixture must recreate the old helper that bound reclaim to pluginRoot',
+  );
+  assert.equal(
+    legacyHelper.split(legacyIdentityFields).length - 1,
+    1,
+    'legacy pluginRoot assertion must be injected exactly once',
+  );
+  fs.writeFileSync(setup.generationHelper, legacyHelper, { mode: 0o700 });
+
   const { manifest, records } = await orphanReadyGeneration(setup, {
     APP_WRAPPER_TERM: 'exit',
   });
