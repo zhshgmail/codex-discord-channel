@@ -50,6 +50,34 @@ function isProcessAlive(pid) {
   }
 }
 
+function readLinuxProcessStartTicks(pid, fsImpl = fs) {
+  try {
+    const stat = fsImpl.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // comm may contain spaces and parentheses.  Field 22 is the twentieth
+    // field after the final `) ` delimiter (the suffix begins at field 3).
+    const suffix = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/);
+    return /^[1-9]\d*$/.test(suffix[19] || '') ? suffix[19] : '';
+  } catch {
+    return '';
+  }
+}
+
+function processRecordIsAlive(record, deps = {}) {
+  if (!record || !processIsAlive(record.pid, deps)) return false;
+  // Injected liveness is used by unit/mixed-binary compatibility tests.  Live
+  // records created by this version also carry Linux start ticks so PID reuse
+  // cannot impersonate an existing gateway.  This is process diagnosis only;
+  // Discord identity remains the stable state directory.
+  if (!record.processStartTicks) return true;
+  if (typeof deps.isProcessAlive === 'function' && typeof deps.readProcessStartTicks !== 'function') {
+    return true;
+  }
+  const actual = typeof deps.readProcessStartTicks === 'function'
+    ? deps.readProcessStartTicks(record.pid)
+    : readLinuxProcessStartTicks(record.pid, deps.fs || fs);
+  return actual === record.processStartTicks;
+}
+
 function getReceiverAuthorityPath(config = {}) {
   return config.paths?.gatewayPidPath || '';
 }
@@ -163,8 +191,8 @@ function processIsAlive(pid, deps = {}) {
 function effectiveReceiverOwnership(snapshot, deps = {}) {
   const record = snapshot?.valid ? snapshot.record : null;
   if (!record) return null;
-  if (processIsAlive(record.pid, deps)) return { record, fallback: false };
-  if (record.version === 2 && record.fallback && processIsAlive(record.fallback.pid, deps)) {
+  if (processRecordIsAlive(record, deps)) return { record, fallback: false };
+  if (record.version === 2 && record.fallback && processRecordIsAlive(record.fallback, deps)) {
     return { record: record.fallback, fallback: true };
   }
   return null;
@@ -238,11 +266,15 @@ function fallbackRecord(record) {
 function createReceiverOwnership(previous, deps = {}) {
   const pid = localPid(deps);
   const nowValue = typeof deps.now === 'function' ? deps.now() : Date.now();
+  const processStartTicks = deps.processStartTicks || readLinuxProcessStartTicks(pid, deps.fs || fs);
+  const stateDir = typeof deps.stateDir === 'string' ? deps.stateDir : '';
   return {
     version: 2,
     pid,
     generation: (deps.randomUUID || randomUUID)(),
     claimedAt: new Date(nowValue).toISOString(),
+    ...(processStartTicks ? { processStartTicks } : {}),
+    ...(stateDir ? { stateDir, role: 'gateway' } : {}),
     fallback: previous && previous.pid !== pid ? fallbackRecord(previous) : null,
   };
 }
@@ -286,7 +318,7 @@ function releaseReceiverOwnership(config, expected, deps = {}) {
   const fsImpl = deps.fs || fs;
   const current = snapshot.record;
   if (sameReceiverOwnership(current, expected)) {
-    const fallback = current.version === 2 && current.fallback && processIsAlive(current.fallback.pid, deps)
+    const fallback = current.version === 2 && current.fallback && processRecordIsAlive(current.fallback, deps)
       ? fallbackRecord(current.fallback)
       : null;
     if (fallback) {
@@ -319,6 +351,8 @@ module.exports = {
   isActiveDiscordReceiver,
   isCurrentReceiverOwnership,
   isProcessAlive,
+  processRecordIsAlive,
+  readLinuxProcessStartTicks,
   readReceiverAuthoritySnapshot,
   releaseReceiverOwnership,
   sameReceiverOwnership,

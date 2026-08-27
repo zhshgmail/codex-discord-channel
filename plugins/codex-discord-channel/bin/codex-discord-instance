@@ -124,6 +124,11 @@ if [[ ! $stop_timeout_ms =~ ^[0-9]+$ ]] || ((stop_timeout_ms < 50 || stop_timeou
   echo "CODEX_DISCORD_STOP_TIMEOUT_MS must be an integer from 50 to 30000" >&2
   exit 2
 fi
+gateway_stop_timeout_ms=${CODEX_DISCORD_GATEWAY_STOP_TIMEOUT_MS:-30000}
+if [[ ! $gateway_stop_timeout_ms =~ ^[0-9]+$ ]] || ((gateway_stop_timeout_ms < 1000 || gateway_stop_timeout_ms > 120000)); then
+  echo "CODEX_DISCORD_GATEWAY_STOP_TIMEOUT_MS must be an integer from 1000 to 120000" >&2
+  exit 2
+fi
 
 socket_generation() {
   [[ -S $socket ]] || return 1
@@ -242,7 +247,15 @@ stop_pending_worker() {
     return 0
   fi
   kill -TERM -- "$pid" 2>/dev/null || true
-  local attempts=$(((stop_timeout_ms + 49) / 50))
+  # Forking `sleep` every 50 ms can turn a nominal 30-second shutdown into
+  # more than a minute on a memory-pressured host.  Poll at 250 ms instead:
+  # the bound remains the configured timeout while subprocess overhead stays
+  # small enough for a high-RSS gateway handoff to finish predictably.
+  local poll_ms=250
+  ((stop_timeout_ms < poll_ms)) && poll_ms=$stop_timeout_ms
+  local attempts=$(((stop_timeout_ms + poll_ms - 1) / poll_ms))
+  local poll_seconds
+  printf -v poll_seconds '%d.%03d' $((poll_ms / 1000)) $((poll_ms % 1000))
   local attempt
   for ((attempt = 0; attempt < attempts; attempt += 1)); do
     set +e
@@ -254,7 +267,7 @@ stop_pending_worker() {
       echo "Refusing to continue stopping changed pending $role pid $pid" >&2
       break
     fi
-    sleep 0.05
+    sleep "$poll_seconds"
   done
   if ((state_status == 0)); then
     set +e
@@ -284,6 +297,7 @@ stop_worker_group() {
   local pid=$2
   local start_ticks=$3
   local pgid=$4
+  local role_timeout_ms=${5:-$stop_timeout_ms}
   [[ -n $pid && -n $start_ticks && -n $pgid ]] || return 0
   local state_status=0
   set +e
@@ -299,7 +313,14 @@ stop_worker_group() {
     return 0
   fi
   kill -TERM -- "-$pgid" 2>/dev/null || true
-  local attempts=$(((stop_timeout_ms + 49) / 50))
+  # A short external sleep per poll is expensive under memory pressure.  Use
+  # a coarser interval so elapsed wall time tracks the configured grace rather
+  # than hundreds of process launches.
+  local poll_ms=250
+  ((role_timeout_ms < poll_ms)) && poll_ms=$role_timeout_ms
+  local attempts=$(((role_timeout_ms + poll_ms - 1) / poll_ms))
+  local poll_seconds
+  printf -v poll_seconds '%d.%03d' $((poll_ms / 1000)) $((poll_ms % 1000))
   local attempt
   for ((attempt = 0; attempt < attempts; attempt += 1)); do
     set +e
@@ -311,7 +332,7 @@ stop_worker_group() {
       echo "Refusing to continue stopping changed $role process group $pgid" >&2
       break
     fi
-    sleep 0.05
+    sleep "$poll_seconds"
   done
   if ((state_status == 0)); then
     kill -KILL -- "-$pgid" 2>/dev/null || true
@@ -323,9 +344,10 @@ stop_worker() {
   local pid=$2
   local start_ticks=$3
   local pgid=$4
+  local role_timeout_ms=${5:-$stop_timeout_ms}
   [[ -n $pid && -n $start_ticks && -n $pgid ]] || return 0
   if [[ $pgid == "$pid" ]]; then
-    stop_worker_group "$role" "$pid" "$start_ticks" "$pgid"
+    stop_worker_group "$role" "$pid" "$start_ticks" "$pgid" "$role_timeout_ms"
   else
     stop_pending_worker "$role" "$pid" "$start_ticks" "$pgid"
   fi
@@ -360,8 +382,11 @@ cleanup_launcher() {
   # before removing EXIT ownership so no second signal can strand descendants.
   trap '' INT TERM HUP
   trap - EXIT
+  # Stop the receiver first while the app-server is still available.  Its FIFO
+  # is already durable, and a high-RSS gateway receives a longer bounded grace
+  # period to flush metadata and release receiver ownership cleanly.
+  stop_worker gateway "$gateway_pid" "$gateway_start_ticks" "$gateway_pgid" "$gateway_stop_timeout_ms"
   stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
-  stop_worker gateway "$gateway_pid" "$gateway_start_ticks" "$gateway_pgid"
   stop_worker app "$app_pid" "$app_start_ticks" "$app_pgid"
   if [[ -n $launch_generation ]]; then
     run_generation finish-owned --nonce "$launch_generation" >/dev/null 2>&1 || true
@@ -374,18 +399,28 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 
 exec {launcher_lock_fd}>"$lock_file"
-if ! flock -n "$launcher_lock_fd"; then
-  echo "Discord instance $instance already has an active launcher" >&2
+if ! flock -w 1 "$launcher_lock_fd"; then
+  echo "Discord instance $instance already has an active launcher for state-dir $state_dir." >&2
+  echo "The launcher lock remained live after a 1-second handoff window. Do not start a second instance; stop the existing alias process, then retry codex-discord-instance $instance." >&2
   exit 73
 fi
 set +e
-run_generation prepare --timeout-ms "$stop_timeout_ms" >/dev/null
+prepare_output=$(run_generation prepare --timeout-ms "$stop_timeout_ms")
 prepare_status=$?
 set -e
 if ((prepare_status != 0)); then
-  echo "Discord instance $instance already has an app-server socket; stop the legacy service before relaunching" >&2
+  echo "Discord instance $instance has a live or unreclaimed app-server for state-dir $state_dir." >&2
+  echo "Inspect $generation_manifest and its recorded /proc identity; stop that exact alias generation before relaunching." >&2
   exit 73
 fi
+case $prepare_output in
+  *'"status":"reclaimed_orphan_socket"'*)
+    echo "WARNING: Discord instance $instance automatically removed an orphan app-server socket with no live listener: $socket" >&2
+    ;;
+  *'"status":"reclaimed_generation"'*)
+    echo "WARNING: Discord instance $instance automatically reclaimed a dead, identity-verified launcher generation for state-dir $state_dir." >&2
+    ;;
+esac
 if [[ -e $socket || -e $generation_manifest ]]; then
   echo "Discord instance $instance has ambiguous launcher state" >&2
   exit 73

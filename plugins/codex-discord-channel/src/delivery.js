@@ -14,6 +14,7 @@ const { isProcessAlive } = require('./receiver-state');
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
 const DELIVERY_QUEUE_VERSION = 5;
 const DELIVERY_IN_PROGRESS = 'structured_delivery_in_progress';
+const DELIVERY_PROOF_PENDING = 'delivery_proof_pending';
 // Read-only migration marker from queue schema <=4.  Version 5 never creates
 // this state: an RPC response loss is retried from the state-dir FIFO with the
 // stable Discord source id instead of being pinned to a transient Codex turn.
@@ -24,6 +25,7 @@ const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
 const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
 const DEFAULT_UNCERTAIN_RETRY_BASE_MS = 5000;
 const DEFAULT_UNCERTAIN_RETRY_MAX_MS = 5 * 60 * 1000;
+const DEFAULT_DELIVERY_PROOF_RETRY_DELAY_MS = 2000;
 const activeDeliveryAttempts = new Set();
 
 function currentTimeMs(deps = {}) {
@@ -716,6 +718,13 @@ function unavailableTarget(error) {
   };
 }
 
+async function hasDurableSourceProof(host, target, clientUserMessageId) {
+  if (typeof host.hasDeliveredSource === 'function') {
+    return Boolean(await host.hasDeliveredSource(clientUserMessageId));
+  }
+  return Boolean(await host.hasDelivered(target.threadId, clientUserMessageId));
+}
+
 async function flushStructuredQueue(config, logger, deps, host, options = {}) {
   const verifyReceiverOwnership = options.verifyReceiverOwnership;
   let reconciledCount = 0;
@@ -746,6 +755,84 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       return { status: 'idle', reason: 'queue_empty', deliveredCount: 0, queueDepth: 0 };
     }
     const next = snapshot.items[0];
+
+    if (snapshot.blocked?.reason === DELIVERY_PROOF_PENDING) {
+      let target;
+      try {
+        target = await host.resolveTarget();
+      } catch (error) {
+        target = unavailableTarget(error);
+      }
+      let hasDurableProof = false;
+      if (target?.available === true && typeof target.threadId === 'string' && target.threadId) {
+        try {
+          hasDurableProof = await hasDurableSourceProof(
+            host,
+            target,
+            snapshot.blocked.clientUserMessageId,
+          );
+        } catch {}
+      }
+      if (hasDurableProof) {
+        const reconciled = await withDeliveryQueueLock(config, deps, () => {
+          const queue = readDeliveryQueue(config, deps);
+          if (
+            !queueHeadMatches(queue, next) ||
+            queue.blocked?.reason !== DELIVERY_PROOF_PENDING ||
+            queue.blocked?.clientUserMessageId !== snapshot.blocked.clientUserMessageId
+          ) {
+            return { retry: true };
+          }
+          const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+          if (receiverRejected) return { receiverRejected, queue };
+          const updated = completedQueue(queue, next, {
+            clientUserMessageId: snapshot.blocked.clientUserMessageId,
+          }, config, deps);
+          writeDeliveryQueue(updated, config, deps);
+          return { completed: true };
+        });
+        if (reconciled.retry) continue;
+        if (reconciled.receiverRejected) {
+          return receiverRejectedResult(reconciled.queue, reconciled.receiverRejected);
+        }
+        reconciledCount += 1;
+        continue;
+      }
+
+      const retryAt = timestampMs(snapshot.blocked.retryAt);
+      const targetIsIdle = ['idle', 'systemError'].includes(target?.status);
+      if (!targetIsIdle || retryAt == null || retryAt > currentTimeMs(deps)) {
+        const result = blockedResult(snapshot, DELIVERY_PROOF_PENDING);
+        if (retryAt != null && retryAt > currentTimeMs(deps)) {
+          Object.defineProperty(result, DELIVERY_LEASE_RETRY_AT, { value: retryAt });
+        }
+        return result;
+      }
+
+      // The accepted input did not become durable before the target returned
+      // idle.  Release only the attempt state and retry the same stable Discord
+      // source.  Neither the transient thread nor a session id is persisted.
+      const released = await withDeliveryQueueLock(config, deps, () => {
+        const queue = readDeliveryQueue(config, deps);
+        if (
+          !queueHeadMatches(queue, next) ||
+          queue.blocked?.reason !== DELIVERY_PROOF_PENDING ||
+          queue.blocked?.clientUserMessageId !== snapshot.blocked.clientUserMessageId
+        ) {
+          return { retry: true };
+        }
+        const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+        if (receiverRejected) return { receiverRejected, queue };
+        queue.blocked = null;
+        writeDeliveryQueue(queue, config, deps);
+        return { released: true };
+      });
+      if (released.retry) continue;
+      if (released.receiverRejected) {
+        return receiverRejectedResult(released.queue, released.receiverRejected);
+      }
+      continue;
+    }
 
     if (snapshot.blocked?.reason === DELIVERY_IN_PROGRESS) {
       const activeResult = activeAttemptBlockedResult(snapshot, deps);
@@ -939,6 +1026,61 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
     }
 
     try {
+      // turn/start success only proves that the app-server accepted the RPC.
+      // It does not prove that Codex persisted the matching UserMessage.  Keep
+      // the stable Discord source at the ordinary FIFO head until the current
+      // rollout contains its exact client id.  The thread id is used only for
+      // this immediate read and is never persisted as identity or authority.
+      let hasDurableProof = false;
+      try {
+        hasDurableProof = await hasDurableSourceProof(
+          host,
+          target,
+          params.clientUserMessageId,
+        );
+      } catch {}
+      if (!hasDurableProof) {
+        const retained = await withDeliveryQueueLock(config, deps, () => {
+          const queue = readDeliveryQueue(config, deps);
+          if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {
+            return { retry: true, queue };
+          }
+          const receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+          if (receiverRejected) return { receiverRejected, queue };
+          const retryDelayMs = Math.max(
+            1,
+            Number(config.deliveryProofRetryDelayMs) || DEFAULT_DELIVERY_PROOF_RETRY_DELAY_MS,
+          );
+          queue.blocked = {
+            reason: DELIVERY_PROOF_PENDING,
+            at: new Date(currentTimeMs(deps)).toISOString(),
+            retryAt: new Date(currentTimeMs(deps) + retryDelayMs).toISOString(),
+            messageId: next.normalized.messageId,
+            clientUserMessageId: params.clientUserMessageId,
+          };
+          writeDeliveryQueue(queue, config, deps);
+          return { queue, retryAt: currentTimeMs(deps) + retryDelayMs };
+        });
+        activeDeliveryAttempts.delete(attemptId);
+        if (retained.receiverRejected) {
+          return receiverRejectedResult(retained.queue, retained.receiverRejected);
+        }
+        if (retained.retry) continue;
+        logger('WARN', 'App-server accepted Discord input without durable UserMessage proof', {
+          channelId: next.normalized.channelId,
+          messageId: next.normalized.messageId,
+          queueDepth: claim.queueDepth,
+        });
+        const result = {
+          status: 'queued',
+          reason: DELIVERY_PROOF_PENDING,
+          deliveredCount: 0,
+          queueDepth: claim.queueDepth,
+        };
+        Object.defineProperty(result, DELIVERY_LEASE_RETRY_AT, { value: retained.retryAt });
+        return result;
+      }
+
       const turnId = response?.turn?.id || response?.turnId || (
         target.status === 'active' ? target.activeTurnId : ''
       );

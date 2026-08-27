@@ -2,6 +2,7 @@
 
 const { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require('./access-state');
 const { normalizeDiscordMessage } = require('./delivery');
+const { discordClientResourceOptions } = require('./gateway-resources');
 const {
   commitReceiverOwnership,
   createReceiverOwnership,
@@ -191,6 +192,13 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
     throw new Error('Discord receiver authority record is invalid.');
   }
   const effectiveOwnership = effectiveReceiverOwnership(authoritySnapshot, deps)?.record || null;
+  if (claimReceiver && authoritySnapshot.record && !effectiveOwnership) {
+    log(logger, 'WARN', 'Automatically reclaiming stale Discord gateway receiver record', {
+      stalePid: authoritySnapshot.record.pid,
+      authorityPath: authoritySnapshot.path,
+      action: 'replace_after_discord_login',
+    });
+  }
   const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps);
   const shouldReceive = claimReceiver || receiver.active;
 
@@ -200,6 +208,7 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
     GatewayIntentBits,
     Partials,
   } = deps.discord || require('discord.js');
+  const discord = deps.discord || require('discord.js');
 
   const intents = [
     GatewayIntentBits.DirectMessages,
@@ -213,6 +222,7 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
   const client = new Client({
     intents,
     partials: [Partials.Channel],
+    ...discordClientResourceOptions(discord),
   });
 
   try {
@@ -232,7 +242,10 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
         }
         await delivery.ensureReady();
       }
-      const candidate = createReceiverOwnership(effectiveOwnership, deps);
+      const candidate = createReceiverOwnership(effectiveOwnership, {
+        ...deps,
+        stateDir: config.paths?.stateDir || '',
+      });
       receiverOwnership = await delivery.coordinateReceiverOwnership(() => {
         const handler = createDiscordMessageHandler({
           config,

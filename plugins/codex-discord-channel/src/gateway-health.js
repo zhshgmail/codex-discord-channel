@@ -62,6 +62,25 @@ function normalizedLastDrain(value = {}, deps = {}) {
   };
 }
 
+function normalizedResources(value = {}) {
+  const integerOrNull = (field) => Number.isInteger(value[field]) && value[field] >= 0
+    ? value[field]
+    : null;
+  return {
+    rssBytes: integerOrNull('rssBytes'),
+    heapTotalBytes: integerOrNull('heapTotalBytes'),
+    heapUsedBytes: integerOrNull('heapUsedBytes'),
+    externalBytes: integerOrNull('externalBytes'),
+    arrayBuffersBytes: integerOrNull('arrayBuffersBytes'),
+    totalMemoryBytes: integerOrNull('totalMemoryBytes'),
+    caches: {
+      guilds: Number.isInteger(value.caches?.guilds) ? value.caches.guilds : null,
+      channels: Number.isInteger(value.caches?.channels) ? value.caches.channels : null,
+      users: Number.isInteger(value.caches?.users) ? value.caches.users : null,
+    },
+  };
+}
+
 function writeGatewayHealth(config = {}, state = {}, deps = {}) {
   const file = getGatewayHealthPath(config);
   if (!file) throw new Error('Discord gateway health path is not configured.');
@@ -80,6 +99,10 @@ function writeGatewayHealth(config = {}, state = {}, deps = {}) {
     },
     structured: normalizedStructured(state.structured),
     queue: normalizedQueue(state.queue),
+    resources: normalizedResources(state.resources),
+    memoryLimitBytes: Number.isInteger(state.memoryLimitBytes) && state.memoryLimitBytes >= 0
+      ? state.memoryLimitBytes
+      : null,
     lastDrain: normalizedLastDrain(state.lastDrain, deps),
   };
   fsImpl.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -118,6 +141,10 @@ function emptyStatus(file, reason, valid = false, receiverPresent = false) {
     gatewayObservedReadyCount: null,
     gatewayObservedUncertainCount: null,
     gatewayObservedBlockedReason: null,
+    gatewayRssBytes: null,
+    gatewayHeapUsedBytes: null,
+    gatewayMemoryLimitBytes: null,
+    gatewayDiscordCacheCounts: null,
   };
 }
 
@@ -146,6 +173,7 @@ function readGatewayHealthStatus(config = {}, deps = {}) {
     !record.discord ||
     !record.structured ||
     !record.queue ||
+    !record.resources ||
     !record.lastDrain
   ) {
     return emptyStatus(file, 'gateway_health_invalid', false, receiverPresent);
@@ -159,6 +187,7 @@ function readGatewayHealthStatus(config = {}, deps = {}) {
     ? null
     : (authorityMatches && expired ? 'gateway_health_expired' : 'gateway_health_stale');
   const structured = normalizedStructured(record.structured);
+  const resources = normalizedResources(record.resources);
   return {
     gatewayHealthPath: file,
     gatewayHealthValid: true,
@@ -185,6 +214,12 @@ function readGatewayHealthStatus(config = {}, deps = {}) {
       ? record.queue.uncertain
       : null,
     gatewayObservedBlockedReason: record.queue.blockedReason || null,
+    gatewayRssBytes: resources.rssBytes,
+    gatewayHeapUsedBytes: resources.heapUsedBytes,
+    gatewayMemoryLimitBytes: Number.isInteger(record.memoryLimitBytes)
+      ? record.memoryLimitBytes
+      : null,
+    gatewayDiscordCacheCounts: resources.caches,
   };
 }
 

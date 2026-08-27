@@ -1198,6 +1198,64 @@ test('latest top-level thread/started notification selects the rotated TUI threa
   );
 });
 
+test('top-level system background thread cannot replace the visible TUI delivery target', async () => {
+  const tuiThreadId = '01a04483-a23b-7141-90cc-c4f0a6778821';
+  const systemThreadId = '01a04483-c2ea-74f2-a377-1c1af8db3e1f';
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      // Codex 0.150 reports the newer title-generation thread first.
+      return { data: [systemThreadId, tuiThreadId], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (params.threadId === systemThreadId) {
+        return {
+          thread: {
+            id: systemThreadId,
+            parentThreadId: null,
+            ephemeral: true,
+            threadSource: 'system',
+            status: { type: 'active' },
+            turns: [],
+          },
+        };
+      }
+      return {
+        thread: {
+          id: tuiThreadId,
+          parentThreadId: null,
+          ephemeral: false,
+          threadSource: 'user',
+          status: { type: 'idle' },
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: systemThreadId,
+        parentThreadId: null,
+        ephemeral: true,
+        threadSource: 'system',
+        status: { type: 'active' },
+      },
+    },
+  });
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: tuiThreadId,
+    status: 'idle',
+  });
+  assert.equal(host.currentThreadId, tuiThreadId);
+  host.destroy();
+});
+
 test('in-flight thread read cannot overwrite a newer top-level thread notification', async () => {
   let loadedThreadIds = ['thread-before-clear'];
   let releaseFirstRead;
@@ -4281,6 +4339,125 @@ test('restart without a lifecycle signal recovers from exact local rollout proof
   t.after(() => host.destroy());
 
   assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
+  assert.deepEqual(client.requests, []);
+});
+
+test('source proof is limited to rollout indexes exposed by this state-dir app-server', async (t) => {
+  const clientId = 'discord:c1:m-source-without-thread-coordinate';
+  const { codexHome } = createRolloutFixture(t, [
+    sessionMeta(OTHER_DELIVERY_THREAD_ID),
+    {
+      type: 'event_msg',
+      payload: {
+        type: 'item_completed',
+        thread_id: OTHER_DELIVERY_THREAD_ID,
+        item: { type: 'UserMessage', client_id: clientId },
+      },
+    },
+  ], { filenameThreadId: OTHER_DELIVERY_THREAD_ID });
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`source-only rollout proof must not request ${method}`);
+  });
+  const host = createLocalRolloutHost(client, codexHome);
+  t.after(() => host.destroy());
+
+  // Two aliases may share CODEX_HOME.  A matching source in a rollout that
+  // this state-dir app-server did not expose must not prove delivery here.
+  assert.equal(host.currentThreadId, '');
+  assert.deepEqual([...host.knownLoadedThreadIds], []);
+  assert.equal(await host.hasDeliveredSource(clientId), false);
+  host.knownLoadedThreadIds.add(OTHER_DELIVERY_THREAD_ID);
+  assert.equal(await host.hasDeliveredSource(clientId), true);
+  assert.deepEqual(client.requests, []);
+});
+
+test('source proof survives same-state top-level thread rotation through live inventory', async (t) => {
+  const clientId = 'discord:c1:m-source-before-thread-rotation';
+  const { codexHome } = createRolloutFixture(t, [
+    sessionMeta(OTHER_DELIVERY_THREAD_ID),
+    deliveredUserMessage(clientId),
+  ], { filenameThreadId: OTHER_DELIVERY_THREAD_ID });
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID, OTHER_DELIVERY_THREAD_ID] };
+    }
+    if (method === 'thread/read') {
+      assert.equal(
+        params.threadId,
+        DELIVERY_THREAD_ID,
+        'old loaded history must remain a proof index without a blocking RPC read',
+      );
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createLocalRolloutHost(client, codexHome);
+  t.after(() => host.destroy());
+
+  client.emit('notification', {
+    method: 'thread/started',
+    params: {
+      thread: {
+        id: DELIVERY_THREAD_ID,
+        parentThreadId: null,
+        status: { type: 'idle' },
+      },
+    },
+  });
+  const target = await host.resolveTarget();
+
+  assert.equal(target.threadId, DELIVERY_THREAD_ID);
+  assert.deepEqual(
+    [...host.knownLoadedThreadIds],
+    [DELIVERY_THREAD_ID, OTHER_DELIVERY_THREAD_ID],
+  );
+  assert.equal(await host.hasDeliveredSource(clientId), true);
+  assert.equal(
+    client.requests.filter(({ method }) => method === 'thread/read').length,
+    1,
+  );
+});
+
+test('system rollout cannot prove source delivery but the visible TUI rollout can', async (t) => {
+  const clientId = 'discord:c1:m-system-proof-must-not-dequeue';
+  const systemThreadId = OTHER_DELIVERY_THREAD_ID;
+  const fixture = createRolloutFixture(t, [
+    {
+      type: 'session_meta',
+      payload: { id: systemThreadId, thread_source: 'system' },
+    },
+    deliveredUserMessage(clientId),
+  ], { filenameThreadId: systemThreadId });
+  const tuiRolloutPath = path.join(
+    fixture.sessionsDir,
+    `rollout-2026-07-31T00-00-01-${DELIVERY_THREAD_ID}.jsonl`,
+  );
+  fs.writeFileSync(
+    tuiRolloutPath,
+    `${JSON.stringify({
+      type: 'session_meta',
+      payload: { id: DELIVERY_THREAD_ID, thread_source: 'user', originator: 'codex-tui' },
+    })}\n`,
+  );
+  const client = new FakeRpcClient(async (method) => {
+    throw new Error(`system-proof discriminator must not request ${method}`);
+  });
+  const host = createLocalRolloutHost(client, fixture.codexHome);
+  t.after(() => host.destroy());
+  host.knownLoadedThreadIds.add(systemThreadId);
+  host.knownLoadedThreadIds.add(DELIVERY_THREAD_ID);
+
+  assert.equal(await host.hasDeliveredSource(clientId), false);
+
+  fs.appendFileSync(tuiRolloutPath, `${JSON.stringify(deliveredUserMessage(clientId))}\n`);
+  assert.equal(await host.hasDeliveredSource(clientId), true);
   assert.deepEqual(client.requests, []);
 });
 

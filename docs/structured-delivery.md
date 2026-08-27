@@ -1,5 +1,11 @@
 # Structured Delivery Contract
 
+For the v0.3.18 durable-identity, gateway supervision, resource-budget, slow
+shutdown, and stale-state recovery invariants, see
+[`runtime-lifecycle-design.md`](runtime-lifecycle-design.md). That document is
+normative where older session/thread or receiver-generation wording on this
+page describes historical implementations.
+
 ## Boundary
 
 Inbound Discord delivery is valid only when the gateway and visible TUI share
@@ -96,30 +102,17 @@ Every accepted Discord event is persisted before target resolution. Queue
 mutations use a process-safe lock and deduplicate pending, completed, and
 archived Discord identities.
 
-The queue's durable activation id defaults to the real installed plugin root
-and is paired with a durable activation timestamp. After receiver authority
-transfers, the first locked drain rotates a missing or changed activation and
-archives every legacy, mismatched, or pre-activation pending item before that
-item can resolve a target. Discord source creation time is also compared when
-present, so a historical event received after activation cannot become current
-work. Archive entries contain only channel id, message id, queue time, archive
-time, and disposition; queued message content is discarded. Archival cannot
-call `turn/start` or `turn/steer`.
+Ordinary ready FIFO items are state-directory scoped and survive plugin/cache,
+launcher, gateway, and TUI generation changes. A version change is not replay
+authority and is not a reason to archive or discard them. The stable Discord
+source identity and exact durable UserMessage proof remain the delivery and
+deduplication boundary.
 
-Newly admitted items are stamped with the active id. A restart of the same
-installed runtime can therefore recover its own pending items, while a new
-versioned runtime cannot replay the old backlog. Readiness checks before an
-authority transfer are read-only, so a successor that fails readiness does not
-modify the incumbent queue. Queue schema v3 makes an older runtime reject an
-activated queue instead of replaying it after rollback. Deployments without
-versioned install paths may set `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`
-explicitly for standalone workers. The alias-owned launcher always supplies
-its real installed plugin root to each channel and TUI child after clearing
-inherited selectors, so an old state `.env` value cannot keep pre-upgrade ready
-or uncertain work eligible.
-
-If the activation or archive cannot be persisted, receiver activation fails and
-the gateway does not continue as an inbound receiver.
+Legacy v4 `structured_ack_uncertain` records are different: the older runtime
+cannot prove whether its former TUI accepted them, so they are retained in a
+visible legacy archive and never automatically replayed. This migration rule
+does not apply to ordinary ready FIFO sources. Tests pin that an activation
+change preserves every ordinary queued Discord source.
 
 Each drain may accept only the queue head. A proven idle target uses
 `turn/start`. A proven top-level `systemError` target also uses `turn/start` to

@@ -48,6 +48,12 @@ test('gateway health exposes the live receiver rather than an MCP-local client',
       reason: 'turn_accepted',
       at: '2026-08-08T00:00:01.000Z',
     },
+    resources: {
+      rssBytes: 1234,
+      heapUsedBytes: 456,
+      caches: { guilds: 1, channels: 2, users: 3 },
+    },
+    memoryLimitBytes: 9999,
   }, { now: () => Date.parse('2026-08-08T00:00:02.000Z') });
 
   assert.deepEqual(readGatewayHealthStatus(config, {
@@ -74,6 +80,10 @@ test('gateway health exposes the live receiver rather than an MCP-local client',
     gatewayObservedReadyCount: 2,
     gatewayObservedUncertainCount: 1,
     gatewayObservedBlockedReason: null,
+    gatewayRssBytes: 1234,
+    gatewayHeapUsedBytes: 456,
+    gatewayMemoryLimitBytes: 9999,
+    gatewayDiscordCacheCounts: { guilds: 1, channels: 2, users: 3 },
   });
   assert.equal(fs.statSync(config.paths.gatewayHealthPath).mode & 0o777, 0o600);
 });

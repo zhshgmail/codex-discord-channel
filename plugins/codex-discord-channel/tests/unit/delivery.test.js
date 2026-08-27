@@ -1136,8 +1136,9 @@ test('busy target drains one FIFO item per idle transition and dynamically follo
   assert.deepEqual(drained.completed.map((item) => item.messageId), ['m1', 'm2']);
 });
 
-test('startup and reconnect recover an active goal turn and steer the persisted queue', async () => {
+test('startup and reconnect recover an active goal turn and steer the persisted queue', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-active-recovery-'));
+  const { codexHome, rolloutPath } = createDeliveryRollout(t);
   writePendingQueue(dir, [discordMessage('m-startup-goal', 'startup goal input')]);
   const client = new EventEmitter();
   const requests = [];
@@ -1157,7 +1158,7 @@ test('startup and reconnect recover an active goal turn and steer the persisted 
       throw error;
     }
     if (method === 'thread/loaded/list') {
-      return { data: ['thread-goal'], nextCursor: null };
+      return { data: [ROLLOUT_THREAD_ID], nextCursor: null };
     }
     if (method === 'thread/read') {
       return {
@@ -1178,12 +1179,29 @@ test('startup and reconnect recover an active goal turn and steer the persisted 
     }
     if (method === 'turn/steer') {
       persistedClientUserMessageIds.add(params.clientUserMessageId);
+      fs.appendFileSync(rolloutPath, `${JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          thread_id: ROLLOUT_THREAD_ID,
+          turn_id: params.expectedTurnId,
+          item: {
+            type: 'UserMessage',
+            id: `item-${params.clientUserMessageId}`,
+            client_id: params.clientUserMessageId,
+            content: [],
+          },
+        },
+      })}\n`);
       return { turnId: params.expectedTurnId };
     }
     throw new Error(`unexpected method ${method}`);
   };
   const host = createAppServerHost(
-    { appServerUrl: 'ws://127.0.0.1:4500' },
+    {
+      appServerUrl: 'ws://127.0.0.1:4500',
+      env: { CODEX_HOME: codexHome },
+    },
     () => {},
     { client },
   );
@@ -1207,7 +1225,7 @@ test('startup and reconnect recover an active goal turn and steer the persisted 
   available = true;
   client.emit('connectionChanged', { generation: 3 });
   for (let attempt = 0; attempt < 20 && readQueue(dir).items.length > 0; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
+    await delivery.flush();
   }
 
   steerRequests = requests.filter((request) => request.method === 'turn/steer');
@@ -1891,14 +1909,111 @@ test('successful response without a persisted user item is not marked complete',
   const result = await fixture.delivery.deliver(discordMessage('m-ack-gap', 'must persist'));
   const queue = readQueue(fixture.dir);
 
-  assert.equal(result.status, 'failed');
-  assert.equal(result.reason, 'structured_ack_uncertain');
+  assert.equal(result.status, 'queued');
+  assert.equal(result.reason, 'delivery_proof_pending');
   assert.equal(starts, 1);
-  assert.deepEqual(queue.items, []);
-  assert.deepEqual(queue.uncertain.map((item) => item.normalized.messageId), ['m-ack-gap']);
+  assert.deepEqual(queue.items.map((item) => item.normalized.messageId), ['m-ack-gap']);
+  assert.deepEqual(queue.uncertain, []);
   assert.deepEqual(queue.completed, []);
-  assert.equal(queue.blocked, null);
-  assert.equal(queue.uncertain[0].delivery.clientUserMessageId, 'discord:c1:m-ack-gap');
+  assert.equal(queue.blocked.reason, 'delivery_proof_pending');
+  assert.equal(queue.blocked.clientUserMessageId, 'discord:c1:m-ack-gap');
+  assert.equal('threadId' in queue.blocked, false);
+});
+
+test('durable source proof is accepted across a transient target-thread rotation', async () => {
+  let starts = 0;
+  const fixture = structuredFixture({
+    onStartTurn() {
+      starts += 1;
+      return { turn: { id: 'turn-old-coordinate' } };
+    },
+    hasDelivered() {
+      return false;
+    },
+  });
+  const pending = await fixture.delivery.deliver(
+    discordMessage('m-source-proof', 'rotated'),
+  );
+  assert.equal(pending.reason, 'delivery_proof_pending');
+  fixture.delivery.destroy();
+
+  const delivery = createDelivery(deliveryConfig(fixture.dir), () => {}, {
+    structuredHost: {
+      async resolveTarget() {
+        return { available: true, threadId: 'thread-new-coordinate', status: 'idle' };
+      },
+      async startTurn() {
+        starts += 1;
+        return { turn: { id: 'must-not-start' } };
+      },
+      async hasDeliveredSource(clientUserMessageId) {
+        return clientUserMessageId === 'discord:c1:m-source-proof';
+      },
+      async hasDelivered() { return false; },
+      onThreadIdle() { return () => {}; },
+      onThreadActive() { return () => {}; },
+      onReconnect() { return () => {}; },
+      onThreadClosed() { return () => {}; },
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await delivery.activateReceiver(activeReceiver);
+  const result = await delivery.flush();
+
+  assert.equal(result.status, 'idle');
+  assert.equal(starts, 1);
+  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), [
+    'm-source-proof',
+  ]);
+  delivery.destroy();
+});
+
+test('three rapid FIFO sources survive false acceptance and all gain durable proof', async () => {
+  const attempts = new Map();
+  let allowQueuedProof = false;
+  const fixture = structuredFixture({
+    onStartTurn(params) {
+      const count = (attempts.get(params.clientUserMessageId) || 0) + 1;
+      attempts.set(params.clientUserMessageId, count);
+      return { turn: { id: `turn-${params.clientUserMessageId}-${count}` } };
+    },
+    hasDelivered(_threadId, clientUserMessageId) {
+      if (clientUserMessageId === 'discord:c1:m1') return true;
+      return allowQueuedProof;
+    },
+  });
+
+  const first = await fixture.delivery.deliver(discordMessage('m1', 'first'));
+  const second = await fixture.delivery.deliver(discordMessage('m2', 'second'));
+  const thirdAdmission = await fixture.delivery.enqueue(discordMessage('m3', 'third'));
+
+  assert.equal(first.status, 'delivered');
+  assert.equal(second.status, 'queued');
+  assert.equal(second.reason, 'delivery_proof_pending');
+  assert.equal(thirdAdmission.status, 'accepted');
+  assert.deepEqual(
+    readQueue(fixture.dir).items.map((item) => item.normalized.messageId),
+    ['m2', 'm3'],
+  );
+  assert.deepEqual(readQueue(fixture.dir).completed.map((item) => item.messageId), ['m1']);
+
+  allowQueuedProof = true;
+  const secondRetry = await fixture.delivery.flush();
+  const thirdRetry = await fixture.delivery.flush();
+  const queue = readQueue(fixture.dir);
+
+  assert.equal(secondRetry.status, 'delivered');
+  assert.equal(secondRetry.deliveredCount, 2);
+  assert.equal(thirdRetry.status, 'idle');
+  assert.deepEqual(queue.items, []);
+  assert.deepEqual(queue.uncertain, []);
+  assert.deepEqual(queue.completed.map((item) => item.messageId), ['m1', 'm2', 'm3']);
+  assert.deepEqual([...attempts.entries()], [
+    ['discord:c1:m1', 1],
+    ['discord:c1:m2', 1],
+    ['discord:c1:m3', 1],
+  ]);
 });
 
 test('positive ack then real rollout UserMessage proof terminally reconciles uncertain without replay', async (t) => {

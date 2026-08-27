@@ -64,7 +64,6 @@ const RETIRED = new Set([
   'foreign delivery lease schedules one expiry wake and drains without replay',
   'reconnect drain reconciles an accepted head before submitting the next FIFO item',
   'uncertain structured acknowledgement is visible but cannot block later FIFO items',
-  'successful response without a persisted user item is not marked complete',
   'unsupported acknowledgement recovery remains structured_ack_uncertain',
   'remote unsupported acknowledgement read remains structured_ack_uncertain',
   'unpersisted successful response reconciles later without replay',

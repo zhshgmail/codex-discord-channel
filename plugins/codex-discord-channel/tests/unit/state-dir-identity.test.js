@@ -239,7 +239,7 @@ test('v4 thread-bound uncertainty is archived and never replayed while ready FIF
     },
     async hasDelivered() {
       hasDeliveredCalls += 1;
-      return false;
+      return true;
     },
     status() { return { configured: true, available: true, reason: null }; },
   };
@@ -266,7 +266,7 @@ test('v4 thread-bound uncertainty is archived and never replayed while ready FIF
   ]);
   assert.equal(JSON.stringify(queue.completed[0]).includes('threadId'), false);
   assert.equal(JSON.stringify(queue.completed[0]).includes('turnId'), false);
-  assert.equal(hasDeliveredCalls, 0);
+  assert.equal(hasDeliveredCalls, 1);
   delivery.destroy();
 });
 
@@ -295,6 +295,9 @@ test('plugin activation changes preserve every queued Discord source', async (t)
     async startTurn(params) {
       submitted.push(params.clientUserMessageId);
       return { turn: { id: 'turn-after-restart' } };
+    },
+    async hasDelivered(_threadId, clientUserMessageId) {
+      return submitted.includes(clientUserMessageId);
     },
     status() { return { configured: true, available: true, reason: null }; },
   };
@@ -328,6 +331,10 @@ test('RPC response loss stays ready and retries the same Discord source against 
         throw error;
       }
       return { turn: { id: 'turn-ok' } };
+    },
+    async hasDelivered(_threadId, clientUserMessageId) {
+      return calls.some((entry) => entry.params.clientUserMessageId === clientUserMessageId)
+        && calls.length > 1;
     },
     status() { return { configured: true, available: true, reason: null }; },
   };

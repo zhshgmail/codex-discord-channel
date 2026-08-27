@@ -15,6 +15,7 @@ const MAX_EMITTED_ASSISTANT_FINALS = 256;
 const MAX_ROLLOUT_SEARCH_DEPTH = 4;
 const MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096;
 const MAX_ROLLOUT_SEARCH_ENTRIES = 65536;
+const MAX_SOURCE_ROLLOUT_CANDIDATES = 512;
 const MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024;
 const MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024;
 const MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024;
@@ -118,6 +119,10 @@ function includeTurnsUnsupported(error) {
 
 function deliveryProofKey(threadId, clientUserMessageId) {
   return JSON.stringify([threadId, clientUserMessageId]);
+}
+
+function isSystemBackgroundThread(thread) {
+  return thread?.threadSource === 'system';
 }
 
 function assistantFinalKey(threadId, turnId) {
@@ -245,6 +250,44 @@ async function findExactRolloutPath(sessionsDir, threadId, fsPromises) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
+async function findRecentRolloutPaths(sessionsDir, fsPromises) {
+  const pending = [{ directory: sessionsDir, depth: 0 }];
+  const candidates = [];
+  let directoryCount = 0;
+  let entryCount = 0;
+
+  while (pending.length > 0) {
+    const current = pending.shift();
+    directoryCount += 1;
+    if (directoryCount > MAX_ROLLOUT_SEARCH_DIRECTORIES) return [];
+    let directory;
+    try {
+      directory = await fsPromises.opendir(current.directory);
+      for await (const entry of directory) {
+        entryCount += 1;
+        if (entryCount > MAX_ROLLOUT_SEARCH_ENTRIES) return [];
+        const entryPath = path.join(current.directory, entry.name);
+        if (entry.isDirectory()) {
+          if (current.depth < MAX_ROLLOUT_SEARCH_DEPTH) {
+            pending.push({ directory: entryPath, depth: current.depth + 1 });
+          }
+          continue;
+        }
+        if (
+          entry.isFile() &&
+          entry.name.startsWith('rollout-') &&
+          entry.name.endsWith('.jsonl')
+        ) {
+          candidates.push(entryPath);
+        }
+      }
+    } catch {
+      return [];
+    }
+  }
+  return candidates.sort().reverse().slice(0, MAX_SOURCE_ROLLOUT_CANDIDATES);
+}
+
 function parseRolloutLine(line) {
   if (line.length === 0 || line.length > MAX_ROLLOUT_LINE_BYTES) return null;
   const normalized = line.at(-1) === 0x0d ? line.subarray(0, -1) : line;
@@ -270,7 +313,7 @@ async function readBoundedRange(handle, offset, length) {
 
 async function rolloutContainsUserMessage(
   rolloutPath,
-  threadId,
+  expectedThreadId,
   clientUserMessageId,
   fsPromises,
 ) {
@@ -286,12 +329,21 @@ async function rolloutContainsUserMessage(
     const headerEnd = header.indexOf(0x0a);
     if (headerEnd === -1) return false;
     const sessionMeta = parseRolloutLine(header.subarray(0, headerEnd));
+    const rolloutThreadId = sessionMeta?.payload?.id;
+    const rolloutThreadSource = sessionMeta?.payload?.thread_source;
     if (
       sessionMeta?.type !== 'session_meta' ||
       !sessionMeta.payload ||
       typeof sessionMeta.payload !== 'object' ||
       Array.isArray(sessionMeta.payload) ||
-      sessionMeta.payload.id !== threadId
+      !CANONICAL_THREAD_ID.test(rolloutThreadId || '') ||
+      // A background/title thread may contain the same stable Discord client
+      // id in diagnostic text or a copied UserMessage.  It is not the visible
+      // TUI consumer and therefore cannot prove delivery.  Keep legacy
+      // rollouts (which predate thread_source) readable, but fail closed for
+      // the explicit system classification emitted by current Codex.
+      rolloutThreadSource === 'system' ||
+      (expectedThreadId !== null && rolloutThreadId !== expectedThreadId)
     ) {
       return false;
     }
@@ -325,7 +377,7 @@ async function rolloutContainsUserMessage(
       );
       const completedUserMessage = (
         payload?.type === 'item_completed' &&
-        payload.thread_id === threadId &&
+        payload.thread_id === rolloutThreadId &&
         item &&
         typeof item === 'object' &&
         !Array.isArray(item) &&
@@ -571,7 +623,7 @@ class AppServerRpcClient extends EventEmitter {
         clientInfo: {
           name: 'codex-discord-channel',
           title: 'Discord Channel Gateway',
-          version: '0.3.17',
+          version: '0.3.18',
         },
         capabilities: {
           experimentalApi: true,
@@ -824,6 +876,7 @@ class AppServerHost extends EventEmitter {
     this.knownLoadedThreadIds = new Set();
     this.ephemeralThreadIds = new Set();
     this.verifiedUserMessages = new Map();
+    this.verifiedSourceMessages = new Map();
     this.deliveryWaiters = new Map();
     this.emittedAssistantFinals = new Map();
     this.destroyed = false;
@@ -907,6 +960,12 @@ class AppServerHost extends EventEmitter {
       }
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
+        // Codex 0.150 starts top-level ephemeral `threadSource=system`
+        // threads for background work such as session-title generation.  They
+        // share the state-dir app-server but are not the visible TUI input
+        // target.  Ignore them as transient routing noise; no thread id is
+        // persisted or used as instance/message identity here.
+        if (isSystemBackgroundThread(thread)) return;
         if (thread?.id) {
           this.threadSelectionRevision += 1;
         }
@@ -1100,6 +1159,14 @@ class AppServerHost extends EventEmitter {
     this.verifiedUserMessages.set(key, true);
     while (this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES) {
       this.verifiedUserMessages.delete(this.verifiedUserMessages.keys().next().value);
+    }
+  }
+
+  rememberVerifiedSourceMessage(clientUserMessageId) {
+    this.verifiedSourceMessages.delete(clientUserMessageId);
+    this.verifiedSourceMessages.set(clientUserMessageId, true);
+    while (this.verifiedSourceMessages.size > MAX_VERIFIED_USER_MESSAGES) {
+      this.verifiedSourceMessages.delete(this.verifiedSourceMessages.keys().next().value);
     }
   }
 
@@ -1369,7 +1436,11 @@ class AppServerHost extends EventEmitter {
           return request('thread/read', { threadId: candidateId });
         });
         const candidate = candidateResponse?.thread;
-        if (candidate?.id === candidateId && candidate.parentThreadId == null) {
+        if (
+          candidate?.id === candidateId &&
+          candidate.parentThreadId == null &&
+          !isSystemBackgroundThread(candidate)
+        ) {
           response = candidateResponse;
           threadId = candidateId;
           break;
@@ -1387,6 +1458,15 @@ class AppServerHost extends EventEmitter {
         this.lastStatus = { configured: true, available: false, reason };
         return { available: false, reason, status: 'unavailable' };
       }
+      // The loaded ids come from this state-dir's own live app-server socket.
+      // Preserve them only as bounded transient rollout-proof indexes so a
+      // source accepted immediately before /clear or resume rotation can be
+      // reconciled.  Do not thread/read every historical id: one slow stale
+      // history must not hold the FIFO or retain large turn payloads.  Exact
+      // UserMessage proof is still required before dequeue, and these ids are
+      // never identity, authorization, ownership, or restart state.
+      this.knownLoadedThreadIds = new Set(orderedIds);
+      this.loadedInventoryProven = true;
       this.currentThreadId = threadId;
       this.threadStatuses.set(threadId, status);
       const target = { available: true, threadId, status };
@@ -1662,9 +1742,15 @@ class AppServerHost extends EventEmitter {
           if (!candidate || candidate.id !== candidateThreadId) {
             return rejectUnprovableTopology();
           }
-          if (candidate.parentThreadId == null) {
+          if (candidate.parentThreadId == null && !isSystemBackgroundThread(candidate)) {
             candidateParents.set(candidateThreadId, null);
             topLevelThreads.push({ threadId: candidateThreadId, response: candidateResponse });
+          } else if (candidate.parentThreadId == null) {
+            // A top-level system thread is an app-server background task, not
+            // a visible TUI root.  Keep it out of both target selection and
+            // lineage validation without turning its transient id into a
+            // durable exclusion record.
+            candidateParents.set(candidateThreadId, null);
           } else if (
             typeof candidate.parentThreadId !== 'string' ||
             candidate.parentThreadId.trim() === ''
@@ -2109,6 +2195,34 @@ class AppServerHost extends EventEmitter {
     }
   }
 
+
+  async hasDeliveredSource(clientUserMessageId) {
+    if (typeof clientUserMessageId !== 'string' || clientUserMessageId === '') return false;
+    if (this.verifiedSourceMessages.has(clientUserMessageId)) return true;
+
+    // The Discord source id is the durable identity.  Thread ids below are
+    // only a dynamically rediscovered read index exposed by this state-dir's
+    // own app-server connection; none is persisted or accepted as authority.
+    // Never scan all CODEX_HOME rollouts by source id: two state directories
+    // may intentionally share one account home, and proof from instance A
+    // must not dequeue instance B's source.
+    const candidates = [...new Set([
+      this.currentThreadId,
+      ...this.knownLoadedThreadIds,
+    ].filter((threadId) => CANONICAL_THREAD_ID.test(threadId || '')))];
+    for (const threadId of candidates) {
+      let verified = false;
+      try {
+        verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
+      } catch {}
+      if (!verified) continue;
+      this.rememberVerifiedUserMessage(threadId, clientUserMessageId);
+      this.rememberVerifiedSourceMessage(clientUserMessageId);
+      return true;
+    }
+    return false;
+  }
+
   onThreadIdle(listener) {
     this.on('idle', listener);
     return () => this.off('idle', listener);
@@ -2141,6 +2255,7 @@ class AppServerHost extends EventEmitter {
     }
     this.deliveryWaiters.clear();
     this.verifiedUserMessages.clear();
+    this.verifiedSourceMessages.clear();
     this.emittedAssistantFinals.clear();
     this.activeTurnProvenance.clear();
     this.client.off('notification', this.onNotification);
