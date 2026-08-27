@@ -5,7 +5,9 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const test = require('node:test');
+const nodeTest = require('node:test');
+const { stateDirContractTest } = require('./retired-session-bound-contracts');
+const test = stateDirContractTest(nodeTest);
 const { createAppServerHost } = require('../../src/app-server-host');
 const {
   createDelivery,
@@ -395,7 +397,7 @@ test('activation archives stale backlog before target resolution and delivers a 
   assert.equal(targetResolutions, 0);
   assert.deepEqual(requests, []);
   const activated = readQueue(dir);
-  assert.equal(activated.version, 3);
+  assert.equal(activated.version, 4);
   assert.deepEqual(activated.items, []);
   assert.deepEqual(activated.completed, []);
   assert.deepEqual(activated.activation, {

@@ -1,159 +1,211 @@
 ---
-name: codex-discord-channel
-description: Use when inspecting or managing the Discord channel plugin, its persistent inbound queue, owner metadata, gateway receiver, or structured app-server delivery.
+name: repair-codex-discord-delivery
+description: Diagnose and repair Codex Discord startup, inbound delivery, gateway restart, queue, duplicate-reply, and visible-TUI faults. Use when an alias starts but later messages disappear, the gateway exits, an app-server/socket generation is stale, resume history looks missing, or Codex01/Codex02 needs live recovery. Do not use for routine channel configuration.
 ---
 
-# Codex Discord Channel
+# Repair Codex Discord Delivery
 
-## Runtime Model
+## Non-negotiable identity model
 
-- One Discord instance uses one state directory under
-  `$HOME/.codex/channels/discord/<instance>`.
-- The live receiver is selected by that state directory and
-  `session-gateway.pid`.
-- `owner.json` is status and handoff metadata only. Never use its owner or
-  thread id as a per-message receive gate.
-- Accepted events are persisted in a cross-process locked FIFO and deduplicated
-  by Discord channel and message id.
-- Inbound delivery uses only a shared app-server endpoint and a dynamically
-  resolved current top-level thread: `turn/start` while idle, or `turn/steer`
-  with an exact active turn precondition.
-- There is no terminal-input fallback. Missing or ambiguous structured state is
-  unavailable and leaves the FIFO queued.
+`DISCORD_STATE_DIR` (normally selected by the instance configuration) is the
+only durable Discord bot identity.
 
-## Local State
+- Token, access policy, inbound FIFO, reply receipts, gateway authority,
+  health, and app-server socket all live under that state directory.
+- Codex session, thread, turn, rollout, launcher nonce, and TUI lease ids are
+  transient transport coordinates only. Never persist or compare them as
+  ownership, authentication, receive, replay, or restart gates.
+- `/clear`, resume, TUI replacement, gateway replacement, and thread rotation
+  must not change which Discord queue the instance consumes.
+- `owner.json` is status/handover metadata only. It cannot admit or reject a
+  message.
+- Completed inbound records persist only Discord source identity and the stable
+  client message id. Never persist Codex thread, turn, session, or lease ids in
+  the delivery queue.
+- Do not add a session/thread binding to make a test pass. A test requiring one
+  is a legacy-contract test and must be replaced by a state-directory causal
+  test.
+
+This follows the official Claude Code Discord plugin shape: the state directory
+owns configuration and inbox, while an admitted Discord event is forwarded to
+the current host. Codex needs an app-server RPC coordinate, but must discover it
+at delivery time and forget it as identity.
+
+## Fast startup recovery
+
+For `already has an app-server socket`, stale generation, wrong socket inode,
+or process-group mismatch:
+
+1. Stop repeated alias launches.
+2. Resolve the alias (`type -a codex01` / `codex02`) and the exact instance state
+   directory. Inspect the installed cache named by the active command line; do
+   not infer live bytes from a checkout.
+3. Snapshot only that alias:
+
+   ```bash
+   python3 scripts/inspect_discord_delivery.py --instance codex02
+   python3 scripts/recover_startup_generation.py --instance codex02
+   ```
+
+4. Apply the recovery helper only when it identifies one exact stale alias
+   generation:
+
+   ```bash
+   python3 scripts/recover_startup_generation.py --instance codex02 --apply
+   ```
+
+5. If it refuses, inspect the manifest, `/proc` environment, parent chain,
+   process group, socket inode, and cache path. Terminate only processes proven
+   to belong to that exact alias. Never broad-`pkill`; never touch DS, Scan,
+   Kimi, K301, or another alias.
+6. Preserve `pending-delivery.json`, reply receipts, access policy, account
+   binding, and `sessions/` bytes. A resume picker hiding old sessions is not
+   deletion evidence; use `resume --all --include-non-interactive` for history
+   discovery when needed.
+7. Launch the whole instance once:
+
+   ```bash
+   codex-discord-instance codex02 --dangerously-bypass-approvals-and-sandbox resume --last
+   ```
+
+Never start gateway/app-server/TUI workers separately.
+
+## Diagnose delivery
+
+Read the exact installed skill and runtime first. For the target state directory
+record, without printing message text or tokens:
+
+- gateway PID/generation and its live command line;
+- app-server PID, Unix socket path and inode;
+- launcher/TUI PIDs and exact installed cache path;
+- queue schema, depth, FIFO Discord `(channelId,messageId)`, and last reason;
+- account binding and access-policy paths;
+- plugin version and runtime digest.
+
+Then trace one source:
 
 ```text
-$HOME/.codex/channels/discord/<instance>/.env
-$HOME/.codex/channels/discord/<instance>/access.json
-$HOME/.codex/channels/discord/<instance>/owner.json
-$HOME/.codex/channels/discord/<instance>/session-gateway.pid
-$HOME/.codex/channels/discord/<instance>/gateway-health.json
-$HOME/.codex/channels/discord/<instance>/pending-delivery.json
-$HOME/.codex/channels/discord/<instance>/reply-receipts/
-$HOME/.codex/channels/discord/<instance>/app-server.sock
+Discord (channelId,messageId)
+  -> state-dir FIFO
+  -> current app-server route discovered now
+  -> visible TUI user item
+  -> assistant final
+  -> state-dir reply receipt
+  -> Discord outbound id
+  -> exact-destination readback
 ```
 
-Do not print Discord tokens, proxy values, queued message text, or raw Discord
-errors. Do not commit `.env`.
+Stop at the first missing arrow. Service health, queue removal, RPC acceptance,
+or a console final is not visible-TUI or outbound proof.
 
-## Status
+## Required runtime behavior
 
-Use these MCP tools when available:
+- Every admitted source is persisted before injection and deduplicated only by
+  Discord channel plus message id.
+- Plugin activation/version changes preserve all queued sources. They do not
+  archive or discard ready FIFO items. Legacy `structured_ack_uncertain`
+  entries are the exception: preserve their full Discord source in the archive
+  with reason `legacy_ack_uncertain_no_auto_replay`, but never execute them
+  automatically because the old sender could not prove whether Codex accepted
+  them.
+- On every drain, resolve the current loaded top-level TUI through the app
+  server. Use returned thread/turn ids only for that RPC.
+- A definitive stale-route rejection permits one rediscovery and retry of the
+  same stable Discord client id.
+- A lost/uncertain RPC response leaves the source in the ordinary FIFO. The
+  next drain uses the same stable Discord client id against the current route.
+  Do not create a thread-bound uncertainty lane.
+- A gateway exit while the TUI remains alive restarts the gateway in place. It
+  must not terminate the TUI or invent `resume <thread-id>`.
+- App-server loss may require whole-alias relaunch, but the launcher must not
+  synthesize or capture a session/thread identity.
+- Gateway process PID/generation is only a single-receiver lock inside the
+  state directory; it is not Discord account or message identity.
+- Automatic assistant-final mapping is disabled. Outbound Discord replies use
+  the explicit receipt-aware sender with exact `(channelId,messageId)` source;
+  no persisted Codex thread/turn may select an outbound reply.
+- Before app-server or gateway start, the launcher copies the generation helper
+  and channel runtime to `DISCORD_STATE_DIR/generation-runtime/current`. Worker
+  restart and cleanup use that durable snapshot so a marketplace cache refresh
+  cannot strand the live generation.
 
-- `discord_channel_status`
-- `discord_channel_read_owner`
-- `discord_channel_claim_owner`
-- `discord_channel_read_history`
-- `discord_channel_send`
+## Repair and tests
 
-Healthy structured delivery requires:
+Make the smallest repair at the first broken boundary. Add known-bad causal
+tests for:
 
-```json
-{
-  "deliveryMode": "app-server",
-  "deliverySafety": "structured_only",
-  "structuredDeliveryState": "available",
-  "sharedAppServerAvailable": true,
-  "discordStarted": true
-}
+1. stale persisted thread/session data cannot redirect delivery;
+2. a restarted host follows the live app-server target;
+3. three sequential sources reach one visible TUI;
+4. response loss retries the same Discord source after route rotation;
+5. activation/version change preserves queued sources;
+6. v4 `structured_ack_uncertain` records retain full source bytes in the
+   archive and never auto-replay, while ordinary ready FIFO entries still drain;
+7. killing only the gateway preserves the TUI PID, restarts the gateway, and a
+   later source reaches that same visible TUI;
+8. two state directories cannot read or mutate each other's queues.
+9. deleting the installed marketplace cache while the test TUI is active does
+   not prevent gateway restart or exact generation cleanup.
+
+Legacy tests that require durable session/thread/turn/lease identity must be
+explicitly labeled retired. Do not silently weaken unrelated access, queue,
+concurrency, receiver-lock, receipt, or exact-outbound tests.
+
+Run the focused tests, then:
+
+```bash
+npm run build
+npm run check
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/validate_plugin.py" .
 ```
 
-Inspect `runtimeStatusSource`, `gatewayLive`, `deliveryState`,
-`deliveryQueueDepth`, `deliveryUncertainCount`, `deliveryDegradedReason`, and
-`sharedAppServerReason` before making delivery claims. Stable unavailable
-reasons include a missing endpoint/socket, no loaded thread, an ambiguous
-thread, a busy thread, and uncertain structured acknowledgement.
-Top-level receiver and structured-delivery status comes only from the durable
-gateway health record. MCP-local Discord login is a separate diagnostic and is
-never receiver-health evidence.
+Report pass/fail/cancel/skip counts. Skips must be an enumerated retired
+contract, never incidental cancellation.
+
+## Isolated live acceptance before deployment
+
+Use a temporary test instance and a repairer-owned Codex TUI. Do not occupy the
+user's Codex01/Codex02 slot for testing.
+
+1. Install the exact built version into an isolated cache/state directory.
+2. Start it through `codex-discord-instance`.
+3. Send at least three sequential uniquely identified sources and verify each
+   appears in the visible TUI, not merely in logs or queue state.
+4. Kill only the test gateway. Verify the TUI PID remains unchanged and a new
+   gateway PID appears.
+5. Send a fourth source and verify it reaches the same visible TUI.
+6. Verify pending queue and reply-receipt accounting, then exit the validation
+   TUI and prove all test-instance processes and socket are gone.
+
+## Deploy one alias at a time
+
+Deployment requires the user's alias window. Snapshot queue/receipts, stop only
+the selected alias, install the versioned cache, update only its activation
+metadata, and relaunch the whole alias. Never install over a running generation.
+
+Repeat live acceptance independently for Codex01 and Codex02. One alias's GREEN
+does not transfer to the other.
 
 ## Alias-Owned Runtime Boundary
 
-A direct `codex ... resume` TUI has a private embedded app-server and cannot be
-joined by the gateway. Exact-console delivery requires one operator-approved
-whole-alias relaunch:
+Exit only the selected alias before changing its installed marketplace bytes.
+Then install the released plugin, update that alias's marketplace revision, and
+launch the whole instance once. The running generation itself uses its durable
+state-directory runtime snapshot, but deployment must still be one alias at a
+time so acceptance remains attributable.
 
-1. Exit only the selected alias; keep every other alias running.
-2. From an ordinary shell, install the released plugin through that account's
-   configured marketplace and update any version-pinned alias path.
-3. Verify the account binding and alias point at the same versioned cache, then
-   relaunch it with
-   `codex-discord-instance INSTANCE resume --last`.
-4. Verify an allowed Discord-origin turn in the exact visible TUI, then repeat
-   after `/clear`.
+## Outbound acceptance
 
-The installer may remove the previous cache, so never replace a plugin under a
-running alias. The launcher owns the matching app-server, gateway, and TUI as one generation.
-Do not start workers separately, register systemd units, copy a development
-checkout, or claim live ownership without exact-console evidence. Repository
-tests prove the delivery contract, not the live process migration.
+For one reply-required source, require one durable per-source receipt, one
+stable outbound Discord id, and exact channel/thread readback showing the right
+reply reference, bot identity, and content. Use the plugin's receipt-aware MCP
+sender or released CLI; never a generic webhook as proof.
 
-## Delivery Contract
+## Stop conditions
 
-The gateway resolves the current thread for each queued item. A fresh endpoint
-must expose one provable top-level loaded thread. The latest top-level
-`thread/started` notification replaces it after thread rotation. Subagents are
-never targets.
-
-Each drain accepts at most one ready FIFO head. Idle targets and proven top-level
-`systemError` targets use `turn/start`; active targets use `turn/steer` only with
-an exact turn id observed from app-server notifications or recovered from
-`thread/read` during startup and reconnect.
-Unknown or ambiguous active-turn identity remains `thread_busy`, while a new
-`turn/started` notification wakes the serialized drain. Requests omit model,
-reasoning effort, service tier, personality, cwd, sandbox, permissions,
-collaboration mode, and approval overrides.
-
-Every positive acknowledgement is read back from the exact target thread. A
-positive RPC response without that user item moves into the visible uncertain
-reconciliation lane and must not be described as delivered. Later ready items
-continue, but expiry only schedules another proof check; it never authorizes a
-second `turn/start` call.
-
-The exact top-level thread binding is durable across idle and active gateway
-restarts, but active turn ids are never persisted. Restart recovery rereads the
-bound thread before choosing start versus steer. `gateway-health.json` is the
-receiver truth; MCP-local login state is diagnostic only.
-
-## History Reads
-
-`discord_channel_read_history` accepts an optional exact `channelId`, an
-exclusive `before` message cursor, and `limit` from 1 to 25. Results are newest
-first. Guild history requires the exact enabled channel or thread; DM history
-requires the configured DM policy. The tool returns sanitized stable errors and
-bounded output.
-
-## Reply Once
-
-For a Discord-origin request, send through `discord_channel_send` with the exact
-source `channelId` and `replyTo`. The sender does not infer either identity from
-`last-inbound.json`. Before the network send it fsyncs a recoverable `in_flight`
-receipt keyed by that source identity under a per-source cross-process lock.
-The request uses a deterministic enforced nonce. Success is terminal only after
-any nonce in the create-message response matches and the returned message id is
-read back with that exact id, channel, source reply, content, and bot identity.
-Discord may omit nonce from the later GET.
-If the response returns an id with a conflicting nonce, the receipt preserves
-that id as permanently uncertain and suppresses both reconciliation and replay.
-
-An interrupted send is reconciled by recorded message id or any available
-stable nonce identity. A same-nonce retry is allowed only when no message id was
-returned and the bounded enforcement window is still open; nonce enforcement
-must deduplicate that replay. Otherwise uncertainty remains fail-closed.
-Confirmed replies suppress later automatic continuations. Use `followup: true`
-only when a second Discord message is intentionally required.
-
-Do not answer a Discord-origin request through a generic Discord MCP sender.
-That path does not share this plugin's reply receipt and bypasses the one-source
-one-reply guard. A new inbound Discord message gets a new receipt identity.
-
-## Guild Reply Audience
-
-With `requireMention: true`, an otherwise-authorized guild message is accepted
-only when the current message directly mentions the bot, Discord marks the
-current message as `@everyone` or `@here`, or the current message directly
-replies to that bot's own message. A reply to a peer does not inherit mentions
-from the referenced message. Literal broadcast lookalikes do not count as
-Discord broadcast metadata. With `requireMention: false`, mention and reply
-audience do not gate otherwise-authorized guild messages.
+- Stop destructive cleanup if exact alias/process ownership is ambiguous.
+- Stop deployment if queues/receipts drift without explanation.
+- Do not expose tokens or commit `.env`.
+- Do not leave a repairer-launched TUI holding the user's alias slot.
+- Never claim fixed from tests alone; label source, installed, component-health,
+  visible-TUI, and outbound-readback evidence separately.

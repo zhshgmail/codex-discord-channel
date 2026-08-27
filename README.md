@@ -4,12 +4,12 @@ Standalone Codex plugin project for Discord session delivery. The plugin lives
 at `plugins/codex-discord-channel` and is exposed through the repository
 marketplace at `.agents/plugins/marketplace.json`.
 
-## v0.3.5 Team Install And Upgrade
+## v0.3.8 Team Install And Upgrade
 
-Team release: [v0.3.5](https://github.com/zhshgmail/codex-discord-channel/releases/tag/v0.3.5).
+Team release: [v0.3.8](https://github.com/zhshgmail/codex-discord-channel/releases/tag/v0.3.8).
 
 This is the current team-host rollout, not a claim of cross-host portability.
-The marketplace MCP manifest in v0.3.5 still pins the team's absolute Node
+The marketplace MCP manifest in v0.3.8 still pins the team's absolute Node
 path; a host with a different Node path needs a later manifest fix.
 
 One instance is one launcher-owned process tree: launcher, app-server, Discord
@@ -57,10 +57,10 @@ Install the pinned tag from an ordinary shell:
 
 ```bash
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.5
+  zhshgmail/codex-discord-channel --ref v0.3.8
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.5+codex.alias-isolated-runtime"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.8+codex.alias-isolated-runtime"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 ```
 
@@ -83,7 +83,7 @@ start `app-server`, `gateway`, a bare `codex --remote`, or a new systemd unit
 separately. The launcher supplies the correct `CODEX_HOME`, instance, state
 directory, socket, and installed activation root to every child.
 
-### Upgrade To v0.3.5
+### Upgrade To v0.3.8
 
 Upgrade one alias at a time:
 
@@ -101,15 +101,15 @@ CODEX_HOME="$ACCOUNT_HOME" codex plugin list --json
 CODEX_HOME="$ACCOUNT_HOME" codex plugin remove codex-discord-channel@personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace remove personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.5
+  zhshgmail/codex-discord-channel --ref v0.3.8
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.5+codex.alias-isolated-runtime"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.8+codex.alias-isolated-runtime"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 "$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" resume --last
 ```
 
-If the marketplace already points at `v0.3.5`, use
+If the marketplace already points at `v0.3.8`, use
 `codex plugin marketplace upgrade personal` instead of replacing it. Never
 install over a running alias: the installer may remove files used by that
 generation, and an open MCP transport cannot hot-reload the replacement.
@@ -127,10 +127,16 @@ generation, and an open MCP transport cannot hot-reload the replacement.
 - If its launcher is stuck, verify the exact absolute launcher path, instance,
   PID, start time, children, and state directory; send `TERM` only to that
   launcher PID and let its cleanup trap stop its children.
+- v0.3.6 and later also record one atomic alias-local launch generation.
+  If the launcher dies abnormally, an immediate same-alias relaunch may reclaim
+  only that exact dead generation: launcher and process-group identities,
+  generation environment, command lines, and the Unix-socket inode must all
+  still match. A missing, malformed, live, reused, or changed identity remains
+  fail-closed with status 73 and is left untouched.
 - Never use `pkill codex`, `pkill node`, `killall`, an unresolved stale PID,
   or another alias's process, socket, config, or queue.
 - The only relevant `systemctl --user disable --now` command is for a retired
-  `discord-codex-bridge@INSTANCE.service` that actually exists. v0.3.5 itself
+  `discord-codex-bridge@INSTANCE.service` that actually exists. v0.3.6 itself
   has no service.
 - Never edit, delete, or replay `pending-delivery.json` during an upgrade.
 
@@ -165,6 +171,15 @@ the launcher has failed its nonblocking lock acquisition and exits with status
 73. This normally means another process still owns that instance; the lock
 file's mere existence is not the proof. Do not delete the lock, socket, queue,
 or PID files, and do not start a second receiver.
+
+v0.3.6 and later distinguish this live-lock case from an exact orphan
+left by an abnormally killed launcher. Under the alias lock, the latter is
+stopped as one isolated process group with a bounded TERM-to-KILL sequence; the
+socket is unlinked only if its device and inode still match the atomic
+generation manifest. The relaunch then continues normally. Legacy sockets with
+no manifest and any PID, PGID, command, environment, listener-count, or inode
+mismatch still produce the existing status-73 refusal and are never deleted or
+signalled automatically.
 
 ```bash
 INSTANCE=codex02
@@ -264,6 +279,26 @@ boundary. Requests include a stable Discord client message id and untrusted
 Discord context, but omit model, reasoning effort, service tier, personality,
 sandbox, cwd, and approval overrides.
 
+One top-level turn owns at most one automatic Discord reply. When several
+Discord source envelopes are accepted into the same exact `(threadId, turnId)`,
+the first exact source durably bound to that turn owns its final response even
+if an earlier uncertain acknowledgement makes it complete later. Later sources
+remain durably completed but their automatic outbound work is suppressed with
+the owning source identity. Restart reconciliation preserves confirmed,
+uncertain, in-flight, and legacy-sent per-source receipt facts as a turn-wide
+gate: a confirmed or sent receipt is the already-visible reply, a pending
+receipt is reconciled before any new POST, and an unreadable or wrong-identity
+receipt fails the whole turn closed. The durable owner may POST only after every
+other same-turn source is proven to have no receipt. Sources accepted into
+separate top-level turns keep independent per-source reply rights. Receipt
+inspection is independent of the queue's current outbound status: a pending
+receipt on a previously suppressed sibling is restored to guarded
+reconciliation instead of letting the owner send around it. That recovery is
+reconciliation-only: finding the remote reply confirms it; proving absence
+releases the stale receipt while the sibling remains suppressed, then the
+durable owner becomes the sole source allowed to POST. Recovery never POSTs as
+the sibling.
+
 If the trusted local app-server rejects a steer with an exact canonical
 expected-to-current turn mismatch, the gateway rechecks the same connection,
 thread revision, root, and TUI lease before retrying that one logical delivery
@@ -345,7 +380,7 @@ Prerequisites:
 - one isolated `CODEX_HOME` and Discord state directory per alias.
 
 ```bash
-codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.5
+codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.8
 codex plugin add codex-discord-channel@personal
 ```
 
@@ -357,7 +392,7 @@ gateway/app-server worker therefore use committed self-contained bundles:
 `runtime/mcp-server.cjs` and `runtime/channel.cjs`. `npm ci` and
 `npm run build:runtime` are development steps, not installation requirements.
 
-For a review branch or pinned deployment, replace `v0.3.5` with the exact
+For a review branch or pinned deployment, replace `v0.3.8` with the exact
 branch, tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
 

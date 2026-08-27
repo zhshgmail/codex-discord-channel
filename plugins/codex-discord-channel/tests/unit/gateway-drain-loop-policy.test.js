@@ -70,6 +70,7 @@ function createFixture(options = {}) {
   const config = {
     ownerId: options.ownerId || 'session-before-compaction',
     deliveryMode: 'app-server',
+    automaticOutboundEnabled: options.automaticOutboundEnabled ?? true,
     appServerRequestTimeoutMs: 100,
     deliveryDrainIntervalMs: 10,
     deliveryDrainMaxBackoffMs: 40,
@@ -175,6 +176,99 @@ test('empty durable queue refreshes the recovery target without flushing', async
   assert.equal(refreshes, 1);
   assert.equal(fixture.targetAttempts(), 1);
   assert.deepEqual(fixture.requests, []);
+  assert.deepEqual(timers.delays, [10, 10]);
+
+  await loop.stop();
+  fixture.delivery.destroy();
+});
+
+test('inbound-only mode drains an accepted Discord message without attempting automatic outbound', async () => {
+  const fixture = createFixture({ available: true, automaticOutboundEnabled: false });
+  const timers = createManualTimers();
+  const reports = [];
+  let outboundFlushes = 0;
+  fixture.delivery.flushOutbound = async () => {
+    outboundFlushes += 1;
+    return { status: 'failed', reason: 'ambiguous_automatic_outbound', deliveredCount: 0 };
+  };
+  await fixture.delivery.enqueue(normalizedMessage({
+    source: 'dm',
+    channelId: 'owner-dm',
+    guildId: null,
+    messageId: 'inbound-only-message',
+    authorId: 'configured-owner',
+    authorName: 'Owner',
+  }));
+  const loop = startGatewayDrainLoop({
+    config: fixture.config,
+    delivery: fixture.delivery,
+    receiverOwnership: fixture.receiverOwnership,
+    logger: () => {},
+    reportHealth(result) {
+      reports.push(result);
+    },
+    deps: {
+      clearTimeout: timers.clearTimeout,
+      setTimeout: timers.setTimeout,
+    },
+  });
+
+  assert.equal(await timers.runNext(), true);
+  assert.equal(outboundFlushes, 0);
+  assert.deepEqual(
+    fixture.requests.map((request) => request.clientUserMessageId),
+    ['discord:owner-dm:inbound-only-message'],
+  );
+  assert.deepEqual(readQueue(fixture.dir).items, []);
+  assert.deepEqual(
+    readQueue(fixture.dir).completed.map((item) => item.messageId),
+    ['inbound-only-message'],
+  );
+  assert.equal(reports.at(-1)?.status, 'delivered');
+  assert.deepEqual(timers.delays, [10, 10]);
+
+  await loop.stop();
+  fixture.delivery.destroy();
+});
+
+test('inbound-only mode refreshes an empty recovery target without automatic outbound backoff', async () => {
+  const fixture = createFixture({ available: true, automaticOutboundEnabled: false });
+  const timers = createManualTimers();
+  const reports = [];
+  let refreshes = 0;
+  let outboundFlushes = 0;
+  const originalRefresh = fixture.delivery.refreshTargetCheckpoint.bind(fixture.delivery);
+  fixture.delivery.refreshTargetCheckpoint = (...args) => {
+    refreshes += 1;
+    return originalRefresh(...args);
+  };
+  fixture.delivery.flushOutbound = async () => {
+    outboundFlushes += 1;
+    return { status: 'failed', reason: 'ambiguous_automatic_outbound', deliveredCount: 0 };
+  };
+  const loop = startGatewayDrainLoop({
+    config: fixture.config,
+    delivery: fixture.delivery,
+    receiverOwnership: fixture.receiverOwnership,
+    logger: () => {},
+    reportHealth(result) {
+      reports.push(result);
+    },
+    deps: {
+      clearTimeout: timers.clearTimeout,
+      setTimeout: timers.setTimeout,
+    },
+  });
+
+  assert.equal(await timers.runNext(), true);
+  assert.equal(refreshes, 1);
+  assert.equal(outboundFlushes, 0);
+  assert.deepEqual(reports, [{
+    status: 'idle',
+    reason: 'queue_empty',
+    deliveredCount: 0,
+    queueDepth: 0,
+  }]);
   assert.deepEqual(timers.delays, [10, 10]);
 
   await loop.stop();

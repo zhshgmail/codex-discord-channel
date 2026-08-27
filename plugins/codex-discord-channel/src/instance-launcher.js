@@ -6,7 +6,12 @@ const { sanitizedAppServerEnv } = require('./app-server-runtime');
 const { loadEnvFile } = require('./config');
 
 const ACCOUNT_BINDING_KEYS = new Set(['DISCORD_INSTANCE', 'DISCORD_CONFIG_DIR']);
-
+const ENTER_KEYMAP_COMPAT_ARGS = [
+  '-c',
+  'tui.keymap.composer.submit=["enter","ctrl-m"]',
+  '-c',
+  'tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]',
+];
 function verifyAccountBinding(config) {
   const binding = {};
   const loaded = loadEnvFile(config.paths.accountBindingPath, binding, {
@@ -41,6 +46,15 @@ function verifyLiveProcess(config, pid, dependencies = {}) {
     || path.resolve(env.DISCORD_CONFIG_DIR || '') !== path.resolve(config.paths.stateDir)
   ) === false;
   if (explicitIdentityMatches) return;
+  const generationIdentityMatches = Boolean(
+    env.CODEX_DISCORD_LAUNCH_GENERATION
+    && ['app', 'gateway'].includes(env.CODEX_DISCORD_LAUNCH_ROLE)
+    && env.CODEX_DISCORD_LAUNCH_INSTANCE === config.paths.instance
+    && path.resolve(env.CODEX_DISCORD_LAUNCH_STATE_DIR || '') === path.resolve(config.paths.stateDir)
+    && path.resolve(env.CODEX_DISCORD_LAUNCH_CODEX_HOME || '') === path.resolve(config.codexHome)
+    && env.CODEX_DISCORD_LAUNCH_ENDPOINT === config.appServerUrl.replace(/^unix:\/\//, '')
+  );
+  if (generationIdentityMatches) return;
 
   let argv = [];
   try {
@@ -92,7 +106,7 @@ function buildTuiLaunch(config, codexArgs = [], dependencies = {}) {
   const { codexBin, nodeBin } = requireInstanceReady(config, dependencies);
   return {
     command: nodeBin,
-    args: [codexBin, '--remote', config.appServerUrl, ...codexArgs],
+    args: [codexBin, '--remote', config.appServerUrl, ...ENTER_KEYMAP_COMPAT_ARGS, ...codexArgs],
     env: {
       ...sanitizedAppServerEnv(config),
       CODEX_HOME: config.codexHome,

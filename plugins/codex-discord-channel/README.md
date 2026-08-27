@@ -51,35 +51,47 @@ channel and message id. Inbound delivery uses only a shared app-server endpoint.
 The default is `unix://<state-dir>/app-server.sock`; an explicit
 `CODEX_DISCORD_APP_SERVER_URL` may use `unix://`, `ws://`, or `wss://`.
 
-The gateway dynamically resolves the current top-level loaded TUI thread and
-tracks thread rotation plus active turn identity. It sends at most one FIFO item
-per drain: `turn/start` for an idle target or a top-level target whose previous
-turn ended in `systemError`, or `turn/steer` with an exact active turn
-precondition when a goal continuation or other turn is already running.
-Unknown active-turn identity remains `thread_busy`. Turn payloads omit model,
+`DISCORD_STATE_DIR` is the durable bot identity. On every delivery the gateway
+asks the state-directory-owned app-server for its current loaded top-level TUI
+and uses the returned thread/turn only as a transient RPC coordinate. It never
+persists a session/thread/turn as ownership, authentication, receive, replay, or
+restart authority. `/clear`, resume, TUI replacement, and gateway replacement
+therefore do not change which Discord queue the instance owns.
+
+The gateway sends at most one FIFO item per drain: `turn/start` for an idle or
+`systemError` target, or `turn/steer` for an active target. If the app-server
+definitively rejects a stale transient coordinate, the gateway rediscovers the
+current route once and retries the same Discord source id. Turn payloads omit model,
 reasoning effort, service tier, personality, cwd, sandbox, and approval
 overrides; Discord metadata is carried only in the sanitized text envelope.
-Every positive acknowledgement is read back from the exact thread by the
-echoed client user message id before completion. A response without a persisted
-user item remains `structured_ack_uncertain`, so the gateway does not report a
-false completion. The item moves to a visible fail-closed reconciliation lane; later FIFO
-items continue. Expiry schedules another exact proof check but never authorizes
-another `turn/start` call.
+One top-level turn owns at most one automatic Discord reply. If multiple exact
+Discord sources enter the same `(threadId, turnId)`, the first durably bound
+source owns the final even when acknowledgement uncertainty reorders completion.
+Later source records are durably marked suppressed with that owner identity.
+Restart reconciliation treats all same-turn receipts as one send gate: a
+confirmed or legacy-sent receipt is the already-visible reply, a pending receipt
+must reconcile before any new POST, and an unreadable or wrong-identity receipt
+fails the whole turn closed. The durable owner may POST only after every other
+same-turn source is proven to have no receipt. Separate turns retain separate
+per-source reply rights. The receipt barrier does not trust the queue's current
+outbound status: a pending receipt on a previously suppressed sibling is
+restored to guarded reconciliation before the owner becomes eligible. This
+recovery is reconciliation-only: an existing remote reply is confirmed, while
+proven absence releases the stale receipt and keeps the sibling suppressed so
+only the durable owner can POST. It never retries the POST as the sibling.
+An accepted app-server response commits the queue item. If the response is lost
+or transport outcome is uncertain, the item stays in the ordinary ready FIFO
+with the stable `discord:<channel>:<message>` client id; the next drain resolves
+the then-current route and retries. There is no thread-bound uncertainty lane.
+Queue format v5 migrates v4 uncertainty records back into that FIFO.
 
-`pending-delivery.json` uses a durable activation id and timestamp. The id
-defaults to the real installed plugin root. A new versioned install archives
-legacy, mismatched, pre-activation queued, and delayed pre-activation Discord
-events before target resolution, retaining only their Discord identity and
-timestamps for deduplication. A restart of the same installed runtime may
-recover matching post-activation items. `CODEX_DISCORD_DELIVERY_ACTIVATION_ID`
-can set an explicit activation boundary for standalone workers when deployment
-paths are not versioned. The alias-owned launcher instead pins every channel
-and TUI child to the real root of its own installed plugin, so a stale instance
-`.env` override cannot preserve an older activation across a marketplace
-upgrade.
+`pending-delivery.json` retains queued Discord sources across plugin activation
+and version changes. Activation metadata is diagnostic only: it never archives,
+drops, authenticates, or deduplicates an inbound message. Durable deduplication
+uses only Discord channel plus message id.
 
 The standalone gateway checks the durable queue periodically as well as on
-app-server recovery events. A nonempty blocked queue retries with exponential
+app-server recovery events. A nonempty queue retries with exponential
 backoff from 1 second to a 30-second maximum, and each tick re-verifies the
 durable PID/generation receiver authority before resolving the structured
 target. `owner.json` and volatile thread/session ids never gate these retries.
@@ -90,6 +102,12 @@ The bounds are configurable with `CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS` and
 These legacy-named settings never authorize replaying `turn/start`.
 `CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS` controls the receiver heartbeat expiry
 (3 minutes by default).
+
+Set `CODEX_DISCORD_AUTOMATIC_OUTBOUND_ENABLED=false` for inbound-only emergency
+operation. The gateway continues to persist and inject inbound Discord messages
+and refresh the exact TUI target, but it does not inspect or send automatic
+assistant-final replies. Guarded explicit sends remain available through the MCP
+send tool.
 
 If the shared endpoint or exact current thread is unavailable, the queue stays
 persisted and status reports a stable reason such as
@@ -114,14 +132,20 @@ exactly-once boundary until every running gateway uses the current format. The
 current reader prefers `.v2`, so legacy cleanup cannot remove successor
 authority.
 
-The visible TUI must be relaunched through
-`codex-discord-instance INSTANCE resume --last`, which starts the matching
-app-server, gateway, and remote TUI from one installed cache generation. A
-direct `codex ... resume` process cannot be verified from this plugin. See the repository
+Launch the visible TUI through `codex-discord-instance INSTANCE ...`, which
+starts the matching app-server, gateway, and remote TUI from one installed cache
+generation. The launcher does not capture or invent an exact resume thread. If
+the gateway exits while the TUI is alive, it restarts only the gateway and keeps
+the TUI running. See the repository
 [Structured Delivery Contract](../../docs/structured-delivery.md) for the full
 migration and acceptance boundary. User-visible failure signatures and
 diagnostic steps are recorded in
 [Known Issues And Operational Boundaries](../../docs/known-issues.md).
+
+The launcher owns an atomic `instance-generation.json` beside its alias lock.
+It is process-cleanup metadata, not Discord identity. Instance paths and process
+groups are checked before cleanup so one alias cannot kill another. It is never
+used to choose, authenticate, or resume a Codex session/thread.
 
 ## Checks
 

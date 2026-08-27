@@ -11,6 +11,7 @@ const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
 const MAX_TARGET_RESOLUTION_RESTARTS = 4;
 const MAX_VERIFIED_USER_MESSAGES = 256;
+const MAX_EMITTED_ASSISTANT_FINALS = 256;
 const MAX_ROLLOUT_SEARCH_DEPTH = 4;
 const MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096;
 const MAX_ROLLOUT_SEARCH_ENTRIES = 65536;
@@ -23,7 +24,10 @@ const MAX_LIFECYCLE_PROOF_DELAY_MS = 250;
 const DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]);
 const TARGET_CHECKPOINT_VERSION = 3;
 const CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// Top-level app-server turns use UUIDv7, while automatic goal continuations
+// currently use UUIDv4. Both identities come from the same trusted local
+// app-server rejection and must remain eligible for the bounded exact-ID rebind.
+const CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
 
 function parseTargetCheckpoint(raw) {
@@ -102,8 +106,46 @@ function reconnectableError(error) {
   ].includes(error?.code);
 }
 
+function includeTurnsUnsupported(error) {
+  if (error?.code !== 'shared_app_server_request_rejected') return false;
+  const message = String(error?.message || '');
+  return (
+    error.rpcCode === -32601 && /list_turns is not supported yet/i.test(message)
+  ) || (
+    error.rpcCode === -32600 && /ephemeral threads do not support includeTurns/i.test(message)
+  );
+}
+
 function deliveryProofKey(threadId, clientUserMessageId) {
   return JSON.stringify([threadId, clientUserMessageId]);
+}
+
+function assistantFinalKey(threadId, turnId) {
+  return JSON.stringify([threadId, turnId]);
+}
+
+function exactAssistantFinal(threadId, turnId, turn) {
+  if (
+    typeof threadId !== 'string' || threadId === '' ||
+    typeof turnId !== 'string' || turnId === '' ||
+    turn?.id !== turnId || turn?.status !== 'completed' ||
+    !Array.isArray(turn.items)
+  ) {
+    return null;
+  }
+  const finals = turn.items.filter((item) => (
+    item?.type === 'agentMessage' &&
+    item.phase === 'final_answer' &&
+    typeof item.id === 'string' && item.id !== '' &&
+    typeof item.text === 'string' && item.text.trim() !== ''
+  ));
+  if (finals.length !== 1) return null;
+  return {
+    threadId,
+    turnId,
+    itemId: finals[0].id,
+    text: finals[0].text,
+  };
 }
 
 function isLocalAppServer(endpoint) {
@@ -529,7 +571,7 @@ class AppServerRpcClient extends EventEmitter {
         clientInfo: {
           name: 'codex-discord-channel',
           title: 'Discord Channel Gateway',
-          version: '0.3.5',
+          version: '0.3.17',
         },
         capabilities: {
           experimentalApi: true,
@@ -780,8 +822,10 @@ class AppServerHost extends EventEmitter {
     this.activeTurnIds = new Map();
     this.activeTurnProvenance = new Map();
     this.knownLoadedThreadIds = new Set();
+    this.ephemeralThreadIds = new Set();
     this.verifiedUserMessages = new Map();
     this.deliveryWaiters = new Map();
+    this.emittedAssistantFinals = new Map();
     this.destroyed = false;
     this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
       deps.lifecycleProofRetryDelaysMs,
@@ -799,7 +843,11 @@ class AppServerHost extends EventEmitter {
         )
         : async () => false);
     this.loadedInventoryProven = false;
-    this.restoredTargetCheckpoint = this.loadTargetCheckpoint();
+    // Thread checkpoints from older releases are diagnostic leftovers, not
+    // authority.  Always rediscover the live target from this state-dir-owned
+    // app-server connection.
+    this.restoredTargetCheckpoint = null;
+    this.clearTargetCheckpoint();
     this.observedTuiLeaseTarget = null;
     if (this.requireTuiLease && this.restoredTargetCheckpoint) {
       const checkpoint = this.restoredTargetCheckpoint;
@@ -826,6 +874,7 @@ class AppServerHost extends EventEmitter {
         notification?.method === 'item/completed'
       ) {
         const threadId = notification.params?.threadId;
+        const turnId = notification.params?.turnId;
         const item = notification.params?.item;
         if (
           typeof threadId === 'string' &&
@@ -834,7 +883,25 @@ class AppServerHost extends EventEmitter {
           typeof item.clientId === 'string' &&
           item.clientId !== ''
         ) {
+          // Codex 0.150+ TUI sessions can be ephemeral: thread/read with
+          // includeTurns is rejected and no durable rollout is available.
+          // The exact lifecycle event from the bound local app-server is the
+          // only live, visible-session acknowledgement for those threads.
+          if (this.ephemeralThreadIds.has(threadId)) {
+            this.rememberVerifiedUserMessage(threadId, item.clientId);
+          }
           this.wakeDeliveryWaiters(threadId, item.clientId);
+        }
+        if (
+          notification.method === 'item/completed' &&
+          item?.type === 'agentMessage' &&
+          item.phase === 'final_answer' &&
+          typeof threadId === 'string' && threadId !== '' &&
+          typeof turnId === 'string' && turnId !== '' &&
+          typeof item.id === 'string' && item.id !== '' &&
+          typeof item.text === 'string' && item.text.trim() !== ''
+        ) {
+          this.emitAssistantFinal({ threadId, turnId, itemId: item.id, text: item.text });
         }
         return;
       }
@@ -901,6 +968,8 @@ class AppServerHost extends EventEmitter {
         const threadId = notification.params?.threadId;
         const turnId = notification.params?.turn?.id;
         if (!threadId) return;
+        const final = exactAssistantFinal(threadId, turnId, notification.params?.turn);
+        if (final) this.emitAssistantFinal(final);
         if (!turnId || this.activeTurnIds.get(threadId) === turnId) {
           this.activeTurnIds.delete(threadId);
           this.activeTurnProvenance.delete(threadId);
@@ -947,6 +1016,7 @@ class AppServerHost extends EventEmitter {
         if (!threadId) return;
         this.threadSelectionRevision += 1;
         if (this.loadedInventoryProven) this.knownLoadedThreadIds.delete(threadId);
+        this.ephemeralThreadIds.delete(threadId);
         this.threadStatuses.delete(threadId);
         this.activeTurnIds.delete(threadId);
         this.activeTurnProvenance.delete(threadId);
@@ -1031,6 +1101,22 @@ class AppServerHost extends EventEmitter {
     while (this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES) {
       this.verifiedUserMessages.delete(this.verifiedUserMessages.keys().next().value);
     }
+  }
+
+  emitAssistantFinal(final) {
+    const key = assistantFinalKey(final.threadId, final.turnId);
+    const identity = JSON.stringify([final.itemId, final.text]);
+    const prior = this.emittedAssistantFinals.get(key);
+    if (prior === identity) return;
+    if (prior !== undefined) {
+      this.emittedAssistantFinals.set(key, null);
+      return;
+    }
+    this.emittedAssistantFinals.set(key, identity);
+    while (this.emittedAssistantFinals.size > MAX_EMITTED_ASSISTANT_FINALS) {
+      this.emittedAssistantFinals.delete(this.emittedAssistantFinals.keys().next().value);
+    }
+    this.emit('assistantFinal', final);
   }
 
   addDeliveryWaiter(key, waiter) {
@@ -1135,39 +1221,8 @@ class AppServerHost extends EventEmitter {
   }
 
   persistTargetCheckpoint() {
-    if (!this.targetCheckpointPath) return;
-    const threadId = this.currentThreadId;
-    if (
-      !threadId ||
-      !this.loadedInventoryProven ||
-      !this.knownLoadedThreadIds.has(threadId)
-    ) {
-      return;
-    }
-    const lease = this.readTuiLease(threadId);
-    if (!lease.available) return;
-    const record = {
-      version: this.requireTuiLease ? TARGET_CHECKPOINT_VERSION : 2,
-      threadId,
-      loadedThreadIds: [...this.knownLoadedThreadIds].sort(),
-    };
-    if (this.requireTuiLease) record.leaseId = lease.record.leaseId;
-    const directory = path.dirname(this.targetCheckpointPath);
-    const tempPath = `${this.targetCheckpointPath}.tmp-${process.pid}-${Date.now()}`;
-    try {
-      this.fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-      this.fs.writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-      this.fs.renameSync(tempPath, this.targetCheckpointPath);
-      this.fs.chmodSync(this.targetCheckpointPath, 0o600);
-      this.clearTargetInvalidation();
-    } catch (error) {
-      try {
-        this.fs.unlinkSync(tempPath);
-      } catch {}
-      this.logger('WARN', 'Unable to persist app-server target checkpoint', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+    // Deliberately empty.  Persisting thread/session identity made a harmless
+    // /clear, resume, or TUI restart capable of wedging the whole instance.
   }
 
   status() {
@@ -1263,7 +1318,100 @@ class AppServerHost extends EventEmitter {
   }
 
   async resolveTarget() {
-    return this.resolveTargetAttempt({ revisionRestarts: 0 });
+    return this.resolveStateDirTarget();
+  }
+
+  async resolveStateDirTarget() {
+    // The shared app-server socket belongs to one DISCORD_STATE_DIR instance.
+    // Thread ids are only transient RPC coordinates inside that app-server;
+    // they are rediscovered on every delivery and never serve as identity,
+    // ownership, or restart authority.
+    let connectionGeneration = null;
+    const request = async (method, params) => {
+      if (typeof this.client.requestOnConnection !== 'function') {
+        return this.client.request(method, params);
+      }
+      const response = await this.client.requestOnConnection(
+        method,
+        params,
+        connectionGeneration,
+      );
+      connectionGeneration = response.generation;
+      return response.result;
+    };
+    try {
+      const loaded = await request('thread/loaded/list', { limit: 100 });
+      if (!Array.isArray(loaded?.data) || loaded.data.length === 0) {
+        const reason = 'shared_app_server_no_loaded_thread';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
+      const orderedIds = [...new Set(loaded.data.filter((value) => (
+        typeof value === 'string' && value.trim() !== ''
+      )))];
+      if (orderedIds.length === 0) {
+        const reason = 'shared_app_server_no_loaded_thread';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
+      if (this.currentThreadId && orderedIds.includes(this.currentThreadId)) {
+        orderedIds.splice(orderedIds.indexOf(this.currentThreadId), 1);
+        orderedIds.unshift(this.currentThreadId);
+      }
+      let response = null;
+      let threadId = '';
+      for (const candidateId of orderedIds) {
+        const candidateResponse = await request('thread/read', {
+          threadId: candidateId,
+          includeTurns: true,
+        }).catch(async (error) => {
+          if (!includeTurnsUnsupported(error)) throw error;
+          return request('thread/read', { threadId: candidateId });
+        });
+        const candidate = candidateResponse?.thread;
+        if (candidate?.id === candidateId && candidate.parentThreadId == null) {
+          response = candidateResponse;
+          threadId = candidateId;
+          break;
+        }
+      }
+      const thread = response?.thread;
+      if (!thread || !threadId) {
+        const reason = 'shared_app_server_no_top_level_thread';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
+      const status = thread.status?.type || 'unavailable';
+      if (!['idle', 'active', 'systemError'].includes(status)) {
+        const reason = 'shared_app_server_thread_unavailable';
+        this.lastStatus = { configured: true, available: false, reason };
+        return { available: false, reason, status: 'unavailable' };
+      }
+      this.currentThreadId = threadId;
+      this.threadStatuses.set(threadId, status);
+      const target = { available: true, threadId, status };
+      if (status === 'active') {
+        const activeTurnId = (Array.isArray(thread.turns) ? thread.turns : [])
+          .filter((turn) => turn?.status === 'inProgress' && typeof turn.id === 'string' && turn.id)
+          .map((turn) => turn.id)
+          .at(-1) || this.activeTurnIds.get(threadId) || '';
+        if (activeTurnId) {
+          this.activeTurnIds.set(threadId, activeTurnId);
+          target.activeTurnId = activeTurnId;
+        }
+      } else {
+        this.activeTurnIds.delete(threadId);
+      }
+      this.lastStatus = { configured: true, available: true, reason: null };
+      Object.defineProperty(target, TARGET_GENERATION, {
+        value: Object.freeze({ connectionGeneration }),
+      });
+      return target;
+    } catch (error) {
+      const reason = error?.code || 'shared_app_server_unavailable';
+      this.lastStatus = { configured: true, available: false, reason };
+      return { available: false, reason, status: 'unavailable' };
+    }
   }
 
   async resolveTargetAttempt(resolutionBudget) {
@@ -1396,6 +1544,11 @@ class AppServerHost extends EventEmitter {
       return { available: false, reason, status: 'unavailable' };
     }
     const loadedThreadIds = new Set(threadIds);
+    for (const ephemeralThreadId of this.ephemeralThreadIds) {
+      if (!loadedThreadIds.has(ephemeralThreadId)) {
+        this.ephemeralThreadIds.delete(ephemeralThreadId);
+      }
+    }
     const trustedThreadIds = restoredTargetCheckpoint
       ? new Set(restoredTargetCheckpoint.loadedThreadIds)
       : provenLoadedThreadIds;
@@ -1564,15 +1717,17 @@ class AppServerHost extends EventEmitter {
             threadId,
           };
         }
+      } else if (topLevelThreads.length > 1) {
+        // thread/loaded/list is ordered by the app-server's live recency.  The
+        // state-dir owns exactly one visible TUI, so choose the first current
+        // top-level thread instead of turning historical loaded threads into a
+        // permanent ambiguity gate.
+        [{ threadId, response }] = topLevelThreads;
+        this.logger('INFO', 'Selected the most recent top-level thread for the state-dir instance', {
+          loadedTopLevelCount: topLevelThreads.length,
+        });
       } else {
-        const reason = topLevelThreads.length > 1
-          ? 'shared_app_server_thread_ambiguous'
-          : 'shared_app_server_thread_unprovable';
-        if (reason === 'shared_app_server_thread_unprovable') {
-          return rejectUnprovableTopology();
-        }
-        this.lastStatus = { configured: true, available: false, reason };
-        return { available: false, reason, status: 'unavailable' };
+        return rejectUnprovableTopology();
       }
     }
 
@@ -1600,9 +1755,19 @@ class AppServerHost extends EventEmitter {
           includeTurns: true,
         });
       } catch (error) {
-        const reason = error?.code || 'shared_app_server_thread_unreadable';
-        this.lastStatus = { configured: true, available: false, reason };
-        return { available: false, reason, status: 'unavailable' };
+        if (ephemeralIncludeTurnsUnsupported(error)) {
+          try {
+            response = await requestForTarget('thread/read', { threadId });
+          } catch (fallbackError) {
+            const reason = fallbackError?.code || 'shared_app_server_thread_unreadable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          }
+        } else {
+          const reason = error?.code || 'shared_app_server_thread_unreadable';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
       }
     }
     if (this.threadSelectionRevision !== threadSelectionRevision) {
@@ -1633,6 +1798,11 @@ class AppServerHost extends EventEmitter {
     this.knownLoadedThreadIds = new Set(threadIds);
     this.loadedInventoryProven = true;
     this.currentThreadId = thread.id;
+    // Ephemeral lifecycle events are delivery proof only after this exact
+    // thread has passed status/topology checks and the TUI lease gate above.
+    // Remembering it earlier would let an unavailable or unleased thread
+    // authorize an otherwise unproven userMessage notification.
+    if (thread.ephemeral === true) this.ephemeralThreadIds.add(thread.id);
     this.threadStatuses.set(thread.id, status);
     if (status === 'active') {
       const latestInProgressTurnId = (Array.isArray(thread.turns) ? thread.turns : [])
@@ -1668,52 +1838,22 @@ class AppServerHost extends EventEmitter {
   }
 
   async startTurn(params, target) {
-    const validateTarget = (candidate) => {
-      const generation = candidate?.[TARGET_GENERATION];
-      const lease = this.readTuiLease(params.threadId);
-      if (!lease.available) {
-        throw deliveryError(
-          'The supervised TUI lease is no longer fresh for structured delivery.',
-          lease.reason,
-        );
-      }
-      const statusChanged = candidate?.status === 'active'
-        ? !candidate.activeTurnId ||
-          this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId
-        : this.threadStatuses.get(params.threadId) !== candidate?.status;
-      const connectionChanged = generation?.connectionGeneration != null &&
-        this.client.connectionGeneration !== generation.connectionGeneration;
-      if (
-        !generation ||
-        connectionChanged ||
-        generation.threadSelectionRevision !== this.threadSelectionRevision ||
-        generation.threadId !== params.threadId ||
-        generation.leaseId !== (lease.record?.leaseId || '') ||
-        candidate.threadId !== params.threadId ||
-        this.currentThreadId !== params.threadId ||
-        statusChanged
-      ) {
-        throw deliveryError(
-          'The current app-server thread changed before structured turn submission.',
-          'shared_app_server_thread_changed',
-        );
-      }
-      return lease;
-    };
-
     const submit = async (candidate) => {
       const generation = candidate[TARGET_GENERATION];
-      validateTarget(candidate);
       const method = candidate.status === 'active' ? 'turn/steer' : 'turn/start';
       const requestParams = candidate.status === 'active'
-        ? { ...params, expectedTurnId: candidate.activeTurnId }
-        : params;
+        ? {
+            ...params,
+            threadId: candidate.threadId,
+            ...(candidate.activeTurnId ? { expectedTurnId: candidate.activeTurnId } : {}),
+          }
+        : { ...params, threadId: candidate.threadId };
       if (typeof this.client.requestOnConnection === 'function') {
         const response = await this.client.requestOnConnection(
           method,
           requestParams,
-          generation.connectionGeneration,
-          () => validateTarget(candidate),
+          generation?.connectionGeneration ?? null,
+          null,
           true,
         );
         return {
@@ -1729,130 +1869,19 @@ class AppServerHost extends EventEmitter {
       };
     };
 
-    const rejectedWithoutSubmissionUncertainty = (error) => (
-      error?.deliveryOutcome === 'rejected' || error?.deliveryOutcome === 'not_sent'
-    );
-
-    const invalidateChangedLease = (candidate) => {
-      const generation = candidate?.[TARGET_GENERATION];
-      if (!this.requireTuiLease || !generation || this.currentThreadId !== params.threadId) {
-        return false;
-      }
-      const lease = this.readTuiLease(params.threadId);
-      if (
-        !lease.available ||
-        !lease.record ||
-        lease.record.leaseId === generation.leaseId
-      ) {
-        return false;
-      }
-      this.threadSelectionRevision += 1;
-      this.timeoutRecoveryTarget = null;
-      this.currentThreadId = '';
-      this.threadStatuses.clear();
-      this.activeTurnIds.clear();
-      this.activeTurnProvenance.clear();
-      this.knownLoadedThreadIds.clear();
-      this.loadedInventoryProven = false;
-      this.observedTuiLeaseTarget = null;
-      this.invalidateTargetCheckpoint('tui_lease_replaced');
-      this.restoredTargetCheckpoint = null;
-      return true;
-    };
-
-    const clearUnprovenActiveTurn = (candidate) => {
-      if (
-        candidate?.status !== 'active' ||
-        this.currentThreadId !== params.threadId ||
-        this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId
-      ) {
-        return;
-      }
-      this.threadSelectionRevision += 1;
-      this.timeoutRecoveryTarget = null;
-      this.threadStatuses.set(params.threadId, 'active');
-      this.activeTurnIds.delete(params.threadId);
-      this.activeTurnProvenance.delete(params.threadId);
-      this.persistTargetCheckpoint();
-    };
-
-    const rebindAuthoritativeTurn = (candidate, error) => {
-      const mismatch = error?.authoritativeActiveTurnMismatch;
-      if (
-        candidate?.status !== 'active' ||
-        !rejectedWithoutSubmissionUncertainty(error) ||
-        mismatch?.provenance !== 'trusted_local_app_server_rejection' ||
-        mismatch.expectedTurnId !== candidate.activeTurnId ||
-        !CANONICAL_TURN_ID.test(mismatch.activeTurnId) ||
-        mismatch.activeTurnId === candidate.activeTurnId
-      ) {
-        return null;
-      }
-      let lease;
-      try {
-        lease = validateTarget(candidate);
-      } catch {
-        invalidateChangedLease(candidate);
-        return null;
-      }
-      const generation = candidate[TARGET_GENERATION];
-      this.threadSelectionRevision += 1;
-      this.timeoutRecoveryTarget = null;
-      this.currentThreadId = params.threadId;
-      this.threadStatuses.set(params.threadId, 'active');
-      this.activeTurnIds.set(params.threadId, mismatch.activeTurnId);
-      this.activeTurnProvenance.set(
-        params.threadId,
-        mismatch.provenance,
-      );
-      this.persistTargetCheckpoint();
-      const rebound = {
-        available: true,
-        threadId: params.threadId,
-        status: 'active',
-        activeTurnId: mismatch.activeTurnId,
-      };
-      Object.defineProperty(rebound, TARGET_GENERATION, {
-        value: Object.freeze({
-          connectionGeneration: generation.connectionGeneration,
-          threadSelectionRevision: this.threadSelectionRevision,
-          threadId: params.threadId,
-          leaseId: lease.record?.leaseId || '',
-          activeTurnProvenance: mismatch.provenance,
-        }),
-      });
-      return rebound;
-    };
-
     let submitted;
     try {
       submitted = await submit(target);
     } catch (error) {
-      if (target?.status !== 'active') throw error;
-      const rebound = rebindAuthoritativeTurn(target, error);
-      if (!rebound) {
-        if (rejectedWithoutSubmissionUncertainty(error)) {
-          if (!invalidateChangedLease(target)) clearUnprovenActiveTurn(target);
-        }
-        throw error;
-      }
-      try {
-        submitted = await submit(rebound);
-      } catch (retryError) {
-        const nextAuthoritative = rebindAuthoritativeTurn(rebound, retryError);
-        if (nextAuthoritative) {
-          retryError.code = 'thread_busy';
-          throw retryError;
-        }
-        if (rejectedWithoutSubmissionUncertainty(retryError)) {
-          if (!invalidateChangedLease(rebound)) clearUnprovenActiveTurn(rebound);
-        }
-        throw retryError;
-      }
+      if (!['rejected', 'not_sent'].includes(error?.deliveryOutcome)) throw error;
+      const current = await this.resolveStateDirTarget();
+      if (!current.available) throw error;
+      submitted = await submit(current);
+      target = current;
     }
     if (submitted.method === 'turn/start') {
       this.rememberAcceptedTurn(
-        params.threadId,
+        target.threadId,
         submitted.result,
         submitted.acceptedGeneration,
       );
@@ -1867,17 +1896,31 @@ class AppServerHost extends EventEmitter {
     if (typeof this.client.requestOnConnection === 'function') {
       await this.client.ensureConnected();
       threadSelectionRevision = this.threadSelectionRevision;
-      response = (await this.client.requestOnConnection(
-        'thread/read',
-        params,
-        this.client.connectionGeneration,
-        null,
-        false,
-        signal,
-      )).result;
+      try {
+        response = (await this.client.requestOnConnection(
+          'thread/read',
+          params,
+          this.client.connectionGeneration,
+          null,
+          false,
+          signal,
+        )).result;
+      } catch (error) {
+        if (includeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
+          return false;
+        }
+        throw error;
+      }
     } else {
       threadSelectionRevision = this.threadSelectionRevision;
-      response = await this.client.request('thread/read', params);
+      try {
+        response = await this.client.request('thread/read', params);
+      } catch (error) {
+        if (includeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
+          return false;
+        }
+        throw error;
+      }
     }
     if (this.threadSelectionRevision !== threadSelectionRevision) {
       throw deliveryError(
@@ -1892,6 +1935,32 @@ class AppServerHost extends EventEmitter {
         item?.type === 'userMessage' && item.clientId === clientUserMessageId
       ))
     ));
+  }
+
+  async readAssistantFinal(threadId, turnId) {
+    if (
+      typeof threadId !== 'string' || threadId === '' ||
+      typeof turnId !== 'string' || turnId === ''
+    ) {
+      return null;
+    }
+    let response;
+    try {
+      response = await this.client.request('thread/read', {
+        threadId,
+        includeTurns: true,
+      });
+    } catch (error) {
+      if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
+        return null;
+      }
+      throw error;
+    }
+    const thread = response?.thread;
+    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
+    const matches = thread.turns.filter((turn) => turn?.id === turnId);
+    if (matches.length !== 1) return null;
+    return exactAssistantFinal(threadId, turnId, matches[0]);
   }
 
   async hasDelivered(threadId, clientUserMessageId) {
@@ -2060,6 +2129,11 @@ class AppServerHost extends EventEmitter {
     return () => this.off('threadClosed', listener);
   }
 
+  onAssistantFinal(listener) {
+    this.on('assistantFinal', listener);
+    return () => this.off('assistantFinal', listener);
+  }
+
   destroy() {
     this.destroyed = true;
     for (const waiters of this.deliveryWaiters.values()) {
@@ -2067,6 +2141,7 @@ class AppServerHost extends EventEmitter {
     }
     this.deliveryWaiters.clear();
     this.verifiedUserMessages.clear();
+    this.emittedAssistantFinals.clear();
     this.activeTurnProvenance.clear();
     this.client.off('notification', this.onNotification);
     this.client.off('connectionChanged', this.onConnectionChanged);

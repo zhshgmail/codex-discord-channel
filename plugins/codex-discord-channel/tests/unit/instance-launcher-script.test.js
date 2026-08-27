@@ -5,10 +5,12 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const test = require('node:test');
+const nodeTest = require('node:test');
+const { stateDirContractTest } = require('./retired-session-bound-contracts');
+const test = stateDirContractTest(nodeTest);
 
 const sourceLauncher = path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-instance');
-
+const enterCompatTrace = '-c tui.keymap.composer.submit=["enter","ctrl-m"] -c tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]';
 function executable(file, source) {
   fs.writeFileSync(file, source, { mode: 0o700 });
 }
@@ -24,10 +26,14 @@ function fixture() {
   const childEnvTrace = path.join(home, 'child-env.log');
   const channelEnvTrace = path.join(home, 'channel-env.log');
   const loginMarker = path.join(home, 'login-complete');
+  const ptyLauncher = path.join(binDir, 'pty-launcher');
+  const tuiActiveMarker = path.join(home, 'tui-active');
   const fakeNode = path.join(binDir, 'node');
   const fakeCodex = path.join(binDir, 'codex.js');
   const fakeChannel = path.join(pluginRuntimeDir, 'channel.cjs');
+  const socketOwner = path.join(binDir, 'socket-owner.py');
   const launcher = path.join(pluginBinDir, 'codex-discord-instance');
+  const generationHelper = path.join(pluginBinDir, 'codex-discord-generation');
   const codexHome = path.join(home, '.codex-account-02');
   fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
@@ -36,20 +42,68 @@ function fixture() {
   fs.mkdirSync(codexHome, { recursive: true });
   fs.copyFileSync(sourceLauncher, launcher);
   fs.chmodSync(launcher, 0o700);
+  fs.copyFileSync(path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-generation'), generationHelper);
+  fs.chmodSync(generationHelper, 0o700);
   fs.writeFileSync(fakeCodex, '// fixture\n');
   fs.writeFileSync(fakeChannel, '// fixture\n');
+  executable(socketOwner, String.raw`#!/usr/bin/env python3
+import os, signal, socket, sys, time
+
+path = sys.argv[1]
+replace_marker = path + '.replace'
+sock = None
+
+def bind():
+    global sock
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    sock.listen(1)
+
+def stop(_signum, _frame):
+    global sock
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if os.environ.get('APP_CREATES_SOCKET_ON_TERM') == '1' and sock is None:
+        bind()
+        time.sleep(0.15)
+    if sock is not None:
+        sock.close()
+    if os.environ.get('APP_LEAVES_SOCKET') != '1' and os.environ.get('APP_CREATES_SOCKET_ON_TERM') != '1':
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+if os.environ.get('APP_CREATES_SOCKET_ON_TERM') != '1':
+    bind()
+while True:
+    if os.path.exists(replace_marker):
+        os.unlink(replace_marker)
+        if sock is not None:
+            sock.close()
+        bind()
+    time.sleep(0.01)
+`);
   executable(fakeNode, [
     '#!/usr/bin/env bash',
+    'if [[ $1 == "$GENERATION_HELPER" || $1 == "$STATE_DIR"/generation-runtime/*/codex-discord-generation ]]; then exec "$REAL_NODE_BIN" "$@"; fi',
     'if [[ $1 == -e && $2 == \'process.stdout.write(String(Date.now()))\' ]]; then',
     '  printf "%s" "$FAKE_NODE_NOW_MS"',
     '  exit 0',
     'fi',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" ]]; then',
+    'if [[ $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ]]; then',
     '  state_activation=$(awk -F= \'$1 == "CODEX_DISCORD_DELIVERY_ACTIVATION_ID" { print substr($0, index($0, "=") + 1) }\' "$STATE_DIR/.env")',
     '  effective_activation=${CODEX_DISCORD_DELIVERY_ACTIVATION_ID:-$state_activation}',
     '  printf "%s|%s|%s|%s|%s|%s|%s\n" "$2" "${CODEX_HOME-UNSET}" "${DISCORD_CONFIG_DIR-UNSET}" "${DISCORD_STATE_DIR-UNSET}" "${CODEX_ACCOUNT_ENV_FILE-UNSET}" "${CODEX_NETWORK_ENV_FILE-UNSET}" "$effective_activation" >>"$CHANNEL_ENV_TRACE"',
     'fi',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
+    'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
     '    begin)',
     '      printf "recovery-begin %s\\n" "$7" >>"$TRACE"',
@@ -59,6 +113,7 @@ function fixture() {
     '    clear) rm -f "$STATE_DIR/tui-recovery-target.json"; exit 0 ;;',
     '    clear-owned) rm -f "$STATE_DIR/tui-recovery-target.json"; exit 0 ;;',
     '    snapshot)',
+    '      if [[ ${SNAPSHOT_RESET_TTY:-0} == 1 && -t 0 ]]; then stty sane; fi',
     '      if [[ -f $STATE_DIR/app-server-target.json ]]; then',
     '        python3 - "$STATE_DIR/tui-recovery-target.json" "$STATE_DIR/app-server-target.json" <<\'PY\'',
     'import json, sys',
@@ -82,32 +137,22 @@ function fixture() {
     '  esac',
     'fi',
     'printf "node %s\\n" "$*" >>"$TRACE"',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == app-server ]]; then',
-    '  if [[ ${APP_CREATES_SOCKET_ON_TERM:-0} == 1 ]]; then',
-    '    trap \'python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()" "$STATE_DIR/app-server.sock"; exit 0\' TERM INT',
-    '    while true; do sleep 0.1; done',
-    '  fi',
-    '  rm -f "$STATE_DIR/app-server.sock"',
-    '  python3 - "$STATE_DIR/app-server.sock" <<\'PY\'',
-    'import socket, sys',
-    'sock = socket.socket(socket.AF_UNIX)',
-    'sock.bind(sys.argv[1])',
-    'sock.close()',
-    'PY',
-    '  if [[ ${APP_LEAVES_SOCKET:-0} == 1 ]]; then',
-    '    trap \'exit 0\' TERM INT',
-    '  else',
-    '    trap \'rm -f "$STATE_DIR/app-server.sock"; exit 0\' TERM INT',
-    '  fi',
-    '  while true; do sleep 0.1; done',
+    'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == app-server ]]; then',
+    '  exec python3 "$SOCKET_OWNER" "$STATE_DIR/app-server.sock"',
     'fi',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == gateway ]]; then',
-    '  if [[ ${GATEWAY_EXIT_IMMEDIATELY:-0} == 1 ]]; then exit 42; fi',
+    'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == gateway ]]; then',
+    '  if [[ ${GATEWAY_EXIT_IMMEDIATELY:-0} == 1 ]]; then sleep 0.1; exit 42; fi',
     '  if [[ ${GATEWAY_EXIT_WHEN_SOCKET_EXISTS:-0} == 1 ]]; then',
     '    while [[ ! -S $STATE_DIR/app-server.sock ]]; do sleep 0.01; done',
     '    exit 42',
     '  fi',
-    '  if [[ ${GATEWAY_EXIT_AFTER_START:-0} == 1 ]]; then sleep 0.2; exit 42; fi',
+    '  if [[ ${GATEWAY_EXIT_WHEN_TUI_ACTIVE:-0} == 1 ]]; then',
+    '    while [[ ! -e $TUI_ACTIVE_MARKER ]]; do sleep 0.01; done',
+    '    if [[ ! -e $STATE_DIR/gateway-exited-once ]]; then',
+    '      : >$STATE_DIR/gateway-exited-once',
+    '      exit 42',
+    '    fi',
+    '  fi',
     '  trap \'exit 0\' TERM INT',
     '  while true; do sleep 0.1; done',
     'fi',
@@ -115,7 +160,12 @@ function fixture() {
     '  env | LC_ALL=C sort | grep -E "^(DISCORD_|CODEX_DISCORD_|CODEX_APP_SERVER_URL=|CODEX_ACCOUNT_ENV_FILE=|CODEX_NETWORK_ENV_FILE=)" >>"$CHILD_ENV_TRACE" || true',
     'fi',
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${TUI_STAY_ACTIVE:-0} == 1 ]]; then',
+    '  : >"$TUI_ACTIVE_MARKER"',
     '  trap \'exit 0\' TERM INT',
+    '  if [[ ${TUI_EXIT_AFTER_GATEWAY_RESTART:-0} == 1 ]]; then',
+    '    while (( $(grep -c "node .* gateway" "$TRACE" 2>/dev/null || true) < 2 )); do sleep 0.02; done',
+    '    exit 0',
+    '  fi',
     '  while true; do sleep 0.1; done',
     'fi',
     'if [[ ${LOGIN_REQUIRED:-0} == 1 && $2 == tui-login-state && ! -f $LOGIN_MARKER ]]; then exit 10; fi',
@@ -131,14 +181,13 @@ function fixture() {
     '  printf "%s\\n" "$count" >"$TUI_COUNT"',
     '  if ((count == 1)); then',
     '    printf "{\\"version\\":1,\\"threadId\\":\\"%s\\",\\"status\\":\\"active\\",\\"activeTurnId\\":\\"turn-1\\",\\"loadedThreadIds\\":[\\"%s\\"]}\\n" "$THREAD_ID" "$THREAD_ID" >"$STATE_DIR/app-server-target.json"',
-    '    sleep 0.4',
-    '    rm -f "$STATE_DIR/app-server.sock"',
-    '    python3 - "$STATE_DIR/app-server.sock" <<\'PY\'',
-    'import socket, sys',
-    'sock = socket.socket(socket.AF_UNIX)',
-    'sock.bind(sys.argv[1])',
-    'sock.close()',
-    'PY',
+    '    before=$(stat -Lc "%d:%i" "$STATE_DIR/app-server.sock")',
+    '    : >"$STATE_DIR/app-server.sock.replace"',
+    '    for _attempt in {1..100}; do',
+    '      after=$(stat -Lc "%d:%i" "$STATE_DIR/app-server.sock" 2>/dev/null || true)',
+    '      [[ -n $after && $after != "$before" ]] && break',
+    '      sleep 0.01',
+    '    done',
     '    exit 71',
     '  fi',
     'fi',
@@ -146,6 +195,22 @@ function fixture() {
     '  printf "{\\"version\\":1,\\"threadId\\":\\"%s\\",\\"status\\":\\"active\\",\\"activeTurnId\\":\\"turn-1\\",\\"loadedThreadIds\\":[\\"%s\\"]}\\n" "$THREAD_ID" "$THREAD_ID" >"$STATE_DIR/app-server-target.json"',
     '  sleep 0.4',
     '  exit 72',
+    'fi',
+    'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote ]]; then',
+    '  read -r tui_pgid tui_session tui_tty_nr tui_tpgid tui_start_ticks < <(awk \'{print $5 " " $6 " " $7 " " $8 " " $22}\' "/proc/$$/stat")',
+    '  printf "%s %s %s %s %s %s\\n" "$$" "$tui_pgid" "$tui_start_ticks" "$tui_session" "$tui_tty_nr" "$tui_tpgid" >>"$TUI_IDENTITY_TRACE"',
+    '  if [[ ${TUI_RAW_MODE_TEST:-0} == 1 ]]; then',
+    '    stty raw -echo',
+    '    sleep 0.35',
+    '    stty -a >"$TUI_MODE_TRACE"',
+    '    stty sane',
+    '  fi',
+    '  if [[ ${TUI_READ_LINE:-0} == 1 ]]; then',
+    '    IFS= read -r tui_input',
+    '    printf "%s\\n" "$tui_input" >"$TUI_INPUT_TRACE"',
+    '  fi',
+    '  if [[ ${DELETE_PLUGIN_DURING_TUI:-0} == 1 ]]; then rm -rf "$PLUGIN_ROOT"; fi',
+    '  /usr/bin/sleep 0.1',
     'fi',
     'exit 0',
     '',
@@ -165,6 +230,53 @@ function fixture() {
     'exit 99',
     '',
   ].join('\n'));
+  executable(path.join(binDir, 'setsid'), [
+    '#!/usr/bin/env bash',
+    'stat_tail=$(awk \'{print $22}\' "/proc/$$/stat")',
+    'printf "%s %s\\n" "$$" "$stat_tail" >>"$SETSID_TRACE"',
+    'case ${SETSID_TEST_MODE:-pass} in',
+    '  delay) /usr/bin/sleep 0.05; exec /usr/bin/setsid "$@" ;;',
+    '  vanish) /usr/bin/sleep 0.05; exit 0 ;;',
+    '  drift) /usr/bin/sleep 0.20; exit 0 ;;',
+    '  timeout)',
+    '    while [[ ! -e ${SETSID_TIMEOUT_RELEASE:?} ]]; do /usr/bin/sleep 0.01; done',
+    '    exit 0',
+    '    ;;',
+    '  *) exec /usr/bin/setsid "$@" ;;',
+    'esac',
+    '',
+  ].join('\n'));
+  executable(path.join(binDir, 'awk'), [
+    '#!/usr/bin/env bash',
+    'if [[ ${WORKER_GROUP_TEST_START_TICKS_DRIFT:-0} == 1 && $# == 2',
+    '  && $1 == *\'$5 " " $22\'* && $2 == /proc/*/stat ]]; then',
+    '  output=$(/usr/bin/awk "$@")',
+    '  count=0',
+    '  [[ -f $WORKER_GROUP_TEST_AWK_COUNTER ]] && read -r count <"$WORKER_GROUP_TEST_AWK_COUNTER"',
+    '  count=$((count + 1))',
+    '  printf "%s\\n" "$count" >"$WORKER_GROUP_TEST_AWK_COUNTER"',
+    '  if ((count >= 2)); then',
+    '    read -r pgid start_ticks <<<"$output"',
+    '    printf "%s %s\\n" "$pgid" "$((start_ticks + 1))"',
+    '  else',
+    '    printf "%s\\n" "$output"',
+    '  fi',
+    '  exit 0',
+    'fi',
+    'exec /usr/bin/awk "$@"',
+    '',
+  ].join('\n'));
+  executable(path.join(binDir, 'sleep'), [
+    '#!/usr/bin/env bash',
+    'if [[ ${WORKER_GROUP_TEST_FAST_TIMEOUT:-0} == 1 && ${1:-} == 0.01 ]]; then exit 0; fi',
+    'exec /usr/bin/sleep "$@"',
+    '',
+  ].join('\n'));
+  executable(ptyLauncher, [
+    '#!/usr/bin/env bash',
+    'exec "$LAUNCHER_UNDER_TEST" codex02',
+    '',
+  ].join('\n'));
   fs.writeFileSync(path.join(stateDir, 'account.env'), [
     `CODEX_HOME=${codexHome}`,
     `CODEX_BIN=${fakeCodex}`,
@@ -182,13 +294,21 @@ function fixture() {
     codexHome,
     fakeChannel,
     fakeCodex,
+    generationHelper,
     home,
     launcher,
     loginMarker,
     pluginRoot,
+    ptyLauncher,
+    socketOwner,
+    setsidTrace: path.join(home, 'setsid-trace.log'),
     stateDir,
     trace,
     tuiCount: path.join(home, 'tui-count'),
+    tuiActiveMarker,
+    tuiIdentityTrace: path.join(home, 'tui-identity-trace.log'),
+    tuiInputTrace: path.join(home, 'tui-input-trace.log'),
+    tuiModeTrace: path.join(home, 'tui-mode-trace.log'),
   };
 }
 
@@ -202,13 +322,23 @@ function launchEnv(setup, overrides = {}) {
     CHANNEL_ENV_TRACE: setup.channelEnvTrace,
     FAKE_CHANNEL_BIN: setup.fakeChannel,
     FAKE_CODEX_BIN: setup.fakeCodex,
+    GENERATION_HELPER: setup.generationHelper,
     HOME: setup.home,
     LOGIN_MARKER: setup.loginMarker,
+    PLUGIN_ROOT: setup.pluginRoot,
+    LAUNCHER_UNDER_TEST: setup.launcher,
     PATH: `${setup.binDir}:${process.env.PATH}`,
+    REAL_NODE_BIN: process.execPath,
+    SOCKET_OWNER: setup.socketOwner,
+    SETSID_TRACE: setup.setsidTrace,
     STATE_DIR: setup.stateDir,
     THREAD_ID: '019f3763-d308-7871-bedc-e6489b02190e',
     TRACE: setup.trace,
     TUI_COUNT: setup.tuiCount,
+    TUI_ACTIVE_MARKER: setup.tuiActiveMarker,
+    TUI_IDENTITY_TRACE: setup.tuiIdentityTrace,
+    TUI_INPUT_TRACE: setup.tuiInputTrace,
+    TUI_MODE_TRACE: setup.tuiModeTrace,
     ...overrides,
   };
 }
@@ -226,16 +356,28 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.equal(result.status, 0, result.stderr);
   const trace = fs.readFileSync(setup.trace, 'utf8').trim().split('\n');
   assert.equal(trace.some((line) => line.startsWith('systemctl ')), false);
-  assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.some((line) => line.startsWith(`node ${setup.fakeChannel} live-check `)));
-  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs app-server --instance codex02 --state-dir ${setup.stateDir}`)));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs gateway --instance codex02 --state-dir ${setup.stateDir}`)));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.includes('channel.cjs live-check ')));
+  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
   for (const entry of channelEnvironments) {
-    assert.equal(entry.split('|')[6], setup.pluginRoot);
+    assert.equal(entry.split('|')[6], setup.stateDir);
   }
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
+});
+
+test('generation runtime survives marketplace eviction of the installed plugin cache', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, { DELETE_PLUGIN_DURING_TUI: '1' }),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(setup.pluginRoot), false);
+  assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
+  assert.equal(fs.existsSync(path.join(setup.stateDir, 'instance-generation.json')), false);
 });
 
 test('instance argument ignores Discord state inherited from another alias', () => {
@@ -263,11 +405,11 @@ test('instance argument ignores Discord state inherited from another alias', () 
 
   assert.equal(result.status, 0, result.stderr);
   const trace = fs.readFileSync(setup.trace, 'utf8').trim().split('\n');
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(
+    `channel.cjs gateway --instance codex02 --state-dir ${setup.stateDir}`,
+  )));
   assert.ok(trace.includes(
-    `node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`,
-  ));
-  assert.ok(trace.includes(
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock resume thread-2`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`,
   ));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
@@ -279,7 +421,7 @@ test('instance argument ignores Discord state inherited from another alias', () 
     assert.equal(legacyStateDir, 'UNSET');
     assert.equal(accountEnvFile, 'UNSET');
     assert.equal(networkEnvFile, 'UNSET');
-    assert.equal(activationId, setup.pluginRoot);
+    assert.equal(activationId, setup.stateDir);
   }
 });
 
@@ -300,9 +442,9 @@ test('first-run TTY login succeeds before workers and the TUI start', () => {
     `node ${setup.fakeChannel} tui-check --instance codex02 --state-dir ${setup.stateDir}`,
   ]);
   assert.equal(trace.some((line) => line.startsWith('systemctl ')), false);
-  assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock`));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs app-server --instance codex02 --state-dir ${setup.stateDir}`)));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs gateway --instance codex02 --state-dir ${setup.stateDir}`)));
+  assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace}`));
 });
 
 test('cancelled first-run TTY login starts neither worker nor TUI', () => {
@@ -370,32 +512,146 @@ test('launcher rejection never removes an app-server socket it does not own', ()
   assert.equal(fs.existsSync(socketPath), true, 'foreign socket must remain untouched');
 });
 
-test('worker exit fails the active TUI closed and cleans the owned socket', () => {
+test('gateway exit restarts the receiver without terminating the active TUI', () => {
   const setup = fixture();
   const result = spawnSync(setup.launcher, ['codex02'], {
     encoding: 'utf8',
-    env: launchEnv(setup, { GATEWAY_EXIT_AFTER_START: '1', TUI_STAY_ACTIVE: '1' }),
+    env: launchEnv(setup, {
+      GATEWAY_EXIT_WHEN_TUI_ACTIVE: '1',
+      TUI_STAY_ACTIVE: '1',
+      TUI_EXIT_AFTER_GATEWAY_RESTART: '1',
+    }),
     timeout: 5000,
   });
-  assert.equal(result.status, 75, result.stderr);
-  assert.match(result.stderr, /Discord gateway .* exited while the TUI was active/);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Discord gateway .* restarted while the TUI remained active/);
+  const trace = fs.readFileSync(setup.trace, 'utf8');
+  assert.equal((trace.match(/node .* gateway/g) || []).length, 2);
+  assert.equal((trace.match(/node .* --remote/g) || []).length, 1);
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
 });
 
-test('startup failure cleans a socket created by the owned app-server child', () => {
+test('gateway failure around readiness fails closed and cleans the owned socket', () => {
   const setup = fixture();
   const result = spawnSync(setup.launcher, ['codex02'], {
     encoding: 'utf8',
     env: launchEnv(setup, { APP_LEAVES_SOCKET: '1', GATEWAY_EXIT_WHEN_SOCKET_EXISTS: '1' }),
     timeout: 5000,
   });
-  assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stderr, /gateway .* exited during startup/);
+  assert.ok([1, 75].includes(result.status), result.stderr);
+  assert.match(
+    result.stderr,
+    /gateway .* exited (?:during startup|while the TUI was active)/,
+  );
   assert.equal(
     fs.existsSync(path.join(setup.stateDir, 'app-server.sock')),
     false,
     'socket created after launcher ownership must be cleaned',
   );
+});
+
+test('interactive TUI retains the foreground PTY and receives Enter', {
+  skip: process.platform !== 'linux' || !fs.existsSync('/usr/bin/script'),
+}, () => {
+  const setup = fixture();
+  const marker = 'foreground-enter-marker';
+  const result = spawnSync(
+    '/usr/bin/script',
+    ['-qefc', setup.ptyLauncher, '/dev/null'],
+    {
+      encoding: 'utf8',
+      env: launchEnv(setup, {
+        SNAPSHOT_RESET_TTY: '1',
+        TUI_RAW_MODE_TEST: '1',
+        TUI_READ_LINE: '1',
+      }),
+      input: `${marker}\n`,
+      timeout: 5000,
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(setup.tuiInputTrace, 'utf8').trim(), marker);
+  const terminalMode = fs.readFileSync(setup.tuiModeTrace, 'utf8');
+  assert.match(terminalMode, /(?:^|\s)-icanon(?:\s|$)/);
+  assert.match(terminalMode, /(?:^|\s)-echo(?:\s|$)/);
+  const identity = fs.readFileSync(setup.tuiIdentityTrace, 'utf8').trim().split(' ');
+  const [, tuiPgid, , , tuiTtyNr, tuiTpgid] = identity;
+  assert.notEqual(tuiTtyNr, '0', 'interactive TUI must retain a controlling terminal');
+  assert.equal(tuiTpgid, tuiPgid, 'interactive TUI process group must own the terminal');
+});
+
+test('launcher isolates workers while keeping the TUI in the foreground process group', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, { SETSID_TEST_MODE: 'delay' }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /did not isolate its process group/);
+  const tuiIdentities = fs.readFileSync(setup.tuiIdentityTrace, 'utf8').trim().split('\n');
+  assert.equal(tuiIdentities.length, 1);
+  const [tuiPid, tuiPgid, tuiStartTicks] = tuiIdentities[0].split(' ');
+  assert.notEqual(tuiPgid, tuiPid);
+  const wrapperIdentities = fs.readFileSync(setup.setsidTrace, 'utf8').trim().split('\n');
+  assert.equal(
+    wrapperIdentities.includes(`${tuiPid} ${tuiStartTicks}`),
+    false,
+    'the interactive TUI must not pass through setsid',
+  );
+});
+
+test('worker disappearance during process-group isolation fails closed with a typed reason', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, { SETSID_TEST_MODE: 'vanish' }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /worker_group_pid_vanished/);
+});
+
+test('worker start-time drift during process-group isolation fails closed with a typed reason', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      SETSID_TEST_MODE: 'drift',
+      WORKER_GROUP_TEST_AWK_COUNTER: path.join(setup.home, 'worker-group-awk-count'),
+      WORKER_GROUP_TEST_START_TICKS_DRIFT: '1',
+    }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /worker_group_start_ticks_drift/);
+});
+
+test('worker process-group isolation bound expiry fails closed without extending startup timeout', () => {
+  const setup = fixture();
+  const timeoutRelease = path.join(setup.home, 'setsid-timeout-release');
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, {
+      SETSID_TEST_MODE: 'timeout',
+      SETSID_TIMEOUT_RELEASE: timeoutRelease,
+      WORKER_GROUP_TEST_FAST_TIMEOUT: '1',
+    }),
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /worker_group_isolation_timeout/);
+  assert.equal(fs.existsSync(timeoutRelease), false);
+  for (const line of fs.readFileSync(setup.setsidTrace, 'utf8').trim().split('\n')) {
+    const [pid, startTicks] = line.split(' ');
+    let current = null;
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      current = stat.trim().split(/\s+/)[21];
+    } catch {}
+    assert.notEqual(current, startTicks, `setsid wrapper PID ${pid} survived bound expiry`);
+  }
 });
 
 test('cleanup removes an owned socket created after sibling startup failure', () => {
@@ -432,8 +688,8 @@ test('shell launcher resumes the exact captured thread after app-server replacem
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume --last`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume --last`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
   assert.match(result.stderr, /resuming thread 019f3763-d308-7871-bedc-e6489b02190e/);
 });
@@ -481,8 +737,17 @@ test('Codex child receives only the explicit Discord instance allowlist', () => 
     }),
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(fs.readFileSync(setup.childEnvTrace, 'utf8').trim().split('\n'), [
-    `CODEX_DISCORD_DELIVERY_ACTIVATION_ID=${setup.pluginRoot}`,
+  const childEnvironment = fs.readFileSync(setup.childEnvTrace, 'utf8').trim().split('\n');
+  const generationEntry = childEnvironment.find((entry) => entry.startsWith('CODEX_DISCORD_LAUNCH_GENERATION='));
+  assert.match(generationEntry, /^CODEX_DISCORD_LAUNCH_GENERATION=[0-9a-f-]{36}$/);
+  assert.deepEqual(childEnvironment.filter((entry) => entry !== generationEntry), [
+    `CODEX_DISCORD_DELIVERY_ACTIVATION_ID=${setup.stateDir}`,
+    `CODEX_DISCORD_LAUNCH_CODEX_HOME=${setup.codexHome}`,
+    `CODEX_DISCORD_LAUNCH_ENDPOINT=${setup.stateDir}/app-server.sock`,
+    'CODEX_DISCORD_LAUNCH_INSTANCE=codex02',
+    `CODEX_DISCORD_LAUNCH_PLUGIN_ROOT=${setup.pluginRoot}`,
+    'CODEX_DISCORD_LAUNCH_ROLE=tui',
+    `CODEX_DISCORD_LAUNCH_STATE_DIR=${setup.stateDir}`,
     `DISCORD_CONFIG_DIR=${setup.stateDir}`,
     'DISCORD_INSTANCE=codex02',
   ]);
@@ -503,8 +768,8 @@ test('recovery inserts exact resume after preserving global flags when no resume
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
 });
 
@@ -530,8 +795,8 @@ test('recovery discards the original prompt instead of replaying it after resume
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review -- initial prompt`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`,
   ]);
 });
 
@@ -552,6 +817,6 @@ test('recovery discards image prompt inputs instead of replaying them after resu
       .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
     assert.equal(tuiLaunches.length, 2);
     assert.equal(tuiLaunches[1],
-      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
+      `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --profile review resume 019f3763-d308-7871-bedc-e6489b02190e`);
   }
 });

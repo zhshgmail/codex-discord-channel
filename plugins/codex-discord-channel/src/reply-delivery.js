@@ -240,6 +240,27 @@ function suppressResult(identity, receipt, reason) {
   };
 }
 
+function provenAbsentResult(identity) {
+  return {
+    channelId: identity.channelId,
+    messageId: null,
+    sourceMessageId: identity.sourceMessageId,
+    duplicateSuppressed: true,
+    reason: 'source_message_reply_proven_absent',
+    receiptStatus: 'absent',
+    receiptReleased: true,
+    reconciliationProvenAbsent: true,
+  };
+}
+
+async function releaseProvenAbsentReply(config, state, identity, deps = {}) {
+  const released = await releaseReplyClaim(config, state, deps);
+  if (released !== null) {
+    return suppressResult(identity, released, 'source_message_reply_uncertain').result;
+  }
+  return provenAbsentResult(identity);
+}
+
 async function beginReply(config, identity, content, deps = {}) {
   const file = receiptPath(config, identity.channelId, identity.sourceMessageId);
   const digest = contentDigest(content);
@@ -438,6 +459,7 @@ async function sendDiscordReplyOnce({
   sender,
   confirmer,
   reconciler,
+  reconciliationOnly = false,
   deps = {},
 }) {
   const dispatch = replyDispatch(args, config);
@@ -453,6 +475,10 @@ async function sendDiscordReplyOnce({
   };
   const state = await beginReply(config, identity, content, deps);
   if (state.mode === 'suppress') return state.result;
+
+  if (reconciliationOnly === true && state.mode === 'send') {
+    return releaseProvenAbsentReply(config, state, identity, deps);
+  }
 
   if (state.mode === 'send' && typeof confirmer !== 'function') {
     await releaseReplyClaim(config, state, deps);
@@ -504,6 +530,9 @@ async function sendDiscordReplyOnce({
     if (!replayWindowOpen(state.receipt, config, deps)) {
       const uncertain = await markReplyUncertain(config, state, null, deps);
       return suppressResult(identity, uncertain, 'source_message_reply_uncertain').result;
+    }
+    if (reconciliationOnly === true) {
+      return releaseProvenAbsentReply(config, state, identity, deps);
     }
     if (typeof confirmer !== 'function') {
       const uncertain = await markReplyUncertain(config, state, null, deps);

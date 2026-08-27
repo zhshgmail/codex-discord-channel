@@ -182,12 +182,10 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.http_proxy ||
     '';
   const cwd = env.CODEX_CWD || options.cwd || process.cwd();
-  const ownerId =
-    env.CODEX_DISCORD_OWNER_ID ||
-    env.CODEX_THREAD_ID ||
-    env.CODEX_SESSION_ID ||
-    env.CODEX_TARGET_THREAD_ID ||
-    `${os.hostname()}:${process.pid}:${Date.now()}`;
+  // The configured state directory is the durable Discord identity.  Codex
+  // session/thread ids are intentionally excluded: /clear, resume, and TUI
+  // replacement may change them while the bot instance remains the same.
+  const ownerId = `discord-state:${paths.stateDir}`;
   const requestedDeliveryMode = String(
     env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'app-server',
   ).toLowerCase();
@@ -227,6 +225,10 @@ function loadConfig(inputEnv = process.env, options = {}) {
     appServerRequestTimeoutMs: parseInteger(env.CODEX_DISCORD_APP_SERVER_REQUEST_TIMEOUT_MS, 30000),
     deliveryDrainIntervalMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_INTERVAL_MS, 1000),
     deliveryDrainMaxBackoffMs: parseInteger(env.CODEX_DISCORD_QUEUE_DRAIN_MAX_BACKOFF_MS, 30000),
+    automaticOutboundEnabled: parseBool(
+      env.CODEX_DISCORD_AUTOMATIC_OUTBOUND_ENABLED,
+      true,
+    ),
     deliveryUncertainRetryBaseMs: parseInteger(
       env.CODEX_DISCORD_UNCERTAIN_RETRY_BASE_MS,
       5000,
@@ -239,7 +241,10 @@ function loadConfig(inputEnv = process.env, options = {}) {
       env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
       180000,
     ),
-    requireTuiLease: true,
+    // The state directory and its single supervised app-server are the instance
+    // identity.  A Codex session/thread is transient transport state and must
+    // never become a receive or replay gate.
+    requireTuiLease: false,
     tuiLeaseStaleMs: Math.max(
       1000,
       parseInteger(env.CODEX_DISCORD_TUI_LEASE_STALE_MS, 3000),

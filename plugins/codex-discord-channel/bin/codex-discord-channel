@@ -121,6 +121,51 @@ function readStdin() {
   });
 }
 
+async function sendGuardedReply(args, config, content, client, deps = {}, options = {}) {
+  return (deps.sendDiscordReplyOnce || sendDiscordReplyOnce)({
+    args,
+    config,
+    content,
+    reconciliationOnly: options.reconciliationOnly === true,
+    preflight: (target, identity) => (deps.prepareDiscordMessageSend || prepareDiscordMessageSend)(
+      client,
+      { ...args, ...target, ...identity, content },
+    ),
+    sender: (target, prepared, identity) => (deps.sendDiscordMessage || sendDiscordMessage)(
+      client,
+      { ...args, ...target, ...identity, content },
+      prepared,
+    ),
+    confirmer: (target, prepared, message, receipt) => (
+      deps.confirmDiscordMessage || confirmDiscordMessage
+    )(
+      client,
+      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+      prepared,
+      message,
+    ),
+    reconciler: (target, prepared, receipt) => (
+      deps.reconcileDiscordMessage || reconcileDiscordMessage
+    )(
+      client,
+      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
+      prepared,
+      receipt,
+    ),
+  });
+}
+
+function createAutomaticReplySender(config, client, deps = {}) {
+  return ({ channelId, replyTo, content, reconciliationOnly = false }) => sendGuardedReply(
+    { channelId, replyTo, followup: false },
+    config,
+    content,
+    client,
+    deps,
+    { reconciliationOnly },
+  );
+}
+
 async function sendViaRest(args, deps = {}) {
   const content = (await (deps.readStdin || readStdin)()).trim();
   if (!content) throw new Error('stdin message content is required');
@@ -136,32 +181,7 @@ async function sendViaRest(args, deps = {}) {
     fetchImpl: deps.fetchImpl || globalThis.fetch,
   });
 
-  const sent = await sendDiscordReplyOnce({
-    args,
-    config,
-    content,
-    preflight: (target, identity) => prepareDiscordMessageSend(
-      client,
-      { ...args, ...target, ...identity, content },
-    ),
-    sender: (target, prepared, identity) => sendDiscordMessage(
-      client,
-      { ...args, ...target, ...identity, content },
-      prepared,
-    ),
-    confirmer: (target, prepared, message, receipt) => confirmDiscordMessage(
-      client,
-      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
-      prepared,
-      message,
-    ),
-    reconciler: (target, prepared, receipt) => reconcileDiscordMessage(
-      client,
-      { ...args, ...target, nonce: receipt.nonce, enforceNonce: true, content },
-      prepared,
-      receipt,
-    ),
-  });
+  const sent = await sendGuardedReply(args, config, content, client, deps);
   (deps.writeOutput || ((text) => process.stdout.write(text)))(`${JSON.stringify(sent)}\n`);
   return sent;
 }
@@ -179,7 +199,14 @@ function enabled(value) {
 
 async function runGateway(config = loadConfig()) {
   const logger = makeLogger();
-  const delivery = createDelivery(config, logger);
+  const restClient = createDiscordRestClient({
+    token: config.token,
+    botUserId: config.botUserId,
+    fetchImpl: globalThis.fetch,
+  });
+  const delivery = createDelivery(config, logger, {
+    sendAutomaticReply: createAutomaticReplySender(config, restClient),
+  });
   let discordState;
   try {
     discordState = await startDiscordClient({ config, delivery, logger, claimReceiver: true });
@@ -367,6 +394,7 @@ async function main() {
 }
 
 module.exports = {
+  createAutomaticReplySender,
   main,
   parseLiveCheckArgs,
   parseRuntimeArgs,

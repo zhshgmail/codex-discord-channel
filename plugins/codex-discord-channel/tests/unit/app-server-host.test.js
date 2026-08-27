@@ -6,7 +6,9 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const test = require('node:test');
+const nodeTest = require('node:test');
+const { stateDirContractTest } = require('./retired-session-bound-contracts');
+const test = stateDirContractTest(nodeTest);
 const {
   AppServerRpcClient,
   createAppServerHost,
@@ -35,6 +37,8 @@ const OTHER_DELIVERY_THREAD_ID = '019f3763-d308-7871-bedc-e6489b02190f';
 const ACTIVE_TURN_A = '019f3763-d308-7871-bedc-e6489b021910';
 const ACTIVE_TURN_B = '019f3763-d308-7871-bedc-e6489b021911';
 const ACTIVE_TURN_C = '019f3763-d308-7871-bedc-e6489b021912';
+const GOAL_CONTINUATION_TURN = 'aff9a9a4-3fe1-49a0-a80b-45396b6d5341';
+const NEXT_GOAL_CONTINUATION_TURN = 'e8d49570-dde4-4a4f-a334-bfd3df379e98';
 
 function sessionMeta(threadId = DELIVERY_THREAD_ID) {
   return { type: 'session_meta', payload: { id: threadId } };
@@ -74,6 +78,14 @@ function activeTurnMismatchError(expectedTurnId, activeTurnId) {
     code: -32602,
     message: `expected active turn id \`${expectedTurnId}\` but found \`${activeTurnId}\``,
   };
+}
+
+function ephemeralIncludeTurnsError() {
+  const error = new Error('ephemeral threads do not support includeTurns');
+  error.code = 'shared_app_server_request_rejected';
+  error.rpcCode = -32600;
+  error.deliveryOutcome = 'rejected';
+  return error;
 }
 
 function createRolloutFixture(t, records, options = {}) {
@@ -3117,7 +3129,69 @@ test('trusted local A-to-B active-turn mismatch retries once as one exact-readba
   );
 });
 
-test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven root', async (t) => {
+test('trusted local top-level-to-goal-continuation mismatch retries the UUIDv4 turn once', async (t) => {
+  const requests = [];
+  let accepted = false;
+  const clientUserMessageId = 'discord:c1:m-goal-continuation-rebind';
+  const { WebSocket } = createFakeWebSocket(async (request) => {
+    requests.push(request);
+    if (request.method === 'initialize') return {};
+    if (request.method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (request.method === 'thread/read') {
+      return activeThread(
+        DELIVERY_THREAD_ID,
+        ACTIVE_TURN_A,
+        accepted ? [{ type: 'userMessage', clientId: clientUserMessageId }] : [],
+      );
+    }
+    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_A) {
+      return {
+        error: activeTurnMismatchError(ACTIVE_TURN_A, GOAL_CONTINUATION_TURN),
+      };
+    }
+    if (
+      request.method === 'turn/steer' &&
+      request.params.expectedTurnId === GOAL_CONTINUATION_TURN
+    ) {
+      accepted = true;
+      return { turnId: GOAL_CONTINUATION_TURN };
+    }
+    throw new Error(`unexpected method ${request.method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { WebSocket },
+  );
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.activeTurnId, ACTIVE_TURN_A);
+  const params = {
+    threadId: DELIVERY_THREAD_ID,
+    clientUserMessageId,
+    input: [{ type: 'text', text: 'deliver during automatic goal continuation' }],
+  };
+
+  assert.deepEqual(
+    await host.startTurn(params, target),
+    { turnId: GOAL_CONTINUATION_TURN },
+  );
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientUserMessageId), true);
+  const steerRequests = requests.filter((request) => request.method === 'turn/steer');
+  assert.deepEqual(
+    steerRequests.map((request) => request.params.expectedTurnId),
+    [ACTIVE_TURN_A, GOAL_CONTINUATION_TURN],
+  );
+  assert.deepEqual(
+    new Set(steerRequests.map((request) => request.params.clientUserMessageId)),
+    new Set([clientUserMessageId]),
+  );
+});
+
+test('v7-to-v4-to-v4 mismatch stops after two rejects and retains the latest goal turn', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-rebind-cap-'));
   const requests = [];
   const { WebSocket } = createFakeWebSocket(async (request) => {
@@ -3130,10 +3204,18 @@ test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven r
       return activeThread(DELIVERY_THREAD_ID, ACTIVE_TURN_A);
     }
     if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_A) {
-      return { error: activeTurnMismatchError(ACTIVE_TURN_A, ACTIVE_TURN_B) };
+      return { error: activeTurnMismatchError(ACTIVE_TURN_A, GOAL_CONTINUATION_TURN) };
     }
-    if (request.method === 'turn/steer' && request.params.expectedTurnId === ACTIVE_TURN_B) {
-      return { error: activeTurnMismatchError(ACTIVE_TURN_B, ACTIVE_TURN_C) };
+    if (
+      request.method === 'turn/steer' &&
+      request.params.expectedTurnId === GOAL_CONTINUATION_TURN
+    ) {
+      return {
+        error: activeTurnMismatchError(
+          GOAL_CONTINUATION_TURN,
+          NEXT_GOAL_CONTINUATION_TURN,
+        ),
+      };
     }
     throw new Error(`unexpected method ${request.method}`);
   });
@@ -3161,9 +3243,9 @@ test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven r
   assert.equal(steerRequests.length, 2);
   assert.deepEqual(
     steerRequests.map((request) => request.params.expectedTurnId),
-    [ACTIVE_TURN_A, ACTIVE_TURN_B],
+    [ACTIVE_TURN_A, GOAL_CONTINUATION_TURN],
   );
-  assert.equal(host.activeTurnIds.get(DELIVERY_THREAD_ID), ACTIVE_TURN_C);
+  assert.equal(host.activeTurnIds.get(DELIVERY_THREAD_ID), NEXT_GOAL_CONTINUATION_TURN);
   assert.equal(
     host.activeTurnProvenance.get(DELIVERY_THREAD_ID),
     'trusted_local_app_server_rejection',
@@ -3174,7 +3256,7 @@ test('A-to-B-to-C mismatch stops after two rejects and retains C on the proven r
 
   const readsBefore = requests.filter((request) => request.method === 'thread/read').length;
   const nextTarget = await host.resolveTarget();
-  assert.equal(nextTarget.activeTurnId, ACTIVE_TURN_C);
+  assert.equal(nextTarget.activeTurnId, NEXT_GOAL_CONTINUATION_TURN);
   assert.equal(
     requests.filter((request) => request.method === 'thread/read').length,
     readsBefore,
@@ -4200,6 +4282,199 @@ test('restart without a lifecycle signal recovers from exact local rollout proof
 
   assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
   assert.deepEqual(client.requests, []);
+});
+
+test('restored ephemeral target retries thread/read without includeTurns', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-ephemeral-target-'));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const config = {
+    appServerUrl: 'ws://127.0.0.1:4500',
+    paths: { stateDir },
+  };
+  await createDurableTarget(config, 'turn-before-ephemeral-restart');
+
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-a'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (params.includeTurns === true) throw ephemeralIncludeTurnsError();
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(config, () => {}, { client });
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.available, true);
+  assert.equal(target.threadId, 'thread-a');
+  assert.deepEqual(
+    client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params),
+    [
+      { threadId: 'thread-a', includeTurns: true },
+      { threadId: 'thread-a' },
+    ],
+  );
+});
+
+test('exact lifecycle signal proves delivery for a resolved ephemeral TUI thread', async (t) => {
+  const clientId = 'discord:c1:m-ephemeral-live-proof';
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read' && params.includeTurns === false) {
+      return {
+        thread: {
+          id: DELIVERY_THREAD_ID,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
+    client,
+    verifyRolloutDelivery: async () => false,
+  });
+  t.after(() => host.destroy());
+
+  assert.equal((await host.resolveTarget()).available, true);
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), true);
+  assert.equal(
+    client.requests.filter((request) => request.method === 'thread/read').length,
+    1,
+  );
+});
+
+test('unavailable ephemeral thread cannot authorize lifecycle delivery proof', async (t) => {
+  const clientId = 'discord:c1:m-ephemeral-unavailable';
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'notLoaded' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
+    client,
+    verifyRolloutDelivery: async () => false,
+  });
+  t.after(() => host.destroy());
+
+  const target = await host.resolveTarget();
+  assert.equal(target.available, false);
+  assert.equal(target.reason, 'shared_app_server_thread_unavailable');
+  assert.equal(host.ephemeralThreadIds.has(DELIVERY_THREAD_ID), false);
+
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    clientId,
+  ));
+
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
+});
+
+test('missing or stale TUI lease cannot authorize ephemeral lifecycle delivery proof', async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-ephemeral-lease-proof-'));
+  const leasePath = path.join(stateDir, 'tui-recovery-target.json');
+  const now = Date.now();
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: [DELIVERY_THREAD_ID], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'idle' },
+          ephemeral: true,
+          turns: [],
+        },
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost({
+    appServerUrl: 'unix:///tmp/codex-discord-test.sock',
+    paths: { stateDir },
+    requireTuiLease: true,
+    tuiLeaseStaleMs: 3000,
+  }, () => {}, {
+    client,
+    hasRemoteTuiChild: () => true,
+    now: () => now,
+    readProcessStartTicks: () => '12345',
+    verifyRolloutDelivery: async () => false,
+  });
+  t.after(() => {
+    host.destroy();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const missingClientId = 'discord:c1:m-ephemeral-missing-lease';
+  const missing = await host.resolveTarget();
+  assert.equal(missing.reason, 'shared_app_server_tui_lease_missing');
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    missingClientId,
+  ));
+  assert.equal(host.ephemeralThreadIds.has(DELIVERY_THREAD_ID), false);
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, missingClientId), false);
+
+  fs.writeFileSync(leasePath, `${JSON.stringify({
+    version: 3,
+    leaseId: 'lease-ephemeral-stale-0001',
+    supervisorPid: 4242,
+    supervisorStartTicks: '12345',
+    startedAtMs: now - 4000,
+    phase: 'active',
+    threadId: DELIVERY_THREAD_ID,
+    loadedThreadIds: [DELIVERY_THREAD_ID],
+  })}\n`, { mode: 0o600 });
+  fs.utimesSync(leasePath, new Date(now - 4000), new Date(now - 4000));
+
+  const staleClientId = 'discord:c1:m-ephemeral-stale-lease';
+  const stale = await host.resolveTarget();
+  assert.equal(stale.reason, 'shared_app_server_tui_lease_stale');
+  client.emit('notification', userLifecycleSignal(
+    'item/started',
+    DELIVERY_THREAD_ID,
+    staleClientId,
+  ));
+  assert.equal(host.ephemeralThreadIds.has(DELIVERY_THREAD_ID), false);
+  assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, staleClientId), false);
 });
 
 test('hasDelivered falls back to exact structured thread/read after a missed notification', async () => {
