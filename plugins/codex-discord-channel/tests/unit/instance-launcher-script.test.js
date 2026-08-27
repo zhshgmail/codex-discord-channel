@@ -741,7 +741,7 @@ test('Codex child receives only the explicit Discord instance allowlist', () => 
   const generationEntry = childEnvironment.find((entry) => entry.startsWith('CODEX_DISCORD_LAUNCH_GENERATION='));
   assert.match(generationEntry, /^CODEX_DISCORD_LAUNCH_GENERATION=[0-9a-f-]{36}$/);
   assert.deepEqual(childEnvironment.filter((entry) => entry !== generationEntry), [
-    `CODEX_DISCORD_DELIVERY_ACTIVATION_ID=${setup.pluginRoot}`,
+    `CODEX_DISCORD_DELIVERY_ACTIVATION_ID=${setup.stateDir}`,
     `CODEX_DISCORD_LAUNCH_CODEX_HOME=${setup.codexHome}`,
     `CODEX_DISCORD_LAUNCH_ENDPOINT=${setup.stateDir}/app-server.sock`,
     'CODEX_DISCORD_LAUNCH_INSTANCE=codex02',

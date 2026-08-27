@@ -227,7 +227,7 @@ function expectedIdentity(options) {
 function assertManifestIdentity(manifest, expected) {
   const fields = [
     'channelBin', 'codexBin', 'codexHome', 'generationBin', 'instance', 'nodeBin',
-    'pluginRoot', 'socketPath', 'stateDir',
+    'socketPath', 'stateDir',
   ];
   for (const field of fields) {
     if (manifest[field] !== expected[field]) refuse(`manifest ${field} does not match this launcher`);

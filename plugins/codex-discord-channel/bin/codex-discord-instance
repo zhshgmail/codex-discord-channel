@@ -516,7 +516,7 @@ while ((SECONDS <= deadline)); do
         CODEX_HOME="$codex_home" \
         DISCORD_INSTANCE="$instance" \
         DISCORD_CONFIG_DIR="$state_dir" \
-        CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
+        CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$state_dir" \
         "${generation_env[@]}" \
         CODEX_DISCORD_LAUNCH_ROLE=tui \
         "$node_bin" "$codex_bin" --remote "unix://$socket" \
