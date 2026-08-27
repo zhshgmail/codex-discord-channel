@@ -198,7 +198,7 @@ test('a rejected transient route is rediscovered once without making it instance
   host.destroy();
 });
 
-test('v4 thread-bound uncertainty migrates to the state-dir FIFO and drains in source order', async (t) => {
+test('v4 thread-bound uncertainty is archived and never replayed while ready FIFO drains', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-state-dir-v4-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const oldUncertain = {
@@ -253,9 +253,19 @@ test('v4 thread-bound uncertainty migrates to the state-dir FIFO and drains in s
   assert.deepEqual(queue.uncertain, []);
   assert.equal(queue.blocked, null);
   assert.deepEqual(submitted.map((params) => params.clientUserMessageId), [
-    'discord:discord-channel:old-uncertain',
     'discord:discord-channel:old-ready',
   ]);
+  assert.equal(queue.archived.length, 1);
+  assert.equal(queue.archived[0].reason, 'legacy_ack_uncertain_no_auto_replay');
+  assert.equal(queue.archived[0].normalized.content, 'old-uncertain');
+  assert.deepEqual(Object.keys(queue.completed[0]).sort(), [
+    'channelId',
+    'clientUserMessageId',
+    'completedAt',
+    'messageId',
+  ]);
+  assert.equal(JSON.stringify(queue.completed[0]).includes('threadId'), false);
+  assert.equal(JSON.stringify(queue.completed[0]).includes('turnId'), false);
   assert.equal(hasDeliveredCalls, 0);
   delivery.destroy();
 });

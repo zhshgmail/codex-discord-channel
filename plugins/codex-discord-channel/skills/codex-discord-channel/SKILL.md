@@ -19,6 +19,9 @@ only durable Discord bot identity.
   must not change which Discord queue the instance consumes.
 - `owner.json` is status/handover metadata only. It cannot admit or reject a
   message.
+- Completed inbound records persist only Discord source identity and the stable
+  client message id. Never persist Codex thread, turn, session, or lease ids in
+  the delivery queue.
 - Do not add a session/thread binding to make a test pass. A test requiring one
   is a legacy-contract test and must be replaced by a state-directory causal
   test.
@@ -100,7 +103,11 @@ or a console final is not visible-TUI or outbound proof.
 - Every admitted source is persisted before injection and deduplicated only by
   Discord channel plus message id.
 - Plugin activation/version changes preserve all queued sources. They do not
-  archive or discard pre-activation items.
+  archive or discard ready FIFO items. Legacy `structured_ack_uncertain`
+  entries are the exception: preserve their full Discord source in the archive
+  with reason `legacy_ack_uncertain_no_auto_replay`, but never execute them
+  automatically because the old sender could not prove whether Codex accepted
+  them.
 - On every drain, resolve the current loaded top-level TUI through the app
   server. Use returned thread/turn ids only for that RPC.
 - A definitive stale-route rejection permits one rediscovery and retry of the
@@ -114,6 +121,13 @@ or a console final is not visible-TUI or outbound proof.
   synthesize or capture a session/thread identity.
 - Gateway process PID/generation is only a single-receiver lock inside the
   state directory; it is not Discord account or message identity.
+- Automatic assistant-final mapping is disabled. Outbound Discord replies use
+  the explicit receipt-aware sender with exact `(channelId,messageId)` source;
+  no persisted Codex thread/turn may select an outbound reply.
+- Before app-server or gateway start, the launcher copies the generation helper
+  and channel runtime to `DISCORD_STATE_DIR/generation-runtime/current`. Worker
+  restart and cleanup use that durable snapshot so a marketplace cache refresh
+  cannot strand the live generation.
 
 ## Repair and tests
 
@@ -125,10 +139,13 @@ tests for:
 3. three sequential sources reach one visible TUI;
 4. response loss retries the same Discord source after route rotation;
 5. activation/version change preserves queued sources;
-6. v4 `structured_ack_uncertain` records migrate to the ordinary FIFO;
+6. v4 `structured_ack_uncertain` records retain full source bytes in the
+   archive and never auto-replay, while ordinary ready FIFO entries still drain;
 7. killing only the gateway preserves the TUI PID, restarts the gateway, and a
    later source reaches that same visible TUI;
 8. two state directories cannot read or mutate each other's queues.
+9. deleting the installed marketplace cache while the test TUI is active does
+   not prevent gateway restart or exact generation cleanup.
 
 Legacy tests that require durable session/thread/turn/lease identity must be
 explicitly labeled retired. Do not silently weaken unrelated access, queue,
@@ -168,6 +185,14 @@ metadata, and relaunch the whole alias. Never install over a running generation.
 
 Repeat live acceptance independently for Codex01 and Codex02. One alias's GREEN
 does not transfer to the other.
+
+## Alias-Owned Runtime Boundary
+
+Exit only the selected alias before changing its installed marketplace bytes.
+Then install the released plugin, update that alias's marketplace revision, and
+launch the whole instance once. The running generation itself uses its durable
+state-directory runtime snapshot, but deployment must still be one alias at a
+time so acceptance remains attributable.
 
 ## Outbound acceptance
 

@@ -93,17 +93,17 @@ while True:
 `);
   executable(fakeNode, [
     '#!/usr/bin/env bash',
-    'if [[ $1 == "$GENERATION_HELPER" ]]; then exec "$REAL_NODE_BIN" "$@"; fi',
+    'if [[ $1 == "$GENERATION_HELPER" || $1 == "$STATE_DIR"/generation-runtime/*/codex-discord-generation ]]; then exec "$REAL_NODE_BIN" "$@"; fi',
     'if [[ $1 == -e && $2 == \'process.stdout.write(String(Date.now()))\' ]]; then',
     '  printf "%s" "$FAKE_NODE_NOW_MS"',
     '  exit 0',
     'fi',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" ]]; then',
+    'if [[ $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ]]; then',
     '  state_activation=$(awk -F= \'$1 == "CODEX_DISCORD_DELIVERY_ACTIVATION_ID" { print substr($0, index($0, "=") + 1) }\' "$STATE_DIR/.env")',
     '  effective_activation=${CODEX_DISCORD_DELIVERY_ACTIVATION_ID:-$state_activation}',
     '  printf "%s|%s|%s|%s|%s|%s|%s\n" "$2" "${CODEX_HOME-UNSET}" "${DISCORD_CONFIG_DIR-UNSET}" "${DISCORD_STATE_DIR-UNSET}" "${CODEX_ACCOUNT_ENV_FILE-UNSET}" "${CODEX_NETWORK_ENV_FILE-UNSET}" "$effective_activation" >>"$CHANNEL_ENV_TRACE"',
     'fi',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == tui-recovery-target ]]; then',
+    'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == tui-recovery-target ]]; then',
     '  case $3 in',
     '    begin)',
     '      printf "recovery-begin %s\\n" "$7" >>"$TRACE"',
@@ -137,10 +137,10 @@ while True:
     '  esac',
     'fi',
     'printf "node %s\\n" "$*" >>"$TRACE"',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == app-server ]]; then',
+    'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == app-server ]]; then',
     '  exec python3 "$SOCKET_OWNER" "$STATE_DIR/app-server.sock"',
     'fi',
-    'if [[ $1 == "$FAKE_CHANNEL_BIN" && $2 == gateway ]]; then',
+    'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == gateway ]]; then',
     '  if [[ ${GATEWAY_EXIT_IMMEDIATELY:-0} == 1 ]]; then sleep 0.1; exit 42; fi',
     '  if [[ ${GATEWAY_EXIT_WHEN_SOCKET_EXISTS:-0} == 1 ]]; then',
     '    while [[ ! -S $STATE_DIR/app-server.sock ]]; do sleep 0.01; done',
@@ -209,6 +209,7 @@ while True:
     '    IFS= read -r tui_input',
     '    printf "%s\\n" "$tui_input" >"$TUI_INPUT_TRACE"',
     '  fi',
+    '  if [[ ${DELETE_PLUGIN_DURING_TUI:-0} == 1 ]]; then rm -rf "$PLUGIN_ROOT"; fi',
     '  /usr/bin/sleep 0.1',
     'fi',
     'exit 0',
@@ -324,6 +325,7 @@ function launchEnv(setup, overrides = {}) {
     GENERATION_HELPER: setup.generationHelper,
     HOME: setup.home,
     LOGIN_MARKER: setup.loginMarker,
+    PLUGIN_ROOT: setup.pluginRoot,
     LAUNCHER_UNDER_TEST: setup.launcher,
     PATH: `${setup.binDir}:${process.env.PATH}`,
     REAL_NODE_BIN: process.execPath,
@@ -354,16 +356,28 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.equal(result.status, 0, result.stderr);
   const trace = fs.readFileSync(setup.trace, 'utf8').trim().split('\n');
   assert.equal(trace.some((line) => line.startsWith('systemctl ')), false);
-  assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.some((line) => line.startsWith(`node ${setup.fakeChannel} live-check `)));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs app-server --instance codex02 --state-dir ${setup.stateDir}`)));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs gateway --instance codex02 --state-dir ${setup.stateDir}`)));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.includes('channel.cjs live-check ')));
   assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`));
   const channelEnvironments = fs.readFileSync(setup.channelEnvTrace, 'utf8').trim().split('\n');
   assert.ok(channelEnvironments.length > 0);
   for (const entry of channelEnvironments) {
-    assert.equal(entry.split('|')[6], setup.pluginRoot);
+    assert.equal(entry.split('|')[6], setup.stateDir);
   }
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
+});
+
+test('generation runtime survives marketplace eviction of the installed plugin cache', () => {
+  const setup = fixture();
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: launchEnv(setup, { DELETE_PLUGIN_DURING_TUI: '1' }),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(setup.pluginRoot), false);
+  assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
+  assert.equal(fs.existsSync(path.join(setup.stateDir, 'instance-generation.json')), false);
 });
 
 test('instance argument ignores Discord state inherited from another alias', () => {
@@ -391,9 +405,9 @@ test('instance argument ignores Discord state inherited from another alias', () 
 
   assert.equal(result.status, 0, result.stderr);
   const trace = fs.readFileSync(setup.trace, 'utf8').trim().split('\n');
-  assert.ok(trace.includes(
-    `node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`,
-  ));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(
+    `channel.cjs gateway --instance codex02 --state-dir ${setup.stateDir}`,
+  )));
   assert.ok(trace.includes(
     `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume thread-2`,
   ));
@@ -407,7 +421,7 @@ test('instance argument ignores Discord state inherited from another alias', () 
     assert.equal(legacyStateDir, 'UNSET');
     assert.equal(accountEnvFile, 'UNSET');
     assert.equal(networkEnvFile, 'UNSET');
-    assert.equal(activationId, setup.pluginRoot);
+    assert.equal(activationId, setup.stateDir);
   }
 });
 
@@ -428,8 +442,8 @@ test('first-run TTY login succeeds before workers and the TUI start', () => {
     `node ${setup.fakeChannel} tui-check --instance codex02 --state-dir ${setup.stateDir}`,
   ]);
   assert.equal(trace.some((line) => line.startsWith('systemctl ')), false);
-  assert.ok(trace.includes(`node ${setup.fakeChannel} app-server --instance codex02 --state-dir ${setup.stateDir}`));
-  assert.ok(trace.includes(`node ${setup.fakeChannel} gateway --instance codex02 --state-dir ${setup.stateDir}`));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs app-server --instance codex02 --state-dir ${setup.stateDir}`)));
+  assert.ok(trace.some((line) => line.includes('/generation-runtime/') && line.endsWith(`channel.cjs gateway --instance codex02 --state-dir ${setup.stateDir}`)));
   assert.ok(trace.includes(`node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace}`));
 });
 

@@ -5253,7 +5253,7 @@ var require_delivery = __commonJS({
       readReceipt,
       receiptPath,
       replyNonce
-    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 5, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
+    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 5, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", LEGACY_ACK_UNCERTAIN_ARCHIVE = "legacy_ack_uncertain_no_auto_replay", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
     function currentTimeMs(deps = {}) {
       let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
       return Number.isFinite(value) ? value : Date.now();
@@ -5509,14 +5509,20 @@ ${normalized.content}${attachmentText}
         deps.deliveryActivationId || config.deliveryActivationId || ""
       ).trim() || fs.realpathSync(path.resolve(__dirname, ".."));
     }
-    function timestampMs(value) {
-      if (typeof value != "string" || value.trim() === "") return null;
-      let parsed = Date.parse(value);
-      return Number.isFinite(parsed) ? parsed : null;
-    }
     function activateDeliveryQueue(queue, config = {}, deps = {}) {
-      let activationId = deliveryActivationId(config, deps), archivedAt = new Date(currentTimeMs(deps)).toISOString(), completed = queue.completed || [], archived = queue.archived || [], seen = /* @__PURE__ */ new Set(), eligible = [];
-      for (let item of [...queue.uncertain, ...queue.items]) {
+      let activationId = deliveryActivationId(config, deps), archivedAt = new Date(currentTimeMs(deps)).toISOString(), completed = queue.completed || [], archived = queue.archived || [], seen = /* @__PURE__ */ new Set(), eligible = [], archivedCount = 0;
+      for (let item of queue.uncertain) {
+        let identity = item?.normalized;
+        !identity?.channelId || !identity?.messageId || completed.some((entry) => sameDiscordIdentity(entry, identity)) || archived.some((entry) => sameDiscordIdentity(entry, identity)) || (archived.push({
+          channelId: identity.channelId,
+          messageId: identity.messageId,
+          queuedAt: item.queuedAt || null,
+          archivedAt,
+          reason: LEGACY_ACK_UNCERTAIN_ARCHIVE,
+          normalized: identity
+        }), archivedCount += 1);
+      }
+      for (let item of queue.items) {
         let identity = item?.normalized;
         if (!identity?.channelId || !identity?.messageId) continue;
         let key = `${identity.channelId}\0${identity.messageId}`;
@@ -5539,7 +5545,7 @@ ${normalized.content}${attachmentText}
           blocked: queue.blocked?.reason === DELIVERY_ACK_UNCERTAIN ? null : queue.blocked
         },
         changed: !0,
-        archivedCount: 0
+        archivedCount
       } : { queue, changed: !1, archivedCount: 0 };
     }
     function queueDelivery(normalized, config = {}, deps = {}) {
@@ -5605,76 +5611,27 @@ ${normalized.content}${attachmentText}
         ...details || {}
       }, writeDeliveryQueue(queue, config, deps);
     }
-    function exactOutboundSource(record) {
-      return !(record?.source?.channelId !== record?.channelId || record?.source?.messageId !== record?.messageId || record?.outbound?.channelId !== record?.channelId || record?.outbound?.sourceMessageId !== record?.messageId || typeof record?.delivery?.threadId != "string" || !record.delivery.threadId || typeof record?.delivery?.turnId != "string" || !record.delivery.turnId || typeof record?.delivery?.clientUserMessageId != "string" || !record.delivery.clientUserMessageId);
-    }
-    function sameCompletedTurn(left, right) {
-      return left?.delivery?.threadId === right?.threadId && left?.delivery?.turnId === right?.turnId;
-    }
-    function sameSourceIdentity(left, right) {
-      let leftIdentity = left?.normalized || left, rightIdentity = right?.normalized || right;
-      return leftIdentity?.channelId === rightIdentity?.channelId && leftIdentity?.messageId === rightIdentity?.messageId;
-    }
-    function exactTurnReplyOwners(queue, binding) {
-      return [...queue.uncertain, ...queue.completed].filter((record) => record?.delivery?.turnReplyOwner === !0 && sameCompletedTurn(record, binding));
-    }
-    function bindDurableTurnReplyOwner(queue, record, binding, deps = {}) {
-      if (typeof binding?.threadId != "string" || !binding.threadId || typeof binding?.turnId != "string" || !binding.turnId)
-        return binding;
-      let owners = exactTurnReplyOwners(queue, binding), ownsReply = binding.turnReplyOwner === !0 || owners.length === 0 && binding.turnReplyOwner !== !1, owner = owners.length === 1 ? owners[0] : null;
-      return {
-        ...binding,
-        turnReplyOwner: ownsReply || !!(owner && sameSourceIdentity(owner, record)),
-        turnReplyBoundAt: binding.turnReplyBoundAt || (ownsReply ? new Date(currentTimeMs(deps)).toISOString() : owner?.delivery?.turnReplyBoundAt || null)
-      };
-    }
-    function suppressedTurnOutbound(record, owner, deps = {}) {
-      let ownerIdentity = owner?.normalized || owner;
-      return {
-        status: "suppressed",
-        channelId: record.channelId,
-        sourceMessageId: record.messageId,
-        reason: "turn_reply_owned_by_prior_source",
-        ownerChannelId: ownerIdentity.channelId,
-        ownerSourceMessageId: ownerIdentity.messageId,
-        suppressedAt: new Date(currentTimeMs(deps)).toISOString()
-      };
-    }
     function completedRecord(next, binding = {}, deps = {}) {
-      let record = {
+      return {
         channelId: next.normalized.channelId,
         messageId: next.normalized.messageId,
-        completedAt: new Date(currentTimeMs(deps)).toISOString()
-      }, exactBinding = {
-        threadId: String(binding.threadId || ""),
-        turnId: String(binding.turnId || ""),
         clientUserMessageId: String(binding.clientUserMessageId || ""),
-        turnReplyOwner: binding.turnReplyOwner === !0,
-        turnReplyBoundAt: typeof binding.turnReplyBoundAt == "string" ? binding.turnReplyBoundAt : null
+        completedAt: new Date(currentTimeMs(deps)).toISOString()
       };
-      return !exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId || (record.source = {
-        channelId: next.normalized.channelId,
-        messageId: next.normalized.messageId
-      }, record.delivery = exactBinding, record.outbound = {
-        status: "waiting",
-        channelId: next.normalized.channelId,
-        sourceMessageId: next.normalized.messageId
-      }), record;
     }
     function completedQueue(queue, next, binding = {}, config = {}, deps = {}) {
-      let durableBinding = bindDurableTurnReplyOwner(queue, next, binding, deps), updated = {
+      return {
         version: DELIVERY_QUEUE_VERSION,
         activation: queue.activation,
         items: queue.items.slice(1),
         uncertain: queue.uncertain,
         completed: [
           ...queue.completed,
-          completedRecord(next, durableBinding, deps)
+          completedRecord(next, binding, deps)
         ],
         archived: queue.archived,
         blocked: null
       };
-      return reconcileTurnOutboundQueue(updated, config, deps), updated;
     }
     async function releaseCurrentHeadForRetry(config, deps, expected, attemptId, verifyReceiverOwnership = null) {
       return withDeliveryQueueLock(config, deps, () => {
@@ -5903,245 +5860,6 @@ ${normalized.content}${attachmentText}
         }
       }
     }
-    function automaticOutboundRecord(record) {
-      return exactOutboundSource(record) && ["waiting", "ready"].includes(record.outbound.status);
-    }
-    function sameCompletedSource(left, right) {
-      return left?.channelId === right?.channelId && left?.messageId === right?.messageId;
-    }
-    function outboundReceiptObservation(record, config, deps = {}) {
-      let fsImpl = deps.fs || fs, file;
-      try {
-        file = receiptPath(config, record.channelId, record.messageId);
-      } catch {
-        return { state: "indeterminate", receipt: null };
-      }
-      if (!fsImpl.existsSync(file)) return { state: "absent", receipt: null };
-      let receipt = readReceipt(file, fsImpl);
-      return !receipt || receipt.channelId !== record.channelId || receipt.sourceMessageId !== record.messageId || receipt.version === 2 && receipt.nonce !== replyNonce(record.channelId, record.messageId) ? { state: "indeterminate", receipt } : (receipt.status === "confirmed" || receipt.version === 1 && receipt.status === "sent") && typeof receipt.outboundMessageId == "string" && receipt.outboundMessageId ? { state: "confirmed", receipt } : typeof record.outbound.text == "string" && receipt.contentSha256 !== contentDigest(record.outbound.text) ? { state: "indeterminate", receipt } : { state: "pending", receipt };
-    }
-    function markReceiptConfirmed(record, receipt) {
-      return record.outbound.status === "confirmed" && record.outbound.outboundMessageId === receipt.outboundMessageId ? !1 : (record.outbound = {
-        ...record.outbound,
-        status: "confirmed",
-        outboundMessageId: receipt.outboundMessageId,
-        confirmedAt: receipt.confirmedAt || receipt.sentAt || receipt.updatedAt || null
-      }, !0);
-    }
-    function blockTurnOutbound(record, reason, deps = {}) {
-      record.outbound = {
-        ...record.outbound,
-        status: "blocked",
-        reason,
-        blockedAt: new Date(currentTimeMs(deps)).toISOString()
-      };
-    }
-    function completedTurnGroups(queue) {
-      let groups = /* @__PURE__ */ new Map();
-      for (let record of queue.completed) {
-        if (!exactOutboundSource(record)) continue;
-        let key = JSON.stringify([record.delivery.threadId, record.delivery.turnId]);
-        groups.has(key) || groups.set(key, []), groups.get(key).push(record);
-      }
-      return groups;
-    }
-    function confirmedTurnReply(records, observations) {
-      return records.find((record) => observations.get(record).state === "confirmed") || records.find((record) => record.outbound.status === "confirmed" && typeof record.outbound.outboundMessageId == "string" && record.outbound.outboundMessageId) || null;
-    }
-    function reconcileTurnOutboundQueue(queue, config = {}, deps = {}) {
-      let changed = !1;
-      for (let records of completedTurnGroups(queue).values()) {
-        let binding = records[0].delivery, owners = exactTurnReplyOwners(queue, binding), owner = owners.length === 1 ? owners[0] : null, observations = new Map(records.map((record) => [
-          record,
-          outboundReceiptObservation(record, config, deps)
-        ]));
-        for (let record of records) {
-          let observation = observations.get(record);
-          observation.state === "confirmed" && (changed = markReceiptConfirmed(record, observation.receipt) || changed);
-        }
-        if (records.some((record) => observations.get(record).state === "indeterminate")) {
-          for (let record of records)
-            ["waiting", "ready"].includes(record.outbound.status) && (blockTurnOutbound(record, "turn_reply_receipt_indeterminate", deps), changed = !0);
-          continue;
-        }
-        let confirmed = confirmedTurnReply(records, observations);
-        if (confirmed) {
-          for (let record of records)
-            ["waiting", "ready"].includes(record.outbound.status) && (record.outbound = {
-              ...suppressedTurnOutbound(record, confirmed, deps),
-              reason: "turn_reply_receipt_confirmed"
-            }, changed = !0);
-          continue;
-        }
-        let pendingReceipts = records.filter(
-          (record) => observations.get(record).state === "pending"
-        );
-        if (pendingReceipts.length > 0) {
-          for (let record of records)
-            ["waiting", "ready"].includes(record.outbound.status) && observations.get(record).state === "absent" && (owner && sameSourceIdentity(record, owner) || (record.outbound = suppressedTurnOutbound(record, owner || pendingReceipts[0], deps), changed = !0));
-          continue;
-        }
-        for (let record of records)
-          if (["waiting", "ready"].includes(record.outbound.status)) {
-            if (owner) {
-              if (sameSourceIdentity(record, owner)) continue;
-              record.outbound = suppressedTurnOutbound(record, owner, deps), changed = !0;
-              continue;
-            }
-            records.length > 1 && (blockTurnOutbound(record, "turn_reply_owner_unproven", deps), changed = !0);
-          }
-      }
-      return changed;
-    }
-    function automaticOutboundWorkCount(record) {
-      return record?.outbound?.status === "ready" ? Math.max(0, Number(record.outbound.sendAttemptCount) || 0) : Math.max(0, Number(record?.outbound?.checkCount) || 0);
-    }
-    function automaticOutboundLastWorkAt(record) {
-      return record?.outbound?.status === "ready" ? timestampMs(record.outbound.lastSendAttemptAt) : timestampMs(record?.outbound?.lastCheckedAt);
-    }
-    function nextAutomaticOutbound(queue, config = {}, deps = {}) {
-      let candidates = [];
-      for (let records of completedTurnGroups(queue).values()) {
-        let automatic = records.filter((record) => automaticOutboundRecord(record));
-        if (automatic.length === 0) continue;
-        let observations = new Map(records.map((record) => [
-          record,
-          outboundReceiptObservation(record, config, deps)
-        ]));
-        if (records.some((record) => observations.get(record).state === "indeterminate") || confirmedTurnReply(records, observations)) continue;
-        let pendingReceipts = records.filter(
-          (record) => observations.get(record).state === "pending"
-        );
-        if (pendingReceipts.length > 0) {
-          candidates.push(...pendingReceipts.filter((record) => automaticOutboundRecord(record) || record.outbound.status === "suppressed"));
-          continue;
-        }
-        let owners = exactTurnReplyOwners(queue, records[0].delivery);
-        if (owners.length === 1) {
-          let owner = automatic.find((record) => sameSourceIdentity(record, owners[0]));
-          owner && candidates.push(owner);
-          continue;
-        }
-        records.length === 1 && candidates.push(automatic[0]);
-      }
-      return candidates.sort((left, right) => {
-        let countDelta = automaticOutboundWorkCount(left) - automaticOutboundWorkCount(right);
-        return countDelta !== 0 ? countDelta : automaticOutboundLastWorkAt(left) - automaticOutboundLastWorkAt(right);
-      })[0] || null;
-    }
-    function automaticReplyIsConfirmed(sent, record) {
-      return sent?.channelId !== record.channelId || sent?.sourceMessageId !== record.messageId || typeof sent?.messageId != "string" || !sent.messageId || sent.receiptStatus != null && sent.receiptStatus !== "confirmed" ? !1 : sent.duplicateSuppressed === !1 ? !0 : sent.duplicateSuppressed === !0 && sent.receiptStatus === "confirmed" && sent.reason === "source_message_already_replied";
-    }
-    function automaticReplyProvesReceiptAbsence(sent, record) {
-      return record.outbound.receiptRecovery === !0 && sent?.channelId === record.channelId && sent?.sourceMessageId === record.messageId && sent?.messageId === null && sent?.duplicateSuppressed === !0 && sent?.reason === "source_message_reply_proven_absent" && sent?.receiptStatus === "absent" && sent?.receiptReleased === !0 && sent?.reconciliationProvenAbsent === !0;
-    }
-    async function flushAutomaticOutbound(config, logger, deps, host, options = {}) {
-      let inspection = await withDeliveryQueueLock(config, deps, () => {
-        let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
-        if (receiverRejected) return { queue, receiverRejected };
-        let fanoutReconciled = reconcileTurnOutboundQueue(queue, config, deps), record2 = nextAutomaticOutbound(queue, config, deps);
-        if (!record2)
-          return fanoutReconciled && writeDeliveryQueue(queue, config, deps), { queue, record: null };
-        let timestamp = new Date(currentTimeMs(deps)).toISOString();
-        return record2.outbound.status === "ready" ? (record2.outbound.sendAttemptCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastSendAttemptAt = timestamp) : (record2.outbound.checkCount = automaticOutboundWorkCount(record2) + 1, record2.outbound.lastCheckedAt = timestamp), writeDeliveryQueue(queue, config, deps), { queue, record: record2 };
-      });
-      if (inspection.receiverRejected)
-        return receiverRejectedResult(inspection.queue, inspection.receiverRejected);
-      let record = inspection.record;
-      if (!record)
-        return { status: "idle", reason: "outbound_empty", deliveredCount: 0 };
-      if (record.outbound.status === "waiting" || record.outbound.status === "suppressed") {
-        if (typeof host.readAssistantFinal != "function")
-          return { status: "queued", reason: "assistant_final_waiting", deliveredCount: 0 };
-        let final;
-        try {
-          final = await host.readAssistantFinal(record.delivery.threadId, record.delivery.turnId);
-        } catch (error) {
-          return {
-            status: "failed",
-            reason: error?.code || "assistant_final_read_failed",
-            deliveredCount: 0
-          };
-        }
-        if (!final || final.threadId !== record.delivery.threadId || final.turnId !== record.delivery.turnId || typeof final.itemId != "string" || !final.itemId || typeof final.text != "string" || !final.text.trim())
-          return { status: "queued", reason: "assistant_final_waiting", deliveredCount: 0 };
-        let prepared = await withDeliveryQueueLock(config, deps, () => {
-          let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
-          if (receiverRejected) return { queue, receiverRejected };
-          let current = queue.completed.find((entry) => sameCompletedSource(entry, record));
-          if (!current) return { retry: !0, queue };
-          let currentReceipt = outboundReceiptObservation(current, config, deps), suppressedReceiptRecovery = current.outbound.status === "suppressed" && currentReceipt.state === "pending";
-          return !automaticOutboundRecord(current) && !suppressedReceiptRecovery ? { retry: !0, queue } : ["waiting", "suppressed"].includes(current.outbound.status) ? current.delivery.threadId !== final.threadId || current.delivery.turnId !== final.turnId ? { retry: !0, queue } : (current.outbound = {
-            ...current.outbound,
-            status: "ready",
-            itemId: final.itemId,
-            text: final.text,
-            readyAt: new Date(currentTimeMs(deps)).toISOString(),
-            ...suppressedReceiptRecovery ? {
-              receiptRecovery: !0,
-              receiptRecoveryAt: new Date(currentTimeMs(deps)).toISOString()
-            } : {}
-          }, writeDeliveryQueue(queue, config, deps), { prepared: !0, queue }) : { retry: !0, queue };
-        });
-        return prepared.receiverRejected ? receiverRejectedResult(prepared.queue, prepared.receiverRejected) : prepared.prepared ? { status: "queued", reason: "outbound_ready", deliveredCount: 0 } : { status: "queued", reason: "outbound_checkpoint_changed", deliveredCount: 0 };
-      }
-      if (typeof deps.sendAutomaticReply != "function")
-        return { status: "failed", reason: "outbound_sender_unavailable", deliveredCount: 0 };
-      let sent;
-      try {
-        sent = await deps.sendAutomaticReply({
-          channelId: record.channelId,
-          replyTo: record.messageId,
-          content: record.outbound.text,
-          ...record.outbound.receiptRecovery === !0 ? { reconciliationOnly: !0 } : {}
-        });
-      } catch (error) {
-        return logger("ERROR", "Guarded automatic Discord reply is not confirmed", {
-          channelId: record.channelId,
-          messageId: record.messageId,
-          error: error instanceof Error ? error.message : String(error)
-        }), {
-          status: "failed",
-          reason: error?.code || "outbound_reply_unconfirmed",
-          deliveredCount: 0
-        };
-      }
-      if (automaticReplyProvesReceiptAbsence(sent, record)) {
-        let released = await withDeliveryQueueLock(config, deps, () => {
-          let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
-          if (receiverRejected) return { queue, receiverRejected };
-          let current = queue.completed.find((entry) => sameCompletedSource(entry, record));
-          return !current || current.outbound?.status !== "ready" || current.outbound?.receiptRecovery !== !0 || current.delivery?.threadId !== record.delivery.threadId || current.delivery?.turnId !== record.delivery.turnId || current.outbound?.itemId !== record.outbound.itemId || current.outbound?.text !== record.outbound.text || outboundReceiptObservation(current, config, deps).state !== "absent" ? { changed: !0, queue } : (current.outbound = {
-            ...current.outbound,
-            status: "suppressed",
-            reason: "turn_reply_receipt_proven_absent",
-            receiptRecoveryCompletedAt: new Date(currentTimeMs(deps)).toISOString()
-          }, reconcileTurnOutboundQueue(queue, config, deps), writeDeliveryQueue(queue, config, deps), { released: !0, queue });
-        });
-        return released.receiverRejected ? receiverRejectedResult(released.queue, released.receiverRejected) : released.released ? { status: "queued", reason: "outbound_receipt_released", deliveredCount: 0 } : { status: "queued", reason: "outbound_checkpoint_changed", deliveredCount: 0 };
-      }
-      if (!automaticReplyIsConfirmed(sent, record))
-        return { status: "failed", reason: "outbound_reply_unconfirmed", deliveredCount: 0 };
-      let confirmed = await withDeliveryQueueLock(config, deps, () => {
-        let queue = readDeliveryQueue(config, deps), receiverRejected = rejectedReceiver(options.verifyReceiverOwnership);
-        if (receiverRejected) return { queue, receiverRejected };
-        let current = queue.completed.find((entry) => sameCompletedSource(entry, record));
-        return !current || current.outbound?.status !== "ready" || current.delivery?.threadId !== record.delivery.threadId || current.delivery?.turnId !== record.delivery.turnId || current.outbound?.itemId !== record.outbound.itemId || current.outbound?.text !== record.outbound.text ? { changed: !0, queue } : (current.outbound = {
-          ...current.outbound,
-          status: "confirmed",
-          outboundMessageId: sent.messageId,
-          confirmedAt: new Date(currentTimeMs(deps)).toISOString()
-        }, reconcileTurnOutboundQueue(queue, config, deps), writeDeliveryQueue(queue, config, deps), { confirmed: !0, queue });
-      });
-      return confirmed.receiverRejected ? receiverRejectedResult(confirmed.queue, confirmed.receiverRejected) : confirmed.confirmed ? {
-        status: "delivered",
-        reason: "outbound_confirmed",
-        deliveredCount: 1,
-        channelId: record.channelId,
-        sourceMessageId: record.messageId,
-        messageId: sent.messageId
-      } : { status: "failed", reason: "outbound_checkpoint_changed", deliveredCount: 0 };
-    }
     function inboundContext(normalized) {
       return {
         version: 1,
@@ -6250,17 +5968,11 @@ ${normalized.content}${attachmentText}
           });
         },
         flushOutbound(options = {}) {
-          return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : config.automaticOutboundEnabled === !1 ? Promise.resolve({
+          return config.deliveryMode === "off" ? Promise.resolve({ status: "unsupported", reason: "delivery_disabled" }) : Promise.resolve({
             status: "idle",
-            reason: "automatic_outbound_disabled",
+            reason: "outbound_empty",
             deliveredCount: 0
-          }) : serializeDrain(() => flushAutomaticOutbound(
-            config,
-            logger,
-            deps,
-            host,
-            options
-          ));
+          });
         },
         coordinateReceiverOwnership(operation) {
           let coordinate = async () => {
@@ -6366,10 +6078,7 @@ ${normalized.content}${attachmentText}
         let verifyReceiverOwnership = receiverVerification;
         if (!receiverActivated || typeof verifyReceiverOwnership != "function")
           return Promise.resolve({ status: "idle", reason: "receiver_inactive" });
-        let operation = delivery.flush({ verifyReceiverOwnership }).then(async (inbound) => {
-          let outbound = await delivery.flushOutbound({ verifyReceiverOwnership });
-          return ["outbound_empty", "assistant_final_waiting"].includes(outbound.reason) ? inbound : outbound;
-        });
+        let operation = delivery.flush({ verifyReceiverOwnership });
         return options.propagateErrors ? operation : operation.catch((error) => (logger("ERROR", "Failed to drain Discord delivery queue automatically", {
           trigger,
           error: error instanceof Error ? error.message : String(error)
@@ -6378,7 +6087,7 @@ ${normalized.content}${attachmentText}
           reason: "shared_app_server_unavailable"
         }));
       };
-      return unsubscribeIdle = typeof host.onThreadIdle == "function" ? host.onThreadIdle(() => drainAutonomously("thread_idle")) : null, unsubscribeActive = typeof host.onThreadActive == "function" ? host.onThreadActive(() => drainAutonomously("thread_active")) : null, unsubscribeReconnect = typeof host.onReconnect == "function" ? host.onReconnect(() => drainAutonomously("reconnect")) : null, unsubscribeThreadClosed = typeof host.onThreadClosed == "function" ? host.onThreadClosed(() => drainAutonomously("thread_closed")) : null, unsubscribeAssistantFinal = typeof host.onAssistantFinal == "function" ? host.onAssistantFinal(() => drainAutonomously("assistant_final")) : null, delivery;
+      return unsubscribeIdle = typeof host.onThreadIdle == "function" ? host.onThreadIdle(() => drainAutonomously("thread_idle")) : null, unsubscribeActive = typeof host.onThreadActive == "function" ? host.onThreadActive(() => drainAutonomously("thread_active")) : null, unsubscribeReconnect = typeof host.onReconnect == "function" ? host.onReconnect(() => drainAutonomously("reconnect")) : null, unsubscribeThreadClosed = typeof host.onThreadClosed == "function" ? host.onThreadClosed(() => drainAutonomously("thread_closed")) : null, unsubscribeAssistantFinal = null, delivery;
     }
     module2.exports = {
       buildReplyCommand,

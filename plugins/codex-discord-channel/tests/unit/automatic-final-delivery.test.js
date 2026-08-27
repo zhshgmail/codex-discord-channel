@@ -6,8 +6,11 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const nodeTest = require('node:test');
-const { stateDirContractTest } = require('./retired-session-bound-contracts');
-const test = stateDirContractTest(nodeTest);
+// Automatic final-to-Discord mapping persisted Codex thread/turn ids and is
+// intentionally removed in v0.3.17.  Explicit receipt-aware sends remain the
+// only outbound contract; retain these tests as skipped history of the retired
+// behavior.
+const test = nodeTest.skip;
 
 const { createAppServerHost } = require('../../src/app-server-host');
 const { createDelivery } = require('../../src/delivery');

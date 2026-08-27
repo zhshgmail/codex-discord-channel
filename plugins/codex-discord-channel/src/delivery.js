@@ -19,6 +19,7 @@ const DELIVERY_IN_PROGRESS = 'structured_delivery_in_progress';
 // stable Discord source id instead of being pinned to a transient Codex turn.
 const DELIVERY_ACK_UNCERTAIN = 'structured_ack_uncertain';
 const STALE_DELIVERY_ACTIVATION = 'stale_delivery_activation';
+const LEGACY_ACK_UNCERTAIN_ARCHIVE = 'legacy_ack_uncertain_no_auto_replay';
 const DELIVERY_LEASE_RETRY_AT = Symbol('deliveryLeaseRetryAt');
 const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
 const DEFAULT_UNCERTAIN_RETRY_BASE_MS = 5000;
@@ -417,12 +418,29 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
   const archived = queue.archived || [];
   const seen = new Set();
   const eligible = [];
-  // DISCORD_STATE_DIR is the instance identity.  A plugin upgrade, app-server
-  // restart, or Codex thread rotation must not invalidate work already accepted
-  // by that instance.  Version-4 acknowledgement records are deliberately
-  // returned to the ready FIFO: the old rollout/thread proof was not a delivery
-  // authority and was the cause of permanent first-message-only stalls.
-  for (const item of [...queue.uncertain, ...queue.items]) {
+  // A legacy acknowledgement gap means the old plugin could not prove whether
+  // Codex accepted the source.  Replaying it can create a late duplicate hours
+  // later.  Preserve the complete Discord source for operator recovery, but
+  // never turn old thread/turn uncertainty into executable FIFO work.
+  let archivedCount = 0;
+  for (const item of queue.uncertain) {
+    const identity = item?.normalized;
+    if (!identity?.channelId || !identity?.messageId) continue;
+    if (completed.some((entry) => sameDiscordIdentity(entry, identity))) continue;
+    if (archived.some((entry) => sameDiscordIdentity(entry, identity))) continue;
+    archived.push({
+      channelId: identity.channelId,
+      messageId: identity.messageId,
+      queuedAt: item.queuedAt || null,
+      archivedAt,
+      reason: LEGACY_ACK_UNCERTAIN_ARCHIVE,
+      normalized: identity,
+    });
+    archivedCount += 1;
+  }
+  // Ready work is owned by the stable Discord state directory, not a Codex
+  // session or thread.  It remains eligible across upgrades and restarts.
+  for (const item of queue.items) {
     const identity = item?.normalized;
     if (!identity?.channelId || !identity?.messageId) continue;
     const key = `${identity.channelId}\0${identity.messageId}`;
@@ -453,7 +471,7 @@ function activateDeliveryQueue(queue, config = {}, deps = {}) {
       blocked: queue.blocked?.reason === DELIVERY_ACK_UNCERTAIN ? null : queue.blocked,
     },
     changed: true,
-    archivedCount: 0,
+    archivedCount,
   };
 }
 
@@ -621,38 +639,15 @@ function suppressedTurnOutbound(record, owner, deps = {}) {
 }
 
 function completedRecord(next, binding = {}, deps = {}) {
-  const record = {
+  return {
     channelId: next.normalized.channelId,
     messageId: next.normalized.messageId,
+    clientUserMessageId: String(binding.clientUserMessageId || ''),
     completedAt: new Date(currentTimeMs(deps)).toISOString(),
   };
-  const exactBinding = {
-    threadId: String(binding.threadId || ''),
-    turnId: String(binding.turnId || ''),
-    clientUserMessageId: String(binding.clientUserMessageId || ''),
-    turnReplyOwner: binding.turnReplyOwner === true,
-    turnReplyBoundAt: typeof binding.turnReplyBoundAt === 'string'
-      ? binding.turnReplyBoundAt
-      : null,
-  };
-  if (!exactBinding.threadId || !exactBinding.turnId || !exactBinding.clientUserMessageId) {
-    return record;
-  }
-  record.source = {
-    channelId: next.normalized.channelId,
-    messageId: next.normalized.messageId,
-  };
-  record.delivery = exactBinding;
-  record.outbound = {
-    status: 'waiting',
-    channelId: next.normalized.channelId,
-    sourceMessageId: next.normalized.messageId,
-  };
-  return record;
 }
 
 function completedQueue(queue, next, binding = {}, config = {}, deps = {}) {
-  const durableBinding = bindDurableTurnReplyOwner(queue, next, binding, deps);
   const updated = {
     version: DELIVERY_QUEUE_VERSION,
     activation: queue.activation,
@@ -660,12 +655,11 @@ function completedQueue(queue, next, binding = {}, config = {}, deps = {}) {
     uncertain: queue.uncertain,
     completed: [
       ...queue.completed,
-      completedRecord(next, durableBinding, deps),
+      completedRecord(next, binding, deps),
     ],
     archived: queue.archived,
     blocked: null,
   };
-  reconcileTurnOutboundQueue(updated, config, deps);
   return updated;
 }
 
@@ -1599,20 +1593,16 @@ function createDelivery(config, logger = () => {}, deps = {}) {
       if (config.deliveryMode === 'off') {
         return Promise.resolve({ status: 'unsupported', reason: 'delivery_disabled' });
       }
-      if (config.automaticOutboundEnabled === false) {
-        return Promise.resolve({
-          status: 'idle',
-          reason: 'automatic_outbound_disabled',
-          deliveredCount: 0,
-        });
-      }
-      return serializeDrain(() => flushAutomaticOutbound(
-        config,
-        logger,
-        deps,
-        host,
-        options,
-      ));
+      // Discord replies are explicit receipt-aware sends.  Mapping an
+      // assistant final back through persisted Codex thread/turn ids made a
+      // transient routing coordinate into durable identity and caused late or
+      // duplicate replies after resume.  Automatic turn-derived outbound is
+      // intentionally disabled for every instance.
+      return Promise.resolve({
+        status: 'idle',
+        reason: 'outbound_empty',
+        deliveredCount: 0,
+      });
     },
     coordinateReceiverOwnership(operation) {
       const coordinate = async () => {
@@ -1765,12 +1755,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
     if (!receiverActivated || typeof verifyReceiverOwnership !== 'function') {
       return Promise.resolve({ status: 'idle', reason: 'receiver_inactive' });
     }
-    const operation = delivery.flush({ verifyReceiverOwnership }).then(async (inbound) => {
-      const outbound = await delivery.flushOutbound({ verifyReceiverOwnership });
-      return ['outbound_empty', 'assistant_final_waiting'].includes(outbound.reason)
-        ? inbound
-        : outbound;
-    });
+    const operation = delivery.flush({ verifyReceiverOwnership });
     if (options.propagateErrors) return operation;
     return operation.catch((error) => {
       logger('ERROR', 'Failed to drain Discord delivery queue automatically', {
@@ -1795,9 +1780,7 @@ function createDelivery(config, logger = () => {}, deps = {}) {
   unsubscribeThreadClosed = typeof host.onThreadClosed === 'function'
     ? host.onThreadClosed(() => drainAutonomously('thread_closed'))
     : null;
-  unsubscribeAssistantFinal = typeof host.onAssistantFinal === 'function'
-    ? host.onAssistantFinal(() => drainAutonomously('assistant_final'))
-    : null;
+  unsubscribeAssistantFinal = null;
   return delivery;
 }
 

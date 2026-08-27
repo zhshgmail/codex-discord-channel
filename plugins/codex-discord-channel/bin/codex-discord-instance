@@ -48,11 +48,21 @@ codex_bin=$(read_account_value CODEX_BIN)
 codex_home=$(read_account_value CODEX_HOME)
 launcher_path=$(readlink -f "${BASH_SOURCE[0]}")
 plugin_root=$(dirname "$(dirname "$launcher_path")")
-channel_bin="$plugin_root/runtime/channel.cjs"
-generation_bin="$plugin_root/bin/codex-discord-generation"
+source_channel_bin="$plugin_root/runtime/channel.cjs"
+source_generation_bin="$plugin_root/bin/codex-discord-generation"
+generation_runtime_dir="$state_dir/generation-runtime/current"
+channel_bin="$source_channel_bin"
+generation_bin="$source_generation_bin"
+# A previous launcher may have been SIGKILLed after its marketplace cache was
+# evicted.  Reclaim that generation using the durable helper paths recorded in
+# its manifest; fresh source bytes replace them only after prepare succeeds.
+if [[ -f $generation_runtime_dir/channel.cjs && -f $generation_runtime_dir/codex-discord-generation ]]; then
+  channel_bin="$generation_runtime_dir/channel.cjs"
+  generation_bin="$generation_runtime_dir/codex-discord-generation"
+fi
 setsid_bin=$(command -v setsid 2>/dev/null || true)
-if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $channel_bin \
-  || ! -f $generation_bin || -z $setsid_bin || ! -x $setsid_bin ]]; then
+if [[ ! -x $node_bin || ! -f $codex_bin || ! -d $codex_home || ! -f $source_channel_bin \
+  || ! -f $source_generation_bin || -z $setsid_bin || ! -x $setsid_bin ]]; then
   echo "Instance executable paths are unavailable for $instance" >&2
   exit 1
 fi
@@ -76,7 +86,7 @@ instance_runtime_env=(
   CODEX_HOME="$codex_home"
   DISCORD_INSTANCE="$instance"
   DISCORD_CONFIG_DIR="$state_dir"
-  CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root"
+  CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$state_dir"
 )
 channel_command=("${instance_runtime_env[@]}" "$node_bin" "$channel_bin")
 set +e
@@ -381,6 +391,18 @@ if [[ -e $socket || -e $generation_manifest ]]; then
   exit 73
 fi
 launch_generation=$(tr -d '\n' </proc/sys/kernel/random/uuid)
+mkdir -p "$generation_runtime_dir"
+cp "$source_channel_bin" "$generation_runtime_dir/channel.cjs"
+cp "$source_generation_bin" "$generation_runtime_dir/codex-discord-generation"
+chmod 0700 "$generation_runtime_dir/codex-discord-generation"
+# The marketplace may refresh or evict its versioned cache while Codex is
+# running.  Every generation therefore executes from an immutable state-dir
+# snapshot that survives cache replacement through shutdown and gateway
+# restart.
+channel_bin="$generation_runtime_dir/channel.cjs"
+generation_bin="$generation_runtime_dir/codex-discord-generation"
+generation_command=("$node_bin" "$generation_bin")
+channel_command=("${instance_runtime_env[@]}" "$node_bin" "$channel_bin")
 generation_env=(
   CODEX_DISCORD_LAUNCH_GENERATION="$launch_generation"
   CODEX_DISCORD_LAUNCH_INSTANCE="$instance"
@@ -406,7 +428,7 @@ generation_channel_command=(
   CODEX_HOME="$codex_home"
   DISCORD_INSTANCE="$instance"
   DISCORD_CONFIG_DIR="$state_dir"
-  CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root"
+  CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$state_dir"
   "${generation_env[@]}"
 )
 
