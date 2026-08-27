@@ -1,6 +1,6 @@
 {
   "name": "codex-discord-channel",
-  "version": "0.3.17",
+  "version": "0.3.18",
   "description": "Claude-style Discord channel ownership for Codex sessions.",
   "author": {
     "name": "zhshgmail",
@@ -19,8 +19,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Discord Channel",
-    "shortDescription": "Bind a Discord bot instance to the active Codex session.",
-    "longDescription": "A session-local Discord channel plugin for Codex. It keeps one active owner per bot instance and persistently queues accepted inbound messages until delivery can be verified without unsafe terminal keystrokes.",
+    "shortDescription": "Deliver one Discord bot inbox to the current Codex TUI.",
+    "longDescription": "A state-directory-owned Discord channel plugin for Codex. It persistently queues accepted inbound messages and delivers them to the current TUI without treating Codex session or thread identifiers as durable identity.",
     "developerName": "zhshgmail",
     "category": "Productivity",
     "capabilities": [
@@ -30,8 +30,8 @@
     ],
     "defaultPrompt": [
       "Use $codex-discord-channel to check Discord channel status.",
-      "Claim this Codex session as the Discord bot owner.",
-      "Send a Discord reply from this Codex session."
+      "Check the durable Discord bot inbox for this instance.",
+      "Send a receipt-aware Discord reply from the current Codex TUI."
     ]
   },
   "mcpServers": "./.mcp.json"

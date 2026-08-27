@@ -17,6 +17,12 @@ const { writeGatewayHealth } = require('../src/gateway-health');
 const { sendDiscordReplyOnce } = require('../src/reply-delivery');
 const { isCurrentReceiverOwnership } = require('../src/receiver-state');
 const { startGatewayDrainLoop } = require('../src/gateway-drain-loop');
+const {
+  gatewayResourceSnapshot,
+  resourceRestartLimitBytes,
+  startGatewayResourceMonitor,
+} = require('../src/gateway-resources');
+const { gatewayShutdownTimeouts, settleBounded } = require('../src/gateway-shutdown');
 const { claimOwner, createOwner } = require('../src/owner-state');
 const { instanceDoctor, runAppServer } = require('../src/app-server-runtime');
 const { runTui } = require('../src/instance-launcher');
@@ -220,12 +226,15 @@ async function runGateway(config = loadConfig()) {
   }
   const writeCurrentHealth = (lastDrain, overrides = {}) => {
     if (!isCurrentReceiverOwnership(config, discordState.receiverOwnership)?.active) return null;
+    const resources = gatewayResourceSnapshot(discordState.client);
     return writeGatewayHealth(config, {
       receiverOwnership: discordState.receiverOwnership,
       discordStarted: overrides.discordStarted ?? true,
       discordReason: overrides.discordReason ?? null,
       structured: delivery.status(),
       queue: readDeliveryQueueStatus(config),
+      resources,
+      memoryLimitBytes: resourceRestartLimitBytes(config, resources),
       lastDrain: {
         ...lastDrain,
         at: lastDrain?.at || new Date().toISOString(),
@@ -254,29 +263,54 @@ async function runGateway(config = loadConfig()) {
   }
   const keepAlive = setInterval(() => {}, 2 ** 30);
   let stopping = false;
-  const stop = async () => {
+  let resourceMonitor = null;
+  const stop = async (reason = 'gateway_stopped') => {
     if (stopping) return;
     stopping = true;
     clearInterval(keepAlive);
+    resourceMonitor?.stop();
     if (typeof delivery.deactivateReceiver === 'function') delivery.deactivateReceiver();
-    try {
+    const timeouts = gatewayShutdownTimeouts(config);
+    const hardExit = setTimeout(() => {
+      logger('ERROR', 'Discord gateway exceeded total shutdown grace; durable FIFO remains for successor recovery', {
+        reason,
+        timeoutMs: timeouts.totalMs,
+      });
+      process.exit(0);
+    }, timeouts.totalMs);
+    await settleBounded('discord_client', async () => {
       if (discordState.client?.destroy) await discordState.client.destroy();
-    } catch {}
-    await drainLoop.stop();
-    try {
-      await delivery.coordinateReceiverOwnership(() => {
+    }, timeouts.discordMs, logger);
+    // Deactivation fences new admissions first; closing Discord then releases
+    // any in-flight message handler that a drain tick may be awaiting.  The
+    // durable FIFO is already on disk, so a bounded drain timeout cannot lose
+    // the source and must not strand handoff forever.
+    await settleBounded('queue_drain', () => drainLoop.stop(), timeouts.drainMs, logger);
+    await settleBounded('receiver_release', () => delivery.coordinateReceiverOwnership(() => {
         writeCurrentHealth(
-        { status: 'stopped', reason: 'gateway_stopped', deliveredCount: 0 },
-        { discordStarted: false, discordReason: 'gateway_stopped' },
+        { status: 'stopped', reason, deliveredCount: 0 },
+        { discordStarted: false, discordReason: reason },
         );
         return releaseDiscordReceiverOwnership(config, discordState.receiverOwnership);
-      });
-    } catch {}
+      }), timeouts.releaseMs, logger);
     if (typeof delivery.destroy === 'function') delivery.destroy();
+    clearTimeout(hardExit);
     process.exit(0);
   };
-  process.once('SIGTERM', () => { void stop(); });
-  process.once('SIGINT', () => { void stop(); });
+  resourceMonitor = startGatewayResourceMonitor({
+    config,
+    client: discordState.client,
+    logger,
+    onPressure: ({ snapshot, limitBytes }) => {
+      logger('ERROR', 'Restarting Discord gateway after sustained memory pressure; durable FIFO is preserved', {
+        rssBytes: snapshot.rssBytes,
+        limitBytes,
+      });
+      void stop('gateway_memory_pressure_restart');
+    },
+  });
+  process.once('SIGTERM', () => { void stop('gateway_sigterm'); });
+  process.once('SIGINT', () => { void stop('gateway_sigint'); });
 }
 
 async function main() {

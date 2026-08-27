@@ -420,7 +420,21 @@ async function prepare(options) {
   const record = safeReadManifest(expected.manifestPath);
   const socket = socketIdentity(expected.socketPath);
   if (!record) {
-    if (socket) refuse('app-server socket has no generation manifest');
+    if (socket) {
+      const listeners = unixSocketRecords(expected.socketPath);
+      if (listeners.length !== 0) {
+        refuse(`app-server socket has no generation manifest but still has ${listeners.length} live listener(s)`);
+      }
+      // Revalidate the exact inode captured before the listener check.  A
+      // pathname-only unlink could delete a newly bound foreign socket that
+      // replaced the stale inode during startup repair.
+      unlinkSocketCas(socket);
+      return {
+        status: 'reclaimed_orphan_socket',
+        socketPath: expected.socketPath,
+        reason: 'no_generation_manifest_and_no_live_listener',
+      };
+    }
     return { status: 'clean' };
   }
   const { manifest, raw } = record;
@@ -447,7 +461,12 @@ async function prepare(options) {
   }
   if (manifest.endpoint && socketIdentity(manifest.endpoint.path)) unlinkSocketCas(manifest.endpoint);
   clearManifestCas(expected.manifestPath, raw);
-  return { status: 'reclaimed', nonce: manifest.nonce };
+  return {
+    status: 'reclaimed_generation',
+    nonce: manifest.nonce,
+    socketPath: expected.socketPath,
+    reason: 'recorded_launcher_dead_and_generation_identity_verified',
+  };
 }
 
 function manifestForSupervisor(options) {

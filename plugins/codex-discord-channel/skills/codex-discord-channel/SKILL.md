@@ -110,6 +110,11 @@ or a console final is not visible-TUI or outbound proof.
   them.
 - On every drain, resolve the current loaded top-level TUI through the app
   server. Use returned thread/turn ids only for that RPC.
+- Ignore app-server threads whose explicit `threadSource` is `system`. Title
+  generation and other background system work can be top-level and active, but
+  it is not a visible user TUI and must never replace the delivery target.
+  Select a current non-system top-level user thread at drain time; do not
+  persist its thread id after the RPC.
 - A definitive stale-route rejection permits one rediscovery and retry of the
   same stable Discord client id.
 - A lost/uncertain RPC response leaves the source in the ordinary FIFO. The
@@ -129,6 +134,33 @@ or a console final is not visible-TUI or outbound proof.
   restart and cleanup use that durable snapshot so a marketplace cache refresh
   cannot strand the live generation.
 
+## Gateway resource and shutdown contract
+
+- Discord.js caches are transient accelerators, not evidence. Keep message,
+  member, user, reaction, presence, voice, and thread-member caches tightly
+  bounded; the state-dir FIFO and receipts are the durable store.
+- Persist queue state before injection. Memory pressure, TERM, timeout, crash,
+  or gateway replacement must leave the same FIFO source recoverable.
+- Publish gateway RSS, heap use, cache counts, and the active restart limit in
+  `gateway-health.json`. Diagnose the exact gateway process; do not attribute
+  app-server or TUI RSS to it.
+- Sustained high RSS may exit only the exact gateway so the launcher supervisor
+  can restart it. Require multiple consecutive samples; never restart on one
+  spike and never kill the TUI or app-server for gateway memory pressure.
+- Shutdown order is receiver fence, Discord client close, drain settlement,
+  receiver release, then exit. Every network/queue step is bounded. The alias
+  launcher gives a high-RSS gateway a longer grace period, then escalates only
+  the state-dir and process-start-time verified gateway group.
+- A slow or wedged gateway cannot hold handoff indefinitely. Exceeding the
+  total grace produces a precise diagnostic and exits; the successor recovers
+  the already durable FIFO. Launcher polling must not use hundreds of tiny
+  external sleeps whose fork overhead expands the advertised grace under
+  memory pressure. PID alone is never sufficient cleanup authority.
+- A forced gateway kill may leave `session-gateway.pid` behind. On the next
+  alias start, diagnose the exact stale PID and authority path, then replace it
+  automatically only after Discord login and durable queue readiness. A live
+  PID/start-time match remains a duplicate-receiver error, not cleanup fuel.
+
 ## Repair and tests
 
 Make the smallest repair at the first broken boundary. Add known-bad causal
@@ -146,6 +178,19 @@ tests for:
 8. two state directories cannot read or mutate each other's queues.
 9. deleting the installed marketplace cache while the test TUI is active does
    not prevent gateway restart or exact generation cleanup.
+10. a newer top-level `threadSource=system` background thread cannot replace an
+    older visible user TUI as the delivery target.
+11. two state directories sharing one `CODEX_HOME` cannot use each other's
+    rollout UserMessage as delivery proof.
+12. a no-manifest orphan socket that changes inode before unlink is preserved
+    and startup fails with an actionable diagnostic.
+13. sustained gateway memory pressure triggers one supervised gateway-only
+    restart; a recovered sample resets the pressure count.
+14. a hung drain or Discord close cannot exceed the configured handoff grace,
+    and the persistent FIFO remains available to the successor.
+15. a `SIGSTOP`ed gateway is force-killed within the configured launcher bound,
+    while a dead receiver file is replaced at next start with an actionable
+    warning and a live receiver remains untouched.
 
 Legacy tests that require durable session/thread/turn/lease identity must be
 explicitly labeled retired. Do not silently weaken unrelated access, queue,
@@ -164,8 +209,10 @@ contract, never incidental cancellation.
 
 ## Isolated live acceptance before deployment
 
-Use a temporary test instance and a repairer-owned Codex TUI. Do not occupy the
-user's Codex01/Codex02 slot for testing.
+Use only the owner-designated test alias and a repairer-owned Codex TUI. Do not
+occupy Codex01/Codex02 unless the owner explicitly selected that alias for live
+experiments; when Codex02 is selected, launch it from its own workspace and
+account home, never from the Codex01 checkout.
 
 1. Install the exact built version into an isolated cache/state directory.
 2. Start it through `codex-discord-instance`.
@@ -176,6 +223,10 @@ user's Codex01/Codex02 slot for testing.
 5. Send a fourth source and verify it reaches the same visible TUI.
 6. Verify pending queue and reply-receipt accounting, then exit the validation
    TUI and prove all test-instance processes and socket are gone.
+7. For shutdown/resource repairs, `SIGSTOP` the exact PID/start-time-verified
+   test gateway, exit the TUI normally, and measure bounded cleanup. Relaunch
+   once to prove the stale receiver record is warned about and atomically
+   replaced, then leave the test alias stopped.
 
 ## Deploy one alias at a time
 

@@ -548,6 +548,76 @@ test('foreign listener without a generation manifest remains live and inode-stab
   assert.equal(fs.existsSync(setup.manifestPath), false);
 });
 
+test('orphan socket without a manifest or live listener is automatically reclaimed with a warning', (t) => {
+  const setup = fixture(t);
+  const bound = spawnSync('python3', ['-c', [
+    'import socket, sys',
+    'sock = socket.socket(socket.AF_UNIX)',
+    'sock.bind(sys.argv[1])',
+    'sock.close()',
+  ].join('\n'), setup.socketPath], { encoding: 'utf8' });
+  assert.equal(bound.status, 0, bound.stderr);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: env(setup),
+    timeout: 5000,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /WARNING:.*automatically removed an orphan app-server socket/);
+  assert.equal(fs.existsSync(setup.socketPath), false);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+});
+
+test('orphan socket inode replacement before unlink is rejected and preserves the pathname', (t) => {
+  const setup = fixture(t);
+  const bound = spawnSync('python3', ['-c', [
+    'import socket, sys',
+    'sock = socket.socket(socket.AF_UNIX)',
+    'sock.bind(sys.argv[1])',
+    'sock.close()',
+  ].join('\n'), setup.socketPath], { encoding: 'utf8' });
+  assert.equal(bound.status, 0, bound.stderr);
+  const before = fs.lstatSync(setup.socketPath, { bigint: true });
+  const preload = path.join(setup.home, 'replace-orphan-inode-before-unlink.cjs');
+  fs.writeFileSync(preload, String.raw`
+'use strict';
+const fs = require('node:fs');
+const target = process.env.REPLACE_SOCKET_TARGET;
+const original = fs.lstatSync.bind(fs);
+let matchingReads = 0;
+fs.lstatSync = function guardedLstat(file, options) {
+  const result = original(file, options);
+  if (String(file) !== target || !result.isSocket()) return result;
+  matchingReads += 1;
+  if (matchingReads !== 2) return result;
+  return {
+    isSocket: () => true,
+    dev: result.dev,
+    ino: typeof result.ino === 'bigint' ? result.ino + 1n : result.ino + 1,
+  };
+};
+`);
+
+  const result = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: env(setup, {
+      NODE_OPTIONS: `--require=${preload}`,
+      REPLACE_SOCKET_TARGET: setup.socketPath,
+    }),
+    timeout: 3000,
+  });
+
+  const after = fs.lstatSync(setup.socketPath, { bigint: true });
+  assert.equal(result.status, 73, result.stderr);
+  assert.match(result.stderr, /socket changed before unlink|live or unreclaimed app-server/);
+  assert.equal(after.dev, before.dev);
+  assert.equal(after.ino, before.ino);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+});
+
 test('malformed generation manifest remains byte-stable and cannot authorize a foreign listener reclaim', async (t) => {
   const setup = fixture(t);
   const foreign = bindForeignListener(setup);
@@ -748,6 +818,30 @@ test('repeated TERM during delayed cleanup cannot interrupt descendant teardown'
 
   assert.equal(result.code, 143, child.stderrText);
   assertRecordedDead(owned, 'repeated signals');
+  assert.equal(fs.existsSync(setup.socketPath), false);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+});
+
+test('a SIGSTOPed gateway is force-killed within the configured handoff bound', async (t) => {
+  const setup = fixture(t);
+  const child = await readyLauncher(setup, {
+    CODEX_DISCORD_GATEWAY_STOP_TIMEOUT_MS: '1000',
+  });
+  const owned = recordedProcesses(setup);
+  const gateway = owned.find((item) => item.role === 'gateway');
+  assert.ok(gateway);
+  process.kill(gateway.pid, 'SIGSTOP');
+  await waitFor(() => proc(gateway.pid)?.state === 'T', 'stopped gateway');
+
+  const startedAt = Date.now();
+  child.kill('SIGTERM');
+  const result = await waitForExit(child, 4000);
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.code, 143, child.stderrText);
+  assert.ok(elapsedMs >= 750, `gateway grace was not observed: ${elapsedMs} ms`);
+  assert.ok(elapsedMs < 2500, `gateway handoff exceeded its bound: ${elapsedMs} ms`);
+  assertRecordedDead(owned, `SIGSTOP gateway cleanup (${child.stderrText})`);
   assert.equal(fs.existsSync(setup.socketPath), false);
   assert.equal(fs.existsSync(setup.manifestPath), false);
 });

@@ -8,7 +8,7 @@ const test = require('node:test');
 const { loadConfig, loadEnvFile } = require('../../src/config');
 
 const pluginRoot = path.resolve(__dirname, '..', '..');
-const releasePluginVersion = '0.3.17';
+const releasePluginVersion = '0.3.18';
 
 test('loadEnvFile does not override existing environment values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-config-'));
@@ -53,6 +53,10 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.deliveryUncertainRetryBaseMs, 5000);
   assert.equal(config.deliveryUncertainRetryMaxMs, 300000);
   assert.equal(config.gatewayHealthStaleMs, 180000);
+  assert.equal(config.gatewayMemoryRestartMb, 2048);
+  assert.equal(config.gatewayMemorySampleIntervalMs, 30000);
+  assert.equal(config.gatewayMemoryPressureSamples, 3);
+  assert.equal(config.gatewayShutdownGraceMs, 20000);
   assert.equal(config.requireTuiLease, false);
   assert.equal(config.tuiLeaseStaleMs, 3000);
   assert.equal(config.messageContentIntent, true);
@@ -173,7 +177,7 @@ test('installed MCP recovers its account binding from plugin cache cwd when Code
   assert.equal(
     manifest.version,
     releasePluginVersion,
-    'marketplace cache identity must name the v0.3.17 plugin release',
+    'marketplace cache identity must name the v0.3.18 plugin release',
   );
   const pluginCwd = path.join(
     codexHome,

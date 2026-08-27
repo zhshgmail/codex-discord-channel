@@ -254,6 +254,34 @@ var require_config = __commonJS({
           env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
           18e4
         ),
+        gatewayMemoryRestartMb: parseInteger(
+          env.CODEX_DISCORD_GATEWAY_MEMORY_RESTART_MB,
+          2048
+        ),
+        gatewayMemorySampleIntervalMs: parseInteger(
+          env.CODEX_DISCORD_GATEWAY_MEMORY_SAMPLE_INTERVAL_MS,
+          3e4
+        ),
+        gatewayMemoryPressureSamples: parseInteger(
+          env.CODEX_DISCORD_GATEWAY_MEMORY_PRESSURE_SAMPLES,
+          3
+        ),
+        gatewayShutdownGraceMs: parseInteger(
+          env.CODEX_DISCORD_GATEWAY_SHUTDOWN_GRACE_MS,
+          2e4
+        ),
+        gatewayDrainShutdownGraceMs: parseInteger(
+          env.CODEX_DISCORD_GATEWAY_DRAIN_SHUTDOWN_GRACE_MS,
+          5e3
+        ),
+        gatewayDiscordShutdownGraceMs: parseInteger(
+          env.CODEX_DISCORD_GATEWAY_DISCORD_SHUTDOWN_GRACE_MS,
+          5e3
+        ),
+        gatewayReleaseShutdownGraceMs: parseInteger(
+          env.CODEX_DISCORD_GATEWAY_RELEASE_SHUTDOWN_GRACE_MS,
+          3e3
+        ),
         // The state directory and its single supervised app-server are the instance
         // identity.  A Codex session/thread is transient transport state and must
         // never become a receive or replay gate.
@@ -3292,6 +3320,9 @@ var require_app_server_host = __commonJS({
     function deliveryProofKey(threadId, clientUserMessageId) {
       return JSON.stringify([threadId, clientUserMessageId]);
     }
+    function isSystemBackgroundThread(thread) {
+      return thread?.threadSource === "system";
+    }
     function assistantFinalKey(threadId, turnId) {
       return JSON.stringify([threadId, turnId]);
     }
@@ -3381,7 +3412,7 @@ var require_app_server_host = __commonJS({
       }
       return buffer;
     }
-    async function rolloutContainsUserMessage(rolloutPath, threadId, clientUserMessageId, fsPromises) {
+    async function rolloutContainsUserMessage(rolloutPath, expectedThreadId, clientUserMessageId, fsPromises) {
       let handle;
       try {
         handle = await fsPromises.open(rolloutPath, "r");
@@ -3391,8 +3422,13 @@ var require_app_server_host = __commonJS({
         if (!header) return !1;
         let headerEnd = header.indexOf(10);
         if (headerEnd === -1) return !1;
-        let sessionMeta = parseRolloutLine(header.subarray(0, headerEnd));
-        if (sessionMeta?.type !== "session_meta" || !sessionMeta.payload || typeof sessionMeta.payload != "object" || Array.isArray(sessionMeta.payload) || sessionMeta.payload.id !== threadId)
+        let sessionMeta = parseRolloutLine(header.subarray(0, headerEnd)), rolloutThreadId = sessionMeta?.payload?.id, rolloutThreadSource = sessionMeta?.payload?.thread_source;
+        if (sessionMeta?.type !== "session_meta" || !sessionMeta.payload || typeof sessionMeta.payload != "object" || Array.isArray(sessionMeta.payload) || !CANONICAL_THREAD_ID.test(rolloutThreadId || "") || // A background/title thread may contain the same stable Discord client
+        // id in diagnostic text or a copied UserMessage.  It is not the visible
+        // TUI consumer and therefore cannot prove delivery.  Keep legacy
+        // rollouts (which predate thread_source) readable, but fail closed for
+        // the explicit system classification emitted by current Codex.
+        rolloutThreadSource === "system" || expectedThreadId !== null && rolloutThreadId !== expectedThreadId)
           return !1;
         let tailLength = Math.min(stat.size, MAX_ROLLOUT_TAIL_BYTES), tailOffset = stat.size - tailLength, tail = await readBoundedRange(handle, tailOffset, tailLength);
         if (!tail) return !1;
@@ -3410,7 +3446,7 @@ var require_app_server_host = __commonJS({
         }
         let lineEnd = completeEnd - 1;
         for (; lineEnd >= lowerBound; ) {
-          let previousNewline = tail.lastIndexOf(10, lineEnd - 1), lineStart = Math.max(lowerBound, previousNewline + 1), record = parseRolloutLine(tail.subarray(lineStart, lineEnd)), payload = record?.payload, item = payload?.item, legacyUserMessage = payload?.type === "user_message" && payload.client_id === clientUserMessageId, completedUserMessage = payload?.type === "item_completed" && payload.thread_id === threadId && item && typeof item == "object" && !Array.isArray(item) && item.type === "UserMessage" && item.client_id === clientUserMessageId;
+          let previousNewline = tail.lastIndexOf(10, lineEnd - 1), lineStart = Math.max(lowerBound, previousNewline + 1), record = parseRolloutLine(tail.subarray(lineStart, lineEnd)), payload = record?.payload, item = payload?.item, legacyUserMessage = payload?.type === "user_message" && payload.client_id === clientUserMessageId, completedUserMessage = payload?.type === "item_completed" && payload.thread_id === rolloutThreadId && item && typeof item == "object" && !Array.isArray(item) && item.type === "UserMessage" && item.client_id === clientUserMessageId;
           if (record?.type === "event_msg" && payload && typeof payload == "object" && !Array.isArray(payload) && (legacyUserMessage || completedUserMessage))
             return !0;
           if (previousNewline < lowerBound) break;
@@ -3566,7 +3602,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.17"
+              version: "0.3.18"
             },
             capabilities: {
               experimentalApi: !0,
@@ -3732,7 +3768,7 @@ var require_app_server_host = __commonJS({
             if (remoteIndex >= 0 && argv[remoteIndex + 1] === config.appServerUrl) return !0;
           }
           return !1;
-        }), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.activeTurnProvenance = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.ephemeralThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.emittedAssistantFinals = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
+        }), this.client = deps.client || new AppServerRpcClient(config, logger, deps), this.lastStatus = this.client.status(), this.hasConnected = !!this.lastStatus.available, this.connectionWasLost = !1, this.currentThreadId = "", this.threadSelectionRevision = 0, this.threadStatuses = /* @__PURE__ */ new Map(), this.activeTurnIds = /* @__PURE__ */ new Map(), this.activeTurnProvenance = /* @__PURE__ */ new Map(), this.knownLoadedThreadIds = /* @__PURE__ */ new Set(), this.ephemeralThreadIds = /* @__PURE__ */ new Set(), this.verifiedUserMessages = /* @__PURE__ */ new Map(), this.verifiedSourceMessages = /* @__PURE__ */ new Map(), this.deliveryWaiters = /* @__PURE__ */ new Map(), this.emittedAssistantFinals = /* @__PURE__ */ new Map(), this.destroyed = !1, this.lifecycleProofRetryDelaysMs = lifecycleProofRetryDelays(
           deps.lifecycleProofRetryDelaysMs
         );
         let fsPromises = deps.rolloutFsPromises || fs.promises, sessionsDir = rolloutSessionsDir(config, deps);
@@ -3760,6 +3796,7 @@ var require_app_server_host = __commonJS({
           }
           if (notification?.method === "thread/started") {
             let thread = notification.params?.thread;
+            if (isSystemBackgroundThread(thread)) return;
             if (thread?.id && (this.threadSelectionRevision += 1), thread?.id && !thread.parentThreadId) {
               let lease = this.readTuiLease(), sameProvenRoot = thread.id === this.currentThreadId && (this.loadedInventoryProven && this.knownLoadedThreadIds.has(thread.id) || this.restoredTargetCheckpoint?.threadId === thread.id), sameLease = !this.requireTuiLease || lease.available && lease.record && this.observedTuiLeaseTarget?.leaseId === lease.record.leaseId && this.observedTuiLeaseTarget.threadId === thread.id;
               if (sameProvenRoot && sameLease) {
@@ -3815,6 +3852,10 @@ var require_app_server_host = __commonJS({
         let key = deliveryProofKey(threadId, clientUserMessageId);
         for (this.verifiedUserMessages.delete(key), this.verifiedUserMessages.set(key, !0); this.verifiedUserMessages.size > MAX_VERIFIED_USER_MESSAGES; )
           this.verifiedUserMessages.delete(this.verifiedUserMessages.keys().next().value);
+      }
+      rememberVerifiedSourceMessage(clientUserMessageId) {
+        for (this.verifiedSourceMessages.delete(clientUserMessageId), this.verifiedSourceMessages.set(clientUserMessageId, !0); this.verifiedSourceMessages.size > MAX_VERIFIED_USER_MESSAGES; )
+          this.verifiedSourceMessages.delete(this.verifiedSourceMessages.keys().next().value);
       }
       emitAssistantFinal(final) {
         let key = assistantFinalKey(final.threadId, final.turnId), identity = JSON.stringify([final.itemId, final.text]), prior = this.emittedAssistantFinals.get(key);
@@ -3994,7 +4035,7 @@ var require_app_server_host = __commonJS({
               if (!includeTurnsUnsupported(error)) throw error;
               return request("thread/read", { threadId: candidateId });
             }), candidate = candidateResponse?.thread;
-            if (candidate?.id === candidateId && candidate.parentThreadId == null) {
+            if (candidate?.id === candidateId && candidate.parentThreadId == null && !isSystemBackgroundThread(candidate)) {
               response = candidateResponse, threadId = candidateId;
               break;
             }
@@ -4009,7 +4050,7 @@ var require_app_server_host = __commonJS({
             let reason = "shared_app_server_thread_unavailable";
             return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
           }
-          this.currentThreadId = threadId, this.threadStatuses.set(threadId, status);
+          this.knownLoadedThreadIds = new Set(orderedIds), this.loadedInventoryProven = !0, this.currentThreadId = threadId, this.threadStatuses.set(threadId, status);
           let target = { available: !0, threadId, status };
           if (status === "active") {
             let activeTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1) || this.activeTurnIds.get(threadId) || "";
@@ -4152,8 +4193,10 @@ var require_app_server_host = __commonJS({
               let candidate = candidateResponse?.thread;
               if (!candidate || candidate.id !== candidateThreadId)
                 return rejectUnprovableTopology();
-              if (candidate.parentThreadId == null)
+              if (candidate.parentThreadId == null && !isSystemBackgroundThread(candidate))
                 candidateParents.set(candidateThreadId, null), topLevelThreads.push({ threadId: candidateThreadId, response: candidateResponse });
+              else if (candidate.parentThreadId == null)
+                candidateParents.set(candidateThreadId, null);
               else {
                 if (typeof candidate.parentThreadId != "string" || candidate.parentThreadId.trim() === "")
                   return rejectUnprovableTopology();
@@ -4441,6 +4484,24 @@ var require_app_server_host = __commonJS({
           readAbort && readAbort.abort(), this.removeDeliveryWaiter(proofKey, waiter);
         }
       }
+      async hasDeliveredSource(clientUserMessageId) {
+        if (typeof clientUserMessageId != "string" || clientUserMessageId === "") return !1;
+        if (this.verifiedSourceMessages.has(clientUserMessageId)) return !0;
+        let candidates = [...new Set([
+          this.currentThreadId,
+          ...this.knownLoadedThreadIds
+        ].filter((threadId) => CANONICAL_THREAD_ID.test(threadId || "")))];
+        for (let threadId of candidates) {
+          let verified = !1;
+          try {
+            verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
+          } catch {
+          }
+          if (verified)
+            return this.rememberVerifiedUserMessage(threadId, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0;
+        }
+        return !1;
+      }
       onThreadIdle(listener) {
         return this.on("idle", listener), () => this.off("idle", listener);
       }
@@ -4460,7 +4521,7 @@ var require_app_server_host = __commonJS({
         this.destroyed = !0;
         for (let waiters of this.deliveryWaiters.values())
           for (let waiter of [...waiters]) waiter.close();
-        this.deliveryWaiters.clear(), this.verifiedUserMessages.clear(), this.emittedAssistantFinals.clear(), this.activeTurnProvenance.clear(), this.client.off("notification", this.onNotification), this.client.off("connectionChanged", this.onConnectionChanged), typeof this.client.destroy == "function" && this.client.destroy();
+        this.deliveryWaiters.clear(), this.verifiedUserMessages.clear(), this.verifiedSourceMessages.clear(), this.emittedAssistantFinals.clear(), this.activeTurnProvenance.clear(), this.client.off("notification", this.onNotification), this.client.off("connectionChanged", this.onConnectionChanged), typeof this.client.destroy == "function" && this.client.destroy();
       }
     };
     function createAppServerHost(config = {}, logger = () => {
@@ -4926,6 +4987,17 @@ var require_receiver_state = __commonJS({
         return !1;
       }
     }
+    function readLinuxProcessStartTicks(pid, fsImpl = fs) {
+      try {
+        let stat = fsImpl.readFileSync(`/proc/${pid}/stat`, "utf8"), suffix = stat.slice(stat.lastIndexOf(") ") + 2).trim().split(/\s+/);
+        return /^[1-9]\d*$/.test(suffix[19] || "") ? suffix[19] : "";
+      } catch {
+        return "";
+      }
+    }
+    function processRecordIsAlive(record, deps = {}) {
+      return !record || !processIsAlive(record.pid, deps) ? !1 : !record.processStartTicks || typeof deps.isProcessAlive == "function" && typeof deps.readProcessStartTicks != "function" ? !0 : (typeof deps.readProcessStartTicks == "function" ? deps.readProcessStartTicks(record.pid) : readLinuxProcessStartTicks(record.pid, deps.fs || fs)) === record.processStartTicks;
+    }
     function getReceiverAuthorityPath(config = {}) {
       return config.paths?.gatewayPidPath || "";
     }
@@ -5021,7 +5093,7 @@ var require_receiver_state = __commonJS({
     }
     function effectiveReceiverOwnership(snapshot, deps = {}) {
       let record = snapshot?.valid ? snapshot.record : null;
-      return record ? processIsAlive(record.pid, deps) ? { record, fallback: !1 } : record.version === 2 && record.fallback && processIsAlive(record.fallback.pid, deps) ? { record: record.fallback, fallback: !0 } : null : null;
+      return record ? processRecordIsAlive(record, deps) ? { record, fallback: !1 } : record.version === 2 && record.fallback && processRecordIsAlive(record.fallback, deps) ? { record: record.fallback, fallback: !0 } : null : null;
     }
     function sameReceiverOwnership(left, right) {
       return !!(left && right && left.pid === right.pid && left.generation === right.generation);
@@ -5063,12 +5135,14 @@ var require_receiver_state = __commonJS({
       return record ? record.version === 2 ? { ...record, fallback: null } : { ...record } : null;
     }
     function createReceiverOwnership(previous, deps = {}) {
-      let pid = localPid(deps), nowValue = typeof deps.now == "function" ? deps.now() : Date.now();
+      let pid = localPid(deps), nowValue = typeof deps.now == "function" ? deps.now() : Date.now(), processStartTicks = deps.processStartTicks || readLinuxProcessStartTicks(pid, deps.fs || fs), stateDir = typeof deps.stateDir == "string" ? deps.stateDir : "";
       return {
         version: 2,
         pid,
         generation: (deps.randomUUID || randomUUID)(),
         claimedAt: new Date(nowValue).toISOString(),
+        ...processStartTicks ? { processStartTicks } : {},
+        ...stateDir ? { stateDir, role: "gateway" } : {},
         fallback: previous && previous.pid !== pid ? fallbackRecord(previous) : null
       };
     }
@@ -5103,7 +5177,7 @@ var require_receiver_state = __commonJS({
       if (!snapshot.valid || !snapshot.record || !expected) return !1;
       let fsImpl = deps.fs || fs, current = snapshot.record;
       if (sameReceiverOwnership(current, expected)) {
-        let fallback = current.version === 2 && current.fallback && processIsAlive(current.fallback.pid, deps) ? fallbackRecord(current.fallback) : null;
+        let fallback = current.version === 2 && current.fallback && processRecordIsAlive(current.fallback, deps) ? fallbackRecord(current.fallback) : null;
         return fallback ? fallback.version === 1 && snapshot.source === "staged" ? fsImpl.unlinkSync(snapshot.path) : writeAuthorityAtomically(snapshot.path, fallback, deps) : fsImpl.unlinkSync(snapshot.path), !0;
       }
       return current.version === 2 && sameReceiverOwnership(current.fallback, expected) ? (writeAuthorityAtomically(snapshot.path, { ...current, fallback: null }, deps), !0) : !1;
@@ -5117,6 +5191,8 @@ var require_receiver_state = __commonJS({
       isActiveDiscordReceiver,
       isCurrentReceiverOwnership,
       isProcessAlive,
+      processRecordIsAlive,
+      readLinuxProcessStartTicks,
       readReceiverAuthoritySnapshot,
       releaseReceiverOwnership,
       sameReceiverOwnership
@@ -5133,7 +5209,7 @@ var require_delivery = __commonJS({
       readReceipt,
       receiptPath,
       replyNonce
-    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 5, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", LEGACY_ACK_UNCERTAIN_ARCHIVE = "legacy_ack_uncertain_no_auto_replay", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
+    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 5, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_PROOF_PENDING = "delivery_proof_pending", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", LEGACY_ACK_UNCERTAIN_ARCHIVE = "legacy_ack_uncertain_no_auto_replay", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, DEFAULT_DELIVERY_PROOF_RETRY_DELAY_MS = 2e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
     function currentTimeMs(deps = {}) {
       let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
       return Number.isFinite(value) ? value : Date.now();
@@ -5389,6 +5465,11 @@ ${normalized.content}${attachmentText}
         deps.deliveryActivationId || config.deliveryActivationId || ""
       ).trim() || fs.realpathSync(path.resolve(__dirname, ".."));
     }
+    function timestampMs(value) {
+      if (typeof value != "string" || value.trim() === "") return null;
+      let parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
     function activateDeliveryQueue(queue, config = {}, deps = {}) {
       let activationId = deliveryActivationId(config, deps), archivedAt = new Date(currentTimeMs(deps)).toISOString(), completed = queue.completed || [], archived = queue.archived || [], seen = /* @__PURE__ */ new Set(), eligible = [], archivedCount = 0;
       for (let item of queue.uncertain) {
@@ -5540,6 +5621,9 @@ ${normalized.content}${attachmentText}
         error: error instanceof Error ? error.message : String(error)
       };
     }
+    async function hasDurableSourceProof(host, target, clientUserMessageId) {
+      return typeof host.hasDeliveredSource == "function" ? !!await host.hasDeliveredSource(clientUserMessageId) : !!await host.hasDelivered(target.threadId, clientUserMessageId);
+    }
     async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       let verifyReceiverOwnership = options.verifyReceiverOwnership, reconciledCount = 0;
       for (; ; ) {
@@ -5559,6 +5643,58 @@ ${normalized.content}${attachmentText}
             queueDepth: 0
           } : { status: "idle", reason: "queue_empty", deliveredCount: 0, queueDepth: 0 };
         let next = snapshot.items[0];
+        if (snapshot.blocked?.reason === DELIVERY_PROOF_PENDING) {
+          let target2;
+          try {
+            target2 = await host.resolveTarget();
+          } catch (error) {
+            target2 = unavailableTarget(error);
+          }
+          let hasDurableProof = !1;
+          if (target2?.available === !0 && typeof target2.threadId == "string" && target2.threadId)
+            try {
+              hasDurableProof = await hasDurableSourceProof(
+                host,
+                target2,
+                snapshot.blocked.clientUserMessageId
+              );
+            } catch {
+            }
+          if (hasDurableProof) {
+            let reconciled = await withDeliveryQueueLock(config, deps, () => {
+              let queue = readDeliveryQueue(config, deps);
+              if (!queueHeadMatches(queue, next) || queue.blocked?.reason !== DELIVERY_PROOF_PENDING || queue.blocked?.clientUserMessageId !== snapshot.blocked.clientUserMessageId)
+                return { retry: !0 };
+              let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+              if (receiverRejected) return { receiverRejected, queue };
+              let updated = completedQueue(queue, next, {
+                clientUserMessageId: snapshot.blocked.clientUserMessageId
+              }, config, deps);
+              return writeDeliveryQueue(updated, config, deps), { completed: !0 };
+            });
+            if (reconciled.retry) continue;
+            if (reconciled.receiverRejected)
+              return receiverRejectedResult(reconciled.queue, reconciled.receiverRejected);
+            reconciledCount += 1;
+            continue;
+          }
+          let retryAt = timestampMs(snapshot.blocked.retryAt);
+          if (!["idle", "systemError"].includes(target2?.status) || retryAt == null || retryAt > currentTimeMs(deps)) {
+            let result = blockedResult(snapshot, DELIVERY_PROOF_PENDING);
+            return retryAt != null && retryAt > currentTimeMs(deps) && Object.defineProperty(result, DELIVERY_LEASE_RETRY_AT, { value: retryAt }), result;
+          }
+          let released = await withDeliveryQueueLock(config, deps, () => {
+            let queue = readDeliveryQueue(config, deps);
+            if (!queueHeadMatches(queue, next) || queue.blocked?.reason !== DELIVERY_PROOF_PENDING || queue.blocked?.clientUserMessageId !== snapshot.blocked.clientUserMessageId)
+              return { retry: !0 };
+            let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+            return receiverRejected ? { receiverRejected, queue } : (queue.blocked = null, writeDeliveryQueue(queue, config, deps), { released: !0 });
+          });
+          if (released.retry) continue;
+          if (released.receiverRejected)
+            return receiverRejectedResult(released.queue, released.receiverRejected);
+          continue;
+        }
         if (snapshot.blocked?.reason === DELIVERY_IN_PROGRESS) {
           let activeResult = activeAttemptBlockedResult(snapshot, deps);
           if (activeResult) return activeResult;
@@ -5687,6 +5823,50 @@ ${normalized.content}${attachmentText}
           }), blocked;
         }
         try {
+          let hasDurableProof = !1;
+          try {
+            hasDurableProof = await hasDurableSourceProof(
+              host,
+              target,
+              params.clientUserMessageId
+            );
+          } catch {
+          }
+          if (!hasDurableProof) {
+            let retained = await withDeliveryQueueLock(config, deps, () => {
+              let queue = readDeliveryQueue(config, deps);
+              if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId)
+                return { retry: !0, queue };
+              let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+              if (receiverRejected) return { receiverRejected, queue };
+              let retryDelayMs = Math.max(
+                1,
+                Number(config.deliveryProofRetryDelayMs) || DEFAULT_DELIVERY_PROOF_RETRY_DELAY_MS
+              );
+              return queue.blocked = {
+                reason: DELIVERY_PROOF_PENDING,
+                at: new Date(currentTimeMs(deps)).toISOString(),
+                retryAt: new Date(currentTimeMs(deps) + retryDelayMs).toISOString(),
+                messageId: next.normalized.messageId,
+                clientUserMessageId: params.clientUserMessageId
+              }, writeDeliveryQueue(queue, config, deps), { queue, retryAt: currentTimeMs(deps) + retryDelayMs };
+            });
+            if (activeDeliveryAttempts.delete(attemptId), retained.receiverRejected)
+              return receiverRejectedResult(retained.queue, retained.receiverRejected);
+            if (retained.retry) continue;
+            logger("WARN", "App-server accepted Discord input without durable UserMessage proof", {
+              channelId: next.normalized.channelId,
+              messageId: next.normalized.messageId,
+              queueDepth: claim.queueDepth
+            });
+            let result = {
+              status: "queued",
+              reason: DELIVERY_PROOF_PENDING,
+              deliveredCount: 0,
+              queueDepth: claim.queueDepth
+            };
+            return Object.defineProperty(result, DELIVERY_LEASE_RETRY_AT, { value: retained.retryAt }), result;
+          }
           let turnId = response?.turn?.id || response?.turnId || (target.status === "active" ? target.activeTurnId : ""), committed = await withDeliveryQueueLock(config, deps, () => {
             let queue = readDeliveryQueue(config, deps);
             if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId)
@@ -6099,6 +6279,112 @@ var require_access_state = __commonJS({
       loadAccessState,
       mentionsBot,
       normalizeAccessState
+    };
+  }
+});
+
+// src/gateway-resources.js
+var require_gateway_resources = __commonJS({
+  "src/gateway-resources.js"(exports2, module2) {
+    "use strict";
+    var os = require("node:os"), MIB = 1024 * 1024, DEFAULT_RESTART_MIB = 2048, DEFAULT_SAMPLE_INTERVAL_MS = 3e4, DEFAULT_PRESSURE_SAMPLES = 3;
+    function finiteNonNegative(value) {
+      let number = Number(value);
+      return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
+    }
+    function collectionSize(value) {
+      return finiteNonNegative(value?.cache?.size) ?? 0;
+    }
+    function gatewayResourceSnapshot(client, deps = {}) {
+      let memoryUsage = (deps.memoryUsage || process.memoryUsage)(), totalMemoryBytes = finiteNonNegative(
+        typeof deps.totalmem == "function" ? deps.totalmem() : os.totalmem()
+      );
+      return {
+        rssBytes: finiteNonNegative(memoryUsage?.rss),
+        heapTotalBytes: finiteNonNegative(memoryUsage?.heapTotal),
+        heapUsedBytes: finiteNonNegative(memoryUsage?.heapUsed),
+        externalBytes: finiteNonNegative(memoryUsage?.external),
+        arrayBuffersBytes: finiteNonNegative(memoryUsage?.arrayBuffers),
+        totalMemoryBytes,
+        caches: {
+          guilds: collectionSize(client?.guilds),
+          channels: collectionSize(client?.channels),
+          users: collectionSize(client?.users)
+        }
+      };
+    }
+    function discordClientResourceOptions(discord = {}) {
+      let Options2 = discord.Options;
+      return !Options2 || typeof Options2.cacheWithLimits != "function" ? {} : {
+        // Inbound messages are persisted immediately in the state-dir FIFO.  The
+        // gateway therefore needs only a tiny transient Discord cache; delivery,
+        // replay and handoff never depend on this process-local cache.
+        makeCache: Options2.cacheWithLimits({
+          ...Options2.DefaultMakeCacheSettings || {},
+          MessageManager: 5,
+          ReactionManager: 0,
+          ReactionUserManager: 0,
+          GuildMemberManager: 8,
+          PresenceManager: 0,
+          VoiceStateManager: 0,
+          ThreadMemberManager: 0,
+          UserManager: 32
+        }),
+        sweepers: {
+          ...Options2.DefaultSweeperSettings || {},
+          messages: { interval: 60, lifetime: 120 },
+          threads: { interval: 300, lifetime: 900 }
+        }
+      };
+    }
+    function resourceRestartLimitBytes(config = {}, snapshot = {}) {
+      let configuredBytes = Math.max(
+        256,
+        finiteNonNegative(config.gatewayMemoryRestartMb) || DEFAULT_RESTART_MIB
+      ) * MIB, totalBytes = finiteNonNegative(snapshot.totalMemoryBytes);
+      return totalBytes ? Math.min(configuredBytes, Math.max(256 * MIB, Math.floor(totalBytes * 0.25))) : configuredBytes;
+    }
+    function startGatewayResourceMonitor({
+      config = {},
+      client,
+      logger = () => {
+      },
+      onPressure = () => {
+      },
+      deps = {}
+    }) {
+      let intervalMs = Math.max(
+        1e3,
+        finiteNonNegative(config.gatewayMemorySampleIntervalMs) || DEFAULT_SAMPLE_INTERVAL_MS
+      ), requiredSamples = Math.max(
+        1,
+        finiteNonNegative(config.gatewayMemoryPressureSamples) || DEFAULT_PRESSURE_SAMPLES
+      ), scheduleInterval = deps.setInterval || setInterval, cancelInterval = deps.clearInterval || clearInterval, pressureSamples = 0, triggered = !1, lastWarningAt = 0, sample = () => {
+        let snapshot = gatewayResourceSnapshot(client, deps), limitBytes = resourceRestartLimitBytes(config, snapshot), rssBytes = snapshot.rssBytes || 0;
+        if (rssBytes < limitBytes)
+          return pressureSamples = 0, { snapshot, limitBytes, pressureSamples, triggered };
+        pressureSamples += 1;
+        let now = typeof deps.now == "function" ? deps.now() : Date.now();
+        return (now - lastWarningAt >= 3e5 || lastWarningAt === 0) && (lastWarningAt = now, logger("WARN", "Discord gateway memory pressure detected", {
+          rssBytes,
+          limitBytes,
+          pressureSamples,
+          requiredSamples,
+          caches: snapshot.caches
+        })), !triggered && pressureSamples >= requiredSamples && (triggered = !0, onPressure({ snapshot, limitBytes, pressureSamples })), { snapshot, limitBytes, pressureSamples, triggered };
+      }, timer = scheduleInterval(sample, intervalMs);
+      return typeof timer?.unref == "function" && timer.unref(), {
+        sample,
+        stop() {
+          cancelInterval(timer);
+        }
+      };
+    }
+    module2.exports = {
+      discordClientResourceOptions,
+      gatewayResourceSnapshot,
+      resourceRestartLimitBytes,
+      startGatewayResourceMonitor
     };
   }
 });
@@ -94320,7 +94606,7 @@ var require_src = __commonJS({
 var require_discord_client = __commonJS({
   "src/discord-client.js"(exports2, module2) {
     "use strict";
-    var { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require_access_state(), { normalizeDiscordMessage } = require_delivery(), {
+    var { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require_access_state(), { normalizeDiscordMessage } = require_delivery(), { discordClientResourceOptions } = require_gateway_resources(), {
       commitReceiverOwnership,
       createReceiverOwnership,
       effectiveReceiverOwnership,
@@ -94457,12 +94743,18 @@ var require_discord_client = __commonJS({
       let authoritySnapshot = readReceiverAuthoritySnapshot(config, deps);
       if (claimReceiver && !authoritySnapshot.valid)
         throw new Error("Discord receiver authority record is invalid.");
-      let effectiveOwnership = effectiveReceiverOwnership(authoritySnapshot, deps)?.record || null, receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps), shouldReceive = claimReceiver || receiver.active, {
+      let effectiveOwnership = effectiveReceiverOwnership(authoritySnapshot, deps)?.record || null;
+      claimReceiver && authoritySnapshot.record && !effectiveOwnership && log(logger, "WARN", "Automatically reclaiming stale Discord gateway receiver record", {
+        stalePid: authoritySnapshot.record.pid,
+        authorityPath: authoritySnapshot.path,
+        action: "replace_after_discord_login"
+      });
+      let receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps), shouldReceive = claimReceiver || receiver.active, {
         Client: Client2,
         Events: Events2,
         GatewayIntentBits,
         Partials
-      } = deps.discord || require_src(), intents = [
+      } = deps.discord || require_src(), discord = deps.discord || require_src(), intents = [
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages
@@ -94470,7 +94762,8 @@ var require_discord_client = __commonJS({
       config.messageContentIntent !== !1 && intents.push(GatewayIntentBits.MessageContent);
       let client = new Client2({
         intents,
-        partials: [Partials.Channel]
+        partials: [Partials.Channel],
+        ...discordClientResourceOptions(discord)
       });
       try {
         await client.login(config.token);
@@ -94485,7 +94778,10 @@ var require_discord_client = __commonJS({
               throw new Error("Discord delivery does not provide app-server readiness checks.");
             await delivery.ensureReady();
           }
-          let candidate = createReceiverOwnership(effectiveOwnership, deps);
+          let candidate = createReceiverOwnership(effectiveOwnership, {
+            ...deps,
+            stateDir: config.paths?.stateDir || ""
+          });
           receiverOwnership = await delivery.coordinateReceiverOwnership(() => {
             let handler = createDiscordMessageHandler({
               config,
@@ -94909,6 +95205,22 @@ var require_gateway_health = __commonJS({
         at: typeof value.at == "string" && value.at ? value.at : new Date(currentTimeMs(deps)).toISOString()
       };
     }
+    function normalizedResources(value = {}) {
+      let integerOrNull = (field) => Number.isInteger(value[field]) && value[field] >= 0 ? value[field] : null;
+      return {
+        rssBytes: integerOrNull("rssBytes"),
+        heapTotalBytes: integerOrNull("heapTotalBytes"),
+        heapUsedBytes: integerOrNull("heapUsedBytes"),
+        externalBytes: integerOrNull("externalBytes"),
+        arrayBuffersBytes: integerOrNull("arrayBuffersBytes"),
+        totalMemoryBytes: integerOrNull("totalMemoryBytes"),
+        caches: {
+          guilds: Number.isInteger(value.caches?.guilds) ? value.caches.guilds : null,
+          channels: Number.isInteger(value.caches?.channels) ? value.caches.channels : null,
+          users: Number.isInteger(value.caches?.users) ? value.caches.users : null
+        }
+      };
+    }
     function writeGatewayHealth(config = {}, state = {}, deps = {}) {
       let file = getGatewayHealthPath(config);
       if (!file) throw new Error("Discord gateway health path is not configured.");
@@ -94924,6 +95236,8 @@ var require_gateway_health = __commonJS({
         },
         structured: normalizedStructured(state.structured),
         queue: normalizedQueue(state.queue),
+        resources: normalizedResources(state.resources),
+        memoryLimitBytes: Number.isInteger(state.memoryLimitBytes) && state.memoryLimitBytes >= 0 ? state.memoryLimitBytes : null,
         lastDrain: normalizedLastDrain(state.lastDrain, deps)
       };
       fsImpl.mkdirSync(path.dirname(file), { recursive: !0, mode: 448 });
@@ -94961,7 +95275,11 @@ var require_gateway_health = __commonJS({
         gatewayObservedQueueDepth: null,
         gatewayObservedReadyCount: null,
         gatewayObservedUncertainCount: null,
-        gatewayObservedBlockedReason: null
+        gatewayObservedBlockedReason: null,
+        gatewayRssBytes: null,
+        gatewayHeapUsedBytes: null,
+        gatewayMemoryLimitBytes: null,
+        gatewayDiscordCacheCounts: null
       };
     }
     function readGatewayHealthStatus2(config = {}, deps = {}) {
@@ -94977,9 +95295,9 @@ var require_gateway_health = __commonJS({
         );
       }
       let receiver = normalizedReceiver(record?.receiver);
-      if (record?.version !== GATEWAY_HEALTH_VERSION || !receiver || typeof record.updatedAt != "string" || !record.discord || !record.structured || !record.queue || !record.lastDrain)
+      if (record?.version !== GATEWAY_HEALTH_VERSION || !receiver || typeof record.updatedAt != "string" || !record.discord || !record.structured || !record.queue || !record.resources || !record.lastDrain)
         return emptyStatus(file, "gateway_health_invalid", !1, receiverPresent);
-      let updatedAtMs = Date.parse(record.updatedAt), staleMs = Math.max(1e3, Number(config.gatewayHealthStaleMs) || 18e4), expired = !Number.isFinite(updatedAtMs) || currentTimeMs(deps) - updatedAtMs > staleMs, authorityMatches = !!(effective && sameReceiverOwnership(receiver, effective)), live = authorityMatches && !expired, reason = live ? null : authorityMatches && expired ? "gateway_health_expired" : "gateway_health_stale", structured = normalizedStructured(record.structured);
+      let updatedAtMs = Date.parse(record.updatedAt), staleMs = Math.max(1e3, Number(config.gatewayHealthStaleMs) || 18e4), expired = !Number.isFinite(updatedAtMs) || currentTimeMs(deps) - updatedAtMs > staleMs, authorityMatches = !!(effective && sameReceiverOwnership(receiver, effective)), live = authorityMatches && !expired, reason = live ? null : authorityMatches && expired ? "gateway_health_expired" : "gateway_health_stale", structured = normalizedStructured(record.structured), resources = normalizedResources(record.resources);
       return {
         gatewayHealthPath: file,
         gatewayHealthValid: !0,
@@ -95001,7 +95319,11 @@ var require_gateway_health = __commonJS({
         gatewayObservedQueueDepth: Number.isInteger(record.queue.depth) ? record.queue.depth : null,
         gatewayObservedReadyCount: Number.isInteger(record.queue.ready) ? record.queue.ready : null,
         gatewayObservedUncertainCount: Number.isInteger(record.queue.uncertain) ? record.queue.uncertain : null,
-        gatewayObservedBlockedReason: record.queue.blockedReason || null
+        gatewayObservedBlockedReason: record.queue.blockedReason || null,
+        gatewayRssBytes: resources.rssBytes,
+        gatewayHeapUsedBytes: resources.heapUsedBytes,
+        gatewayMemoryLimitBytes: Number.isInteger(record.memoryLimitBytes) ? record.memoryLimitBytes : null,
+        gatewayDiscordCacheCounts: resources.caches
       };
     }
     module2.exports = {
@@ -95022,7 +95344,7 @@ var readline = require("node:readline"), { loadConfig } = require_config(), {
   reconcileDiscordMessage,
   sendDiscordMessage,
   startDiscordClient
-} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.17", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.18", MAX_TOOL_RESULT_BYTES = 64 * 1024;
 function makeLogger() {
   return (level, message, meta) => {
     let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

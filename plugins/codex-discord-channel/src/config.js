@@ -241,6 +241,34 @@ function loadConfig(inputEnv = process.env, options = {}) {
       env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
       180000,
     ),
+    gatewayMemoryRestartMb: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_MEMORY_RESTART_MB,
+      2048,
+    ),
+    gatewayMemorySampleIntervalMs: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_MEMORY_SAMPLE_INTERVAL_MS,
+      30000,
+    ),
+    gatewayMemoryPressureSamples: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_MEMORY_PRESSURE_SAMPLES,
+      3,
+    ),
+    gatewayShutdownGraceMs: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_SHUTDOWN_GRACE_MS,
+      20000,
+    ),
+    gatewayDrainShutdownGraceMs: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_DRAIN_SHUTDOWN_GRACE_MS,
+      5000,
+    ),
+    gatewayDiscordShutdownGraceMs: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_DISCORD_SHUTDOWN_GRACE_MS,
+      5000,
+    ),
+    gatewayReleaseShutdownGraceMs: parseInteger(
+      env.CODEX_DISCORD_GATEWAY_RELEASE_SHUTDOWN_GRACE_MS,
+      3000,
+    ),
     // The state directory and its single supervised app-server are the instance
     // identity.  A Codex session/thread is transient transport state and must
     // never become a receive or replay gate.

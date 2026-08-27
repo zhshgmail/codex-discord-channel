@@ -492,7 +492,7 @@ test('shell launcher rejects duplicate executable authority before starting work
   assert.equal(fs.existsSync(setup.trace), false);
 });
 
-test('launcher rejection never removes an app-server socket it does not own', () => {
+test('launcher automatically repairs an orphan app-server socket with no listener', () => {
   const setup = fixture();
   const socketPath = path.join(setup.stateDir, 'app-server.sock');
   const bound = spawnSync('python3', ['-c', [
@@ -507,9 +507,9 @@ test('launcher rejection never removes an app-server socket it does not own', ()
     encoding: 'utf8',
     env: launchEnv(setup),
   });
-  assert.equal(result.status, 73, result.stderr);
-  assert.match(result.stderr, /already has an app-server socket/);
-  assert.equal(fs.existsSync(socketPath), true, 'foreign socket must remain untouched');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /automatically removed an orphan app-server socket with no live listener/);
+  assert.equal(fs.existsSync(socketPath), false, 'orphan socket must be removed');
 });
 
 test('gateway exit restarts the receiver without terminating the active TUI', () => {

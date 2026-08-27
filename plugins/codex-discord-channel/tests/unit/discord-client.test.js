@@ -777,6 +777,54 @@ test('successor app-server readiness failure preserves incumbent durable receive
   assert.deepEqual(JSON.parse(fs.readFileSync(gatewayPidPath, 'utf8')), ownership);
 });
 
+test('a dead receiver record is replaced automatically with an actionable warning', async () => {
+  const { config, gatewayPidPath, ownership } = incumbentGatewayFixture();
+  const successorPid = 20002;
+  const logs = [];
+  const { EventEmitter } = require('node:events');
+  class ReadyDiscordClient extends EventEmitter {
+    constructor() {
+      super();
+      this.user = { id: 'bot', tag: 'bot#0001' };
+    }
+    async login() {}
+  }
+
+  const result = await startDiscordClient({
+    config,
+    claimReceiver: true,
+    delivery: {
+      async ensurePersistenceReady() {},
+      async coordinateReceiverOwnership(operation) { return operation(); },
+    },
+    logger: (level, message, meta) => logs.push({ level, message, meta }),
+    deps: {
+      discord: gatewayDiscordDeps(ReadyDiscordClient),
+      isProcessAlive: (pid) => pid === successorPid,
+      pid: successorPid,
+      randomUUID: () => 'replacement-generation',
+    },
+  });
+
+  assert.equal(result.started, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(gatewayPidPath, 'utf8')), {
+    version: 2,
+    pid: successorPid,
+    generation: 'replacement-generation',
+    claimedAt: readReceiverAuthoritySnapshot(config).record.claimedAt,
+    fallback: null,
+  });
+  assert.deepEqual(logs.find((entry) => entry.message.includes('reclaiming stale')), {
+    level: 'WARN',
+    message: 'Automatically reclaiming stale Discord gateway receiver record',
+    meta: {
+      stalePid: ownership.pid,
+      authorityPath: gatewayPidPath,
+      action: 'replace_after_discord_login',
+    },
+  });
+});
+
 test('successor replaces durable receiver ownership only after login and app-server readiness', async () => {
   const { config, gatewayPidPath, ownership } = incumbentGatewayFixture();
   const successorPid = 20002;

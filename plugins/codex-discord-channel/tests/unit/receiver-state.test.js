@@ -6,11 +6,51 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
+  createReceiverOwnership,
   getStagedReceiverAuthorityPath,
   isActiveDiscordReceiver,
   readReceiverAuthoritySnapshot,
   releaseReceiverOwnership,
 } = require('../../src/receiver-state');
+
+test('new receiver records bind PID reuse checks to process start ticks, not session ids', () => {
+  const record = createReceiverOwnership(null, {
+    pid: 12345,
+    processStartTicks: '998877',
+    stateDir: '/tmp/codex02-state',
+    randomUUID: () => 'receiver-generation',
+    now: () => Date.parse('2026-08-27T18:00:00.000Z'),
+  });
+
+  assert.equal(record.pid, 12345);
+  assert.equal(record.processStartTicks, '998877');
+  assert.equal(record.stateDir, '/tmp/codex02-state');
+  assert.equal(record.role, 'gateway');
+  assert.equal('threadId' in record, false);
+  assert.equal('sessionId' in record, false);
+});
+
+test('a reused live PID with different start ticks is diagnosed as stale', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-reused-pid-'));
+  const gatewayPidPath = path.join(dir, 'session-gateway.pid');
+  const config = { paths: { gatewayPidPath } };
+  fs.writeFileSync(gatewayPidPath, `${JSON.stringify({
+    version: 2,
+    pid: 12345,
+    generation: 'old-gateway-generation',
+    claimedAt: '2026-08-27T18:00:00.000Z',
+    processStartTicks: '100',
+    stateDir: dir,
+    role: 'gateway',
+    fallback: null,
+  })}\n`);
+
+  const decision = isActiveDiscordReceiver(config, {
+    isProcessAlive: () => true,
+    readProcessStartTicks: () => '200',
+  });
+  assert.deepEqual(decision, { active: false, reason: 'stale_gateway_pid', pid: 12345 });
+});
 
 test('gateway pid file selects active receiver independently from owner id', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-'));
