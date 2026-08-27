@@ -5,7 +5,9 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const test = require('node:test');
+const nodeTest = require('node:test');
+const { stateDirContractTest } = require('./retired-session-bound-contracts');
+const test = stateDirContractTest(nodeTest);
 const { createAppServerHost } = require('../../src/app-server-host');
 const {
   createDelivery,

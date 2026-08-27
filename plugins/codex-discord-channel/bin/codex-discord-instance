@@ -109,12 +109,6 @@ if [[ ! $timeout_seconds =~ ^[0-9]+$ ]]; then
   echo "CODEX_DISCORD_START_TIMEOUT_SECONDS must be a non-negative integer" >&2
   exit 2
 fi
-recovery_timeout_seconds=${CODEX_DISCORD_RECOVERY_TIMEOUT_SECONDS:-30}
-if [[ ! $recovery_timeout_seconds =~ ^[0-9]+$ ]] \
-  || ((recovery_timeout_seconds < 1 || recovery_timeout_seconds > 300)); then
-  echo "CODEX_DISCORD_RECOVERY_TIMEOUT_SECONDS must be an integer from 1 to 300" >&2
-  exit 2
-fi
 stop_timeout_ms=${CODEX_DISCORD_STOP_TIMEOUT_MS:-5000}
 if [[ ! $stop_timeout_ms =~ ^[0-9]+$ ]] || ((stop_timeout_ms < 50 || stop_timeout_ms > 30000)); then
   echo "CODEX_DISCORD_STOP_TIMEOUT_MS must be an integer from 50 to 30000" >&2
@@ -126,27 +120,6 @@ socket_generation() {
   stat -Lc '%d:%i:%z' "$socket"
 }
 
-begin_tui_lease() {
-  local lease_id=$1
-  local started_at_ms=$2
-  "${channel_command[@]}" tui-recovery-target begin \
-    "$launcher_pid" "$launcher_start_ticks" "$lease_id" "$started_at_ms" \
-    "${runtime_args[@]}" >/dev/null
-}
-
-snapshot_recovery_target() {
-  local minimum_mtime_ms=$1
-  local lease_id=$2
-  "${channel_command[@]}" tui-recovery-target snapshot "$minimum_mtime_ms" "$lease_id" \
-    "${runtime_args[@]}" >/dev/null
-}
-
-read_recovery_target() {
-  "${channel_command[@]}" tui-recovery-target read "${runtime_args[@]}"
-}
-
-watcher_pid=''
-watcher_stop=''
 app_pid=''
 app_start_ticks=''
 app_pgid=''
@@ -158,23 +131,9 @@ tui_start_ticks=''
 tui_pgid=''
 launcher_pid=$$
 launcher_start_ticks=$(awk '{print $22}' "/proc/$launcher_pid/stat")
-current_lease_id=''
 launch_generation=''
 generation_manifest="$state_dir/instance-generation.json"
 generation_command=("$node_bin" "$generation_bin")
-stop_watcher() {
-  if [[ -n $watcher_stop ]]; then
-    : >"$watcher_stop"
-  fi
-  if [[ -n $watcher_pid ]]; then
-    wait "$watcher_pid" 2>/dev/null || true
-  fi
-  if [[ -n $watcher_stop ]]; then
-    rm -f "$watcher_stop"
-  fi
-  watcher_pid=''
-  watcher_stop=''
-}
 generation_identity_args() {
   printf '%s\0' \
     --manifest "$generation_manifest" \
@@ -391,11 +350,6 @@ cleanup_launcher() {
   # before removing EXIT ownership so no second signal can strand descendants.
   trap '' INT TERM HUP
   trap - EXIT
-  stop_watcher
-  if [[ -n $current_lease_id ]]; then
-    "${channel_command[@]}" tui-recovery-target clear-owned "$current_lease_id" \
-      "${runtime_args[@]}" >/dev/null 2>&1 || true
-  fi
   stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
   stop_worker gateway "$gateway_pid" "$gateway_start_ticks" "$gateway_pgid"
   stop_worker app "$app_pid" "$app_start_ticks" "$app_pgid"
@@ -456,6 +410,24 @@ generation_channel_command=(
   "${generation_env[@]}"
 )
 
+start_gateway_worker() {
+  (
+    exec {launcher_lock_fd}>&-
+    exec "$setsid_bin" "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
+      "$node_bin" "$channel_bin" gateway "${runtime_args[@]}"
+  ) >>"$state_dir/session-gateway.log" 2>&1 &
+  gateway_pid=$!
+  if ! record_worker_group "$gateway_pid"; then
+    gateway_start_ticks=$recorded_worker_start_ticks
+    gateway_pgid=$recorded_worker_pgid
+    gateway_pid=''
+    return 1
+  fi
+  gateway_start_ticks=$recorded_worker_start_ticks
+  gateway_pgid=$recorded_worker_pgid
+  return 0
+}
+
 umask 077
 (
   exec {launcher_lock_fd}>&-
@@ -486,20 +458,10 @@ if ! record_worker_group "$app_pid"; then
 fi
 app_start_ticks=$recorded_worker_start_ticks
 app_pgid=$recorded_worker_pgid
-(
-  exec {launcher_lock_fd}>&-
-  exec "$setsid_bin" "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=gateway \
-    "$node_bin" "$channel_bin" gateway "${runtime_args[@]}"
-) >>"$state_dir/session-gateway.log" 2>&1 &
-gateway_pid=$!
-if ! record_worker_group "$gateway_pid"; then
-  gateway_start_ticks=$recorded_worker_start_ticks
-  gateway_pgid=$recorded_worker_pgid
+if ! start_gateway_worker; then
   echo "Discord gateway for $instance did not isolate its process group" >&2
   exit 1
 fi
-gateway_start_ticks=$recorded_worker_start_ticks
-gateway_pgid=$recorded_worker_pgid
 
 deadline=$((SECONDS + timeout_seconds))
 while ((SECONDS <= deadline)); do
@@ -520,171 +482,77 @@ while ((SECONDS <= deadline)); do
     fi
     "${channel_command[@]}" live-check "${runtime_args[@]}" \
       --pid "$app_pid" --pid "$gateway_pid" >/dev/null
-    codex_args=("$@")
-    recovery_stamps=()
-    while true; do
-      tui_socket_generation=$(socket_generation)
-      launch_mtime_ms=$("$node_bin" -e 'process.stdout.write(String(Date.now()))')
-      current_lease_id=$(tr -d '\n' </proc/sys/kernel/random/uuid)
-      begin_tui_lease "$current_lease_id" "$launch_mtime_ms"
-      watcher_stop=$(mktemp "$state_dir/.tui-recovery-stop.XXXXXX")
-      rm -f "$watcher_stop"
-      (
-        exec {launcher_lock_fd}>&-
-        while [[ ! -e $watcher_stop ]] && kill -0 "$launcher_pid" 2>/dev/null; do
-          snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
-          sleep 0.2
-        done
-      ) </dev/null &
-      watcher_pid=$!
-
-      set +e
-      (
-        exec {launcher_lock_fd}>&-
-        exec env \
-          "${child_env_unsets[@]}" \
-          -u CODEX_THREAD_ID \
-          -u CODEX_SESSION_ID \
-          -u CODEX_TARGET_THREAD_ID \
-          -u CODEX_APP_SERVER_SOCKET \
-          CODEX_HOME="$codex_home" \
-          DISCORD_INSTANCE="$instance" \
-          DISCORD_CONFIG_DIR="$state_dir" \
-          CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
-          "${generation_env[@]}" \
-          CODEX_DISCORD_LAUNCH_ROLE=tui \
-          "$node_bin" "$codex_bin" --remote "unix://$socket" \
-          "${codex_enter_compat_args[@]}" "${codex_args[@]}"
-      ) <&0 >&1 2>&2 &
-      tui_pid=$!
-      if ! record_worker_group "$tui_pid" 0; then
-        tui_start_ticks=$recorded_worker_start_ticks
-        tui_pgid=$recorded_worker_pgid
-        echo "Discord TUI identity for $instance was unavailable" >&2
-        exit 1
-      fi
+    set +e
+    (
+      exec {launcher_lock_fd}>&-
+      exec env \
+        "${child_env_unsets[@]}" \
+        -u CODEX_THREAD_ID \
+        -u CODEX_SESSION_ID \
+        -u CODEX_TARGET_THREAD_ID \
+        -u CODEX_APP_SERVER_SOCKET \
+        CODEX_HOME="$codex_home" \
+        DISCORD_INSTANCE="$instance" \
+        DISCORD_CONFIG_DIR="$state_dir" \
+        CODEX_DISCORD_DELIVERY_ACTIVATION_ID="$plugin_root" \
+        "${generation_env[@]}" \
+        CODEX_DISCORD_LAUNCH_ROLE=tui \
+        "$node_bin" "$codex_bin" --remote "unix://$socket" \
+        "${codex_enter_compat_args[@]}" "$@"
+    ) <&0 >&1 2>&2 &
+    tui_pid=$!
+    if ! record_worker_group "$tui_pid" 0; then
       tui_start_ticks=$recorded_worker_start_ticks
       tui_pgid=$recorded_worker_pgid
+      echo "Discord TUI process identity for $instance was unavailable" >&2
+      exit 1
+    fi
+    tui_start_ticks=$recorded_worker_start_ticks
+    tui_pgid=$recorded_worker_pgid
+    gateway_restart_count=0
+    while true; do
       completed_pid=''
       wait -n -p completed_pid "$tui_pid" "$app_pid" "$gateway_pid"
       child_status=$?
-      set -e
-      if [[ $completed_pid != "$tui_pid" ]]; then
-        failed_worker=app-server
-        if [[ $completed_pid == "$gateway_pid" ]]; then
-          failed_worker=gateway
-          gateway_pid=''
-        elif [[ $completed_pid == "$app_pid" ]]; then
-          app_pid=''
-        fi
-        stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
-        tui_pid=''
-        tui_start_ticks=''
-        tui_pgid=''
-        echo "Discord $failed_worker for $instance exited while the TUI was active" >&2
-        exit 75
+      if [[ $completed_pid != "$gateway_pid" ]]; then
+        break
       fi
-      tui_status=$child_status
+      wait "$gateway_pid" 2>/dev/null || true
+      gateway_pid=''
+      gateway_start_ticks=''
+      gateway_pgid=''
+      gateway_restart_count=$((gateway_restart_count + 1))
+      sleep 0.25
+      if ! start_gateway_worker; then
+        echo "Discord gateway for $instance could not be restarted" >&2
+        completed_pid='gateway-restart-failed'
+        child_status=75
+        break
+      fi
+      echo "Discord gateway for $instance restarted while the TUI remained active (attempt $gateway_restart_count)" >&2
+    done
+    set -e
+    if [[ $completed_pid != "$tui_pid" ]]; then
+      failed_worker=app-server
+      if [[ $completed_pid == "$gateway_pid" || $completed_pid == gateway-restart-failed ]]; then
+        failed_worker=gateway
+        gateway_pid=''
+      elif [[ $completed_pid == "$app_pid" ]]; then
+        app_pid=''
+      fi
       stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
       tui_pid=''
       tui_start_ticks=''
       tui_pgid=''
-      stop_watcher
-      snapshot_recovery_target "$launch_mtime_ms" "$current_lease_id" 2>/dev/null || true
-
-      if ((tui_status == 0 || tui_status == 130 || tui_status == 143)); then
-        "${channel_command[@]}" tui-recovery-target clear-owned "$current_lease_id" \
-          "${runtime_args[@]}" >/dev/null
-        exit "$tui_status"
-      fi
-
-      current_generation=$(socket_generation 2>/dev/null || true)
-      if [[ -n $current_generation && $current_generation == "$tui_socket_generation" ]]; then
-        exit "$tui_status"
-      fi
-
-      recovery_deadline=$((SECONDS + recovery_timeout_seconds))
-      next_generation=''
-      while ((SECONDS <= recovery_deadline)); do
-        next_generation=$(socket_generation 2>/dev/null || true)
-        if [[ -n $next_generation && $next_generation != "$tui_socket_generation" ]]; then
-          break
-        fi
-        sleep 0.1
-      done
-      if [[ -z $next_generation || $next_generation == "$tui_socket_generation" ]]; then
-        exit "$tui_status"
-      fi
-      if ! run_generation update-endpoint --nonce "$launch_generation" >/dev/null 2>&1; then
-        exit "$tui_status"
-      fi
-
-      set +e
-      recovery_thread=$(read_recovery_target 2>/dev/null)
-      recovery_target_status=$?
-      set -e
-      if ((recovery_target_status != 0)) || [[ -z $recovery_thread ]]; then
-        exit "$tui_status"
-      fi
-
-      now_seconds=$(date +%s)
-      retained_stamps=()
-      for stamp in "${recovery_stamps[@]}"; do
-        if ((now_seconds - stamp < 60)); then
-          retained_stamps+=("$stamp")
-        fi
-      done
-      recovery_stamps=("${retained_stamps[@]}")
-      if ((${#recovery_stamps[@]} >= 5)); then
-        echo "App-server recovery stopped after five replacements in one minute" >&2
-        exit 75
-      fi
-      recovery_stamps+=("$now_seconds")
-
-      recovered_args=()
-      option_index=0
-      while ((option_index < ${#codex_args[@]})); do
-        arg=${codex_args[$option_index]}
-        if [[ $arg == -- ]] || [[ $arg != -* ]]; then
-          break
-        fi
-        case $arg in
-          --oss|--full-auto|--dangerously-bypass-approvals-and-sandbox|--search|--no-alt-screen)
-            recovered_args+=("$arg")
-            option_index=$((option_index + 1))
-            ;;
-          --image=*)
-            option_index=$((option_index + 1))
-            ;;
-          --config=*|--enable=*|--disable=*|--model=*|--local-provider=*|--profile=*|--sandbox=*|--ask-for-approval=*|--cd=*|--add-dir=*)
-            recovered_args+=("$arg")
-            option_index=$((option_index + 1))
-            ;;
-          -i|--image)
-            if ((option_index + 1 >= ${#codex_args[@]})); then
-              echo "App-server recovery cannot discard $arg without its value" >&2
-              exit "$tui_status"
-            fi
-            option_index=$((option_index + 2))
-            ;;
-          -c|--config|--enable|--disable|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir)
-            if ((option_index + 1 >= ${#codex_args[@]})); then
-              echo "App-server recovery cannot preserve $arg without its value" >&2
-              exit "$tui_status"
-            fi
-            recovered_args+=("$arg" "${codex_args[$((option_index + 1))]}")
-            option_index=$((option_index + 2))
-            ;;
-          *)
-            echo "App-server recovery refuses unknown global option $arg" >&2
-            exit "$tui_status"
-            ;;
-        esac
-      done
-      recovered_args+=(resume "$recovery_thread")
-      codex_args=("${recovered_args[@]}")
-      echo "App-server generation changed; resuming thread $recovery_thread." >&2
-    done
+      echo "Discord $failed_worker for $instance exited while the TUI was active" >&2
+      exit 75
+    fi
+    tui_status=$child_status
+    stop_tui_worker "$tui_pid" "$tui_start_ticks" "$tui_pgid"
+    tui_pid=''
+    tui_start_ticks=''
+    tui_pgid=''
+    exit "$tui_status"
   fi
   sleep 0.1
 done

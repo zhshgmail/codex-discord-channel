@@ -207,7 +207,7 @@ var require_config = __commonJS({
         strict: !0
       }), envLoaded = options.loadDiscordEnv === !1 ? !1 : loadEnvFile(paths.envFile, env);
       paths = resolvePaths(env);
-      let token = env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || "", botUserId = env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || "", proxyUrl = env.DISCORD_PROXY_URL || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || "", cwd = env.CODEX_CWD || options.cwd || process.cwd(), ownerId = env.CODEX_DISCORD_OWNER_ID || env.CODEX_THREAD_ID || env.CODEX_SESSION_ID || env.CODEX_TARGET_THREAD_ID || `${os.hostname()}:${process.pid}:${Date.now()}`, requestedDeliveryMode = String(
+      let token = env.DISCORD_BOT_TOKEN || env.DISCORD_TOKEN || "", botUserId = env.DISCORD_BOT_USER_ID || env.DISCORD_BOT_ID || "", proxyUrl = env.DISCORD_PROXY_URL || env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || "", cwd = env.CODEX_CWD || options.cwd || process.cwd(), ownerId = `discord-state:${paths.stateDir}`, requestedDeliveryMode = String(
         env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || "app-server"
       ).toLowerCase(), deliveryMode = requestedDeliveryMode === "off" ? "off" : "app-server", appServerUrl = String(
         env.CODEX_DISCORD_APP_SERVER_URL || `unix://${paths.stateDir}/app-server.sock`
@@ -255,7 +255,10 @@ var require_config = __commonJS({
           env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
           18e4
         ),
-        requireTuiLease: !0,
+        // The state directory and its single supervised app-server are the instance
+        // identity.  A Codex session/thread is transient transport state and must
+        // never become a receive or replay gate.
+        requireTuiLease: !1,
         tuiLeaseStaleMs: Math.max(
           1e3,
           parseInteger(env.CODEX_DISCORD_TUI_LEASE_STALE_MS, 3e3)
@@ -3401,8 +3404,10 @@ var require_app_server_host = __commonJS({
         "shared_app_server_socket_missing"
       ].includes(error?.code);
     }
-    function ephemeralIncludeTurnsUnsupported(error) {
-      return error?.code === "shared_app_server_request_rejected" && error?.rpcCode === -32600 && /ephemeral threads do not support includeTurns/i.test(String(error?.message || ""));
+    function includeTurnsUnsupported(error) {
+      if (error?.code !== "shared_app_server_request_rejected") return !1;
+      let message = String(error?.message || "");
+      return error.rpcCode === -32601 && /list_turns is not supported yet/i.test(message) || error.rpcCode === -32600 && /ephemeral threads do not support includeTurns/i.test(message);
     }
     function deliveryProofKey(threadId, clientUserMessageId) {
       return JSON.stringify([threadId, clientUserMessageId]);
@@ -3681,7 +3686,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.16"
+              version: "0.3.17"
             },
             capabilities: {
               experimentalApi: !0,
@@ -3856,7 +3861,7 @@ var require_app_server_host = __commonJS({
           threadId,
           clientUserMessageId,
           fsPromises
-        ) : async () => !1, this.loadedInventoryProven = !1, this.restoredTargetCheckpoint = this.loadTargetCheckpoint(), this.observedTuiLeaseTarget = null, this.requireTuiLease && this.restoredTargetCheckpoint) {
+        ) : async () => !1, this.loadedInventoryProven = !1, this.restoredTargetCheckpoint = null, this.clearTargetCheckpoint(), this.observedTuiLeaseTarget = null, this.requireTuiLease && this.restoredTargetCheckpoint) {
           let checkpoint = this.restoredTargetCheckpoint, lease = this.readTuiLease(checkpoint.threadId);
           (!lease.available || lease.record.leaseId !== checkpoint.leaseId) && (this.restoredTargetCheckpoint = null);
         }
@@ -4018,31 +4023,6 @@ var require_app_server_host = __commonJS({
         this.clearTargetCheckpoint();
       }
       persistTargetCheckpoint() {
-        if (!this.targetCheckpointPath) return;
-        let threadId = this.currentThreadId;
-        if (!threadId || !this.loadedInventoryProven || !this.knownLoadedThreadIds.has(threadId))
-          return;
-        let lease = this.readTuiLease(threadId);
-        if (!lease.available) return;
-        let record = {
-          version: this.requireTuiLease ? TARGET_CHECKPOINT_VERSION : 2,
-          threadId,
-          loadedThreadIds: [...this.knownLoadedThreadIds].sort()
-        };
-        this.requireTuiLease && (record.leaseId = lease.record.leaseId);
-        let directory = path.dirname(this.targetCheckpointPath), tempPath = `${this.targetCheckpointPath}.tmp-${process.pid}-${Date.now()}`;
-        try {
-          this.fs.mkdirSync(directory, { recursive: !0, mode: 448 }), this.fs.writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}
-`, { mode: 384 }), this.fs.renameSync(tempPath, this.targetCheckpointPath), this.fs.chmodSync(this.targetCheckpointPath, 384), this.clearTargetInvalidation();
-        } catch (error) {
-          try {
-            this.fs.unlinkSync(tempPath);
-          } catch {
-          }
-          this.logger("WARN", "Unable to persist app-server target checkpoint", {
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
       }
       status() {
         let status = { ...this.lastStatus };
@@ -4100,7 +4080,69 @@ var require_app_server_host = __commonJS({
         !threadId || typeof turnId != "string" || !turnId || connectionGeneration != null && this.client.connectionGeneration !== connectionGeneration || (this.threadSelectionRevision += 1, this.currentThreadId = threadId, this.threadStatuses.set(threadId, "active"), this.activeTurnIds.set(threadId, turnId), this.activeTurnProvenance.set(threadId, "turn_start_response"), this.persistTargetCheckpoint(), this.emit("active", { threadId, turnId }));
       }
       async resolveTarget() {
-        return this.resolveTargetAttempt({ revisionRestarts: 0 });
+        return this.resolveStateDirTarget();
+      }
+      async resolveStateDirTarget() {
+        let connectionGeneration = null, request = async (method, params) => {
+          if (typeof this.client.requestOnConnection != "function")
+            return this.client.request(method, params);
+          let response = await this.client.requestOnConnection(
+            method,
+            params,
+            connectionGeneration
+          );
+          return connectionGeneration = response.generation, response.result;
+        };
+        try {
+          let loaded = await request("thread/loaded/list", { limit: 100 });
+          if (!Array.isArray(loaded?.data) || loaded.data.length === 0) {
+            let reason = "shared_app_server_no_loaded_thread";
+            return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+          }
+          let orderedIds = [...new Set(loaded.data.filter((value) => typeof value == "string" && value.trim() !== ""))];
+          if (orderedIds.length === 0) {
+            let reason = "shared_app_server_no_loaded_thread";
+            return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+          }
+          this.currentThreadId && orderedIds.includes(this.currentThreadId) && (orderedIds.splice(orderedIds.indexOf(this.currentThreadId), 1), orderedIds.unshift(this.currentThreadId));
+          let response = null, threadId = "";
+          for (let candidateId of orderedIds) {
+            let candidateResponse = await request("thread/read", {
+              threadId: candidateId,
+              includeTurns: !0
+            }).catch(async (error) => {
+              if (!includeTurnsUnsupported(error)) throw error;
+              return request("thread/read", { threadId: candidateId });
+            }), candidate = candidateResponse?.thread;
+            if (candidate?.id === candidateId && candidate.parentThreadId == null) {
+              response = candidateResponse, threadId = candidateId;
+              break;
+            }
+          }
+          let thread = response?.thread;
+          if (!thread || !threadId) {
+            let reason = "shared_app_server_no_top_level_thread";
+            return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+          }
+          let status = thread.status?.type || "unavailable";
+          if (!["idle", "active", "systemError"].includes(status)) {
+            let reason = "shared_app_server_thread_unavailable";
+            return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+          }
+          this.currentThreadId = threadId, this.threadStatuses.set(threadId, status);
+          let target = { available: !0, threadId, status };
+          if (status === "active") {
+            let activeTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1) || this.activeTurnIds.get(threadId) || "";
+            activeTurnId && (this.activeTurnIds.set(threadId, activeTurnId), target.activeTurnId = activeTurnId);
+          } else
+            this.activeTurnIds.delete(threadId);
+          return this.lastStatus = { configured: !0, available: !0, reason: null }, Object.defineProperty(target, TARGET_GENERATION, {
+            value: Object.freeze({ connectionGeneration })
+          }), target;
+        } catch (error) {
+          let reason = error?.code || "shared_app_server_unavailable";
+          return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+        }
       }
       async resolveTargetAttempt(resolutionBudget) {
         let initialLease = this.readTuiLease();
@@ -4265,10 +4307,12 @@ var require_app_server_host = __commonJS({
               leaseId: initialLease.record.leaseId,
               threadId
             });
-          else {
-            let reason = topLevelThreads.length > 1 ? "shared_app_server_thread_ambiguous" : "shared_app_server_thread_unprovable";
-            return reason === "shared_app_server_thread_unprovable" ? rejectUnprovableTopology() : (this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" });
-          }
+          else if (topLevelThreads.length > 1)
+            [{ threadId, response }] = topLevelThreads, this.logger("INFO", "Selected the most recent top-level thread for the state-dir instance", {
+              loadedTopLevelCount: topLevelThreads.length
+            });
+          else
+            return rejectUnprovableTopology();
         }
         let cachedActiveTurnId = !response && this.threadStatuses.get(threadId) === "active" && this.activeTurnIds.get(threadId);
         if (cachedActiveTurnId && (response = {
@@ -4337,30 +4381,18 @@ var require_app_server_host = __commonJS({
         }), target;
       }
       async startTurn(params, target) {
-        let validateTarget = (candidate) => {
-          let generation = candidate?.[TARGET_GENERATION], lease = this.readTuiLease(params.threadId);
-          if (!lease.available)
-            throw deliveryError(
-              "The supervised TUI lease is no longer fresh for structured delivery.",
-              lease.reason
-            );
-          let statusChanged = candidate?.status === "active" ? !candidate.activeTurnId || this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId : this.threadStatuses.get(params.threadId) !== candidate?.status, connectionChanged = generation?.connectionGeneration != null && this.client.connectionGeneration !== generation.connectionGeneration;
-          if (!generation || connectionChanged || generation.threadSelectionRevision !== this.threadSelectionRevision || generation.threadId !== params.threadId || generation.leaseId !== (lease.record?.leaseId || "") || candidate.threadId !== params.threadId || this.currentThreadId !== params.threadId || statusChanged)
-            throw deliveryError(
-              "The current app-server thread changed before structured turn submission.",
-              "shared_app_server_thread_changed"
-            );
-          return lease;
-        }, submit = async (candidate) => {
-          let generation = candidate[TARGET_GENERATION];
-          validateTarget(candidate);
-          let method = candidate.status === "active" ? "turn/steer" : "turn/start", requestParams = candidate.status === "active" ? { ...params, expectedTurnId: candidate.activeTurnId } : params;
+        let submit = async (candidate) => {
+          let generation = candidate[TARGET_GENERATION], method = candidate.status === "active" ? "turn/steer" : "turn/start", requestParams = candidate.status === "active" ? {
+            ...params,
+            threadId: candidate.threadId,
+            ...candidate.activeTurnId ? { expectedTurnId: candidate.activeTurnId } : {}
+          } : { ...params, threadId: candidate.threadId };
           if (typeof this.client.requestOnConnection == "function") {
             let response = await this.client.requestOnConnection(
               method,
               requestParams,
-              generation.connectionGeneration,
-              () => validateTarget(candidate),
+              generation?.connectionGeneration ?? null,
+              null,
               !0
             );
             return {
@@ -4374,60 +4406,17 @@ var require_app_server_host = __commonJS({
             result: await this.client.request(method, requestParams),
             acceptedGeneration: null
           };
-        }, rejectedWithoutSubmissionUncertainty = (error) => error?.deliveryOutcome === "rejected" || error?.deliveryOutcome === "not_sent", invalidateChangedLease = (candidate) => {
-          let generation = candidate?.[TARGET_GENERATION];
-          if (!this.requireTuiLease || !generation || this.currentThreadId !== params.threadId)
-            return !1;
-          let lease = this.readTuiLease(params.threadId);
-          return !lease.available || !lease.record || lease.record.leaseId === generation.leaseId ? !1 : (this.threadSelectionRevision += 1, this.timeoutRecoveryTarget = null, this.currentThreadId = "", this.threadStatuses.clear(), this.activeTurnIds.clear(), this.activeTurnProvenance.clear(), this.knownLoadedThreadIds.clear(), this.loadedInventoryProven = !1, this.observedTuiLeaseTarget = null, this.invalidateTargetCheckpoint("tui_lease_replaced"), this.restoredTargetCheckpoint = null, !0);
-        }, clearUnprovenActiveTurn = (candidate) => {
-          candidate?.status !== "active" || this.currentThreadId !== params.threadId || this.activeTurnIds.get(params.threadId) !== candidate.activeTurnId || (this.threadSelectionRevision += 1, this.timeoutRecoveryTarget = null, this.threadStatuses.set(params.threadId, "active"), this.activeTurnIds.delete(params.threadId), this.activeTurnProvenance.delete(params.threadId), this.persistTargetCheckpoint());
-        }, rebindAuthoritativeTurn = (candidate, error) => {
-          let mismatch = error?.authoritativeActiveTurnMismatch;
-          if (candidate?.status !== "active" || !rejectedWithoutSubmissionUncertainty(error) || mismatch?.provenance !== "trusted_local_app_server_rejection" || mismatch.expectedTurnId !== candidate.activeTurnId || !CANONICAL_TURN_ID.test(mismatch.activeTurnId) || mismatch.activeTurnId === candidate.activeTurnId)
-            return null;
-          let lease;
-          try {
-            lease = validateTarget(candidate);
-          } catch {
-            return invalidateChangedLease(candidate), null;
-          }
-          let generation = candidate[TARGET_GENERATION];
-          this.threadSelectionRevision += 1, this.timeoutRecoveryTarget = null, this.currentThreadId = params.threadId, this.threadStatuses.set(params.threadId, "active"), this.activeTurnIds.set(params.threadId, mismatch.activeTurnId), this.activeTurnProvenance.set(
-            params.threadId,
-            mismatch.provenance
-          ), this.persistTargetCheckpoint();
-          let rebound = {
-            available: !0,
-            threadId: params.threadId,
-            status: "active",
-            activeTurnId: mismatch.activeTurnId
-          };
-          return Object.defineProperty(rebound, TARGET_GENERATION, {
-            value: Object.freeze({
-              connectionGeneration: generation.connectionGeneration,
-              threadSelectionRevision: this.threadSelectionRevision,
-              threadId: params.threadId,
-              leaseId: lease.record?.leaseId || "",
-              activeTurnProvenance: mismatch.provenance
-            })
-          }), rebound;
         }, submitted;
         try {
           submitted = await submit(target);
         } catch (error) {
-          if (target?.status !== "active") throw error;
-          let rebound = rebindAuthoritativeTurn(target, error);
-          if (!rebound)
-            throw rejectedWithoutSubmissionUncertainty(error) && (invalidateChangedLease(target) || clearUnprovenActiveTurn(target)), error;
-          try {
-            submitted = await submit(rebound);
-          } catch (retryError) {
-            throw rebindAuthoritativeTurn(rebound, retryError) ? (retryError.code = "thread_busy", retryError) : (rejectedWithoutSubmissionUncertainty(retryError) && (invalidateChangedLease(rebound) || clearUnprovenActiveTurn(rebound)), retryError);
-          }
+          if (!["rejected", "not_sent"].includes(error?.deliveryOutcome)) throw error;
+          let current = await this.resolveStateDirTarget();
+          if (!current.available) throw error;
+          submitted = await submit(current), target = current;
         }
         return submitted.method === "turn/start" && this.rememberAcceptedTurn(
-          params.threadId,
+          target.threadId,
           submitted.result,
           submitted.acceptedGeneration
         ), submitted.result;
@@ -4446,7 +4435,7 @@ var require_app_server_host = __commonJS({
               signal
             )).result;
           } catch (error) {
-            if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
+            if (includeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
               return !1;
             throw error;
           }
@@ -4455,7 +4444,7 @@ var require_app_server_host = __commonJS({
           try {
             response = await this.client.request("thread/read", params);
           } catch (error) {
-            if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
+            if (includeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
               return !1;
             throw error;
           }
@@ -5264,7 +5253,7 @@ var require_delivery = __commonJS({
       readReceipt,
       receiptPath,
       replyNonce
-    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 4, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", STALE_DELIVERY_ACTIVATION = "stale_delivery_activation", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_BASE_MS = 5e3, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
+    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 5, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
     function currentTimeMs(deps = {}) {
       let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
       return Number.isFinite(value) ? value : Date.now();
@@ -5444,7 +5433,7 @@ ${normalized.content}${attachmentText}
       } catch {
         throw new Error(DELIVERY_QUEUE_ERROR_MESSAGE);
       }
-      if (![1, 2, 3, DELIVERY_QUEUE_VERSION].includes(parsed?.version) || !Array.isArray(parsed.items))
+      if (![1, 2, 3, 4, DELIVERY_QUEUE_VERSION].includes(parsed?.version) || !Array.isArray(parsed.items))
         throw new Error(`Invalid Discord delivery queue: ${file}`);
       return {
         version: parsed.version,
@@ -5525,63 +5514,36 @@ ${normalized.content}${attachmentText}
       let parsed = Date.parse(value);
       return Number.isFinite(parsed) ? parsed : null;
     }
-    function sourcePredatesActivation(normalized, activatedAtMs) {
-      if (normalized?.createdAt == null || normalized.createdAt === "") return !1;
-      let createdAtMs = timestampMs(normalized.createdAt);
-      return createdAtMs == null || createdAtMs < activatedAtMs;
-    }
-    function itemMatchesActivation(item, activationId, activatedAtMs) {
-      if (item?.activationId !== activationId) return !1;
-      let queuedAtMs = timestampMs(item.queuedAt);
-      return queuedAtMs == null || queuedAtMs < activatedAtMs ? !1 : !sourcePredatesActivation(item.normalized, activatedAtMs);
-    }
-    function archiveIdentity(archived, completed, identity, queuedAt, archivedAt) {
-      return !identity?.channelId || !identity?.messageId || archived.some((entry) => sameDiscordIdentity(entry, identity)) || completed.some((entry) => sameDiscordIdentity(entry, identity)) ? !1 : (archived.push({
-        channelId: identity.channelId,
-        messageId: identity.messageId,
-        queuedAt: queuedAt || null,
-        archivedAt,
-        reason: STALE_DELIVERY_ACTIVATION
-      }), !0);
-    }
     function activateDeliveryQueue(queue, config = {}, deps = {}) {
-      let activationId = deliveryActivationId(config, deps), activatedAtMs = timestampMs(queue.activation?.activatedAt), activationMatches = queue.activation?.id === activationId && activatedAtMs != null, itemIsEligible = (item) => itemMatchesActivation(item, activationId, activatedAtMs) && !queue.completed.some((entry) => sameDiscordIdentity(entry, item.normalized)) && !queue.archived.some((entry) => sameDiscordIdentity(entry, item.normalized)), staleItems = activationMatches ? queue.items.filter((item) => !itemIsEligible(item)) : queue.items, staleIdentities = new Set(staleItems.map((item) => `${item.normalized?.channelId || ""}\0${item.normalized?.messageId || ""}`)), eligibleItems = activationMatches ? queue.items.filter((item) => itemIsEligible(item)) : [], staleUncertain = activationMatches ? queue.uncertain.filter((item) => !itemIsEligible(item)) : queue.uncertain, eligibleUncertain = activationMatches ? queue.uncertain.filter((item) => itemIsEligible(item)) : [], archived = [...queue.archived], archivedAt = new Date(currentTimeMs(deps)).toISOString();
-      for (let item of [...staleItems, ...staleUncertain])
-        archiveIdentity(
-          archived,
-          queue.completed,
-          item.normalized,
-          item.queuedAt,
-          archivedAt
-        );
-      let headIdentity = queue.items[0]?.normalized, headWasArchived = headIdentity && staleIdentities.has(
-        `${headIdentity.channelId || ""}\0${headIdentity.messageId || ""}`
-      );
-      return queue.version !== DELIVERY_QUEUE_VERSION || !activationMatches || staleItems.length > 0 || staleUncertain.length > 0 ? {
+      let activationId = deliveryActivationId(config, deps), archivedAt = new Date(currentTimeMs(deps)).toISOString(), completed = queue.completed || [], archived = queue.archived || [], seen = /* @__PURE__ */ new Set(), eligible = [];
+      for (let item of [...queue.uncertain, ...queue.items]) {
+        let identity = item?.normalized;
+        if (!identity?.channelId || !identity?.messageId) continue;
+        let key = `${identity.channelId}\0${identity.messageId}`;
+        seen.has(key) || (seen.add(key), !completed.some((entry) => sameDiscordIdentity(entry, identity)) && (archived.some((entry) => sameDiscordIdentity(entry, identity)) || eligible.push({
+          version: DELIVERY_QUEUE_VERSION,
+          activationId,
+          queuedAt: item.queuedAt || archivedAt,
+          normalized: identity
+        })));
+      }
+      let activationMatches = queue.activation?.id === activationId;
+      return queue.version !== DELIVERY_QUEUE_VERSION || !activationMatches || queue.uncertain.length > 0 || eligible.length !== queue.items.length || eligible.some((item, index) => !sameDiscordIdentity(item.normalized, queue.items[index]?.normalized)) ? {
         queue: {
           version: DELIVERY_QUEUE_VERSION,
-          activation: activationMatches ? queue.activation : { id: activationId, activatedAt: archivedAt },
-          items: eligibleItems,
-          uncertain: eligibleUncertain,
-          completed: queue.completed,
+          activation: { id: activationId, activatedAt: queue.activation?.activatedAt || archivedAt },
+          items: eligible,
+          uncertain: [],
+          completed,
           archived,
-          blocked: !activationMatches || headWasArchived ? null : queue.blocked
+          blocked: queue.blocked?.reason === DELIVERY_ACK_UNCERTAIN ? null : queue.blocked
         },
         changed: !0,
-        archivedCount: staleItems.length + staleUncertain.length
+        archivedCount: 0
       } : { queue, changed: !1, archivedCount: 0 };
     }
     function queueDelivery(normalized, config = {}, deps = {}) {
-      let activated = activateDeliveryQueue(readDeliveryQueue(config, deps), config, deps), queue = activated.queue, activationId = queue.activation.id, activatedAtMs = timestampMs(queue.activation.activatedAt), identity = { channelId: normalized.channelId, messageId: normalized.messageId };
-      if (sourcePredatesActivation(normalized, activatedAtMs))
-        return archiveIdentity(
-          queue.archived,
-          queue.completed,
-          identity,
-          null,
-          new Date(currentTimeMs(deps)).toISOString()
-        ), writeDeliveryQueue(queue, config, deps), { queue, enqueued: !1, duplicate: "archived" };
-      let pendingDuplicate = queue.items.some((item) => sameDiscordIdentity(item.normalized, identity)), uncertainDuplicate = queue.uncertain.some((item) => sameDiscordIdentity(item.normalized, identity)), completedDuplicate = queue.completed.some((item) => sameDiscordIdentity(item, identity)), archivedDuplicate = queue.archived.some((item) => sameDiscordIdentity(item, identity));
+      let activated = activateDeliveryQueue(readDeliveryQueue(config, deps), config, deps), queue = activated.queue, activationId = queue.activation.id, identity = { channelId: normalized.channelId, messageId: normalized.messageId }, pendingDuplicate = queue.items.some((item) => sameDiscordIdentity(item.normalized, identity)), uncertainDuplicate = queue.uncertain.some((item) => sameDiscordIdentity(item.normalized, identity)), completedDuplicate = queue.completed.some((item) => sameDiscordIdentity(item, identity)), archivedDuplicate = queue.archived.some((item) => sameDiscordIdentity(item, identity));
       return !pendingDuplicate && !uncertainDuplicate && !completedDuplicate && !archivedDuplicate ? (queue.items.push({
         version: DELIVERY_QUEUE_VERSION,
         activationId,
@@ -5617,7 +5579,7 @@ ${normalized.content}${attachmentText}
       };
     }
     function pendingQueueDepth(queue) {
-      return queue.items.length + queue.uncertain.length;
+      return queue.items.length;
     }
     function receiverRejectedResult(queue, receiver = {}) {
       return blockedResult(
@@ -5714,42 +5676,13 @@ ${normalized.content}${attachmentText}
       };
       return reconcileTurnOutboundQueue(updated, config, deps), updated;
     }
-    function uncertainRetryDelayMs(config, attemptCount) {
-      let base = Math.max(
-        1,
-        Number(config.deliveryUncertainRetryBaseMs) || DEFAULT_UNCERTAIN_RETRY_BASE_MS
-      ), maximum = Math.max(
-        base,
-        Number(config.deliveryUncertainRetryMaxMs) || DEFAULT_UNCERTAIN_RETRY_MAX_MS
-      ), exponent = Math.max(0, Math.min(16, Number(attemptCount) - 1));
-      return Math.min(maximum, base * 2 ** exponent);
-    }
-    function moveQueueHeadToUncertain(queue, config, deps, details = {}) {
-      let item = queue.items.shift(), attempts = Math.max(0, Number(item.delivery?.attempts) || 0) + 1, deferredAtMs = currentTimeMs(deps);
-      return item.delivery = bindDurableTurnReplyOwner(queue, item, {
-        state: DELIVERY_ACK_UNCERTAIN,
-        attempts,
-        firstDeferredAt: item.delivery?.firstDeferredAt || new Date(deferredAtMs).toISOString(),
-        lastDeferredAt: new Date(deferredAtMs).toISOString(),
-        retryAt: new Date(
-          deferredAtMs + uncertainRetryDelayMs(config, attempts)
-        ).toISOString(),
-        messageId: item.normalized.messageId,
-        threadId: details.threadId || item.delivery?.threadId || "",
-        clientUserMessageId: details.clientUserMessageId || item.delivery?.clientUserMessageId || "",
-        turnId: details.turnId || item.delivery?.turnId || "",
-        error: details.error || item.delivery?.error || "",
-        turnReplyOwner: item.delivery?.turnReplyOwner,
-        turnReplyBoundAt: item.delivery?.turnReplyBoundAt
-      }, deps), queue.uncertain.push(item), queue.blocked = null, item;
-    }
-    async function deferCurrentHead(config, deps, expected, details = {}, verifyReceiverOwnership = null) {
+    async function releaseCurrentHeadForRetry(config, deps, expected, attemptId, verifyReceiverOwnership = null) {
       return withDeliveryQueueLock(config, deps, () => {
         let queue = readDeliveryQueue(config, deps);
         if (!queueHeadMatches(queue, expected)) return { retry: !0 };
         let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-        return receiverRejected ? { receiverRejected, queue } : (moveQueueHeadToUncertain(queue, config, deps, details), writeDeliveryQueue(queue, config, deps), {
-          result: blockedResult(queue, DELIVERY_ACK_UNCERTAIN, "failed"),
+        return receiverRejected ? { receiverRejected, queue } : attemptId && queue.blocked?.attemptId !== attemptId ? { retry: !0 } : (queue.blocked = null, writeDeliveryQueue(queue, config, deps), {
+          result: blockedResult(queue, "shared_app_server_retry"),
           queue
         });
       });
@@ -5781,43 +5714,6 @@ ${normalized.content}${attachmentText}
         }), snapshot = inspection.queue;
         if (inspection.receiverRejected)
           return receiverRejectedResult(snapshot, inspection.receiverRejected);
-        let uncertain = snapshot.uncertain[0];
-        if (uncertain) {
-          let threadId = uncertain.delivery?.threadId || "", clientUserMessageId = uncertain.delivery?.clientUserMessageId || "", alreadyAccepted = !1;
-          if (threadId && clientUserMessageId && typeof host.hasDelivered == "function")
-            try {
-              alreadyAccepted = await host.hasDelivered(threadId, clientUserMessageId);
-            } catch {
-            }
-          let reconciled = await withDeliveryQueueLock(config, deps, () => {
-            let queue = readDeliveryQueue(config, deps);
-            if (!sameDiscordIdentity(queue.uncertain[0]?.normalized, uncertain.normalized))
-              return { retry: !0 };
-            let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-            if (receiverRejected) return { receiverRejected, queue };
-            if (alreadyAccepted) {
-              let accepted = queue.uncertain.shift();
-              return queue.completed.push(completedRecord(
-                accepted,
-                bindDurableTurnReplyOwner(queue, accepted, accepted.delivery, deps),
-                deps
-              )), reconcileTurnOutboundQueue(queue, config, deps), writeDeliveryQueue(queue, config, deps), { completed: !0, queueDepth: queue.items.length + queue.uncertain.length };
-            }
-            let retryAt = timestampMs(uncertain.delivery?.retryAt);
-            return queue.uncertain.length > 1 && (queue.uncertain.push(queue.uncertain.shift()), writeDeliveryQueue(queue, config, deps)), { waiting: !0, retryAt, queue };
-          });
-          if (reconciled.retry) continue;
-          if (reconciled.receiverRejected)
-            return receiverRejectedResult(reconciled.queue, reconciled.receiverRejected);
-          if (reconciled.completed) {
-            reconciledCount += 1;
-            continue;
-          }
-          if (snapshot.items.length === 0) {
-            let result = blockedResult(snapshot, DELIVERY_ACK_UNCERTAIN);
-            return Number.isFinite(reconciled.retryAt) && reconciled.retryAt > currentTimeMs(deps) && Object.defineProperty(result, DELIVERY_LEASE_RETRY_AT, { value: reconciled.retryAt }), result;
-          }
-        }
         if (snapshot.items.length === 0)
           return reconciledCount > 0 ? {
             status: "delivered",
@@ -5826,39 +5722,6 @@ ${normalized.content}${attachmentText}
             queueDepth: 0
           } : { status: "idle", reason: "queue_empty", deliveredCount: 0, queueDepth: 0 };
         let next = snapshot.items[0];
-        if (snapshot.blocked?.reason === DELIVERY_ACK_UNCERTAIN) {
-          let threadId = snapshot.blocked.threadId || "", clientUserMessageId = snapshot.blocked.clientUserMessageId || "", alreadyAccepted = !1;
-          if (threadId && clientUserMessageId && typeof host.hasDelivered == "function")
-            try {
-              alreadyAccepted = await host.hasDelivered(threadId, clientUserMessageId);
-            } catch {
-            }
-          if (!alreadyAccepted) {
-            let deferred = await deferCurrentHead(
-              config,
-              deps,
-              next,
-              snapshot.blocked,
-              verifyReceiverOwnership
-            );
-            if (deferred.retry) continue;
-            return deferred.receiverRejected ? receiverRejectedResult(deferred.queue, deferred.receiverRejected) : deferred.result;
-          }
-          let reconciled = await withDeliveryQueueLock(config, deps, () => {
-            let queue = readDeliveryQueue(config, deps);
-            if (!queueHeadMatches(queue, next) || queue.blocked?.reason !== DELIVERY_ACK_UNCERTAIN)
-              return { retry: !0 };
-            let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-            if (receiverRejected) return { receiverRejected, queue };
-            let updated = completedQueue(queue, next, snapshot.blocked, config, deps);
-            return writeDeliveryQueue(updated, config, deps), { queueDepth: pendingQueueDepth(updated) };
-          });
-          if (reconciled.retry) continue;
-          if (reconciled.receiverRejected)
-            return receiverRejectedResult(reconciled.queue, reconciled.receiverRejected);
-          reconciledCount += 1;
-          continue;
-        }
         if (snapshot.blocked?.reason === DELIVERY_IN_PROGRESS) {
           let activeResult = activeAttemptBlockedResult(snapshot, deps);
           if (activeResult) return activeResult;
@@ -5875,21 +5738,15 @@ ${normalized.content}${attachmentText}
               return receiverRejectedResult(abandoned.queue, abandoned.receiverRejected);
             continue;
           }
-          let stale = await deferCurrentHead(
-            config,
-            deps,
-            next,
-            {
-              messageId: next.normalized.messageId,
-              threadId: snapshot.blocked.threadId || "",
-              clientUserMessageId: snapshot.blocked.clientUserMessageId || "",
-              error: "Previous structured delivery did not complete."
-            },
-            verifyReceiverOwnership
-          );
-          if (stale.retry) continue;
-          if (stale.receiverRejected)
-            return receiverRejectedResult(stale.queue, stale.receiverRejected);
+          let released = await withDeliveryQueueLock(config, deps, () => {
+            let queue = readDeliveryQueue(config, deps);
+            if (!queueHeadMatches(queue, next)) return { retry: !0 };
+            let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+            return receiverRejected ? { receiverRejected, queue } : (queue.blocked = null, writeDeliveryQueue(queue, config, deps), { released: !0 });
+          });
+          if (released.retry) continue;
+          if (released.receiverRejected)
+            return receiverRejectedResult(released.queue, released.receiverRejected);
           continue;
         }
         let attemptId = `${process.pid}-${currentTimeMs(deps)}-${Math.random().toString(16).slice(2)}`, claim = await withDeliveryQueueLock(config, deps, () => {
@@ -5960,7 +5817,6 @@ ${normalized.content}${attachmentText}
           return receiverRejected ? { receiverRejected, queue } : (queue.blocked = {
             ...queue.blocked,
             phase: "starting_turn",
-            threadId: target.threadId,
             clientUserMessageId: params.clientUserMessageId
           }, writeDeliveryQueue(queue, config, deps), { prepared: !0 });
         });
@@ -5973,83 +5829,33 @@ ${normalized.content}${attachmentText}
         try {
           response = await host.startTurn(params, target);
         } catch (error) {
-          let uncertain2 = error?.deliveryOutcome === "uncertain", reason = uncertain2 ? DELIVERY_ACK_UNCERTAIN : error?.code === "thread_busy" ? "thread_busy" : error?.code || "shared_app_server_unavailable", details = {
-            messageId: next.normalized.messageId,
-            threadId: target.threadId,
-            clientUserMessageId: params.clientUserMessageId,
-            turnId: target.status === "active" ? target.activeTurnId : "",
-            error: error instanceof Error ? error.message : String(error)
-          }, blocked;
-          if (uncertain2) {
-            let deferred = await deferCurrentHead(
-              config,
-              deps,
-              next,
-              details,
-              verifyReceiverOwnership
-            );
-            if (deferred.retry) continue;
-            if (deferred.receiverRejected)
-              return receiverRejectedResult(deferred.queue, deferred.receiverRejected);
-            blocked = deferred.result;
-          } else
-            blocked = await withDeliveryQueueLock(config, deps, () => {
-              let queue = readDeliveryQueue(config, deps);
-              if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId)
-                return blockedResult(queue, DELIVERY_ACK_UNCERTAIN, "failed");
-              let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
-              return receiverRejected ? receiverRejectedResult(queue, receiverRejected) : (setQueueBlock(queue, reason, details, config, deps), blockedResult(queue, reason));
-            });
-          return activeDeliveryAttempts.delete(attemptId), logger("ERROR", uncertain2 ? "Structured Discord delivery acknowledgement is uncertain" : "Structured Discord delivery was not accepted", {
+          let uncertain = error?.deliveryOutcome === "uncertain", reason = error?.code === "thread_busy" ? "thread_busy" : error?.code || (uncertain ? "shared_app_server_retry" : "shared_app_server_unavailable"), blocked = await withDeliveryQueueLock(config, deps, () => {
+            let queue = readDeliveryQueue(config, deps);
+            if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId)
+              return blockedResult(queue, reason);
+            let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
+            return receiverRejected ? receiverRejectedResult(queue, receiverRejected) : (queue.blocked = uncertain ? null : {
+              reason,
+              at: (/* @__PURE__ */ new Date()).toISOString(),
+              messageId: next.normalized.messageId,
+              clientUserMessageId: params.clientUserMessageId,
+              error: error instanceof Error ? error.message : String(error)
+            }, writeDeliveryQueue(queue, config, deps), blockedResult(queue, reason));
+          });
+          return activeDeliveryAttempts.delete(attemptId), logger("ERROR", uncertain ? "Structured Discord delivery will retry after response loss" : "Structured Discord delivery was not accepted", {
             reason,
             channelId: next.normalized.channelId,
             messageId: next.normalized.messageId,
             queueDepth: claim.queueDepth
           }), blocked;
         }
-        let persistedUserItem = !1;
-        try {
-          typeof host.hasDelivered == "function" && (persistedUserItem = await host.hasDelivered(
-            target.threadId,
-            params.clientUserMessageId
-          ));
-        } catch {
-        }
-        if (!persistedUserItem) {
-          let turnId = response?.turn?.id || response?.turnId || (target.status === "active" ? target.activeTurnId : ""), unverified = await deferCurrentHead(
-            config,
-            deps,
-            next,
-            {
-              messageId: next.normalized.messageId,
-              threadId: target.threadId,
-              clientUserMessageId: params.clientUserMessageId,
-              turnId,
-              error: "Structured turn was acknowledged but its user item was not observed."
-            },
-            verifyReceiverOwnership
-          );
-          if (activeDeliveryAttempts.delete(attemptId), unverified.retry) continue;
-          return unverified.receiverRejected ? receiverRejectedResult(unverified.queue, unverified.receiverRejected) : (logger("ERROR", "Structured Discord delivery acknowledgement was not persisted", {
-            reason: DELIVERY_ACK_UNCERTAIN,
-            channelId: next.normalized.channelId,
-            messageId: next.normalized.messageId,
-            queueDepth: claim.queueDepth
-          }), unverified.result);
-        }
         try {
           let turnId = response?.turn?.id || response?.turnId || (target.status === "active" ? target.activeTurnId : ""), committed = await withDeliveryQueueLock(config, deps, () => {
             let queue = readDeliveryQueue(config, deps);
             if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId)
-              return queueHeadMatches(queue, next) && (moveQueueHeadToUncertain(queue, config, deps, {
-                messageId: next.normalized.messageId,
-                threadId: target.threadId,
-                clientUserMessageId: params.clientUserMessageId,
-                turnId,
-                error: "Structured delivery checkpoint changed before commit."
-              }), writeDeliveryQueue(queue, config, deps)), {
-                uncertain: !0,
-                queueDepth: queue.items.length + queue.uncertain.length
+              return {
+                retry: !0,
+                queueDepth: pendingQueueDepth(queue)
               };
             let receiverRejected = rejectedReceiver(verifyReceiverOwnership);
             if (receiverRejected) return { receiverRejected, queue };
@@ -6060,9 +5866,9 @@ ${normalized.content}${attachmentText}
             }, config, deps);
             return writeDeliveryQueue(updated, config, deps), { queueDepth: updated.items.length + updated.uncertain.length };
           });
-          return activeDeliveryAttempts.delete(attemptId), committed.receiverRejected ? receiverRejectedResult(committed.queue, committed.receiverRejected) : committed.uncertain ? {
-            status: "failed",
-            reason: DELIVERY_ACK_UNCERTAIN,
+          return activeDeliveryAttempts.delete(attemptId), committed.receiverRejected ? receiverRejectedResult(committed.queue, committed.receiverRejected) : committed.retry ? {
+            status: "queued",
+            reason: "shared_app_server_retry",
             deliveredCount: 0,
             queueDepth: committed.queueDepth
           } : (logger("INFO", "Accepted queued Discord message through the shared app-server", {
@@ -6078,18 +5884,18 @@ ${normalized.content}${attachmentText}
           });
         } catch (error) {
           try {
-            await deferCurrentHead(config, deps, next, {
-              messageId: next.normalized.messageId,
-              threadId: target.threadId,
-              clientUserMessageId: params.clientUserMessageId,
-              turnId: response?.turn?.id || response?.turnId || (target.status === "active" ? target.activeTurnId : ""),
-              error: error instanceof Error ? error.message : String(error)
-            }, verifyReceiverOwnership);
+            await releaseCurrentHeadForRetry(
+              config,
+              deps,
+              next,
+              attemptId,
+              verifyReceiverOwnership
+            );
           } catch {
           }
           return activeDeliveryAttempts.delete(attemptId), {
-            status: "failed",
-            reason: DELIVERY_ACK_UNCERTAIN,
+            status: "queued",
+            reason: "shared_app_server_retry",
             error: error instanceof Error ? error.message : String(error),
             deliveredCount: 0,
             queueDepth: claim.queueDepth
@@ -95932,7 +95738,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.16", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.17", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

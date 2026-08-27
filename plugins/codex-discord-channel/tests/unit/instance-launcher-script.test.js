@@ -5,7 +5,9 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const test = require('node:test');
+const nodeTest = require('node:test');
+const { stateDirContractTest } = require('./retired-session-bound-contracts');
+const test = stateDirContractTest(nodeTest);
 
 const sourceLauncher = path.resolve(__dirname, '..', '..', 'bin', 'codex-discord-instance');
 const enterCompatTrace = '-c tui.keymap.composer.submit=["enter","ctrl-m"] -c tui.keymap.editor.insert_newline=["ctrl-j","enter","shift-enter","alt-enter"]';
@@ -146,7 +148,10 @@ while True:
     '  fi',
     '  if [[ ${GATEWAY_EXIT_WHEN_TUI_ACTIVE:-0} == 1 ]]; then',
     '    while [[ ! -e $TUI_ACTIVE_MARKER ]]; do sleep 0.01; done',
-    '    exit 42',
+    '    if [[ ! -e $STATE_DIR/gateway-exited-once ]]; then',
+    '      : >$STATE_DIR/gateway-exited-once',
+    '      exit 42',
+    '    fi',
     '  fi',
     '  trap \'exit 0\' TERM INT',
     '  while true; do sleep 0.1; done',
@@ -157,6 +162,10 @@ while True:
     'if [[ $1 == "$FAKE_CODEX_BIN" && $2 == --remote && ${TUI_STAY_ACTIVE:-0} == 1 ]]; then',
     '  : >"$TUI_ACTIVE_MARKER"',
     '  trap \'exit 0\' TERM INT',
+    '  if [[ ${TUI_EXIT_AFTER_GATEWAY_RESTART:-0} == 1 ]]; then',
+    '    while (( $(grep -c "node .* gateway" "$TRACE" 2>/dev/null || true) < 2 )); do sleep 0.02; done',
+    '    exit 0',
+    '  fi',
     '  while true; do sleep 0.1; done',
     'fi',
     'if [[ ${LOGIN_REQUIRED:-0} == 1 && $2 == tui-login-state && ! -f $LOGIN_MARKER ]]; then exit 10; fi',
@@ -489,15 +498,22 @@ test('launcher rejection never removes an app-server socket it does not own', ()
   assert.equal(fs.existsSync(socketPath), true, 'foreign socket must remain untouched');
 });
 
-test('worker exit fails the active TUI closed and cleans the owned socket', () => {
+test('gateway exit restarts the receiver without terminating the active TUI', () => {
   const setup = fixture();
   const result = spawnSync(setup.launcher, ['codex02'], {
     encoding: 'utf8',
-    env: launchEnv(setup, { GATEWAY_EXIT_WHEN_TUI_ACTIVE: '1', TUI_STAY_ACTIVE: '1' }),
+    env: launchEnv(setup, {
+      GATEWAY_EXIT_WHEN_TUI_ACTIVE: '1',
+      TUI_STAY_ACTIVE: '1',
+      TUI_EXIT_AFTER_GATEWAY_RESTART: '1',
+    }),
     timeout: 5000,
   });
-  assert.equal(result.status, 75, result.stderr);
-  assert.match(result.stderr, /Discord gateway .* exited while the TUI was active/);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Discord gateway .* restarted while the TUI remained active/);
+  const trace = fs.readFileSync(setup.trace, 'utf8');
+  assert.equal((trace.match(/node .* gateway/g) || []).length, 2);
+  assert.equal((trace.match(/node .* --remote/g) || []).length, 1);
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
 });
 

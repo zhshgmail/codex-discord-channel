@@ -8,7 +8,7 @@ const test = require('node:test');
 const { loadConfig, loadEnvFile } = require('../../src/config');
 
 const pluginRoot = path.resolve(__dirname, '..', '..');
-const releasePluginVersion = '0.3.16';
+const releasePluginVersion = '0.3.17';
 
 test('loadEnvFile does not override existing environment values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-config-'));
@@ -53,7 +53,7 @@ test('loadConfig resolves default instance state path', () => {
   assert.equal(config.deliveryUncertainRetryBaseMs, 5000);
   assert.equal(config.deliveryUncertainRetryMaxMs, 300000);
   assert.equal(config.gatewayHealthStaleMs, 180000);
-  assert.equal(config.requireTuiLease, true);
+  assert.equal(config.requireTuiLease, false);
   assert.equal(config.tuiLeaseStaleMs, 3000);
   assert.equal(config.messageContentIntent, true);
   assert.equal(config.cwd, '/workspace');
@@ -173,7 +173,7 @@ test('installed MCP recovers its account binding from plugin cache cwd when Code
   assert.equal(
     manifest.version,
     releasePluginVersion,
-    'marketplace cache identity must name the v0.3.16 plugin release',
+    'marketplace cache identity must name the v0.3.17 plugin release',
   );
   const pluginCwd = path.join(
     codexHome,
@@ -395,21 +395,27 @@ test('generic Codex app-server endpoint cannot redirect a Discord instance', () 
   assert.equal(config.appServerUrl, `unix://${path.join(stateDir, 'app-server.sock')}`);
 });
 
-test('loadConfig uses Codex thread id as stable owner id', () => {
+test('loadConfig uses the state directory as stable owner id', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const config = loadConfig({
-    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    HOME: home,
+    DISCORD_INSTANCE: 'codex02',
     CODEX_THREAD_ID: 'thread-123',
   });
-  assert.equal(config.ownerId, 'thread-123');
+  assert.equal(config.ownerId, `discord-state:${path.join(home, '.codex', 'channels', 'discord', 'codex02')}`);
 });
 
-test('explicit Discord owner id overrides Codex thread id', () => {
+test('session and explicit owner ids cannot override state-directory identity', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-'));
   const config = loadConfig({
-    HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-home-')),
+    HOME: home,
+    DISCORD_INSTANCE: 'codex02',
     CODEX_DISCORD_OWNER_ID: 'manual-owner',
     CODEX_THREAD_ID: 'thread-123',
+    CODEX_SESSION_ID: 'session-123',
+    CODEX_TARGET_THREAD_ID: 'target-123',
   });
-  assert.equal(config.ownerId, 'manual-owner');
+  assert.equal(config.ownerId, `discord-state:${path.join(home, '.codex', 'channels', 'discord', 'codex02')}`);
 });
 
 test('loadConfig accepts explicit owner pid for session binding metadata', () => {

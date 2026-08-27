@@ -182,12 +182,10 @@ function loadConfig(inputEnv = process.env, options = {}) {
     env.http_proxy ||
     '';
   const cwd = env.CODEX_CWD || options.cwd || process.cwd();
-  const ownerId =
-    env.CODEX_DISCORD_OWNER_ID ||
-    env.CODEX_THREAD_ID ||
-    env.CODEX_SESSION_ID ||
-    env.CODEX_TARGET_THREAD_ID ||
-    `${os.hostname()}:${process.pid}:${Date.now()}`;
+  // The configured state directory is the durable Discord identity.  Codex
+  // session/thread ids are intentionally excluded: /clear, resume, and TUI
+  // replacement may change them while the bot instance remains the same.
+  const ownerId = `discord-state:${paths.stateDir}`;
   const requestedDeliveryMode = String(
     env.CODEX_DISCORD_DELIVERY_MODE || env.DISCORD_DELIVERY_MODE || 'app-server',
   ).toLowerCase();
@@ -243,7 +241,10 @@ function loadConfig(inputEnv = process.env, options = {}) {
       env.CODEX_DISCORD_GATEWAY_HEALTH_STALE_MS,
       180000,
     ),
-    requireTuiLease: true,
+    // The state directory and its single supervised app-server are the instance
+    // identity.  A Codex session/thread is transient transport state and must
+    // never become a receive or replay gate.
+    requireTuiLease: false,
     tuiLeaseStaleMs: Math.max(
       1000,
       parseInteger(env.CODEX_DISCORD_TUI_LEASE_STALE_MS, 3000),
