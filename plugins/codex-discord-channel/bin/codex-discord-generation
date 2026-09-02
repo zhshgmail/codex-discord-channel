@@ -304,17 +304,21 @@ function matchingGenerationGroups(manifest, processes = listProcesses(), { allow
   }
   for (const [pgid, group] of groups) {
     const allMembers = processes.filter((item) => item.pgid === pgid);
+    const leader = allMembers.find((item) => item.pid === pgid);
+    if (leader && !leaderArgvMatches(leader, manifest, group.role)) {
+      // Generation variables are inherited by commands launched through the
+      // app server.  A command that starts its own process group is not a
+      // Discord role merely because it inherited those variables.
+      groups.delete(pgid);
+      continue;
+    }
     if (allMembers.length !== group.members.length) refuse(`process group ${pgid} contains a foreign member`);
     for (const member of allMembers) {
       if (!identityEnvMatches(member, manifest, group.role)) {
         refuse(`process group ${pgid} identity does not match the manifest`);
       }
     }
-    const leader = allMembers.find((item) => item.pid === pgid);
     if (!leader && !allowMissingLeaders) refuse(`process group ${pgid} has no verifiable leader`);
-    if (leader && !leaderArgvMatches(leader, manifest, group.role)) {
-      refuse(`process group ${pgid} leader argv does not match role ${group.role}`);
-    }
   }
   const appGroups = [...groups.entries()].filter(([, group]) => group.role === 'app');
   if (appGroups.length > 1 || (appGroups.length === 1 && appGroups[0][0] !== manifest.app.pgid)) {

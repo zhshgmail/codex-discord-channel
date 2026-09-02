@@ -53,6 +53,20 @@ source_generation_bin="$plugin_root/bin/codex-discord-generation"
 generation_runtime_dir="$state_dir/generation-runtime/current"
 channel_bin="$source_channel_bin"
 generation_bin="$source_generation_bin"
+
+print_repair_instruction() {
+  printf 'Repair command (copy/paste):\n' >&2
+  printf '%q ' "$launcher_path" "$instance" "$@" >&2
+  printf '\n' >&2
+}
+
+tui_args=("$@")
+for ((arg_index = 0; arg_index + 1 < ${#tui_args[@]}; arg_index += 1)); do
+  if [[ ${tui_args[$arg_index]} == resume && ${tui_args[$((arg_index + 1))]} == --last ]]; then
+    tui_args[$arg_index]=fork
+    break
+  fi
+done
 # Cross-version recovery is interpreted by the helper shipped with this
 # launcher.  An older durable snapshot may enforce an obsolete identity policy
 # (for example, binding authority to its evicted marketplace path) and must not
@@ -127,6 +141,18 @@ fi
 gateway_stop_timeout_ms=${CODEX_DISCORD_GATEWAY_STOP_TIMEOUT_MS:-30000}
 if [[ ! $gateway_stop_timeout_ms =~ ^[0-9]+$ ]] || ((gateway_stop_timeout_ms < 1000 || gateway_stop_timeout_ms > 120000)); then
   echo "CODEX_DISCORD_GATEWAY_STOP_TIMEOUT_MS must be an integer from 1000 to 120000" >&2
+  exit 2
+fi
+gateway_retry_base_ms=${CODEX_DISCORD_GATEWAY_RETRY_BASE_MS:-1000}
+if [[ ! $gateway_retry_base_ms =~ ^[0-9]+$ ]] \
+  || ((gateway_retry_base_ms < 100 || gateway_retry_base_ms > 5000)); then
+  echo "CODEX_DISCORD_GATEWAY_RETRY_BASE_MS must be an integer from 100 to 5000" >&2
+  exit 2
+fi
+gateway_retry_cap_ms=${CODEX_DISCORD_GATEWAY_RETRY_CAP_MS:-30000}
+if [[ ! $gateway_retry_cap_ms =~ ^[0-9]+$ ]] \
+  || ((gateway_retry_cap_ms < gateway_retry_base_ms || gateway_retry_cap_ms > 120000)); then
+  echo "CODEX_DISCORD_GATEWAY_RETRY_CAP_MS must be between the base delay and 120000" >&2
   exit 2
 fi
 
@@ -485,6 +511,13 @@ start_gateway_worker() {
   return 0
 }
 
+wait_gateway_retry() {
+  local delay_ms=$1
+  local seconds=$((delay_ms / 1000))
+  local milliseconds=$((delay_ms % 1000))
+  sleep "${seconds}.$(printf '%03d' "$milliseconds")"
+}
+
 umask 077
 (
   exec {launcher_lock_fd}>&-
@@ -526,10 +559,12 @@ while ((SECONDS <= deadline)); do
   # observing a pathname alone never grants cleanup authority.
   if ! worker_running "$app_pid"; then
     echo "Discord app-server for $instance exited during startup; see $state_dir/app-server.log" >&2
+    print_repair_instruction "$@"
     exit 1
   fi
   if ! worker_running "$gateway_pid"; then
     echo "Discord gateway for $instance exited during startup; see $state_dir/session-gateway.log" >&2
+    print_repair_instruction "$@"
     exit 1
   fi
   if [[ -S $socket ]]; then
@@ -555,7 +590,7 @@ while ((SECONDS <= deadline)); do
         "${generation_env[@]}" \
         CODEX_DISCORD_LAUNCH_ROLE=tui \
         "$node_bin" "$codex_bin" --remote "unix://$socket" \
-        "${codex_enter_compat_args[@]}" "$@"
+        "${codex_enter_compat_args[@]}" "${tui_args[@]}"
     ) <&0 >&1 2>&2 &
     tui_pid=$!
     if ! record_worker_group "$tui_pid" 0; then
@@ -567,6 +602,8 @@ while ((SECONDS <= deadline)); do
     tui_start_ticks=$recorded_worker_start_ticks
     tui_pgid=$recorded_worker_pgid
     gateway_restart_count=0
+    gateway_retry_ms=$gateway_retry_base_ms
+    gateway_started_seconds=$SECONDS
     while true; do
       completed_pid=''
       wait -n -p completed_pid "$tui_pid" "$app_pid" "$gateway_pid"
@@ -579,19 +616,31 @@ while ((SECONDS <= deadline)); do
       gateway_start_ticks=''
       gateway_pgid=''
       gateway_restart_count=$((gateway_restart_count + 1))
-      sleep 0.25
-      if ! start_gateway_worker; then
-        echo "Discord gateway for $instance could not be restarted" >&2
-        completed_pid='gateway-restart-failed'
-        child_status=75
-        break
+      if ((SECONDS - gateway_started_seconds >= 300)); then
+        gateway_retry_ms=$gateway_retry_base_ms
       fi
-      echo "Discord gateway for $instance restarted while the TUI remained active (attempt $gateway_restart_count)" >&2
+      while true; do
+        wait_gateway_retry "$gateway_retry_ms"
+        if start_gateway_worker; then
+          gateway_started_seconds=$SECONDS
+          break
+        fi
+        printf 'Discord gateway process creation failed; retrying in %d ms\n' \
+          "$gateway_retry_ms" >>"$state_dir/session-gateway.log"
+        if ((gateway_retry_ms < gateway_retry_cap_ms)); then
+          gateway_retry_ms=$((gateway_retry_ms * 2))
+          ((gateway_retry_ms > gateway_retry_cap_ms)) && gateway_retry_ms=$gateway_retry_cap_ms
+        fi
+      done
+      if ((gateway_retry_ms < gateway_retry_cap_ms)); then
+        gateway_retry_ms=$((gateway_retry_ms * 2))
+        ((gateway_retry_ms > gateway_retry_cap_ms)) && gateway_retry_ms=$gateway_retry_cap_ms
+      fi
     done
     set -e
     if [[ $completed_pid != "$tui_pid" ]]; then
       failed_worker=app-server
-      if [[ $completed_pid == "$gateway_pid" || $completed_pid == gateway-restart-failed ]]; then
+      if [[ $completed_pid == "$gateway_pid" ]]; then
         failed_worker=gateway
         gateway_pid=''
       elif [[ $completed_pid == "$app_pid" ]]; then
@@ -602,6 +651,7 @@ while ((SECONDS <= deadline)); do
       tui_start_ticks=''
       tui_pgid=''
       echo "Discord $failed_worker for $instance exited while the TUI was active" >&2
+      print_repair_instruction "$@"
       exit 75
     fi
     tui_status=$child_status
@@ -615,4 +665,5 @@ while ((SECONDS <= deadline)); do
 done
 
 echo "Discord instance $instance did not become ready within the startup timeout" >&2
+print_repair_instruction "$@"
 exit 1

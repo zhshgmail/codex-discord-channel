@@ -368,6 +368,26 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
 });
 
+test('shell launcher forks the latest thread instead of contending for its active writer', () => {
+  const setup = fixture();
+  const result = spawnSync(
+    setup.launcher,
+    ['codex02', '--dangerously-bypass-approvals-and-sandbox', 'resume', '--last'],
+    {
+      encoding: 'utf8',
+      env: launchEnv(setup),
+      timeout: 5000,
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
+    .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
+  assert.deepEqual(tuiLaunches, [
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox fork --last`,
+  ]);
+});
+
 test('generation runtime survives marketplace eviction of the installed plugin cache', () => {
   const setup = fixture();
   const result = spawnSync(setup.launcher, ['codex02'], {
@@ -524,7 +544,7 @@ test('gateway exit restarts the receiver without terminating the active TUI', ()
     timeout: 5000,
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, /Discord gateway .* restarted while the TUI remained active/);
+  assert.doesNotMatch(result.stderr, /Discord gateway .* restarted while the TUI remained active/);
   const trace = fs.readFileSync(setup.trace, 'utf8');
   assert.equal((trace.match(/node .* gateway/g) || []).length, 2);
   assert.equal((trace.match(/node .* --remote/g) || []).length, 1);
