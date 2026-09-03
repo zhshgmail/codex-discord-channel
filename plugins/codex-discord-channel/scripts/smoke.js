@@ -5,7 +5,7 @@ const path = require('node:path');
 const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
-const PACKAGE_VERSION = '0.3.19';
+const PACKAGE_VERSION = '0.3.20';
 
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(root, relativePath), 'utf8'));
@@ -50,6 +50,22 @@ assert(
 );
 assert(pkg.version === PACKAGE_VERSION, 'package version mismatch');
 assert(SERVER_VERSION === PACKAGE_VERSION, 'MCP server version mismatch');
+assert(
+  pluginSkill.includes('<channel source="discord"'),
+  'Discord skill must trigger on Discord-origin envelopes',
+);
+for (const requiredReplyContract of [
+  'mcp__codex_discord_channel__discord_channel_send',
+  'replyTo: <message_id>',
+  'mcp__codex_discord_channel__discord_channel_read_history',
+  'do not send a duplicate',
+  'restarting, killing, or replacing',
+]) {
+  assert(
+    pluginSkill.includes(requiredReplyContract),
+    `Discord skill is missing reply contract: ${requiredReplyContract}`,
+  );
+}
 assert(pkg.bin['codex-discord-channel'] === 'bin/codex-discord-channel', 'bin entry mismatch');
 for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepare']) {
   assert(!Object.hasOwn(pkg.scripts, lifecycle), `package must not rely on ${lifecycle}`);
