@@ -1,9 +1,35 @@
 ---
 name: repair-codex-discord-delivery
-description: Diagnose and repair Codex Discord startup, inbound delivery, gateway restart, queue, duplicate-reply, and visible-TUI faults. Use when an alias starts but later messages disappear, the gateway exits, an app-server/socket generation is stale, resume history looks missing, or Codex01/Codex02 needs live recovery. Do not use for routine channel configuration.
+description: Use for every request delivered in a <channel source="discord" ...> envelope that requires a reply, and to diagnose or repair Codex Discord startup, inbound delivery, gateway restart, queue, duplicate-reply, and visible-TUI faults. Do not use for routine channel configuration.
 ---
 
 # Repair Codex Discord Delivery
+
+## Discord-origin reply gate (always)
+
+For every request delivered in a `<channel source="discord" ...
+reply="required">` envelope, this gate applies even when no delivery fault is
+being diagnosed.
+
+1. If the source or a newer owner instruction says to finish a read, handover,
+   verification, or other explicit no-reply gate first, send **zero** Discord
+   messages until that gate is complete. Continue all separable assigned work.
+2. After the gate, reply exactly once to that source with the current instance's
+   `mcp__codex_discord_channel__discord_channel_send` tool and these exact
+   fields: `{channelId: <channel_id>, replyTo: <message_id>, content: <reply>}`.
+   Never use a generic Discord sender, another alias, a webhook, or
+   `{followup: true}` for the required source reply.
+3. Retain the returned stable outbound message id. Then use this instance's
+   `mcp__codex_discord_channel__discord_channel_read_history` for the same
+   `channelId` and verify the outbound id, exact channel, reply parent, content,
+   and current bot author identity. Console output, an accepted send call,
+   queue state, or a receipt alone is not delivery.
+4. If readback is absent, uncertain, or mismatched, do not silently claim
+   success and do not send a duplicate. Preserve the source/outbound ids and
+   diagnose the first missing proof boundary.
+
+This reply workflow never authorizes installing or upgrading the plugin, or
+restarting, killing, or replacing its gateway, app server, or TUI.
 
 ## Non-negotiable identity model
 
@@ -40,24 +66,21 @@ or process-group mismatch:
 2. Resolve the alias (`type -a codex01` / `codex02`) and the exact instance state
    directory. Inspect the installed cache named by the active command line; do
    not infer live bytes from a checkout.
-3. Snapshot only that alias:
+3. Run the installed, read-only doctor for that exact alias:
 
    ```bash
-   python3 scripts/inspect_discord_delivery.py --instance codex02
-   python3 scripts/recover_startup_generation.py --instance codex02
+   <installed-plugin>/bin/codex-discord-channel instance-doctor \
+     --instance codex02 --state-dir ~/.codex/channels/discord/codex02
    ```
 
-4. Apply the recovery helper only when it identifies one exact stale alias
-   generation:
-
-   ```bash
-   python3 scripts/recover_startup_generation.py --instance codex02 --apply
-   ```
-
-5. If it refuses, inspect the manifest, `/proc` environment, parent chain,
+4. If startup refuses, inspect the manifest, `/proc` environment, parent chain,
    process group, socket inode, and cache path. Terminate only processes proven
    to belong to that exact alias. Never broad-`pkill`; never touch DS, Scan,
    Kimi, K301, or another alias.
+5. Do not treat inherited `CODEX_DISCORD_LAUNCH_*` environment variables as
+   process ownership. Commands launched through the app server inherit them.
+   An independent process group whose leader argv is not a Discord role is not
+   part of the Discord generation and must neither be killed nor block reclaim.
 6. Preserve `pending-delivery.json`, reply receipts, access policy, account
    binding, and `sessions/` bytes. A resume picker hiding old sessions is not
    deletion evidence; use `resume --all --include-non-interactive` for history
@@ -81,6 +104,13 @@ record, without printing message text or tokens:
 - queue schema, depth, FIFO Discord `(channelId,messageId)`, and last reason;
 - account binding and access-policy paths;
 - plugin version and runtime digest.
+
+Compare `last-inbound.json` mtime with `gateway-health.json`. A fresh health
+heartbeat plus a stale last inbound is a silent-receiver symptom, not proof of
+health. Inspect the exact gateway's sockets (`ss -tpn`) and recent log before
+restarting it. `SYN-SENT`, a proxy 403, or repeated gateway process creation is
+the first broken boundary. Freeze or stop only that exact gateway if it is
+spamming the TUI; preserve the app server and product processes.
 
 Then trace one source:
 
@@ -120,8 +150,10 @@ or a console final is not visible-TUI or outbound proof.
 - A lost/uncertain RPC response leaves the source in the ordinary FIFO. The
   next drain uses the same stable Discord client id against the current route.
   Do not create a thread-bound uncertainty lane.
-- A gateway exit while the TUI remains alive restarts the gateway in place. It
-  must not terminate the TUI or invent `resume <thread-id>`.
+- A gateway exit while the TUI remains alive retries autonomously without
+  terminating the TUI, inventing `resume <thread-id>`, or writing restart text
+  into the TUI terminal. Repeated startup failures must wait between attempts;
+  they must not form a tight process-creation loop.
 - App-server loss may require whole-alias relaunch, but the launcher must not
   synthesize or capture a session/thread identity.
 - Gateway process PID/generation is only a single-receiver lock inside the
@@ -141,12 +173,12 @@ or a console final is not visible-TUI or outbound proof.
   bounded; the state-dir FIFO and receipts are the durable store.
 - Persist queue state before injection. Memory pressure, TERM, timeout, crash,
   or gateway replacement must leave the same FIFO source recoverable.
-- Publish gateway RSS, heap use, cache counts, and the active restart limit in
+- Publish gateway RSS, heap use, cache counts, and current retry state in
   `gateway-health.json`. Diagnose the exact gateway process; do not attribute
   app-server or TUI RSS to it.
-- Sustained high RSS may exit only the exact gateway so the launcher supervisor
-  can restart it. Require multiple consecutive samples; never restart on one
-  spike and never kill the TUI or app-server for gateway memory pressure.
+- Sustained high RSS may exit only the exact gateway so the launcher can retry
+  it. Require multiple consecutive samples; never act on one spike and never
+  kill the TUI or app-server for gateway memory pressure.
 - Shutdown order is receiver fence, Discord client close, drain settlement,
   receiver release, then exit. Every network/queue step is bounded. The alias
   launcher gives a high-RSS gateway a longer grace period, then escalates only
@@ -173,19 +205,19 @@ tests for:
 5. activation/version change preserves queued sources;
 6. v4 `structured_ack_uncertain` records retain full source bytes in the
    archive and never auto-replay, while ordinary ready FIFO entries still drain;
-7. killing only the gateway preserves the TUI PID, restarts the gateway, and a
-   later source reaches that same visible TUI;
+7. killing only the gateway preserves the TUI PID, eventually starts a
+   replacement, and writes no restart notice into the TUI terminal;
 8. two state directories cannot read or mutate each other's queues.
 9. deleting the installed marketplace cache while the test TUI is active does
-   not prevent gateway restart or exact generation cleanup.
+   not prevent gateway retry or exact generation cleanup.
 10. a newer top-level `threadSource=system` background thread cannot replace an
     older visible user TUI as the delivery target.
 11. two state directories sharing one `CODEX_HOME` cannot use each other's
     rollout UserMessage as delivery proof.
 12. a no-manifest orphan socket that changes inode before unlink is preserved
     and startup fails with an actionable diagnostic.
-13. sustained gateway memory pressure triggers one supervised gateway-only
-    restart; a recovered sample resets the pressure count.
+13. sustained gateway memory pressure triggers gateway-only retry without a
+   tight restart loop or terminal spam.
 14. a hung drain or Discord close cannot exceed the configured handoff grace,
     and the persistent FIFO remains available to the successor.
 15. a `SIGSTOP`ed gateway is force-killed within the configured launcher bound,
@@ -218,8 +250,9 @@ account home, never from the Codex01 checkout.
 2. Start it through `codex-discord-instance`.
 3. Send at least three sequential uniquely identified sources and verify each
    appears in the visible TUI, not merely in logs or queue state.
-4. Kill only the test gateway. Verify the TUI PID remains unchanged and a new
-   gateway PID appears.
+4. Kill only the test gateway. Verify the TUI PID remains unchanged, a new
+   gateway PID eventually appears, and no restart notice is written to the TUI
+   terminal.
 5. Send a fourth source and verify it reaches the same visible TUI.
 6. Verify pending queue and reply-receipt accounting, then exit the validation
    TUI and prove all test-instance processes and socket are gone.

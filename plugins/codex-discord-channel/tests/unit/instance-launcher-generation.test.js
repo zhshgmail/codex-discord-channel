@@ -148,8 +148,8 @@ function procInfo() {
   const tail = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
   return { pid: process.pid, ppid: Number(tail[1]), pgid: Number(tail[2]), startTicks: tail[19] };
 }
-function record(role) {
-  fs.appendFileSync(process.env.PROCESS_TRACE, JSON.stringify({ role, ...procInfo() }) + '\n');
+function record(role, extra = {}) {
+  fs.appendFileSync(process.env.PROCESS_TRACE, JSON.stringify({ role, ...procInfo(), ...extra }) + '\n');
 }
 const command = process.argv[2];
 if (command === 'tui-login-state' || command === 'tui-check' || command === 'live-check') process.exit(0);
@@ -163,10 +163,22 @@ if (command === 'tui-recovery-target') {
   process.exit(0);
 }
 if (command === 'gateway') {
-  record('gateway');
+  record('gateway', { recordedAtMs: Date.now() });
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
   process.on('SIGHUP', () => process.exit(0));
+  if (process.env.GATEWAY_STARTUP_FAIL === '1') process.exit(76);
+  if (process.env.GATEWAY_RECOVERY_FAIL_COUNT) {
+    const counterPath = process.env.GATEWAY_ATTEMPT_COUNTER;
+    const previous = fs.existsSync(counterPath) ? Number(fs.readFileSync(counterPath, 'utf8')) : 0;
+    const current = previous + 1;
+    fs.writeFileSync(counterPath, String(current));
+    if (current === 1) {
+      setTimeout(() => process.exit(76), 800);
+    } else if (current <= Number(process.env.GATEWAY_RECOVERY_FAIL_COUNT) + 1) {
+      setTimeout(() => process.exit(76), 50);
+    }
+  }
   setInterval(() => {}, 1000);
 } else if (command === 'app-server') {
   record('channel-wrapper');
@@ -335,6 +347,7 @@ function env(setup, overrides = {}) {
     DISCORD_BOT_TOKEN: 'fixture-secret',
     DISCORD_BOT_USER_ID: 'fixture-bot',
     FIXTURE_CODEX_BIN: setup.codexWrapper,
+    GATEWAY_ATTEMPT_COUNTER: path.join(setup.home, 'gateway-attempt-counter'),
     HOME: setup.home,
     NATIVE_LISTENER: setup.nativeListener,
     PROCESS_TRACE: setup.processTrace,
@@ -476,6 +489,40 @@ test('SIGKILLed launcher generation is reclaimed on immediate relaunch with no d
 
   assert.equal(relaunched.status, 0, relaunched.stderr);
   assertRecordedDead(firstProcesses, 'old generation reclaim');
+  assert.equal(fs.existsSync(setup.socketPath), false);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+});
+
+test('reclaim ignores a detached product process that inherited generation environment', async (t) => {
+  const setup = fixture(t);
+  const { manifest, records } = await orphanReadyGeneration(setup, {
+    APP_WRAPPER_TERM: 'exit',
+  });
+  const inherited = processEnv(manifest.app.pid);
+  const product = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    detached: true,
+    env: inherited,
+    stdio: 'ignore',
+  });
+  const productIdentity = proc(product.pid);
+  fs.appendFileSync(setup.processTrace, `${JSON.stringify({
+    role: 'inherited-product-process',
+    pid: product.pid,
+    pgid: productIdentity?.pgid,
+    startTicks: productIdentity?.startTicks,
+  })}\n`);
+  assert.equal(productIdentity?.pgid, product.pid, 'the product process owns an independent group');
+  assert.equal(processEnv(product.pid).CODEX_DISCORD_LAUNCH_ROLE, 'app');
+
+  const relaunched = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: env(setup),
+    timeout: 8000,
+  });
+
+  assert.equal(relaunched.status, 0, relaunched.stderr);
+  assert.equal(alive(product.pid), true, 'reclaim must preserve the unrelated product process');
+  assertRecordedDead(records, 'old generation reclaim with an inherited product environment');
   assert.equal(fs.existsSync(setup.socketPath), false);
   assert.equal(fs.existsSync(setup.manifestPath), false);
 });
@@ -777,6 +824,45 @@ test('normal TUI exit terminates the app wrapper and its native listener', async
   assertRecordedDead(owned, `normal exit (${child.stderrText})`);
   assert.equal(fs.existsSync(setup.socketPath), false);
   assert.equal(fs.existsSync(setup.manifestPath), false);
+});
+
+test('repeated gateway failures retry unattended without a process storm or TUI text', async (t) => {
+  const setup = fixture(t);
+  const launcher = launch(setup, {
+    CODEX_DISCORD_GATEWAY_RETRY_BASE_MS: '100',
+    CODEX_DISCORD_GATEWAY_RETRY_CAP_MS: '800',
+    GATEWAY_RECOVERY_FAIL_COUNT: '3',
+    TUI_EXIT_DELAY_MS: '3500',
+  });
+  const result = await waitForExit(launcher, 7000);
+  const gateways = recordedProcesses(setup).filter((item) => item.role === 'gateway');
+  const retrySpanMs = gateways.at(-1).recordedAtMs - gateways[1].recordedAtMs;
+
+  assert.equal(result.code, 0, launcher.stderrText);
+  assert.equal(gateways.length, 5, 'the fifth gateway must recover without operator input');
+  assert.ok(retrySpanMs >= 1300, `three recovery failures retried too quickly: ${retrySpanMs}ms`);
+  assert.doesNotMatch(launcher.stderrText, /gateway.*restart|TUI remained active/i);
+});
+
+test('terminal startup failure prints one exact copy-paste repair command', (t) => {
+  const setup = fixture(t);
+  const result = spawnSync(
+    setup.launcher,
+    ['codex02', '--dangerously-bypass-approvals-and-sandbox', 'resume', '--last'],
+    {
+      encoding: 'utf8',
+      env: env(setup, { GATEWAY_STARTUP_FAIL: '1' }),
+      timeout: 5000,
+    },
+  );
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /Discord gateway .* exited during startup/);
+  assert.match(result.stderr, /Repair command \(copy\/paste\):/);
+  assert.match(
+    result.stderr,
+    new RegExp(`${setup.launcher.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} codex02 --dangerously-bypass-approvals-and-sandbox resume --last`),
+  );
 });
 
 test('TUI wrapper exit terminates a same-generation native descendant before identity is cleared', async (t) => {

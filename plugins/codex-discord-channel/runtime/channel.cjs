@@ -3722,7 +3722,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.18"
+              version: "0.3.20"
             },
             capabilities: {
               experimentalApi: !0,
@@ -95817,7 +95817,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.18", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.20", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;
