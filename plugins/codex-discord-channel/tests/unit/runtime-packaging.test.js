@@ -9,7 +9,7 @@ const readline = require('node:readline');
 const test = require('node:test');
 
 const pluginRoot = path.resolve(__dirname, '..', '..');
-const releasePackageVersion = '0.3.20';
+const releasePackageVersion = '0.3.21';
 
 function findNamed(root, name) {
   const matches = [];
@@ -196,6 +196,10 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
     DISCORD_CHANNEL_DISABLE_LOGIN: '1',
     CODEX_DISCORD_DELIVERY_MODE: 'off',
     NODE_PATH: '',
+    // Exercise the distributed MCP command using the host's supported Node.
+    // Calling process.execPath directly would hide a developer-specific path
+    // accidentally shipped in the manifest.
+    PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH || '/usr/bin:/bin'}`,
   };
   const requests = [
     { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } },
@@ -208,7 +212,7 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
     },
   ];
   const [initialized, tools, status] = await requestMcp(
-    process.execPath,
+    mcp.command,
     mcp.args,
     { cwd: installedRoot, env },
     requests,
@@ -217,7 +221,7 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
   assert.equal(
     initialized.result.serverInfo.version,
     releasePackageVersion,
-    'stripped marketplace runtime must advertise the v0.3.20 package release',
+    'stripped marketplace runtime must advertise the v0.3.21 package release',
   );
   assert.ok(tools.result.tools.some((tool) => tool.name === 'discord_channel_status'));
   assert.equal(status.result.structuredContent.stateDir, stateDir);

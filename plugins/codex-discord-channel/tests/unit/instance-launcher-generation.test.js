@@ -908,6 +908,63 @@ test('repeated TERM during delayed cleanup cannot interrupt descendant teardown'
   assert.equal(fs.existsSync(setup.manifestPath), false);
 });
 
+test('terminal SIGINT during the app ownership check cannot strand a stopped generation', async (t) => {
+  const setup = fixture(t);
+  const neighbor = fixture(t);
+  fs.writeFileSync(path.join(neighbor.stateDir, '.env'),
+    'DISCORD_BOT_TOKEN=other-fixture-secret\nDISCORD_BOT_USER_ID=other-fixture-bot\n');
+  const neighborLauncher = await readyLauncher(neighbor);
+  await waitFor(() => recordedProcesses(neighbor).some(item => item.role === 'tui'), 'other instance TUI');
+  const neighborOwned = recordedProcesses(neighbor);
+  const neighborManifest = fs.readFileSync(neighbor.manifestPath, 'utf8');
+  const neighborSocket = fs.statSync(neighbor.socketPath);
+  const marker = path.join(setup.home, 'cleanup-helper-ready');
+  // Hold the real Node ownership helper at the exact terminal-interrupt boundary.
+  // Node installs its own SIGINT behavior even when Bash ignored the signal.
+  fs.writeFileSync(setup.generationHelper,
+    fs.readFileSync(setup.generationHelper, 'utf8').replace("'use strict';", `
+'use strict';
+if (process.argv[2] === 'group-state'
+    && process.argv[process.argv.indexOf('--role') + 1] === 'app'
+    && !require('node:fs').existsSync(process.env.CLEANUP_HELPER_MARKER)) {
+  require('node:fs').writeFileSync(process.env.CLEANUP_HELPER_MARKER, String(process.pid));
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
+}
+`));
+  const child = spawn(setup.launcher, ['codex02'], {
+    env: env(setup, { TUI_STAY_ACTIVE: '1', CLEANUP_HELPER_MARKER: marker }),
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  await waitFor(() => recordedProcesses(setup).some(item => item.role === 'tui'), 'live TUI');
+  const owned = recordedProcesses(setup);
+  assert.equal(proc(child.pid).pgid, child.pid, 'test signals only its isolated launcher group');
+  child.kill('SIGTERM');
+  await waitFor(() => fs.existsSync(marker), 'cleanup ownership helper');
+  process.kill(-child.pid, 'SIGINT');
+  const result = await waitForExit(child);
+
+  assert.equal(result.code, 143, stderr);
+  assertRecordedDead(owned, `terminal interrupt during ownership verification (${stderr})`);
+  assert.equal(fs.existsSync(setup.socketPath), false);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+  const relaunched = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8', env: env(setup, { CLEANUP_HELPER_MARKER: marker }), timeout: 8000,
+  });
+  assert.equal(relaunched.status, 0, relaunched.stderr);
+  assert.equal(alive(neighborLauncher.pid), true, 'other launcher must survive');
+  for (const item of neighborOwned) {
+    assert.equal(alive(item.pid), true, `other instance ${item.role} must survive`);
+    assert.equal(proc(item.pid).startTicks, item.startTicks, 'other process must not be replaced');
+  }
+  assert.equal(fs.readFileSync(neighbor.manifestPath, 'utf8'), neighborManifest);
+  assert.equal(fs.statSync(neighbor.socketPath).ino, neighborSocket.ino);
+  neighborLauncher.kill('SIGTERM');
+  assert.equal((await waitForExit(neighborLauncher)).code, 143);
+});
+
 test('a SIGSTOPed gateway is force-killed within the configured handoff bound', async (t) => {
   const setup = fixture(t);
   const child = await readyLauncher(setup, {

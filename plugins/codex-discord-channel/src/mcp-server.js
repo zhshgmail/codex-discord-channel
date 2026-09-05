@@ -20,7 +20,7 @@ const { sendDiscordReplyOnce } = require('./reply-delivery');
 const { readGatewayHealthStatus } = require('./gateway-health');
 
 const SERVER_NAME = 'Codex Discord Channel';
-const SERVER_VERSION = '0.3.20';
+const SERVER_VERSION = '0.3.21';
 const MAX_TOOL_RESULT_BYTES = 64 * 1024;
 
 function makeLogger() {
