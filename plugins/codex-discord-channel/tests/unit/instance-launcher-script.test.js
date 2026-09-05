@@ -209,6 +209,14 @@ while True:
     '    IFS= read -r tui_input',
     '    printf "%s\\n" "$tui_input" >"$TUI_INPUT_TRACE"',
     '  fi',
+    '  if [[ -n ${TUI_LEAVE_RAW_MODE:-} ]]; then',
+    '    stty raw -echo',
+    '    if [[ $TUI_LEAVE_RAW_MODE == signal ]]; then',
+    '      kill -TERM "$PPID"',
+    '      while true; do /usr/bin/sleep 0.1; done',
+    '    fi',
+    '    exit 72',
+    '  fi',
     '  if [[ ${DELETE_PLUGIN_DURING_TUI:-0} == 1 ]]; then rm -rf "$PLUGIN_ROOT"; fi',
     '  /usr/bin/sleep 0.1',
     'fi',
@@ -232,6 +240,8 @@ while True:
   ].join('\n'));
   executable(path.join(binDir, 'setsid'), [
     '#!/usr/bin/env bash',
+    // Failure injection below models worker creation, not cleanup verifiers.
+    'if [[ ${1:-} == --wait ]]; then exec /usr/bin/setsid "$@"; fi',
     'stat_tail=$(awk \'{print $22}\' "/proc/$$/stat")',
     'printf "%s %s\\n" "$$" "$stat_tail" >>"$SETSID_TRACE"',
     'case ${SETSID_TEST_MODE:-pass} in',
@@ -621,6 +631,33 @@ test('launcher isolates workers while keeping the TUI in the foreground process 
     'the interactive TUI must not pass through setsid',
   );
 });
+
+for (const mode of ['exit', 'signal']) {
+  test(`launcher restores exact terminal settings after a raw-mode TUI ${mode}`, {
+    skip: process.platform !== 'linux' || !fs.existsSync('/usr/bin/script'),
+  }, () => {
+    const setup = fixture();
+    const terminalTrace = path.join(setup.home, 'terminal-restoration');
+    const driver = path.join(setup.home, 'terminal-driver');
+    executable(driver, [
+      '#!/usr/bin/env bash',
+      'stty -echoctl',
+      'before=$(stty -g)',
+      `"${setup.launcher}" codex02`,
+      'status=$?',
+      'after=$(stty -g)',
+      'stty "$before"',
+      `printf '%s\\n%s\\n' "$before" "$after" >"${terminalTrace}"`,
+      'exit "$status"',
+    ].join('\n'));
+    const result = spawnSync('/usr/bin/script', ['-qefc', driver, '/dev/null'], {
+      encoding: 'utf8', env: launchEnv(setup, { TUI_LEAVE_RAW_MODE: mode }), timeout: 5000,
+    });
+    assert.equal(result.status, mode === 'exit' ? 72 : 143, result.stderr);
+    const [before, after] = fs.readFileSync(terminalTrace, 'utf8').trim().split('\n');
+    assert.equal(after, before, 'restore the original terminal, including its custom settings');
+  });
+}
 
 test('worker disappearance during process-group isolation fails closed with a typed reason', () => {
   const setup = fixture();

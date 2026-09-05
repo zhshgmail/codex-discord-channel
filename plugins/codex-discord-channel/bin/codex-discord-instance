@@ -17,6 +17,19 @@ if [[ ! $instance =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
   exit 2
 fi
 
+# The remote TUI may exit before restoring raw mode.  Save this terminal's
+# exact settings, including user customizations, before starting any child.
+terminal_state=''
+if [[ -t 0 ]]; then
+  terminal_state=$(stty -g 2>/dev/null || true)
+fi
+restore_terminal() {
+  if [[ -n $terminal_state ]]; then
+    stty "$terminal_state" <&0 2>/dev/null || true
+  fi
+}
+trap restore_terminal EXIT
+
 # The positional instance is the authority boundary.  An alias can be launched
 # from a shell (or a resumed TUI) that still carries another instance's
 # DISCORD_CONFIG_DIR, so inherited Discord selection must never override it.
@@ -175,6 +188,7 @@ launcher_start_ticks=$(awk '{print $22}' "/proc/$launcher_pid/stat")
 launch_generation=''
 generation_manifest="$state_dir/instance-generation.json"
 generation_command=("$node_bin" "$generation_bin")
+cleanup_active=0
 generation_identity_args() {
   printf '%s\0' \
     --manifest "$generation_manifest" \
@@ -191,15 +205,23 @@ generation_identity_args() {
 run_generation() {
   local action=$1
   shift
+  local helper_command=("${generation_command[@]}")
+  if ((cleanup_active)); then
+    # Node resets inherited signal dispositions.  Ignoring INT in Bash alone
+    # does not protect a foreground Node verifier from another terminal Ctrl+C.
+    # Keep cleanup helpers outside the terminal's process group, and preserve
+    # their actual exit status so failed identity checks still refuse cleanup.
+    helper_command=("$setsid_bin" --wait "${helper_command[@]}")
+  fi
   local identity_args=()
   while IFS= read -r -d '' value; do identity_args+=("$value"); done < <(generation_identity_args)
   if [[ -n ${launcher_lock_fd-} ]]; then
     (
       exec {launcher_lock_fd}>&-
-      exec "${generation_command[@]}" "$action" "${identity_args[@]}" "$@"
+      exec "${helper_command[@]}" "$action" "${identity_args[@]}" "$@"
     )
   else
-    "${generation_command[@]}" "$action" "${identity_args[@]}" "$@"
+    "${helper_command[@]}" "$action" "${identity_args[@]}" "$@"
   fi
 }
 recorded_worker_start_ticks=''
@@ -408,6 +430,7 @@ cleanup_launcher() {
   # before removing EXIT ownership so no second signal can strand descendants.
   trap '' INT TERM HUP
   trap - EXIT
+  cleanup_active=1
   # Stop the receiver first while the app-server is still available.  Its FIFO
   # is already durable, and a high-RSS gateway receives a longer bounded grace
   # period to flush metadata and release receiver ownership cleanly.
@@ -417,6 +440,7 @@ cleanup_launcher() {
   if [[ -n $launch_generation ]]; then
     run_generation finish-owned --nonce "$launch_generation" >/dev/null 2>&1 || true
   fi
+  restore_terminal
   exit "$status"
 }
 trap cleanup_launcher EXIT

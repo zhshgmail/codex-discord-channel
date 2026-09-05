@@ -1,9 +1,35 @@
 ---
 name: repair-codex-discord-delivery
-description: Diagnose and repair Codex Discord startup, inbound delivery, gateway restart, queue, duplicate-reply, and visible-TUI faults. Use when an alias starts but later messages disappear, the gateway exits, an app-server/socket generation is stale, resume history looks missing, or Codex01/Codex02 needs live recovery. Do not use for routine channel configuration.
+description: Use for every request delivered in a <channel source="discord" ...> envelope that requires a reply, and to diagnose or repair Codex Discord startup, inbound delivery, gateway restart, queue, duplicate-reply, and visible-TUI faults. Do not use for routine channel configuration.
 ---
 
 # Repair Codex Discord Delivery
+
+## Discord-origin reply gate (always)
+
+For every request delivered in a `<channel source="discord" ...
+reply="required">` envelope, this gate applies even when no delivery fault is
+being diagnosed.
+
+1. If the source or a newer owner instruction says to finish a read, handover,
+   verification, or other explicit no-reply gate first, send **zero** Discord
+   messages until that gate is complete. Continue all separable assigned work.
+2. After the gate, reply exactly once to that source with the current instance's
+   `mcp__codex_discord_channel__discord_channel_send` tool and these exact
+   fields: `{channelId: <channel_id>, replyTo: <message_id>, content: <reply>}`.
+   Never use a generic Discord sender, another alias, a webhook, or
+   `{followup: true}` for the required source reply.
+3. Retain the returned stable outbound message id. Then use this instance's
+   `mcp__codex_discord_channel__discord_channel_read_history` for the same
+   `channelId` and verify the outbound id, exact channel, reply parent, content,
+   and current bot author identity. Console output, an accepted send call,
+   queue state, or a receipt alone is not delivery.
+4. If readback is absent, uncertain, or mismatched, do not silently claim
+   success and do not send a duplicate. Preserve the source/outbound ids and
+   diagnose the first missing proof boundary.
+
+This reply workflow never authorizes installing or upgrading the plugin, or
+restarting, killing, or replacing its gateway, app server, or TUI.
 
 ## Non-negotiable identity model
 

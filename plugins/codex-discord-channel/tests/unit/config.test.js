@@ -8,7 +8,7 @@ const test = require('node:test');
 const { loadConfig, loadEnvFile } = require('../../src/config');
 
 const pluginRoot = path.resolve(__dirname, '..', '..');
-const releasePluginVersion = '0.3.19';
+const releasePluginVersion = '0.3.21';
 
 test('loadEnvFile does not override existing environment values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-config-'));
@@ -175,9 +175,9 @@ test('installed MCP recovers its account binding from plugin cache cwd when Code
     'utf8',
   ));
   assert.equal(
-    manifest.version,
+    manifest.version.split('+')[0],
     releasePluginVersion,
-    'marketplace cache identity must name the v0.3.19 plugin release',
+    'marketplace cache identity must name the v0.3.21 plugin release',
   );
   const pluginCwd = path.join(
     codexHome,
