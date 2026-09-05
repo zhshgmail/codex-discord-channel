@@ -5,7 +5,7 @@ const path = require('node:path');
 const { SERVER_VERSION, toolList } = require('../src/mcp-server');
 
 const root = path.resolve(__dirname, '..');
-const PACKAGE_VERSION = '0.3.21';
+const PACKAGE_VERSION = '0.3.22';
 
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(root, relativePath), 'utf8'));
