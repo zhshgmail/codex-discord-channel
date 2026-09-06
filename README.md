@@ -709,9 +709,11 @@ do not require a mention or reply audience.
 
 `discord_channel_read_history` reads sanitized recent history without creating
 a local archive. It supports `channelId`, an exclusive `before` cursor, and a
-`limit` from 1 to 25. Guild reads require the exact enabled channel or thread;
-DM reads require the configured DM policy. Results are newest first, bounded to
-64 KiB, and omit attachment bodies, embeds, components, and reactions.
+`limit` from 1 to 25. Guild reads require authorization by an exact channel or
+thread rule, its parent-channel rule, or an explicit wildcard policy, in that
+precedence order. DM reads require the configured DM policy. Results are newest
+first, bounded to 64 KiB, and omit attachment bodies, embeds, components, and
+reactions.
 
 ## Instance State
 
