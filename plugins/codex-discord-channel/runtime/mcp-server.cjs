@@ -3602,7 +3602,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.22"
+              version: "0.3.23"
             },
             capabilities: {
               experimentalApi: !0,
@@ -6229,7 +6229,14 @@ var require_access_state = __commonJS({
     }
     function guildPolicy(state, message) {
       let channelId = String(message.channelId || ""), policyChannelId = String(message.policyChannelId || "");
-      return channelId && Object.hasOwn(state.groups, channelId) ? state.groups[channelId] : policyChannelId && Object.hasOwn(state.groups, policyChannelId) ? state.groups[policyChannelId] : null;
+      if (channelId && Object.hasOwn(state.groups, channelId))
+        return state.groups[channelId];
+      if (policyChannelId && Object.hasOwn(state.groups, policyChannelId))
+        return state.groups[policyChannelId];
+      let fallback = state.groups["*"];
+      if (!fallback) return null;
+      let allowFrom = fallback.allowFrom.length > 0 ? fallback.allowFrom : state.allowFrom;
+      return allowFrom.length > 0 ? { ...fallback, allowFrom } : null;
     }
     function decideGuildEnvelopeAccess(state, message) {
       let group = guildPolicy(state, message);
@@ -6245,11 +6252,8 @@ var require_access_state = __commonJS({
     }
     var GUILD_HISTORY_CHANNEL_TYPES = /* @__PURE__ */ new Set([0, 5, 10, 11, 12]), GUILD_THREAD_CHANNEL_TYPES = /* @__PURE__ */ new Set([10, 11, 12]);
     function historyGuildPolicy(state, target) {
-      let channelId = String(target.id || "");
-      if (channelId && Object.hasOwn(state.groups, channelId))
-        return state.groups[channelId];
       let parentId = GUILD_THREAD_CHANNEL_TYPES.has(target.type) ? String(target.parentId || "") : "";
-      return parentId && Object.hasOwn(state.groups, parentId) ? state.groups[parentId] : null;
+      return guildPolicy(state, { channelId: target.id, policyChannelId: parentId });
     }
     function dmCounterpartyId(target, botUserId) {
       if (target.recipient?.id) return String(target.recipient.id);
@@ -95352,7 +95356,7 @@ var readline = require("node:readline"), { loadConfig } = require_config(), {
   reconcileDiscordMessage,
   sendDiscordMessage,
   startDiscordClient
-} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.22", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+} = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner, createOwner, readOwner } = require_owner_state(), { sendDiscordReplyOnce } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.23", MAX_TOOL_RESULT_BYTES = 64 * 1024;
 function makeLogger() {
   return (level, message, meta) => {
     let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

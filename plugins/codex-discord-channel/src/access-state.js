@@ -82,7 +82,12 @@ function guildPolicy(state, message) {
   if (policyChannelId && Object.hasOwn(state.groups, policyChannelId)) {
     return state.groups[policyChannelId];
   }
-  return null;
+  const fallback = state.groups['*'];
+  if (!fallback) return null;
+  // Wildcard admission always requires an explicit sender list. An omitted
+  // group list reuses the instance's top-level allowFrom, including for bots.
+  const allowFrom = fallback.allowFrom.length > 0 ? fallback.allowFrom : state.allowFrom;
+  return allowFrom.length > 0 ? { ...fallback, allowFrom } : null;
 }
 
 function decideGuildEnvelopeAccess(state, message) {
@@ -132,17 +137,10 @@ const GUILD_HISTORY_CHANNEL_TYPES = new Set([0, 5, 10, 11, 12]);
 const GUILD_THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
 
 function historyGuildPolicy(state, target) {
-  const channelId = String(target.id || '');
-  if (channelId && Object.hasOwn(state.groups, channelId)) {
-    return state.groups[channelId];
-  }
   const parentId = GUILD_THREAD_CHANNEL_TYPES.has(target.type)
     ? String(target.parentId || '')
     : '';
-  if (parentId && Object.hasOwn(state.groups, parentId)) {
-    return state.groups[parentId];
-  }
-  return null;
+  return guildPolicy(state, { channelId: target.id, policyChannelId: parentId });
 }
 
 function dmCounterpartyId(target, botUserId) {
