@@ -4,16 +4,16 @@ Standalone Codex plugin project for Discord session delivery. The plugin lives
 at `plugins/codex-discord-channel` and is exposed through the repository
 marketplace at `.agents/plugins/marketplace.json`.
 
-## v0.3.22 Team Install And Upgrade
+## v0.3.23 Team Install And Upgrade
 
-Source release candidate: v0.3.22. The tag and installed instances are not
+Source release candidate: v0.3.23. The tag and installed instances are not
 published or changed by this source update. The tag-based commands below apply
 after publication; a reviewed candidate deployment must use its exact commit.
 
-This candidate adds source-bound, per-message MCP reply and readback reminders,
-building on the v0.3.21 interrupt-cleanup and terminal-restoration fixes. See
-[release notes](docs/releases/v0.3.22.md) for validation and the unmeasured
-long-context response-efficacy boundary.
+This candidate adds a cross-channel sender allowlist that also covers new
+threads. It includes the v0.3.22 reply reminders and v0.3.21 interrupt cleanup
+and terminal restoration. See [release notes](docs/releases/v0.3.23.md) for
+validation and deployment limits.
 
 The MCP manifest starts `node` from `PATH`, without a developer-specific path.
 Ensure Node 22.15 or newer is available to the shell launching Codex. The
@@ -65,10 +65,10 @@ Install the pinned tag from an ordinary shell:
 
 ```bash
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.22
+  zhshgmail/codex-discord-channel --ref v0.3.23
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.22"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.23"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 ```
 
@@ -91,7 +91,7 @@ start `app-server`, `gateway`, a bare `codex --remote`, or a new systemd unit
 separately. The launcher supplies the correct `CODEX_HOME`, instance, state
 directory, socket, and installed activation root to every child.
 
-### Upgrade To v0.3.22
+### Upgrade To v0.3.23
 
 Upgrade one alias at a time:
 
@@ -109,15 +109,15 @@ CODEX_HOME="$ACCOUNT_HOME" codex plugin list --json
 CODEX_HOME="$ACCOUNT_HOME" codex plugin remove codex-discord-channel@personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace remove personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.22
+  zhshgmail/codex-discord-channel --ref v0.3.23
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.22"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.23"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 "$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" resume --last
 ```
 
-If the marketplace already points at `v0.3.22`, use
+If the marketplace already points at `v0.3.23`, use
 `codex plugin marketplace upgrade personal` instead of replacing it. Never
 install over a running alias: the installer may remove files used by that
 generation, and an open MCP transport cannot hot-reload the replacement.
@@ -388,7 +388,7 @@ Prerequisites:
 - one isolated `CODEX_HOME` and Discord state directory per alias.
 
 ```bash
-codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.22
+codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.23
 codex plugin add codex-discord-channel@personal
 ```
 
@@ -400,7 +400,7 @@ gateway/app-server worker therefore use committed self-contained bundles:
 `runtime/mcp-server.cjs` and `runtime/channel.cjs`. `npm ci` and
 `npm run build:runtime` are development steps, not installation requirements.
 
-For a review branch or pinned deployment, replace `v0.3.22` with the exact
+For a review branch or pinned deployment, replace `v0.3.23` with the exact
 branch, tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
 
@@ -584,6 +584,18 @@ announcement thread below it. Threads inherit the parent channel's
 `requireMention`, `allowFrom`, and `allowBots` policy while replies remain in
 the actual thread. Add an exact thread id only when that thread needs an
 explicit policy override.
+
+To accept the same trusted senders across all guild channels and threads the
+bot can access, add `"*": { "requireMention": true, "allowBots": true }` under
+`groups`. This fallback uses the top-level `allowFrom` user IDs; it does not
+require enumerating channel or thread IDs. A nonempty `allowFrom` on the
+wildcard itself overrides that sender list. The wildcard denies access when
+both lists are empty. Exact channel/thread policies, followed by thread parent
+policies, take precedence. History uses the same policy selection and sender
+list for text/announcement channels and threads, retains the bot's own replies,
+and does not require mentions on historical messages. Voice/stage channel
+history is not supported. Discord permissions still determine which channels
+the bot can access.
 
 `access.json` is the receive-policy authority. A legacy `state.json` may remain
 after migration, but editing it does not update current access policy.

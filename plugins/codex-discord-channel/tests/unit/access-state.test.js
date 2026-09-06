@@ -425,3 +425,53 @@ test('history filtering preserves own bot messages and guild access ordering', (
     content: 'no mention required for history',
   }, '900000000000000001'), true);
 });
+
+test('wildcard uses instance sender IDs across channels and threads', () => {
+  const state = normalizeAccessState({ allowFrom: ['peer'], groups: { '*': { allowBots: true } } });
+  const base = { source: 'guild', guildId: 'guild', authorId: 'peer', authorIsBot: true,
+    content: '<@self> work', botUserId: 'self' };
+  for (const [channelId, policyChannelId] of [['one', 'one'], ['two', 'two'], ['thread', 'new-parent']]) {
+    const message = { ...base, channelId, policyChannelId };
+    assert.equal(decideAccess(state, message).allowed, true);
+    assert.equal(decideAccess(state, { ...message, authorId: 'unknown' }).reason, 'guild_sender_denied');
+    assert.equal(decideAccess(state, { ...message, content: 'work' }).reason, 'guild_mention_required');
+    const target = { id: channelId, guildId: 'guild', type: channelId === 'thread' ? 11 : 0, parentId: policyChannelId };
+    assert.equal(decideHistoryTarget(state, target, 'self').allowed, true);
+    assert.equal(allowHistoryMessage(state, target, { author: { id: 'peer', bot: true } }, 'self'), true);
+    assert.equal(allowHistoryMessage(state, target, { author: { id: 'unknown', bot: false } }, 'self'), false);
+    assert.equal(decideAccess(normalizeAccessState({ allowFrom: ['peer'] }), message).allowed, false);
+  }
+});
+
+test('wildcard without sender IDs stays closed and bot permission remains explicit', () => {
+  const message = { source: 'guild', channelId: 'new', authorId: 'peer', authorIsBot: true,
+    content: '<@self> work', botUserId: 'self' };
+  const empty = normalizeAccessState({ groups: { '*': { allowBots: true } } });
+  assert.equal(decideAccess(empty, message).allowed, false);
+  assert.equal(decideHistoryTarget(empty, { id: 'new', guildId: 'guild', type: 0 }, 'self').allowed, false);
+  const noBots = normalizeAccessState({ allowFrom: ['peer'], groups: { '*': {} } });
+  assert.equal(decideAccess(noBots, message).reason, 'bot_author_denied');
+});
+
+test('exact thread and parent policies override wildcard sender permissions', () => {
+  const state = normalizeAccessState({ allowFrom: ['global'], groups: {
+    '*': { allowFrom: ['fallback'], allowBots: true },
+    parent: { allowFrom: ['parent-user'], allowBots: true },
+    thread: { allowFrom: ['thread-user'], allowBots: true },
+  } });
+  const base = { source: 'guild', content: '<@self>', botUserId: 'self', authorIsBot: true };
+  for (const [channelId, policyChannelId, authorId] of [
+    ['new', 'new', 'fallback'], ['inherited-thread', 'parent', 'parent-user'], ['thread', 'parent', 'thread-user'],
+  ]) {
+    const message = { ...base, channelId, policyChannelId, authorId };
+    assert.equal(decideAccess(state, message).allowed, true);
+    assert.equal(decideAccess(state, { ...message, authorId: 'global' }).allowed, false);
+    const target = { id: channelId, parentId: policyChannelId, guildId: 'guild', type: 11 };
+    assert.equal(allowHistoryMessage(state, target, { author: { id: authorId, bot: true } }, 'self'), true);
+    assert.equal(allowHistoryMessage(state, target, { author: { id: 'global', bot: true } }, 'self'), false);
+    if (channelId !== 'new') {
+      assert.equal(decideAccess(state, { ...message, authorId: 'fallback' }).allowed, false);
+      assert.equal(allowHistoryMessage(state, target, { author: { id: 'fallback', bot: true } }, 'self'), false);
+    }
+  }
+});

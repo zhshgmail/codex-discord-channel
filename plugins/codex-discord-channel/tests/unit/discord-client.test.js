@@ -1299,3 +1299,34 @@ test('gateway shutdown fences an in-flight admission before releasing receiver a
   assert.ok(lastIndex('authority_release_started') < index('authority_released'));
   assert.ok(index('authority_released') < index('delivery_destroyed'));
 });
+
+test('wildcard handler gates reference fetch and preserves actual thread destination', async () => {
+  const delivered = [];
+  let fetches = 0;
+  const handler = createDiscordMessageHandler({
+    config: { botUserId: 'bot' }, client: { user: { id: 'bot' } }, logger: () => {},
+    delivery: {
+      async enqueue(normalized) { delivered.push(normalized); return { status: 'accepted' }; },
+      async flush() { return { status: 'delivered' }; },
+    },
+    deps: {
+      isActiveDiscordReceiver: () => ({ active: true, reason: 'gateway_pid_match' }),
+      loadAccessState: () => normalizeAccessState({ allowFrom: ['peer'], groups: { '*': { allowBots: true } } }),
+    },
+  });
+  const base = { guildId: 'guild', channelId: 'new-thread', id: 'source',
+    channel: { isThread: () => true, parentId: 'new-parent' }, attachments: [],
+    author: { id: 'unknown', username: 'Unknown', bot: true }, content: '<@bot> work',
+    reference: { messageId: 'parent-source' },
+    async fetchReference() { fetches += 1; return { author: { id: 'bot' }, content: 'prior' }; },
+  };
+  await handler(base);
+  assert.equal(fetches, 0);
+  assert.equal(delivered.length, 0);
+  await handler({ ...base, author: { id: 'peer', username: 'Peer', bot: true } });
+  assert.equal(fetches, 1);
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].channelId, 'new-thread');
+  assert.equal(delivered[0].policyChannelId, 'new-parent');
+  assert.equal(delivered[0].messageId, 'source');
+});

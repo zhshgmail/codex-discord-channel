@@ -311,3 +311,21 @@ test('readDiscordHistory rejects unauthorized targets and sanitizes fetch failur
     client: failed.client,
   }), /^Error: history_fetch_failed$/);
 });
+
+test('wildcard history filters thread authors and preserves own bot readback', async () => {
+  const peerId = '800000000000000001';
+  const fixture = historyFixture({
+    access: { allowFrom: [USER_ID, peerId], groups: { '*': { allowBots: true } } },
+    channel: { type: 11, parentId: '100000000000000099' },
+    messages: [
+      message('500000000000000004', { author: { id: BOT_ID, username: 'Self', bot: true } }),
+      message('500000000000000003', { author: { id: peerId, username: 'Peer', bot: true } }),
+      message('500000000000000002', { author: { id: '300000000000000002', username: 'Unknown', bot: false } }),
+      message('500000000000000001', { content: 'allowed history without mention' }),
+    ],
+  });
+  const result = await readDiscordHistory({ args: { channelId: CHANNEL_ID, limit: 4 },
+    config: fixture.config, client: fixture.client });
+  assert.equal(result.channelId, CHANNEL_ID);
+  assert.deepEqual(result.messages.map((item) => item.authorId), [BOT_ID, peerId, USER_ID]);
+});
