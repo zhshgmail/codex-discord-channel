@@ -9,7 +9,7 @@ const readline = require('node:readline');
 const test = require('node:test');
 
 const pluginRoot = path.resolve(__dirname, '..', '..');
-const releasePackageVersion = '0.3.23';
+const releasePackageVersion = '0.3.24';
 
 function findNamed(root, name) {
   const matches = [];
@@ -221,7 +221,7 @@ test('marketplace cache starts MCP without node_modules in an isolated Codex env
   assert.equal(
     initialized.result.serverInfo.version,
     releasePackageVersion,
-    'stripped marketplace runtime must advertise the v0.3.23 package release',
+    'stripped marketplace runtime must advertise the v0.3.24 package release',
   );
   assert.ok(tools.result.tools.some((tool) => tool.name === 'discord_channel_status'));
   assert.equal(status.result.structuredContent.stateDir, stateDir);

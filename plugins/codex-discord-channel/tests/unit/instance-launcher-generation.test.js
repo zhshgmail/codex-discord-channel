@@ -527,6 +527,66 @@ test('reclaim ignores a detached product process that inherited generation envir
   assert.equal(fs.existsSync(setup.manifestPath), false);
 });
 
+test('reclaim ignores a leaderless product group that inherited generation environment', async (t) => {
+  const setup = fixture(t);
+  const { manifest, records } = await orphanReadyGeneration(setup);
+  const inherited = processEnv(manifest.app.pid);
+
+  const ownGroup = proc(process.pid)?.pgid;
+  const generationGroups = new Set(records.map((item) => item.pgid)
+    .filter((pgid) => pgid > 1 && pgid !== ownGroup));
+  for (const pgid of generationGroups) {
+    try { process.kill(-pgid, 'SIGKILL'); } catch {}
+  }
+  await waitFor(
+    () => records.every((item) => !alive(item.pid)),
+    'old generation processes to exit',
+  );
+  if (fs.existsSync(setup.socketPath)) fs.unlinkSync(setup.socketPath);
+
+  const childPidPath = path.join(setup.home, 'leaderless-product-child.pid');
+  const productLeader = spawn('python3', ['-c', String.raw`
+import os, sys, time
+child = os.fork()
+if child:
+    with open(sys.argv[1], 'w', encoding='utf-8') as out:
+        out.write(str(child))
+    os._exit(0)
+while True:
+    time.sleep(1)
+`, childPidPath], {
+    detached: true,
+    env: inherited,
+    stdio: 'ignore',
+  });
+  const childPid = await waitFor(() => {
+    if (!fs.existsSync(childPidPath)) return null;
+    return Number(fs.readFileSync(childPidPath, 'utf8')) || null;
+  }, 'leaderless product child PID');
+  await waitFor(() => !alive(productLeader.pid), 'detached product group leader to exit');
+  const childIdentity = proc(childPid);
+  assert.ok(childIdentity);
+  assert.equal(childIdentity.pgid, productLeader.pid);
+  assert.equal(processEnv(childPid).CODEX_DISCORD_LAUNCH_ROLE, 'app');
+  fs.appendFileSync(setup.processTrace, `${JSON.stringify({
+    role: 'leaderless-inherited-product',
+    pid: childPid,
+    pgid: childIdentity.pgid,
+    startTicks: childIdentity.startTicks,
+  })}\n`);
+
+  const relaunched = spawnSync(setup.launcher, ['codex02'], {
+    encoding: 'utf8',
+    env: env(setup),
+    timeout: 8000,
+  });
+
+  assert.equal(relaunched.status, 0, relaunched.stderr);
+  assert.equal(alive(childPid), true, 'reclaim must preserve the leaderless product child');
+  assert.equal(fs.existsSync(setup.socketPath), false);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+});
+
 test('cache eviction and version-path change cannot block exact orphan reclaim and relaunch', async (t) => {
   const setup = fixture(t);
   const { manifest, records } = await orphanReadyGeneration(setup, {
