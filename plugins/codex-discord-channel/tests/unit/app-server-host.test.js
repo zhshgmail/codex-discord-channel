@@ -565,11 +565,15 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') return { data: [loadedThreadId], nextCursor: null };
     if (method === 'thread/read') {
+      const active = params.threadId.includes('before');
       return {
         thread: {
           id: params.threadId,
           parentThreadId: null,
-          status: { type: params.threadId.includes('before') ? 'active' : 'idle' },
+          status: { type: active ? 'active' : 'idle' },
+          turns: active
+            ? [{ id: 'turn-before-compaction', status: 'inProgress', items: [] }]
+            : [],
         },
       };
     }
@@ -581,6 +585,7 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
     available: true,
     threadId: 'thread-before-compaction',
     status: 'active',
+    activeTurnId: 'turn-before-compaction',
   });
   loadedThreadId = 'thread-after-compaction';
   assert.deepEqual(await host.resolveTarget(), {
@@ -592,6 +597,60 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
     client.requests.filter((request) => request.method === 'thread/loaded/list').length,
     2,
   );
+  assert.deepEqual(
+    client.requests
+      .filter((request) => request.method === 'thread/read')
+      .map((request) => request.params.includeTurns),
+    [false, false],
+    'target discovery must not hydrate an unbounded thread history',
+  );
+});
+
+test('target discovery survives a thread whose full history exceeds the websocket limit', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-large'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (params.includeTurns !== false) {
+        const error = new Error('Max payload size exceeded');
+        error.code = 'shared_app_server_disconnected';
+        throw error;
+      }
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      assert.deepEqual(params, {
+        threadId: 'thread-large',
+        limit: 8,
+        sortDirection: 'desc',
+        itemsView: 'notLoaded',
+      });
+      return {
+        data: [{ id: 'turn-large-active', status: 'inProgress', items: [] }],
+        nextCursor: null,
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-large',
+    status: 'active',
+    activeTurnId: 'turn-large-active',
+  });
 });
 
 test('fresh recovery selects the unique top-level root among loaded subagent threads', async () => {
@@ -3112,7 +3171,7 @@ test('active goal turn recovered from thread/read accepts input with an exact tu
   const target = await host.resolveTarget();
   assert.equal(
     client.requests.filter((request) => request.method === 'thread/read').at(-1).params.includeTurns,
-    true,
+    false,
   );
   assert.equal(target.activeTurnId, 'goal-continuation-2');
   client.requests.length = 0;
@@ -4461,7 +4520,7 @@ test('system rollout cannot prove source delivery but the visible TUI rollout ca
   assert.deepEqual(client.requests, []);
 });
 
-test('restored ephemeral target retries thread/read without includeTurns', async (t) => {
+test('restored ephemeral target uses metadata-only thread discovery', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-ephemeral-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const config = {
@@ -4497,8 +4556,7 @@ test('restored ephemeral target retries thread/read without includeTurns', async
   assert.deepEqual(
     client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params),
     [
-      { threadId: 'thread-a', includeTurns: true },
-      { threadId: 'thread-a' },
+      { threadId: 'thread-a', includeTurns: false },
     ],
   );
 });

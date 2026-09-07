@@ -3726,7 +3726,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.24"
+              version: "0.3.25"
             },
             capabilities: {
               experimentalApi: !0,
@@ -4154,10 +4154,10 @@ var require_app_server_host = __commonJS({
           for (let candidateId of orderedIds) {
             let candidateResponse = await request("thread/read", {
               threadId: candidateId,
-              includeTurns: !0
-            }).catch(async (error) => {
-              if (!includeTurnsUnsupported(error)) throw error;
-              return request("thread/read", { threadId: candidateId });
+              // Target discovery needs only identity, topology, and status.  A
+              // full-history read can exceed the websocket frame limit on a
+              // long-running Discord TUI and disconnect the entire ingress path.
+              includeTurns: !1
             }), candidate = candidateResponse?.thread;
             if (candidate?.id === candidateId && candidate.parentThreadId == null && !isSystemBackgroundThread(candidate)) {
               response = candidateResponse, threadId = candidateId;
@@ -4177,7 +4177,25 @@ var require_app_server_host = __commonJS({
           this.knownLoadedThreadIds = new Set(orderedIds), this.loadedInventoryProven = !0, this.currentThreadId = threadId, this.threadStatuses.set(threadId, status);
           let target = { available: !0, threadId, status };
           if (status === "active") {
-            let activeTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1) || this.activeTurnIds.get(threadId) || "";
+            let turns = Array.isArray(thread.turns) ? thread.turns : [], turnsNewestFirst = !1;
+            if (turns.length === 0) {
+              let turnPage = await request("thread/turns/list", {
+                threadId,
+                limit: 8,
+                sortDirection: "desc",
+                itemsView: "notLoaded"
+              });
+              if (!Array.isArray(turnPage?.data)) {
+                let reason = "shared_app_server_active_turn_unavailable";
+                return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+              }
+              turns = turnPage.data, turnsNewestFirst = !0;
+            }
+            let activeTurnIds = turns.filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id), activeTurnId = (turnsNewestFirst ? activeTurnIds[0] : activeTurnIds.at(-1)) || this.activeTurnIds.get(threadId) || "";
+            if (!activeTurnId) {
+              let reason = "shared_app_server_active_turn_unavailable";
+              return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+            }
             activeTurnId && (this.activeTurnIds.set(threadId, activeTurnId), target.activeTurnId = activeTurnId);
           } else
             this.activeTurnIds.delete(threadId);
@@ -95829,7 +95847,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.24", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.25", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;

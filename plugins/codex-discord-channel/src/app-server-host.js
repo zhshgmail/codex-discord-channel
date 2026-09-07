@@ -623,7 +623,7 @@ class AppServerRpcClient extends EventEmitter {
         clientInfo: {
           name: 'codex-discord-channel',
           title: 'Discord Channel Gateway',
-          version: '0.3.24',
+          version: '0.3.25',
         },
         capabilities: {
           experimentalApi: true,
@@ -1430,10 +1430,10 @@ class AppServerHost extends EventEmitter {
       for (const candidateId of orderedIds) {
         const candidateResponse = await request('thread/read', {
           threadId: candidateId,
-          includeTurns: true,
-        }).catch(async (error) => {
-          if (!includeTurnsUnsupported(error)) throw error;
-          return request('thread/read', { threadId: candidateId });
+          // Target discovery needs only identity, topology, and status.  A
+          // full-history read can exceed the websocket frame limit on a
+          // long-running Discord TUI and disconnect the entire ingress path.
+          includeTurns: false,
         });
         const candidate = candidateResponse?.thread;
         if (
@@ -1471,10 +1471,34 @@ class AppServerHost extends EventEmitter {
       this.threadStatuses.set(threadId, status);
       const target = { available: true, threadId, status };
       if (status === 'active') {
-        const activeTurnId = (Array.isArray(thread.turns) ? thread.turns : [])
+        let turns = Array.isArray(thread.turns) ? thread.turns : [];
+        let turnsNewestFirst = false;
+        if (turns.length === 0) {
+          const turnPage = await request('thread/turns/list', {
+            threadId,
+            limit: 8,
+            sortDirection: 'desc',
+            itemsView: 'notLoaded',
+          });
+          if (!Array.isArray(turnPage?.data)) {
+            const reason = 'shared_app_server_active_turn_unavailable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          }
+          turns = turnPage.data;
+          turnsNewestFirst = true;
+        }
+        const activeTurnIds = turns
           .filter((turn) => turn?.status === 'inProgress' && typeof turn.id === 'string' && turn.id)
-          .map((turn) => turn.id)
-          .at(-1) || this.activeTurnIds.get(threadId) || '';
+          .map((turn) => turn.id);
+        const activeTurnId = (
+          turnsNewestFirst ? activeTurnIds[0] : activeTurnIds.at(-1)
+        ) || this.activeTurnIds.get(threadId) || '';
+        if (!activeTurnId) {
+          const reason = 'shared_app_server_active_turn_unavailable';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
         if (activeTurnId) {
           this.activeTurnIds.set(threadId, activeTurnId);
           target.activeTurnId = activeTurnId;
