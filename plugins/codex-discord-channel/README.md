@@ -27,7 +27,12 @@ The native TUI still selects the session; the plugin neither selects a second
 session nor stores its ID. At most one request can carry the override while its
 reply is pending, across all relay connections. Concurrent requests pass through
 with their own settings. Success consumes the override; only an explicit error
-for that same request and connection permits another attempt. An ambiguous
+for that same request and connection permits another attempt, including a retry
+that reuses the client RPC ID. Each override attempt has a one-use backend wire
+ID; the current reply restores the client ID, and retired replies are dropped.
+A request that duplicates a pending client ID or collides with that connection's
+private wire-ID namespace closes the connection pair as ambiguous. Server
+requests, notifications and client replies retain their original IDs. An ambiguous
 disconnect keeps it consumed for the rest of the invocation. Later permission
 changes and reconnects retain the user's current settings. Gateway requests
 pass through unchanged.

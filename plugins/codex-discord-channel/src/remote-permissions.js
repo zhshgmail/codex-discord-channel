@@ -22,6 +22,12 @@ function permissionRequest(data, isTui, permissions) {
 
 function connectRelay(front, backendUrl, permissions, startupState = { applied: false }) {
   const back = new WebSocket(backendUrl, { perMessageDeflate: false, maxPayload: 128 * 1024 * 1024 });
+  // A client may reuse its RPC id after an explicit error. Give each override
+  // attempt a one-use backend id; the prefix retires old replies without an
+  // ever-growing id history. This is transport state, never session identity.
+  const wirePrefix = `codex-permission:${randomBytes(16).toString('hex')}:`;
+  let attempt = 0;
+  const isWireId = id => typeof id === 'string' && id.startsWith(wirePrefix);
   let isTui = false;
   let pendingRequest;
   let closed = false;
@@ -65,17 +71,21 @@ function connectRelay(front, backendUrl, permissions, startupState = { applied: 
     if (message?.method === 'initialize') {
       isTui = ['codex-tui', 'codex_cli_rs'].includes(message.params?.clientInfo?.name);
     }
-    if (pendingRequest && message?.id === pendingRequest.id && typeof message.method === 'string') {
-      // Two outstanding requests with the same id cannot be correlated safely.
+    if (typeof message?.method === 'string'
+      && (isWireId(message.id) || (pendingRequest && message.id === pendingRequest.id))) {
+      // Reusing an in-flight client id or this connection's private backend
+      // namespace is ambiguous. Server-request replies have no method and
+      // remain transparent, even if their ids happen to use that namespace.
       close();
       return;
     }
-    const outgoing = permissionRequest(data, isTui && !startupState.applied && !startupState.pending, permissions);
+    let outgoing = permissionRequest(data, isTui && !startupState.applied && !startupState.pending, permissions);
     if (outgoing !== data) {
       // Reserve before forwarding, including while the backend is connecting.
-      // Object identity scopes this ephemeral RPC id to its own connection.
-      pendingRequest = { id: message.id };
+      if (attempt === Number.MAX_SAFE_INTEGER) { close(); return; }
+      pendingRequest = { id: message.id, wireId: `${wirePrefix}${++attempt}` };
       startupState.pending = pendingRequest;
+      outgoing = JSON.stringify({ ...JSON.parse(outgoing), id: pendingRequest.wireId });
     }
     if (back.readyState === WebSocket.OPEN) forward(back, outgoing, binary);
     else if (back.readyState === WebSocket.CONNECTING) {
@@ -95,8 +105,15 @@ function connectRelay(front, backendUrl, permissions, startupState = { applied: 
     if (closed) return;
     let message;
     try { message = JSON.parse(data.toString()); } catch {}
+    let outgoing = data;
+    if (message?.method === undefined && isWireId(message?.id)) {
+      // Retired responses must neither settle the current reservation nor
+      // reach a client that may have reused the original id for a new request.
+      if (!pendingRequest || message.id !== pendingRequest.wireId) return;
+      outgoing = JSON.stringify({ ...message, id: pendingRequest.id });
+    }
     if (pendingRequest && startupState.pending === pendingRequest
-      && message?.id === pendingRequest.id && message.method === undefined) {
+      && message?.id === pendingRequest.wireId && message.method === undefined) {
       const hasResult = Object.hasOwn(message, 'result');
       const hasError = Object.hasOwn(message, 'error');
       const explicitError = hasError && message.error && !Array.isArray(message.error)
@@ -107,7 +124,7 @@ function connectRelay(front, backendUrl, permissions, startupState = { applied: 
         pendingRequest = undefined;
       }
     }
-    forward(front, data, binary);
+    forward(front, outgoing, binary);
   });
 }
 

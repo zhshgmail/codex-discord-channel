@@ -95493,7 +95493,7 @@ var require_remote_permissions = __commonJS({
       return !isTui || !message || typeof message != "object" || Array.isArray(message) || message.id === void 0 || !["thread/start", "thread/resume", "thread/fork"].includes(message.method) || !message.params || typeof message.params != "object" || Array.isArray(message.params) ? data : JSON.stringify({ ...message, params: { ...message.params, ...permissions } });
     }
     function connectRelay(front, backendUrl, permissions, startupState = { applied: !1 }) {
-      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: 134217728 }), isTui = !1, pendingRequest, closed = !1, queued = [], queuedBytes = 0, close = () => {
+      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: 134217728 }), wirePrefix = `codex-permission:${randomBytes(16).toString("hex")}:`, attempt = 0, isWireId = (id) => typeof id == "string" && id.startsWith(wirePrefix), isTui = !1, pendingRequest, closed = !1, queued = [], queuedBytes = 0, close = () => {
         closed || (closed = !0, pendingRequest && startupState.pending === pendingRequest && (startupState.applied = !0, startupState.pending = null), pendingRequest = void 0, queued = [], queuedBytes = 0, front.terminate(), back.terminate());
       }, forward = (socket, data, binary) => {
         if (closed || socket.readyState !== WebSocket.OPEN) return !1;
@@ -95515,12 +95515,19 @@ var require_remote_permissions = __commonJS({
           message = JSON.parse(data.toString());
         } catch {
         }
-        if (message?.method === "initialize" && (isTui = ["codex-tui", "codex_cli_rs"].includes(message.params?.clientInfo?.name)), pendingRequest && message?.id === pendingRequest.id && typeof message.method == "string") {
+        if (message?.method === "initialize" && (isTui = ["codex-tui", "codex_cli_rs"].includes(message.params?.clientInfo?.name)), typeof message?.method == "string" && (isWireId(message.id) || pendingRequest && message.id === pendingRequest.id)) {
           close();
           return;
         }
         let outgoing = permissionRequest(data, isTui && !startupState.applied && !startupState.pending, permissions);
-        outgoing !== data && (pendingRequest = { id: message.id }, startupState.pending = pendingRequest), back.readyState === WebSocket.OPEN ? forward(back, outgoing, binary) : back.readyState === WebSocket.CONNECTING && (queuedBytes += Buffer.byteLength(outgoing), queuedBytes > MAX_BUFFERED_BYTES ? close() : queued.push([outgoing, binary]));
+        if (outgoing !== data) {
+          if (attempt === Number.MAX_SAFE_INTEGER) {
+            close();
+            return;
+          }
+          pendingRequest = { id: message.id, wireId: `${wirePrefix}${++attempt}` }, startupState.pending = pendingRequest, outgoing = JSON.stringify({ ...JSON.parse(outgoing), id: pendingRequest.wireId });
+        }
+        back.readyState === WebSocket.OPEN ? forward(back, outgoing, binary) : back.readyState === WebSocket.CONNECTING && (queuedBytes += Buffer.byteLength(outgoing), queuedBytes > MAX_BUFFERED_BYTES ? close() : queued.push([outgoing, binary]));
       }), back.on("open", () => {
         for (let [data, binary] of queued)
           if (!forward(back, data, binary)) break;
@@ -95532,11 +95539,16 @@ var require_remote_permissions = __commonJS({
           message = JSON.parse(data.toString());
         } catch {
         }
-        if (pendingRequest && startupState.pending === pendingRequest && message?.id === pendingRequest.id && message.method === void 0) {
+        let outgoing = data;
+        if (message?.method === void 0 && isWireId(message?.id)) {
+          if (!pendingRequest || message.id !== pendingRequest.wireId) return;
+          outgoing = JSON.stringify({ ...message, id: pendingRequest.id });
+        }
+        if (pendingRequest && startupState.pending === pendingRequest && message?.id === pendingRequest.wireId && message.method === void 0) {
           let hasResult = Object.hasOwn(message, "result"), hasError = Object.hasOwn(message, "error"), explicitError = hasError && message.error && !Array.isArray(message.error) && Number.isInteger(message.error.code) && typeof message.error.message == "string";
           (hasResult && !hasError || explicitError && !hasResult) && (hasResult && (startupState.applied = !0), startupState.pending = null, pendingRequest = void 0);
         }
-        forward(front, data, binary);
+        forward(front, outgoing, binary);
       });
     }
     async function runPermissionRelay(launch, endpoint, permissions) {

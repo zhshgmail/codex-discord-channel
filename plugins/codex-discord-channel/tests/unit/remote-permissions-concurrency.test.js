@@ -75,13 +75,15 @@ test('one pending permission request across pipelined and concurrent connections
   const a = relay.pair(); const b = relay.pair();
   a.front.receive(request(2));
   patched(a.back);
+  const wireId = last(a.back).id;
   const fork = request(3, 'thread/fork');
   a.front.receive(fork);
   unchanged(a.back, fork);
   const start = request(4, 'thread/start');
   b.front.receive(start);
   unchanged(b.back, start);
-  a.back.receive({ id: 2, result: { thread: { id: 'selected' } } });
+  a.back.receive({ id: wireId, result: { thread: { id: 'selected' } } });
+  assert.deepEqual(last(a.front), { id: 2, result: { thread: { id: 'selected' } } });
   b.front.receive(request(5));
   unchanged(b.back, request(5));
   assert.equal(relay.state.applied, true);
@@ -92,21 +94,25 @@ test('only a matching connection error releases the pending permission request',
   const relay = controlledRelay();
   const a = relay.pair(); const b = relay.pair();
   a.front.receive(request(2));
+  const originalWireId = last(a.back).id;
   b.front.receive(request(2, 'thread/fork'));
   unchanged(b.back, request(2, 'thread/fork'));
   b.back.receive({ id: 2, error: { code: -32600, message: 'other connection' } });
   b.front.receive(request(3));
   unchanged(b.back, request(3));
   b.back.receive({ id: 2, result: {} });
-  a.back.receive({ id: 2, error: { code: -32600, message: 'definitive rejection' } });
+  a.back.receive({ id: originalWireId, error: { code: -32600, message: 'definitive rejection' } });
+  assert.deepEqual(last(a.front), { id: 2, error: { code: -32600, message: 'definitive rejection' } });
   b.front.receive(request(4));
   patched(b.back);
+  const nextWireId = last(b.back).id;
   // A duplicate late response from the prior owner cannot settle B's claim.
-  a.back.receive({ id: 2, result: {} });
-  a.back.receive({ id: 2, error: { code: -32600, message: 'late' } });
+  a.back.receive({ id: originalWireId, result: {} });
+  a.back.receive({ id: originalWireId, error: { code: -32600, message: 'late' } });
   a.front.receive(request(5));
   unchanged(a.back, request(5));
-  b.back.receive({ id: 4, result: {} });
+  b.back.receive({ id: nextWireId, result: {} });
+  assert.deepEqual(last(b.front), { id: 4, result: {} });
   a.front.receive(request(6));
   unchanged(a.back, request(6));
 });
@@ -117,11 +123,12 @@ for (const side of ['front', 'back']) {
     const a = relay.pair();
     a.front.receive(request(2));
     patched(a.back);
+    const wireId = last(a.back).id;
     a[side].terminate();
     const b = relay.pair();
     // These events may already be queued when a transport closes.
-    a.back.receive({ id: 2, error: { code: -32600, message: 'late' } });
-    a.back.receive({ id: 2, result: {} });
+    a.back.receive({ id: wireId, error: { code: -32600, message: 'late' } });
+    a.back.receive({ id: wireId, result: {} });
     b.front.receive(request(2));
     unchanged(b.back, request(2));
     assert.equal(relay.state.applied, true);
@@ -131,7 +138,8 @@ for (const side of ['front', 'back']) {
 test('a disconnect after definitive rejection leaves the next request eligible', () => {
   const relay = controlledRelay(); const a = relay.pair();
   a.front.receive(request(2));
-  a.back.receive({ id: 2, error: { code: -32600, message: 'rejected' } });
+  a.back.receive({ id: last(a.back).id, error: { code: -32600, message: 'rejected' } });
+  assert.deepEqual(last(a.front), { id: 2, error: { code: -32600, message: 'rejected' } });
   a.front.terminate();
   const b = relay.pair(); b.front.receive(request(3)); patched(b.back);
 });
@@ -139,23 +147,27 @@ test('a disconnect after definitive rejection leaves the next request eligible',
 test('malformed or notification-shaped replies cannot release a reservation', () => {
   const relay = controlledRelay(); const a = relay.pair();
   a.front.receive(request(2));
-  for (const response of [{ id: 2, error: null }, { id: 2, error: 'uncertain' },
-    { id: 2, result: {}, error: { code: -1, message: 'contradictory' } },
-    { id: 2, method: 'notification', error: { code: -1, message: 'not a response' } }]) {
+  const wireId = last(a.back).id;
+  for (const response of [{ id: wireId, error: null }, { id: wireId, error: 'uncertain' },
+    { id: wireId, result: {}, error: { code: -1, message: 'contradictory' } },
+    { id: wireId, method: 'notification', error: { code: -1, message: 'not a response' } },
+    { id: 2, error: { code: -1, message: 'client id is not the backend attempt id' } }]) {
     a.back.receive(response);
     a.front.receive(request(3)); unchanged(a.back, request(3));
   }
-  a.back.receive({ id: 2, error: { code: -1, message: 'definitive' } });
+  a.back.receive({ id: wireId, error: { code: -1, message: 'definitive' } });
+  assert.deepEqual(last(a.front), { id: 2, error: { code: -1, message: 'definitive' } });
   a.front.receive(request(4)); patched(a.back);
 });
 
 test('a duplicate pending RPC id on one connection is ambiguous and cannot regrant permission', () => {
   const relay = controlledRelay(); const a = relay.pair();
   a.front.receive(request(2));
+  const wireId = last(a.back).id;
   a.front.receive(request(2, 'thread/fork'));
   assert.equal(a.front.readyState, relay.Socket.CLOSED);
   assert.equal(a.back.readyState, relay.Socket.CLOSED);
-  a.back.receive({ id: 2, error: { code: -1, message: 'uncertain duplicate' } });
+  a.back.receive({ id: wireId, error: { code: -1, message: 'uncertain duplicate' } });
   const b = relay.pair(); b.front.receive(request(3)); unchanged(b.back, request(3));
 });
 
@@ -240,7 +252,8 @@ for (const concurrent of [false, true]) {
     assert.equal(seen[0].message.params.approvalPolicy, 'never');
     assert.deepEqual(seen[1].message, request(3, 'thread/fork'));
     const response = once(a, 'message');
-    seen[0].back.send(JSON.stringify({ id: 2, result: {} })); await response;
+    seen[0].back.send(JSON.stringify({ id: seen[0].message.id, result: {} }));
+    assert.deepEqual(JSON.parse((await response)[0]), { id: 2, result: {} });
     arrived = once(arrivals, 'request'); b.send(JSON.stringify(request(4))); await arrived;
     assert.deepEqual(seen[2].message, request(4));
   });
