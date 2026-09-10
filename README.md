@@ -732,6 +732,11 @@ Do not commit `.env` or print Discord tokens.
 
 ## Operations And Troubleshooting
 
+Codex 0.154 rejects permission overrides on a remote resume or fork. The
+instance launcher supports `--dangerously-bypass-approvals-and-sandbox` and
+`--yolo` through a launch-scoped native request relay and preserves the requested
+resume/fork command. See the [compatibility details](plugins/codex-discord-channel/README.md#codex-0154-remote-resume).
+
 Useful non-secret checks:
 
 ```bash

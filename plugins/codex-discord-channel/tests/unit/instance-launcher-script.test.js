@@ -138,6 +138,7 @@ while True:
     'fi',
     'printf "node %s\\n" "$*" >>"$TRACE"',
     'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == app-server ]]; then',
+    '  printf "app-permissions %s\\n" "${CODEX_DISCORD_REMOTE_PERMISSIONS-UNSET}" >>"$TRACE"',
     '  exec python3 "$SOCKET_OWNER" "$STATE_DIR/app-server.sock"',
     'fi',
     'if [[ ( $1 == "$FAKE_CHANNEL_BIN" || $1 == "$STATE_DIR"/generation-runtime/*/channel.cjs ) && $2 == gateway ]]; then',
@@ -378,7 +379,7 @@ test('shell launcher owns both workers without systemd, verifies each, then ente
   assert.equal(fs.existsSync(path.join(setup.stateDir, 'app-server.sock')), false);
 });
 
-test('shell launcher forks the latest thread instead of contending for its active writer', () => {
+test('shell launcher preserves resume and applies explicit YOLO at the app-server boundary', () => {
   const setup = fixture();
   const result = spawnSync(
     setup.launcher,
@@ -394,9 +395,40 @@ test('shell launcher forks the latest thread instead of contending for its activ
   const tuiLaunches = fs.readFileSync(setup.trace, 'utf8').trim().split('\n')
     .filter((line) => line.includes(`${setup.fakeCodex} --remote`));
   assert.deepEqual(tuiLaunches, [
-    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} --dangerously-bypass-approvals-and-sandbox fork --last`,
+    `node ${setup.fakeCodex} --remote unix://${setup.stateDir}/app-server.sock ${enterCompatTrace} resume --last`,
   ]);
+  assert.match(fs.readFileSync(setup.trace, 'utf8'), /app-permissions yolo/);
 });
+
+for (const args of [
+  ['resume', '--last', '--yolo'],
+  ['--yolo', 'fork', '--last'],
+  ['--yolo', 'resume', 'thread-2'],
+]) {
+  test(`shell launcher forwards YOLO without changing selection: ${args.join(' ')}`, () => {
+    const setup = fixture();
+    const result = spawnSync(setup.launcher, ['codex02', ...args], { encoding: 'utf8', env: launchEnv(setup), timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr);
+    const trace = fs.readFileSync(setup.trace, 'utf8');
+    assert.match(trace, /app-permissions yolo/);
+    assert.ok(trace.includes(`${enterCompatTrace} ${args.filter(arg => arg !== '--yolo').join(' ')}`));
+  });
+}
+
+for (const args of [
+  ['resume', '--last'],
+  ['--', '--yolo'],
+  ['-m', '--yolo', 'resume', '--last'],
+]) {
+  test(`shell launcher does not infer YOLO from inherited state or literal values: ${args.join(' ')}`, () => {
+    const setup = fixture();
+    const result = spawnSync(setup.launcher, ['codex02', ...args], { encoding: 'utf8', env: launchEnv(setup, { CODEX_DISCORD_REMOTE_PERMISSIONS: 'yolo' }), timeout: 5000 });
+    assert.equal(result.status, 0, result.stderr);
+    const trace = fs.readFileSync(setup.trace, 'utf8');
+    assert.match(trace, /app-permissions none/);
+    assert.ok(trace.includes(`${enterCompatTrace} ${args.join(' ')}`));
+  });
+}
 
 test('generation runtime survives marketplace eviction of the installed plugin cache', () => {
   const setup = fixture();

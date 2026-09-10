@@ -358,8 +358,8 @@ function env(setup, overrides = {}) {
   };
 }
 
-function launch(setup, overrides = {}) {
-  const child = spawn(setup.launcher, ['codex02'], {
+function launch(setup, overrides = {}, codexArgs = []) {
+  const child = spawn(setup.launcher, ['codex02', ...codexArgs], {
     env: env(setup, overrides),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -368,6 +368,21 @@ function launch(setup, overrides = {}) {
   child.stderr.on('data', (chunk) => { child.stderrText += chunk; });
   return child;
 }
+
+test('YOLO resume relay remains in the verified app generation and whole-alias cleanup stops its backend', async t => {
+  const setup = fixture(t);
+  const child = launch(setup, { APP_WRAPPER_TERM: 'normal' }, ['--yolo', 'resume', '--last']);
+  const result = await waitForExit(child);
+  assert.equal(result.code, 0, child.stderrText);
+  const records = recordedProcesses(setup);
+  assert.ok(records.some(record => record.role === 'tui'), 'generation readiness permitted the TUI');
+  const app = records.filter(record => ['channel-wrapper', 'app-wrapper', 'native-listener'].includes(record.role));
+  assert.equal(app.length, 3);
+  assert.equal(new Set(app.map(record => record.pgid)).size, 1);
+  assertRecordedDead(records, 'YOLO whole-alias exit');
+  assert.equal(fs.existsSync(setup.socketPath), false);
+  assert.equal(fs.existsSync(setup.manifestPath), false);
+});
 
 async function readyLauncher(setup, overrides = {}) {
   const child = launch(setup, { TUI_STAY_ACTIVE: '1', ...overrides });
