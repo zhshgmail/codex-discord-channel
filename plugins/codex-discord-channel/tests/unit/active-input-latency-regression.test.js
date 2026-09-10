@@ -15,13 +15,22 @@ const THREAD = '019f3763-d308-7871-bedc-e6489b02190e';
 const TURN = '019f3763-d308-7871-bedc-e6489b021910';
 const CLIENT = 'discord:fixture-channel:fixture-source';
 
-function fixture(t, { nativeProof = false, proofEntries = null, rotateOnProof = false, proofThrows = false } = {}) {
+function fixture(t, {
+  nativeProof = false, proofEntries = null, rotateOnProof = false, proofThrows = false,
+  closeAfterProof = false, nextCursor = null, rootKind = 'user', rolloutProof = false,
+} = {}) {
   const dir = fs.mkdtempSync(path.join(ROOT, 'fixture-'));
   const sessions = path.join(dir, 'sessions/2026/09/10');
   fs.mkdirSync(sessions, { recursive: true });
   const rollout = path.join(sessions, `rollout-2026-09-10T00-00-00-${THREAD}.jsonl`);
   fs.writeFileSync(rollout, JSON.stringify({
     type: 'session_meta', payload: { id: THREAD, thread_source: 'user' },
+  }) + '\n');
+  if (rolloutProof) fs.appendFileSync(rollout, JSON.stringify({
+    type: 'event_msg', payload: {
+      type: 'item_completed', thread_id: THREAD, turn_id: TURN,
+      item: { type: 'UserMessage', client_id: CLIENT },
+    },
   }) + '\n');
   let now = Date.parse('2026-09-10T00:00:00Z');
   let status = 'active';
@@ -37,7 +46,7 @@ function fixture(t, { nativeProof = false, proofEntries = null, rotateOnProof = 
     if (method === 'thread/read') {
       assert.equal(params.includeTurns, false, 'No full-history hydration is allowed');
       return { thread: {
-        id: THREAD, parentThreadId: null, threadSource: 'user',
+        id: THREAD, parentThreadId: null, threadSource: rootKind,
         status: { type: status, activeFlags: [] }, turns: [],
       } };
     }
@@ -54,7 +63,7 @@ function fixture(t, { nativeProof = false, proofEntries = null, rotateOnProof = 
           threadSource: 'user', status: { type: 'active' },
         } },
       });
-      return { data: proofEntries || (nativeProof && accepted ? [{ turnId: TURN, item: { type: 'userMessage', clientId: CLIENT } }] : []), nextCursor: null };
+      return { data: proofEntries || (nativeProof && accepted ? [{ turnId: TURN, item: { type: 'userMessage', clientId: CLIENT } }] : []), nextCursor };
     }
     if (method === 'turn/start' || method === 'turn/steer') {
       submissions.push({ method, clientId: params.clientUserMessageId, expectedTurnId: params.expectedTurnId });
@@ -69,9 +78,38 @@ function fixture(t, { nativeProof = false, proofEntries = null, rotateOnProof = 
     }
     throw new Error(`Unexpected RPC method ${method}`);
   };
+  // Exercise the production AppServerRpcClient/requestOnConnection path for
+  // connection fencing; only the WebSocket network transport is substituted.
+  class ClosingWebSocket extends EventEmitter {
+    static OPEN = 1;
+    constructor() {
+      super();
+      this.readyState = 0;
+      queueMicrotask(() => { this.readyState = 1; this.emit('open'); });
+    }
+    send(raw) {
+      const request = JSON.parse(raw);
+      if (!Object.hasOwn(request, 'id')) return;
+      Promise.resolve(request.method === 'initialize' ? {} : client.request(request.method, request.params))
+        .then((result) => {
+          this.emit('message', JSON.stringify({ id: request.id, result }));
+          if (request.method === 'thread/items/list') this.close();
+        }, (error) => this.emit('message', JSON.stringify({
+          id: request.id, error: { code: -32000, message: error.message },
+        })));
+    }
+    close() {
+      if (this.readyState === 3) return;
+      this.readyState = 3;
+      this.emit('close');
+    }
+  }
   const host = createAppServerHost({
-    appServerUrl: `unix://${dir}/unused.sock`, env: { CODEX_HOME: dir },
-  }, (level, message, fields) => logs.push({ level, message, fields }), { client });
+    appServerUrl: closeAfterProof ? 'ws://127.0.0.1:4500' : `unix://${dir}/unused.sock`,
+    env: { CODEX_HOME: dir },
+  }, (level, message, fields) => logs.push({ level, message, fields }), closeAfterProof
+    ? { WebSocket: ClosingWebSocket, reconnectInitialDelayMs: 60000 }
+    : { client });
   const config = {
     deliveryMode: 'app-server', deliveryProofRetryDelayMs: 2000,
     paths: {
@@ -118,11 +156,24 @@ test('regression: current native UserMessage proof must release FIFO without wai
   // evidence while a rollout flush is delayed, keeping the active FIFO stuck.
   const f = fixture(t, { nativeProof: true });
   await f.delivery.deliver(f.source);
+  const trace = () => f.requests.map(({ method, params }) => ({
+    method,
+    ...Object.fromEntries(Object.entries(params).filter(([key]) => [
+      'threadId', 'includeTurns', 'limit', 'sortDirection', 'itemsView',
+      'expectedTurnId', 'clientUserMessageId',
+    ].includes(key))),
+  }));
+  t.diagnostic(JSON.stringify({ phase: 'after_acceptance', rpc: trace() }));
   const result = await f.delivery.flush();
+  t.diagnostic(JSON.stringify({ phase: 'after_active_flush', rpc: trace() }));
   assert.equal(f.queue().items.length, 0,
     `A proven native UserMessage remains blocked: ${result.reason}`);
   assert.equal(f.queue().completed[0].clientUserMessageId, CLIENT);
   assert.equal(f.submissions.length, 1, 'Native proof reconciliation must not replay the user source');
+  assert.deepEqual(f.requests.map((entry) => entry.method), [
+    'thread/loaded/list', 'thread/read', 'thread/turns/list',
+    'turn/steer', 'thread/items/list',
+  ]);
 });
 
 test('native source proof rejects decoys, oversized pages, route changes, and unavailable reads', async (t) => {
@@ -155,4 +206,45 @@ test('submission diagnostics distinguish steer from start without recording inpu
     { clientUserMessageId: CLIENT, method: 'turn/start', targetStatus: 'idle', threadId: THREAD, expectedTurnId: null, acceptedTurnId: TURN },
   ]);
   assert.equal(JSON.stringify(f.logs).includes(f.source.content), false);
+});
+
+test('real RPC connection rotation after native proof response cannot release the active FIFO', async (t) => {
+  const f = fixture(t, { nativeProof: true, closeAfterProof: true });
+  assert.equal((await f.delivery.deliver(f.source)).reason, 'delivery_proof_pending');
+  assert.equal(f.host.client.connectionGeneration, 2,
+    'The production RPC client fenced its first connection after the transport closed');
+  assert.equal(f.host.client.status().available, false);
+  assert.equal(f.queue().items.length, 1);
+  assert.deepEqual(f.queue().completed, []);
+  assert.deepEqual(f.requests.map((entry) => entry.method), [
+    'thread/loaded/list', 'thread/read', 'thread/turns/list',
+    'turn/steer', 'thread/items/list',
+  ]);
+});
+
+test('system root cannot authorize a native source proof request', async (t) => {
+  const f = fixture(t, { rootKind: 'system', nativeProof: true });
+  const result = await f.delivery.deliver(f.source);
+  assert.equal(result.reason, 'shared_app_server_no_top_level_thread');
+  assert.equal(await f.host.hasDeliveredSource(CLIENT), false);
+  assert.deepEqual(f.requests.map((entry) => entry.method), ['thread/loaded/list', 'thread/read']);
+  assert.equal(f.queue().items.length, 1);
+});
+
+test('native proof reads one bounded page and never follows a next cursor', async (t) => {
+  const f = fixture(t, { nextCursor: 'more-native-items' });
+  assert.equal((await f.delivery.deliver(f.source)).reason, 'delivery_proof_pending');
+  assert.deepEqual(f.requests.filter((entry) => entry.method === 'thread/items/list'), [{
+    method: 'thread/items/list', params: { threadId: THREAD, limit: 32, sortDirection: 'desc' },
+  }]);
+  assert.equal(f.queue().items.length, 1);
+});
+
+test('exact rollout proof bypasses native item RPC and releases active FIFO', async (t) => {
+  const f = fixture(t, { rolloutProof: true, proofThrows: true });
+  assert.equal((await f.delivery.deliver(f.source)).status, 'delivered');
+  assert.deepEqual(f.requests.map((entry) => entry.method), [
+    'thread/loaded/list', 'thread/read', 'thread/turns/list', 'turn/steer',
+  ]);
+  assert.equal(f.queue().items.length, 0);
 });
