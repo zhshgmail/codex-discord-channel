@@ -17,6 +17,20 @@ The generic `CODEX_APP_SERVER_URL` is ignored for instance routing. Only the
 plugin-specific endpoint or the socket under that instance state directory may
 select the Discord delivery target.
 
+## Codex 0.154 remote resume
+
+The instance launcher preserves `resume --last` as a resume. With an explicit
+`--dangerously-bypass-approvals-and-sandbox` (or `--yolo`), it applies that policy
+to the native TUI's first successful thread start, resume, or fork request.
+This avoids Codex 0.154's rejection of permission flags on a remote resume.
+The native TUI still selects the session; the plugin neither selects a second
+session nor stores its ID. Later permission changes and reconnects retain the
+user's current settings. Gateway requests pass through unchanged.
+
+Only invocations requesting YOLO use this Unix-socket relay. Both relay and
+native app server remain in the launcher's existing app process group, with
+bounded shutdown and preservation of a replaced public socket.
+
 ## Gateway Message Content Intent
 
 The gateway requests Discord's privileged Message Content intent by default,

@@ -2708,9 +2708,15 @@ test('production source contains no raw TTY or terminal-control injection path',
   const source = productionFiles
     .map((file) => fs.readFileSync(file, 'utf8'))
     .join('\n');
+  // The launch-only relay supervises a native app-server child. Delivery
+  // modules still cannot spawn processes, and no file may inject TTY input.
+  for (const file of productionFiles) {
+    if (file === path.join(root, 'src', 'remote-permissions.js')) continue;
+    assert.equal(fs.readFileSync(file, 'utf8').includes('node:child_process'), false,
+      `process spawning is confined to the native app-server relay: ${file}`);
+  }
   for (const forbidden of [
     'TIOCSTI',
-    'node:child_process',
     'tty-detect',
     'runTtyInjector',
     'injectIntoTty',

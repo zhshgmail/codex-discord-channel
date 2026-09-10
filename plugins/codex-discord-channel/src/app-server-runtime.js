@@ -96,6 +96,11 @@ function buildAppServerLaunch(config) {
 
 function runAppServer(config, dependencies = {}) {
   const launch = buildAppServerLaunch(config);
+  if (config.env.CODEX_DISCORD_REMOTE_PERMISSIONS === 'yolo') {
+    launch.args.push('-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"');
+    const runRelay = dependencies.runPermissionRelay || require('./remote-permissions').runPermissionRelay;
+    return runRelay(launch, config.appServerUrl, { approvalPolicy: 'never', sandbox: 'danger-full-access' });
+  }
   const execve = dependencies.execve || process.execve;
   if (typeof execve !== 'function') {
     const error = new Error('Node 22.15 or newer is required for process.execve');

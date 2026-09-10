@@ -86,6 +86,21 @@ test('runAppServer replaces itself with Codex under the isolated environment', (
   assert.equal(observed.env.DISCORD_CONFIG_DIR, config.paths.stateDir);
 });
 
+test('explicit launcher YOLO uses the native request relay and does not leak its control into the child', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-yolo-relay-'));
+  const config = createInstance(root, 'codex03', '.codex-account-03', '33333333333333333');
+  config.env.CODEX_DISCORD_REMOTE_PERMISSIONS = 'yolo';
+  let called = false;
+  runAppServer(config, { runPermissionRelay(launch, endpoint, permissions) {
+    called = true;
+    assert.equal(endpoint, config.appServerUrl);
+    assert.deepEqual(permissions, { approvalPolicy: 'never', sandbox: 'danger-full-access' });
+    assert.equal(launch.env.CODEX_DISCORD_REMOTE_PERMISSIONS, undefined);
+    assert.deepEqual(launch.args.slice(-4), ['-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"']);
+  } });
+  assert.equal(called, true);
+});
+
 test('instance doctor reports account and Discord state separation without secrets', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-instance-doctor-'));
   const config = createInstance(root, 'codex02', '.codex-account-02', '22222222222222222');
