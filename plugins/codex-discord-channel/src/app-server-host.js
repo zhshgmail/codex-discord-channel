@@ -11,6 +11,7 @@ const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
 const MAX_TARGET_RESOLUTION_RESTARTS = 4;
 const MAX_VERIFIED_USER_MESSAGES = 256;
+const MAX_RECENT_SOURCE_PROOF_ITEMS = 32;
 const MAX_EMITTED_ASSISTANT_FINALS = 256;
 const MAX_ROLLOUT_SEARCH_DEPTH = 4;
 const MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096;
@@ -1958,6 +1959,14 @@ class AppServerHost extends EventEmitter {
             ...(candidate.activeTurnId ? { expectedTurnId: candidate.activeTurnId } : {}),
           }
         : { ...params, threadId: candidate.threadId };
+      const observation = {
+        clientUserMessageId: params.clientUserMessageId,
+        method,
+        targetStatus: candidate.status,
+        threadId: candidate.threadId,
+        expectedTurnId: requestParams.expectedTurnId || null,
+      };
+      this.logger('INFO', 'Submitting Discord input to current app-server target', observation);
       if (typeof this.client.requestOnConnection === 'function') {
         const response = await this.client.requestOnConnection(
           method,
@@ -1966,15 +1975,24 @@ class AppServerHost extends EventEmitter {
           null,
           true,
         );
+        this.logger('INFO', 'App-server acknowledged Discord input', {
+          ...observation,
+          acceptedTurnId: response.result?.turn?.id || response.result?.turnId || null,
+        });
         return {
           method,
           result: response.result,
           acceptedGeneration: response.generation,
         };
       }
+      const result = await this.client.request(method, requestParams);
+      this.logger('INFO', 'App-server acknowledged Discord input', {
+        ...observation,
+        acceptedTurnId: result?.turn?.id || result?.turnId || null,
+      });
       return {
         method,
-        result: await this.client.request(method, requestParams),
+        result,
         acceptedGeneration: null,
       };
     };
@@ -2244,7 +2262,37 @@ class AppServerHost extends EventEmitter {
       this.rememberVerifiedSourceMessage(clientUserMessageId);
       return true;
     }
-    return false;
+    // A just-consumed UserMessage may be visible through the state-dir's
+    // current native app-server before its rollout flush completes. Read one
+    // bounded recent-item page for that already-selected top-level user root;
+    // never hydrate full history or accept another root's RPC proof.
+    const threadId = this.currentThreadId;
+    if (!this.loadedInventoryProven || !candidates.includes(threadId)) return false;
+    const selectionRevision = this.threadSelectionRevision;
+    const params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: 'desc' };
+    let page;
+    try {
+      page = typeof this.client.requestOnConnection === 'function'
+        ? (await this.client.requestOnConnection(
+          'thread/items/list', params, this.client.connectionGeneration,
+        )).result
+        : await this.client.request('thread/items/list', params);
+    } catch {
+      return false;
+    }
+    if (
+      this.threadSelectionRevision !== selectionRevision ||
+      this.currentThreadId !== threadId ||
+      !Array.isArray(page?.data) ||
+      page.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS ||
+      !page.data.some((entry) => (
+        entry?.item?.type === 'userMessage' &&
+        entry.item.clientId === clientUserMessageId
+      ))
+    ) return false;
+    this.rememberVerifiedUserMessage(threadId, clientUserMessageId);
+    this.rememberVerifiedSourceMessage(clientUserMessageId);
+    return true;
   }
 
   onThreadIdle(listener) {
