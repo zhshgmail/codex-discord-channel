@@ -95482,7 +95482,7 @@ var require_owner_state = __commonJS({
 var require_remote_permissions = __commonJS({
   "src/remote-permissions.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), http = require("node:http"), { randomBytes } = require("node:crypto"), { spawn } = require("node:child_process"), { setTimeout: delay } = require("node:timers/promises"), WebSocket = require_ws();
+    var fs = require("node:fs"), http = require("node:http"), { randomBytes } = require("node:crypto"), { spawn } = require("node:child_process"), { setTimeout: delay } = require("node:timers/promises"), WebSocket = require_ws(), MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
     function permissionRequest(data, isTui, permissions) {
       let message;
       try {
@@ -95493,28 +95493,50 @@ var require_remote_permissions = __commonJS({
       return !isTui || !message || typeof message != "object" || Array.isArray(message) || message.id === void 0 || !["thread/start", "thread/resume", "thread/fork"].includes(message.method) || !message.params || typeof message.params != "object" || Array.isArray(message.params) ? data : JSON.stringify({ ...message, params: { ...message.params, ...permissions } });
     }
     function connectRelay(front, backendUrl, permissions, startupState = { applied: !1 }) {
-      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: 134217728 }), isTui = !1, startupRequests = /* @__PURE__ */ new Set(), queued = [], queuedBytes = 0, close = () => {
-        front.terminate(), back.terminate(), queued = [];
+      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: 134217728 }), isTui = !1, pendingRequest, closed = !1, queued = [], queuedBytes = 0, close = () => {
+        closed || (closed = !0, pendingRequest && startupState.pending === pendingRequest && (startupState.applied = !0, startupState.pending = null), pendingRequest = void 0, queued = [], queuedBytes = 0, front.terminate(), back.terminate());
+      }, forward = (socket, data, binary) => {
+        if (closed || socket.readyState !== WebSocket.OPEN) return !1;
+        if (socket.bufferedAmount + Buffer.byteLength(data) > MAX_BUFFERED_BYTES)
+          return close(), !1;
+        try {
+          socket.send(data, { binary }, (error) => {
+            error && close();
+          }), socket.bufferedAmount > MAX_BUFFERED_BYTES && close();
+        } catch {
+          close();
+        }
+        return !closed;
       };
-      front.on("error", close), back.on("error", close), front.on("close", () => back.terminate()), back.on("close", () => front.terminate()), front.on("message", (data, binary) => {
+      front.on("error", close), back.on("error", close), front.on("close", close), back.on("close", close), front.on("message", (data, binary) => {
+        if (closed) return;
         let message;
         try {
           message = JSON.parse(data.toString());
         } catch {
         }
-        message?.method === "initialize" && (isTui = ["codex-tui", "codex_cli_rs"].includes(message.params?.clientInfo?.name));
-        let outgoing = permissionRequest(data, isTui && !startupState.applied, permissions);
-        outgoing !== data && message?.id !== void 0 && startupRequests.add(message.id), back.readyState === WebSocket.OPEN ? back.send(outgoing, { binary }) : back.readyState === WebSocket.CONNECTING && (queuedBytes += Buffer.byteLength(outgoing), queuedBytes > 16 * 1024 * 1024 ? close() : queued.push([outgoing, binary]));
+        if (message?.method === "initialize" && (isTui = ["codex-tui", "codex_cli_rs"].includes(message.params?.clientInfo?.name)), pendingRequest && message?.id === pendingRequest.id && typeof message.method == "string") {
+          close();
+          return;
+        }
+        let outgoing = permissionRequest(data, isTui && !startupState.applied && !startupState.pending, permissions);
+        outgoing !== data && (pendingRequest = { id: message.id }, startupState.pending = pendingRequest), back.readyState === WebSocket.OPEN ? forward(back, outgoing, binary) : back.readyState === WebSocket.CONNECTING && (queuedBytes += Buffer.byteLength(outgoing), queuedBytes > MAX_BUFFERED_BYTES ? close() : queued.push([outgoing, binary]));
       }), back.on("open", () => {
-        for (let [data, binary] of queued) back.send(data, { binary });
+        for (let [data, binary] of queued)
+          if (!forward(back, data, binary)) break;
         queued = [], queuedBytes = 0;
       }), back.on("message", (data, binary) => {
+        if (closed) return;
         let message;
         try {
           message = JSON.parse(data.toString());
         } catch {
         }
-        startupRequests.delete(message?.id) && message.result !== void 0 && (startupState.applied = !0, startupRequests.clear()), front.readyState === WebSocket.OPEN && front.send(data, { binary });
+        if (pendingRequest && startupState.pending === pendingRequest && message?.id === pendingRequest.id && message.method === void 0) {
+          let hasResult = Object.hasOwn(message, "result"), hasError = Object.hasOwn(message, "error"), explicitError = hasError && message.error && !Array.isArray(message.error) && Number.isInteger(message.error.code) && typeof message.error.message == "string";
+          (hasResult && !hasError || explicitError && !hasResult) && (hasResult && (startupState.applied = !0), startupState.pending = null, pendingRequest = void 0);
+        }
+        forward(front, data, binary);
       });
     }
     async function runPermissionRelay(launch, endpoint, permissions) {

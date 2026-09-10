@@ -6,6 +6,7 @@ const { randomBytes } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { setTimeout: delay } = require('node:timers/promises');
 const WebSocket = require('ws');
+const MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
 
 // The native TUI chooses the session. Never resolve --last ourselves or retain
 // a thread ID: permission flags belong to this invocation, not Discord identity.
@@ -22,42 +23,91 @@ function permissionRequest(data, isTui, permissions) {
 function connectRelay(front, backendUrl, permissions, startupState = { applied: false }) {
   const back = new WebSocket(backendUrl, { perMessageDeflate: false, maxPayload: 128 * 1024 * 1024 });
   let isTui = false;
-  const startupRequests = new Set();
+  let pendingRequest;
+  let closed = false;
   let queued = [];
   let queuedBytes = 0;
-  const close = () => { front.terminate(); back.terminate(); queued = []; };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    // A lost reply cannot prove that the backend rejected the override. This
+    // invocation stays consumed across reconnects; retain no thread identity.
+    if (pendingRequest && startupState.pending === pendingRequest) {
+      startupState.applied = true;
+      startupState.pending = null;
+    }
+    pendingRequest = undefined;
+    queued = [];
+    queuedBytes = 0;
+    front.terminate();
+    back.terminate();
+  };
+  const forward = (socket, data, binary) => {
+    if (closed || socket.readyState !== WebSocket.OPEN) return false;
+    if (socket.bufferedAmount + Buffer.byteLength(data) > MAX_BUFFERED_BYTES) {
+      close();
+      return false;
+    }
+    try {
+      socket.send(data, { binary }, error => { if (error) close(); });
+      if (socket.bufferedAmount > MAX_BUFFERED_BYTES) close();
+    } catch { close(); }
+    return !closed;
+  };
   front.on('error', close);
   back.on('error', close);
-  front.on('close', () => back.terminate());
-  back.on('close', () => front.terminate());
+  front.on('close', close);
+  back.on('close', close);
   front.on('message', (data, binary) => {
+    if (closed) return;
     let message;
     try { message = JSON.parse(data.toString()); } catch {}
     if (message?.method === 'initialize') {
       isTui = ['codex-tui', 'codex_cli_rs'].includes(message.params?.clientInfo?.name);
     }
-    const outgoing = permissionRequest(data, isTui && !startupState.applied, permissions);
-    if (outgoing !== data && message?.id !== undefined) startupRequests.add(message.id);
-    if (back.readyState === WebSocket.OPEN) back.send(outgoing, { binary });
+    if (pendingRequest && message?.id === pendingRequest.id && typeof message.method === 'string') {
+      // Two outstanding requests with the same id cannot be correlated safely.
+      close();
+      return;
+    }
+    const outgoing = permissionRequest(data, isTui && !startupState.applied && !startupState.pending, permissions);
+    if (outgoing !== data) {
+      // Reserve before forwarding, including while the backend is connecting.
+      // Object identity scopes this ephemeral RPC id to its own connection.
+      pendingRequest = { id: message.id };
+      startupState.pending = pendingRequest;
+    }
+    if (back.readyState === WebSocket.OPEN) forward(back, outgoing, binary);
     else if (back.readyState === WebSocket.CONNECTING) {
       queuedBytes += Buffer.byteLength(outgoing);
-      if (queuedBytes > 16 * 1024 * 1024) close();
+      if (queuedBytes > MAX_BUFFERED_BYTES) close();
       else queued.push([outgoing, binary]);
     }
   });
   back.on('open', () => {
-    for (const [data, binary] of queued) back.send(data, { binary });
+    for (const [data, binary] of queued) {
+      if (!forward(back, data, binary)) break;
+    }
     queued = [];
     queuedBytes = 0;
   });
   back.on('message', (data, binary) => {
+    if (closed) return;
     let message;
     try { message = JSON.parse(data.toString()); } catch {}
-    if (startupRequests.delete(message?.id) && message.result !== undefined) {
-      startupState.applied = true;
-      startupRequests.clear();
+    if (pendingRequest && startupState.pending === pendingRequest
+      && message?.id === pendingRequest.id && message.method === undefined) {
+      const hasResult = Object.hasOwn(message, 'result');
+      const hasError = Object.hasOwn(message, 'error');
+      const explicitError = hasError && message.error && !Array.isArray(message.error)
+        && Number.isInteger(message.error.code) && typeof message.error.message === 'string';
+      if ((hasResult && !hasError) || (explicitError && !hasResult)) {
+        if (hasResult) startupState.applied = true;
+        startupState.pending = null;
+        pendingRequest = undefined;
+      }
     }
-    if (front.readyState === WebSocket.OPEN) front.send(data, { binary });
+    forward(front, data, binary);
   });
 }
 

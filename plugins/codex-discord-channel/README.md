@@ -24,8 +24,13 @@ The instance launcher preserves `resume --last` as a resume. With an explicit
 to the native TUI's first successful thread start, resume, or fork request.
 This avoids Codex 0.154's rejection of permission flags on a remote resume.
 The native TUI still selects the session; the plugin neither selects a second
-session nor stores its ID. Later permission changes and reconnects retain the
-user's current settings. Gateway requests pass through unchanged.
+session nor stores its ID. At most one request can carry the override while its
+reply is pending, across all relay connections. Concurrent requests pass through
+with their own settings. Success consumes the override; only an explicit error
+for that same request and connection permits another attempt. An ambiguous
+disconnect keeps it consumed for the rest of the invocation. Later permission
+changes and reconnects retain the user's current settings. Gateway requests
+pass through unchanged.
 App-server configuration defaults remain unchanged. An invocation without a
 YOLO flag explicitly disables this forwarding, including when the shell carries
 a marker from an earlier invocation; Discord or account files cannot enable it.
@@ -33,6 +38,9 @@ a marker from an earlier invocation; Discord or account files cannot enable it.
 Only invocations requesting YOLO use this Unix-socket relay. Both relay and
 native app server remain in the launcher's existing app process group, with
 bounded shutdown and preservation of a replaced public socket.
+The relay limits its connecting queue and each open socket's buffered sends to
+16 MiB. Exceeding the limit closes the affected connection pair and clears its
+queue; other clients remain connected.
 
 ## Gateway Message Content Intent
 
