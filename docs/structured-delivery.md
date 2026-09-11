@@ -32,14 +32,15 @@ target readiness, armed its listener, and committed that replacement. The new
 record retains the incumbent as fallback, so an A7 incumbent becomes effective
 again if the committed successor process dies.
 
-Pure A7 handoffs store one-line version-2 JSON in `session-gateway.pid`. When
-the fallback is a running A6 gateway, A6's integer PID and `.generation` files
-remain unchanged and A7 atomically stores its generation-fenced CAS record in
-`session-gateway.pid.v2`. A7 readers prefer that staged record. Because A6
-cannot observe successor death, both listeners remain eligible during this
-interval; the process-safe queue lock and Discord identity deduplication remain
-the exactly-once boundary. A7 crash needs no state rewrite, A7 graceful release
-removes only `.v2`, and A6 graceful shutdown cannot delete A7 authority.
+Pure same-protocol handoffs store one-line version-2 JSON in
+`session-gateway.pid` and may retain a live fallback. A queue-lock protocol
+change is different: the successor refuses to commit while an incompatible
+incumbent is live, before touching the queue lock pathname. The operator must
+stop and verify the old gateway before starting the successor. This quiesced
+transition is mandatory because an already-running legacy binary cannot be
+taught not to reclaim or delete the new writer's lock. The authority record
+carries `deliveryQueueLockProtocol` so the runtime enforces this boundary
+instead of relying on deployment convention.
 
 When no live incumbent exists, target readiness is not a receive-startup gate.
 The first gateway logs in, proves queue persistence, arms its listener, and
@@ -173,7 +174,14 @@ missing loaded threads, busy threads, and stale receiver authority retain the
 head and retry with exponential backoff from the configured base interval to a
 configured maximum. The defaults are 1 second and 30 seconds. Timer, app-server
 event, and restart drains all use the same serialized queue lock, in-progress
-lease, and acknowledgement boundary.
+lease, and acknowledgement boundary. The current lock is a persistent regular
+file held by the kernel through `flock(2)` for the complete operation. Release
+closes the holding process; it never removes the shared lock pathname, so
+owner-write rollback and release have no pathname check/delete ABA window.
+Acquisition timeout and release failure are surfaced as operation errors. A
+legacy directory at the lock pathname is a fail-closed migration error and may
+be removed only after the gateway is quiesced and the exact path has been
+audited.
 
 ## Turn Payload
 

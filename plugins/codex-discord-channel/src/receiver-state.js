@@ -4,6 +4,8 @@ const { randomUUID } = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
+const DELIVERY_QUEUE_LOCK_PROTOCOL = 'flock-v1';
+
 function localPid(deps = {}) {
   const pid = Number(deps.pid);
   return Number.isInteger(pid) && pid > 0 ? pid : process.pid;
@@ -273,6 +275,7 @@ function createReceiverOwnership(previous, deps = {}) {
     pid,
     generation: (deps.randomUUID || randomUUID)(),
     claimedAt: new Date(nowValue).toISOString(),
+    deliveryQueueLockProtocol: DELIVERY_QUEUE_LOCK_PROTOCOL,
     ...(processStartTicks ? { processStartTicks } : {}),
     ...(stateDir ? { stateDir, role: 'gateway' } : {}),
     fallback: previous && previous.pid !== pid ? fallbackRecord(previous) : null,
@@ -298,12 +301,47 @@ function snapshotsMatch(left, right) {
   return left?.path === right?.path && left?.token === right?.token;
 }
 
+function assertReceiverOwnershipProtocolCompatible(
+  incumbent,
+  candidateProtocol = DELIVERY_QUEUE_LOCK_PROTOCOL,
+) {
+  if (
+    incumbent
+    && incumbent.deliveryQueueLockProtocol !== candidateProtocol
+  ) {
+    const error = new Error(
+      'Discord gateway upgrade requires the incompatible incumbent queue-lock protocol to be quiesced first.',
+    );
+    error.code = 'delivery_queue_lock_protocol_quiescence_required';
+    throw error;
+  }
+}
+
 function commitReceiverOwnership(config, expectedSnapshot, candidate, deps = {}) {
+  if (
+    !candidate ||
+    candidate.version !== 2 ||
+    candidate.deliveryQueueLockProtocol !== DELIVERY_QUEUE_LOCK_PROTOCOL
+  ) {
+    const error = new Error('Discord receiver candidate has no supported delivery queue-lock protocol.');
+    error.code = 'receiver_ownership_protocol_invalid';
+    throw error;
+  }
   const current = readReceiverAuthoritySnapshot(config, deps);
   if (!current.valid || !snapshotsMatch(current, expectedSnapshot)) {
     const error = new Error('Discord receiver ownership changed before atomic commit.');
     error.code = 'receiver_ownership_changed';
     throw error;
+  }
+  const incumbent = effectiveReceiverOwnership(current, deps);
+  if (
+    incumbent
+    && incumbent.record.pid !== candidate.pid
+  ) {
+    assertReceiverOwnershipProtocolCompatible(
+      incumbent.record,
+      candidate.deliveryQueueLockProtocol,
+    );
   }
   const targetPath = current.source === 'legacy' && candidate.fallback?.version === 1
     ? getStagedReceiverAuthorityPath(config)
@@ -343,6 +381,7 @@ function releaseReceiverOwnership(config, expected, deps = {}) {
 }
 
 module.exports = {
+  assertReceiverOwnershipProtocolCompatible,
   commitReceiverOwnership,
   createReceiverOwnership,
   effectiveReceiverOwnership,

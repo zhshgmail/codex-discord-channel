@@ -462,7 +462,13 @@ test('accepted Discord events persist in FIFO order while an earlier delivery bl
   const firstHandling = handler(makeMessage('m1', 'first'));
   await firstStarted;
   const secondHandling = handler(makeMessage('m2', 'second'));
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  const persistenceDeadline = Date.now() + 2000;
+  while (
+    JSON.parse(fs.readFileSync(config.paths.deliveryQueuePath, 'utf8')).items.length < 2 &&
+    Date.now() < persistenceDeadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   const persistedBeforeFirstCompleted = JSON.parse(
     fs.readFileSync(config.paths.deliveryQueuePath, 'utf8'),
   );
@@ -692,6 +698,7 @@ function incumbentGatewayFixture() {
     pid: process.pid,
     generation: 'incumbent-generation',
     claimedAt: '2026-07-20T00:00:00.000Z',
+    deliveryQueueLockProtocol: 'flock-v1',
     fallback: null,
   };
   fs.writeFileSync(gatewayPidPath, `${JSON.stringify(ownership)}\n`);
@@ -812,6 +819,7 @@ test('a dead receiver record is replaced automatically with an actionable warnin
     pid: successorPid,
     generation: 'replacement-generation',
     claimedAt: readReceiverAuthoritySnapshot(config).record.claimedAt,
+    deliveryQueueLockProtocol: 'flock-v1',
     fallback: null,
   });
   assert.deepEqual(logs.find((entry) => entry.message.includes('reclaiming stale')), {
@@ -878,6 +886,7 @@ test('successor replaces durable receiver ownership only after login and app-ser
     pid: successorPid,
     generation: 'successor-generation',
     claimedAt: readReceiverAuthoritySnapshot(config).record.claimedAt,
+    deliveryQueueLockProtocol: 'flock-v1',
     fallback: ownership,
   });
 });

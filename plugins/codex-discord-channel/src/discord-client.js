@@ -4,6 +4,7 @@ const { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require('./
 const { normalizeDiscordMessage } = require('./delivery');
 const { discordClientResourceOptions } = require('./gateway-resources');
 const {
+  assertReceiverOwnershipProtocolCompatible,
   commitReceiverOwnership,
   createReceiverOwnership,
   effectiveReceiverOwnership,
@@ -201,6 +202,10 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
   }
   const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps);
   const shouldReceive = claimReceiver || receiver.active;
+  // Refuse a mixed lock-protocol handoff before Discord login or any queue
+  // pathname access. Otherwise a successor could disturb a still-running
+  // legacy gateway even though it can never commit receiver authority.
+  if (shouldReceive) assertReceiverOwnershipProtocolCompatible(effectiveOwnership);
 
   const {
     Client,

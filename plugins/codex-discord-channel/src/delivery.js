@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const { createAppServerHost } = require('./app-server-host');
 const {
   contentDigest,
@@ -9,7 +10,7 @@ const {
   receiptPath,
   replyNonce,
 } = require('./reply-delivery');
-const { isProcessAlive, readLinuxProcessStartTicks } = require('./receiver-state');
+const { isProcessAlive } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
 const DELIVERY_QUEUE_VERSION = 5;
@@ -171,28 +172,41 @@ function getDeliveryQueueLockPath(config = {}) {
   return queuePath ? `${queuePath}.lock` : '';
 }
 
-function readLockOwner(lockPath, fsImpl) {
-  try {
-    const parsed = JSON.parse(fsImpl.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
+const LOCK_HELPER_SOURCE = [
+  "'use strict';",
+  "process.stdout.write('LOCKED\\n');",
+  'process.stdin.resume();',
+  "process.stdin.once('end', () => process.exit(0));",
+].join('');
 
-function removeLockDirectory(lockPath, fsImpl) {
-  fsImpl.rmSync(lockPath, { recursive: true, force: true });
-}
-
-function validateExistingQueueLock(lockPath, fsImpl) {
+function openDeliveryQueueLock(lockPath, fsImpl) {
+  const flags = fs.constants.O_CREAT | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0);
+  let descriptor;
   try {
-    const stat = fsImpl.lstatSync(lockPath);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    descriptor = fsImpl.openSync(lockPath, flags, 0o600);
+    const held = fsImpl.fstatSync(descriptor, { bigint: true });
+    const named = fsImpl.lstatSync(lockPath, { bigint: true });
+    if (
+      !held.isFile()
+      || !named.isFile()
+      || named.isSymbolicLink()
+      || held.nlink !== 1n
+      || named.nlink !== 1n
+      || held.dev !== named.dev
+      || held.ino !== named.ino
+    ) {
       throw new Error(`Unsafe Discord delivery queue lock: ${lockPath}`);
     }
-    return true;
+    return descriptor;
   } catch (error) {
-    if (error?.code === 'ENOENT') return false;
+    if (descriptor !== undefined) fsImpl.closeSync(descriptor);
+    if (error?.code === 'EISDIR') {
+      const migration = new Error(
+        `Discord delivery queue lock protocol migration requires a quiesced gateway and manual removal of the legacy lock directory: ${lockPath}`,
+      );
+      migration.code = 'delivery_queue_lock_protocol_migration_required';
+      throw migration;
+    }
     throw error;
   }
 }
@@ -205,54 +219,103 @@ async function acquireDeliveryQueueLock(config = {}, deps = {}) {
   const lockPath = getDeliveryQueueLockPath(config);
   if (!lockPath) throw new Error('Discord delivery queue path is not configured.');
   const fsImpl = deps.fs || fs;
+  const spawnImpl = deps.spawn || spawn;
   const timeoutMs = Number(config.deliveryQueueLockTimeoutMs) || 60000;
-  const retryMs = Number(config.deliveryQueueLockRetryMs) || 20;
-  const startedAt = Date.now();
-  const token = `${process.pid}-${startedAt}-${Math.random().toString(16).slice(2)}`;
   fsImpl.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-
-  while (true) {
-    try {
-      fsImpl.mkdirSync(lockPath, { mode: 0o700 });
-      try {
-        fsImpl.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
-          pid: process.pid,
-          processStartTicks: readLinuxProcessStartTicks(process.pid),
-          token,
-          acquiredAt: new Date().toISOString(),
-        })}\n`, { mode: 0o600 });
-      } catch (error) {
-        removeLockDirectory(lockPath, fsImpl);
-        throw error;
-      }
-      return () => {
-        try {
-          const owner = readLockOwner(lockPath, fsImpl);
-          if (owner?.token === token) removeLockDirectory(lockPath, fsImpl);
-        } catch {}
-      };
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      // Never reclaim an existing lock automatically. A pathname-level
-      // inspect-then-rename/delete sequence has an ABA window that can remove
-      // a different writer's newly acquired live lock. An abandoned lock is a
-      // fail-closed condition requiring a quiesced, explicit manual audit.
-      validateExistingQueueLock(lockPath, fsImpl);
-      if (Date.now() - startedAt >= timeoutMs) {
-        throw new Error(`Timed out waiting for Discord delivery queue lock: ${lockPath}`);
-      }
-      await sleep(retryMs);
-    }
+  const descriptor = openDeliveryQueueLock(lockPath, fsImpl);
+  let child;
+  try {
+    child = spawnImpl(
+      deps.flockCommand || '/usr/bin/flock',
+      [
+        '--exclusive',
+        '--timeout',
+        String(Math.max(1, timeoutMs) / 1000),
+        '/proc/self/fd/3',
+        process.execPath,
+        '-e',
+        LOCK_HELPER_SOURCE,
+      ],
+      {
+        cwd: path.dirname(lockPath),
+        stdio: ['pipe', 'pipe', 'pipe', descriptor],
+        windowsHide: true,
+      },
+    );
+  } finally {
+    fsImpl.closeSync(descriptor);
   }
+
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-4096);
+  });
+  let acquired = false;
+  const exitPromise = new Promise((resolve) => {
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+  await new Promise((resolve, reject) => {
+    let stdout = '';
+    const fail = (error) => {
+      if (acquired) return;
+      acquired = true;
+      reject(error);
+    };
+    child.once('error', fail);
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk;
+      if (!acquired && stdout.includes('LOCKED\n')) {
+        acquired = true;
+        resolve();
+      }
+    });
+    exitPromise.then(({ code, signal }) => {
+      fail(new Error(
+        code === 1
+          ? `Timed out waiting for Discord delivery queue lock: ${lockPath}`
+          : `Discord delivery queue lock helper exited before acquisition (code=${code}, signal=${signal || 'none'}): ${stderr.trim()}`,
+      ));
+    });
+  });
+
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    child.stdin.end();
+    const { code, signal } = await exitPromise;
+    if (code !== 0) {
+      const error = new Error(
+        `Discord delivery queue lock release failed (code=${code}, signal=${signal || 'none'}): ${stderr.trim()}`,
+      );
+      error.code = 'delivery_queue_lock_release_failed';
+      throw error;
+    }
+  };
 }
 
 async function withDeliveryQueueLock(config, deps, operation) {
   const release = await acquireDeliveryQueueLock(config, deps);
+  let result;
+  let operationError;
   try {
-    return await operation();
-  } finally {
-    release();
+    result = await operation();
+  } catch (error) {
+    operationError = error;
   }
+  try {
+    await release();
+  } catch (releaseError) {
+    if (operationError) {
+      throw new AggregateError(
+        [operationError, releaseError],
+        'Discord delivery queue operation and lock release both failed.',
+      );
+    }
+    throw releaseError;
+  }
+  if (operationError) throw operationError;
+  return result;
 }
 
 function emptyDeliveryQueue() {

@@ -232,24 +232,11 @@ function createManualTimers() {
   };
 }
 
-test('queue lock cleanup failure cannot negate an already committed ownership operation', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-cleanup-'));
+test('queue lock pathname and inode persist after successful and failed operations', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-persistent-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const config = deliveryConfig(dir);
-  let failCleanup = false;
-  const fsProxy = {
-    ...fs,
-    rmSync(target, options) {
-      if (failCleanup && target === `${config.paths.deliveryQueuePath}.lock`) {
-        failCleanup = false;
-        const error = new Error('injected lock cleanup failure');
-        error.code = 'EACCES';
-        throw error;
-      }
-      return fs.rmSync(target, options);
-    },
-  };
   const delivery = createDelivery(config, () => {}, {
-    fs: fsProxy,
     structuredHost: {
       async resolveTarget() { return { available: true, threadId: 'thread-current', status: 'idle' }; },
       onThreadIdle() { return () => {}; },
@@ -260,16 +247,27 @@ test('queue lock cleanup failure cannot negate an already committed ownership op
     },
   });
   await delivery.flush();
-  failCleanup = true;
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  const before = fs.statSync(lockPath);
 
   const result = await delivery.coordinateReceiverOwnership(() => 'authority-committed');
-
   assert.equal(result, 'authority-committed');
-  assert.equal(fs.existsSync(`${config.paths.deliveryQueuePath}.lock`), true);
+
+  await assert.rejects(
+    delivery.coordinateReceiverOwnership(() => {
+      throw new Error('injected ownership operation failure');
+    }),
+    /injected ownership operation failure/,
+  );
+  const after = fs.statSync(lockPath);
+  assert.equal(after.isFile(), true);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.dev, before.dev);
+  assert.equal(fs.existsSync(path.join(dir, '3')), false);
   delivery.destroy();
 });
 
-test('old queue locks are never reclaimed automatically from live or abandoned owners', async (t) => {
+test('legacy directory queue locks require quiesced migration and remain untouched', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-no-reclaim-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
 
@@ -302,7 +300,7 @@ test('old queue locks are never reclaimed automatically from live or abandoned o
     });
     await assert.rejects(
       delivery.ensurePersistenceReady(),
-      /Timed out waiting for Discord delivery queue lock/,
+      (error) => error?.code === 'delivery_queue_lock_protocol_migration_required',
     );
     assert.equal(
       JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')).token,
@@ -313,32 +311,132 @@ test('old queue locks are never reclaimed automatically from live or abandoned o
   }
 });
 
-test('queue lock contention cannot ABA-delete a replacement owner', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-aba-'));
+test('persistent flock serializes contenders without deleting the shared pathname', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-contention-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const config = deliveryConfig(dir, {
     deliveryQueueLockTimeoutMs: 60,
-    deliveryQueueLockRetryMs: 5,
   });
   const lockPath = `${config.paths.deliveryQueuePath}.lock`;
-  fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(lockPath, 'owner.json'), '{"token":"owner-a"}\n', { mode: 0o600 });
+  const first = createDelivery(config, () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  const second = createDelivery(config, () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  let unlock;
+  let markLocked;
+  const locked = new Promise((resolve) => { markLocked = resolve; });
+  const waitForUnlock = new Promise((resolve) => { unlock = resolve; });
+  const firstOperation = first.coordinateReceiverOwnership(async () => {
+    markLocked();
+    await waitForUnlock;
+  });
+  await locked;
+  const before = fs.statSync(lockPath);
 
+  await assert.rejects(
+    second.ensurePersistenceReady(),
+    /Timed out waiting for Discord delivery queue lock/,
+  );
+  assert.equal(fs.statSync(lockPath).ino, before.ino);
+  unlock();
+  await firstOperation;
+  assert.equal(fs.statSync(lockPath).ino, before.ino);
+  first.destroy();
+  second.destroy();
+});
+
+test('distinct delivery queues lock distinct verified inodes', async (t) => {
+  const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-isolation-a-'));
+  const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-isolation-b-'));
+  t.after(() => fs.rmSync(firstDir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(secondDir, { recursive: true, force: true }));
+  const firstConfig = deliveryConfig(firstDir, { deliveryQueueLockTimeoutMs: 100 });
+  const secondConfig = deliveryConfig(secondDir, { deliveryQueueLockTimeoutMs: 100 });
+  const host = {
+    status() { return { configured: true, available: true, reason: null }; },
+    destroy() {},
+  };
+  const first = createDelivery(firstConfig, () => {}, { structuredHost: host });
+  const second = createDelivery(secondConfig, () => {}, { structuredHost: host });
+  let unlock;
+  let markLocked;
+  const locked = new Promise((resolve) => { markLocked = resolve; });
+  const waitForUnlock = new Promise((resolve) => { unlock = resolve; });
+  const firstOperation = first.coordinateReceiverOwnership(async () => {
+    markLocked();
+    await waitForUnlock;
+  });
+  await locked;
+
+  await second.ensurePersistenceReady();
+  assert.notEqual(
+    fs.statSync(`${firstConfig.paths.deliveryQueuePath}.lock`).ino,
+    fs.statSync(`${secondConfig.paths.deliveryQueuePath}.lock`).ino,
+  );
+  assert.equal(fs.existsSync(path.join(firstDir, '3')), false);
+  assert.equal(fs.existsSync(path.join(secondDir, '3')), false);
+  unlock();
+  await firstOperation;
+  first.destroy();
+  second.destroy();
+});
+
+test('queue lock release failure is a visible operation error', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-release-failure-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const spawn = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = {
+      end() {
+        queueMicrotask(() => child.emit('exit', 9, null));
+      },
+    };
+    queueMicrotask(() => child.stdout.emit('data', Buffer.from('LOCKED\n')));
+    return child;
+  };
+  const config = deliveryConfig(dir);
+  const delivery = createDelivery(config, () => {}, {
+    spawn,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(
+    delivery.coordinateReceiverOwnership(() => 'committed'),
+    (error) => error?.code === 'delivery_queue_lock_release_failed',
+  );
+  assert.equal(fs.statSync(`${config.paths.deliveryQueuePath}.lock`).isFile(), true);
+  delivery.destroy();
+});
+
+test('queue lock open-time pathname replacement is rejected without deleting the replacement', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-open-aba-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = deliveryConfig(dir);
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  fs.writeFileSync(lockPath, 'owner-a\n', { mode: 0o600 });
   let swapped = false;
   const fsProxy = {
     ...fs,
-    lstatSync(target) {
+    lstatSync(target, options) {
       if (!swapped && target === lockPath) {
         swapped = true;
-        fs.rmSync(lockPath, { recursive: true, force: true });
-        fs.mkdirSync(lockPath, { mode: 0o700 });
-        fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
-          pid: process.pid,
-          processStartTicks: 'replacement-owner',
-          token: 'owner-b',
-        })}\n`, { mode: 0o600 });
+        fs.unlinkSync(lockPath);
+        fs.writeFileSync(lockPath, 'owner-b\n', { mode: 0o600 });
       }
-      return fs.lstatSync(target);
+      return fs.lstatSync(target, options);
     },
   };
   const delivery = createDelivery(config, () => {}, {
@@ -349,15 +447,9 @@ test('queue lock contention cannot ABA-delete a replacement owner', async (t) =>
     },
   });
 
-  await assert.rejects(
-    delivery.ensurePersistenceReady(),
-    /Timed out waiting for Discord delivery queue lock/,
-  );
+  await assert.rejects(delivery.ensurePersistenceReady(), /Unsafe Discord delivery queue lock/);
   assert.equal(swapped, true);
-  assert.equal(
-    JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')).token,
-    'owner-b',
-  );
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'owner-b\n');
   delivery.destroy();
 });
 
@@ -1813,8 +1905,9 @@ test('persisted message retries autonomously after a loaded child thread closes'
   assert.equal(childClosedListener, null);
 });
 
-test('concurrent receivers persist and submit a Discord identity only once', async () => {
+test('concurrent receivers persist and submit a Discord identity only once', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-concurrent-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const config = deliveryConfig(dir);
   const requests = [];
   let release;
@@ -1839,19 +1932,30 @@ test('concurrent receivers persist and submit a Discord identity only once', asy
   };
   const first = createDelivery(config, () => {}, { structuredHost: host });
   const second = createDelivery(config, () => {}, { structuredHost: host });
+  t.after(() => first.destroy());
+  t.after(() => second.destroy());
 
   const deliveries = [
     first.deliver(discordMessage('m-once', 'once')),
     second.deliver(discordMessage('m-once', 'once')),
   ];
-  const startedBeforeTimeout = await Promise.race([
-    started.then(() => true),
-    new Promise((resolve) => setTimeout(() => resolve(false), 250)),
-  ]);
-  release();
+  let watchdog;
+  try {
+    await Promise.race([
+      started,
+      new Promise((_, reject) => {
+        watchdog = setTimeout(
+          () => reject(new Error('concurrent delivery did not start within watchdog interval')),
+          5000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(watchdog);
+    release();
+  }
   const results = await Promise.all(deliveries);
 
-  assert.equal(startedBeforeTimeout, true);
   assert.equal(results.some((result) => result.status === 'delivered'), true);
   assert.equal(requests.length, 1);
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-once']);
@@ -1918,6 +2022,7 @@ test('receiver handoff waits for the incumbent delivery lease before committing 
     pid: process.pid,
     generation: 'incumbent-generation',
     claimedAt: '2026-07-20T00:00:00.000Z',
+    deliveryQueueLockProtocol: 'flock-v1',
     fallback: null,
   };
   fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(incumbent)}\n`);
@@ -2833,7 +2938,6 @@ test('production source contains no raw TTY or terminal-control injection path',
     .join('\n');
   for (const forbidden of [
     'TIOCSTI',
-    'node:child_process',
     'tty-detect',
     'runTtyInjector',
     'injectIntoTty',
@@ -2853,4 +2957,22 @@ test('production source contains no raw TTY or terminal-control injection path',
   ]) {
     assert.equal(source.includes(forbidden), false, `forbidden delivery primitive remains: ${forbidden}`);
   }
+});
+
+test('delivery child-process use is limited to the descriptor-only flock holder', () => {
+  const root = path.resolve(__dirname, '..', '..');
+  const sourceFiles = fs.readdirSync(path.join(root, 'src'))
+    .filter((name) => name.endsWith('.js'));
+  const users = sourceFiles.filter((name) => (
+    fs.readFileSync(path.join(root, 'src', name), 'utf8').includes('node:child_process')
+  ));
+  assert.deepEqual(users, ['delivery.js']);
+  const source = fs.readFileSync(path.join(root, 'src', 'delivery.js'), 'utf8');
+  assert.equal((source.match(/spawnImpl\(/g) || []).length, 1);
+  assert.match(source, /deps\.flockCommand \|\| '\/usr\/bin\/flock'/);
+  assert.match(source, /'\/proc\/self\/fd\/3'/);
+  assert.match(source, /cwd: path\.dirname\(lockPath\)/);
+  assert.match(source, /stdio: \['pipe', 'pipe', 'pipe', descriptor\]/);
+  assert.equal(source.includes('shell: true'), false);
+  assert.equal(source.includes('stdio: \'inherit\''), false);
 });
