@@ -95622,6 +95622,130 @@ var require_owner_state = __commonJS({
   }
 });
 
+// src/remote-permissions.js
+var require_remote_permissions = __commonJS({
+  "src/remote-permissions.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs"), http = require("node:http"), { randomBytes } = require("node:crypto"), { spawn } = require("node:child_process"), { setTimeout: delay } = require("node:timers/promises"), WebSocket = require_ws(), MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+    function permissionRequest(data, isTui, permissions) {
+      let message;
+      try {
+        message = JSON.parse(data.toString());
+      } catch {
+        return data;
+      }
+      return !isTui || !message || typeof message != "object" || Array.isArray(message) || message.id === void 0 || !["thread/start", "thread/resume", "thread/fork"].includes(message.method) || !message.params || typeof message.params != "object" || Array.isArray(message.params) ? data : JSON.stringify({ ...message, params: { ...message.params, ...permissions } });
+    }
+    function connectRelay(front, backendUrl, permissions, startupState = { applied: !1 }) {
+      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: 134217728 }), wirePrefix = `codex-permission:${randomBytes(16).toString("hex")}:`, attempt = 0, isWireId = (id) => typeof id == "string" && id.startsWith(wirePrefix), isTui = !1, pendingRequest, closed = !1, queued = [], queuedBytes = 0, close = () => {
+        closed || (closed = !0, pendingRequest && startupState.pending === pendingRequest && (startupState.applied = !0, startupState.pending = null), pendingRequest = void 0, queued = [], queuedBytes = 0, front.terminate(), back.terminate());
+      }, forward = (socket, data, binary) => {
+        if (closed || socket.readyState !== WebSocket.OPEN) return !1;
+        if (socket.bufferedAmount + Buffer.byteLength(data) > MAX_BUFFERED_BYTES)
+          return close(), !1;
+        try {
+          socket.send(data, { binary }, (error) => {
+            error && close();
+          }), socket.bufferedAmount > MAX_BUFFERED_BYTES && close();
+        } catch {
+          close();
+        }
+        return !closed;
+      };
+      front.on("error", close), back.on("error", close), front.on("close", close), back.on("close", close), front.on("message", (data, binary) => {
+        if (closed) return;
+        let message;
+        try {
+          message = JSON.parse(data.toString());
+        } catch {
+        }
+        if (message?.method === "initialize" && (isTui = ["codex-tui", "codex_cli_rs"].includes(message.params?.clientInfo?.name)), typeof message?.method == "string" && (isWireId(message.id) || pendingRequest && message.id === pendingRequest.id)) {
+          close();
+          return;
+        }
+        let outgoing = permissionRequest(data, isTui && !startupState.applied && !startupState.pending, permissions);
+        if (outgoing !== data) {
+          if (attempt === Number.MAX_SAFE_INTEGER) {
+            close();
+            return;
+          }
+          pendingRequest = { id: message.id, wireId: `${wirePrefix}${++attempt}` }, startupState.pending = pendingRequest, outgoing = JSON.stringify({ ...JSON.parse(outgoing), id: pendingRequest.wireId });
+        }
+        back.readyState === WebSocket.OPEN ? forward(back, outgoing, binary) : back.readyState === WebSocket.CONNECTING && (queuedBytes += Buffer.byteLength(outgoing), queuedBytes > MAX_BUFFERED_BYTES ? close() : queued.push([outgoing, binary]));
+      }), back.on("open", () => {
+        for (let [data, binary] of queued)
+          if (!forward(back, data, binary)) break;
+        queued = [], queuedBytes = 0;
+      }), back.on("message", (data, binary) => {
+        if (closed) return;
+        let message;
+        try {
+          message = JSON.parse(data.toString());
+        } catch {
+        }
+        let outgoing = data;
+        if (message?.method === void 0 && isWireId(message?.id)) {
+          if (!pendingRequest || message.id !== pendingRequest.wireId) return;
+          outgoing = JSON.stringify({ ...message, id: pendingRequest.id });
+        }
+        if (pendingRequest && startupState.pending === pendingRequest && message?.id === pendingRequest.wireId && message.method === void 0) {
+          let hasResult = Object.hasOwn(message, "result"), hasError = Object.hasOwn(message, "error"), explicitError = hasError && message.error && !Array.isArray(message.error) && Number.isInteger(message.error.code) && typeof message.error.message == "string";
+          (hasResult && !hasError || explicitError && !hasResult) && (hasResult && (startupState.applied = !0), startupState.pending = null, pendingRequest = void 0);
+        }
+        forward(front, outgoing, binary);
+      });
+    }
+    async function runPermissionRelay(launch, endpoint, permissions) {
+      if (!endpoint.startsWith("unix://")) throw new Error("Permission forwarding requires the instance Unix socket");
+      let socket = endpoint.slice(7), nativeSocket = `${socket}.${process.pid}-${randomBytes(4).toString("hex")}`;
+      if (Buffer.byteLength(nativeSocket) >= 108) throw new Error("Instance socket path is too long for permission forwarding");
+      if (fs.existsSync(nativeSocket)) throw new Error("Native permission-forwarding socket already exists");
+      let args = launch.args.map((arg) => arg === endpoint ? `unix://${nativeSocket}` : arg), child = spawn(launch.command, args, { env: launch.env, stdio: "inherit" }), server = http.createServer(), sockets = new WebSocket.Server({ server, perMessageDeflate: !1, maxPayload: 128 * 1024 * 1024 }), nativeIdentity, publicIdentity, childError, childExit = new Promise((resolve) => {
+        child.once("error", (error) => {
+          childError = error, resolve(1);
+        }), child.once("exit", (code) => resolve(code ?? 1));
+      }), resolveShutdown, shutdownRequested = !1, shutdown = new Promise((resolve) => {
+        resolveShutdown = resolve;
+      }), stop = () => {
+        shutdownRequested = !0, child.kill("SIGTERM"), resolveShutdown(0);
+      };
+      process.on("SIGTERM", stop), process.on("SIGINT", stop);
+      let identity = (file) => {
+        try {
+          let s = fs.statSync(file);
+          return `${s.dev}:${s.ino}`;
+        } catch {
+          return null;
+        }
+      };
+      try {
+        let deadline = Date.now() + 1e4;
+        for (; !fs.existsSync(nativeSocket); ) {
+          if (shutdownRequested) throw new Error("Native app server startup cancelled");
+          if (childError || child.exitCode !== null || child.signalCode !== null) throw childError || new Error("Native app server exited during startup");
+          if (Date.now() >= deadline) throw new Error("Native app server socket startup timed out");
+          await delay(25);
+        }
+        nativeIdentity = identity(nativeSocket);
+        let startupState = { applied: !1 };
+        return sockets.on("connection", (front) => connectRelay(front, `ws+unix://${nativeSocket}:/rpc`, permissions, startupState)), await new Promise((resolve, reject) => {
+          server.once("error", reject), server.listen(socket, resolve);
+        }), publicIdentity = identity(socket), fs.chmodSync(socket, 384), await Promise.race([childExit, shutdown]);
+      } finally {
+        for (let client of sockets.clients) client.terminate();
+        sockets.close();
+        let replacedPublicSocket = publicIdentity && identity(socket) !== publicIdentity;
+        publicIdentity && !replacedPublicSocket ? server.close() : (server.closeAllConnections(), server.unref()), stop(), await Promise.race([childExit, delay(2e3, void 0, { ref: !1 })]), child.exitCode === null && child.signalCode === null && (child.kill("SIGKILL"), await childExit);
+        for (let [file, expected] of [[nativeSocket, nativeIdentity], [socket, publicIdentity]])
+          expected && identity(file) === expected && fs.unlinkSync(file);
+        process.removeListener("SIGTERM", stop), process.removeListener("SIGINT", stop), replacedPublicSocket && (fs.writeSync(2, `Permission relay socket changed; preserved replacement and stopped owned backend.
+`), process.exit(1));
+      }
+    }
+    module2.exports = { permissionRequest, connectRelay, runPermissionRelay };
+  }
+});
+
 // src/app-server-runtime.js
 var require_app_server_runtime = __commonJS({
   "src/app-server-runtime.js"(exports2, module2) {
@@ -95686,7 +95810,10 @@ var require_app_server_runtime = __commonJS({
       };
     }
     function runAppServer2(config, dependencies = {}) {
-      let launch = buildAppServerLaunch(config), execve = dependencies.execve || process.execve;
+      let launch = buildAppServerLaunch(config);
+      if (config.env.CODEX_DISCORD_REMOTE_PERMISSIONS === "yolo")
+        return (dependencies.runPermissionRelay || require_remote_permissions().runPermissionRelay)(launch, config.appServerUrl, { approvalPolicy: "never", sandbox: "danger-full-access" });
+      let execve = dependencies.execve || process.execve;
       if (typeof execve != "function") {
         let error = new Error("Node 22.15 or newer is required for process.execve");
         throw error.code = "node_execve_required", error;

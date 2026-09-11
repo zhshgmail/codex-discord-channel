@@ -73,12 +73,33 @@ print_repair_instruction() {
   printf '\n' >&2
 }
 
-tui_args=("$@")
-for ((arg_index = 0; arg_index + 1 < ${#tui_args[@]}; arg_index += 1)); do
-  if [[ ${tui_args[$arg_index]} == resume && ${tui_args[$((arg_index + 1))]} == --last ]]; then
-    tui_args[$arg_index]=fork
-    break
-  fi
+# Remote Codex 0.154 rejects permission flags on resume/fork. Forward an
+# explicitly requested YOLO policy at the native RPC boundary instead, without
+# changing the command or selecting/capturing a session on the TUI's behalf.
+tui_args=()
+# Always supply the launch decision after inherited instance variables are
+# removed. A previous YOLO invocation cannot opt a new no-flag launch in.
+remote_permission_env=(CODEX_DISCORD_REMOTE_PERMISSIONS=none)
+original_args=("$@")
+for ((arg_index = 0; arg_index < ${#original_args[@]}; arg_index += 1)); do
+  arg=${original_args[$arg_index]}
+  case $arg in
+    --dangerously-bypass-approvals-and-sandbox|--yolo)
+      remote_permission_env=(CODEX_DISCORD_REMOTE_PERMISSIONS=yolo)
+      ;;
+    --)
+      tui_args+=("${original_args[@]:$arg_index}")
+      break
+      ;;
+    -c|--config|-p|--profile|-C|--cd|-m|--model|-i|--image|-s|--sandbox|-a|--ask-for-approval|--add-dir|--enable|--disable|--remote|--remote-auth-token-env|--local-provider)
+      tui_args+=("$arg")
+      if ((arg_index + 1 < ${#original_args[@]})); then
+        arg_index=$((arg_index + 1))
+        tui_args+=("${original_args[$arg_index]}")
+      fi
+      ;;
+    *) tui_args+=("$arg") ;;
+  esac
 done
 # Cross-version recovery is interpreted by the helper shipped with this
 # launcher.  An older durable snapshot may enforce an obsolete identity policy
@@ -560,7 +581,7 @@ umask 077
     --generation-bin "$generation_bin" \
     --launcher-pid "$launcher_pid" \
     --launcher-start-ticks "$launcher_start_ticks" \
-    -- "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=app \
+    -- "${generation_channel_command[@]}" CODEX_DISCORD_LAUNCH_ROLE=app "${remote_permission_env[@]}" \
     "$node_bin" "$channel_bin" app-server "${runtime_args[@]}"
 ) >>"$state_dir/app-server.log" 2>&1 &
 app_pid=$!
