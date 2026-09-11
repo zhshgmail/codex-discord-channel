@@ -3135,12 +3135,17 @@ test('production source contains no raw TTY or terminal-control injection path',
   const source = productionFiles
     .map((file) => fs.readFileSync(file, 'utf8'))
     .join('\n');
-  // The startup relay supervises only its native app-server child. Delivery
-  // modules remain unable to spawn processes; the TTY restrictions cover all.
+  // Process spawning is restricted to the native app-server permission relay
+  // and the one-shot descriptor-only queue-lock acquirer. The TTY restrictions
+  // still cover every production source file.
+  const allowedChildProcessUsers = new Set([
+    path.join(root, 'src', 'delivery.js'),
+    path.join(root, 'src', 'remote-permissions.js'),
+  ]);
   for (const file of productionFiles) {
-    if (file === path.join(root, 'src', 'remote-permissions.js')) continue;
+    if (allowedChildProcessUsers.has(file)) continue;
     assert.equal(fs.readFileSync(file, 'utf8').includes('node:child_process'), false,
-      `process spawning is confined to the native app-server relay: ${file}`);
+      `process spawning is confined to the permission relay and queue-lock acquirer: ${file}`);
   }
   for (const forbidden of [
     'TIOCSTI',
@@ -3172,7 +3177,7 @@ test('delivery child-process use is limited to the one-shot descriptor-only floc
   const users = sourceFiles.filter((name) => (
     fs.readFileSync(path.join(root, 'src', name), 'utf8').includes('node:child_process')
   ));
-  assert.deepEqual(users, ['delivery.js']);
+  assert.deepEqual(users.sort(), ['delivery.js', 'remote-permissions.js']);
   const source = fs.readFileSync(path.join(root, 'src', 'delivery.js'), 'utf8');
   assert.equal((source.match(/spawnImpl\(/g) || []).length, 1);
   assert.match(source, /deps\.flockCommand \|\| '\/usr\/bin\/flock'/);
