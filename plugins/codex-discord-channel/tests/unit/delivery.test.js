@@ -5,6 +5,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const nodeTest = require('node:test');
 const { stateDirContractTest } = require('./retired-session-bound-contracts');
 const test = stateDirContractTest(nodeTest);
@@ -232,24 +233,11 @@ function createManualTimers() {
   };
 }
 
-test('queue lock cleanup failure cannot negate an already committed ownership operation', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-cleanup-'));
+test('queue lock pathname and inode persist after successful and failed operations', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-persistent-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const config = deliveryConfig(dir);
-  let failCleanup = false;
-  const fsProxy = {
-    ...fs,
-    rmSync(target, options) {
-      if (failCleanup && target === `${config.paths.deliveryQueuePath}.lock`) {
-        failCleanup = false;
-        const error = new Error('injected lock cleanup failure');
-        error.code = 'EACCES';
-        throw error;
-      }
-      return fs.rmSync(target, options);
-    },
-  };
   const delivery = createDelivery(config, () => {}, {
-    fs: fsProxy,
     structuredHost: {
       async resolveTarget() { return { available: true, threadId: 'thread-current', status: 'idle' }; },
       onThreadIdle() { return () => {}; },
@@ -260,13 +248,407 @@ test('queue lock cleanup failure cannot negate an already committed ownership op
     },
   });
   await delivery.flush();
-  failCleanup = true;
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  const before = fs.statSync(lockPath);
 
   const result = await delivery.coordinateReceiverOwnership(() => 'authority-committed');
-
   assert.equal(result, 'authority-committed');
-  assert.equal(fs.existsSync(`${config.paths.deliveryQueuePath}.lock`), true);
+
+  await assert.rejects(
+    delivery.coordinateReceiverOwnership(() => {
+      throw new Error('injected ownership operation failure');
+    }),
+    /injected ownership operation failure/,
+  );
+  const after = fs.statSync(lockPath);
+  assert.equal(after.isFile(), true);
+  assert.equal(after.ino, before.ino);
+  assert.equal(after.dev, before.dev);
+  assert.equal(fs.existsSync(path.join(dir, '3')), false);
   delivery.destroy();
+});
+
+test('legacy directory queue locks require quiesced migration and remain untouched', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-no-reclaim-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  for (const [kind, pid, processStartTicks] of [
+    ['live', process.pid, 'current-process'],
+    ['abandoned', 2147483647, '1'],
+  ]) {
+    const dir = path.join(root, kind);
+    fs.mkdirSync(dir);
+    const config = deliveryConfig(dir, {
+      deliveryQueueLockTimeoutMs: 60,
+      deliveryQueueLockRetryMs: 5,
+    });
+    const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+    const token = `${kind}-old-owner`;
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
+      pid,
+      processStartTicks,
+      token,
+    })}\n`, { mode: 0o600 });
+    const old = new Date(Date.now() - 120000);
+    fs.utimesSync(lockPath, old, old);
+
+    const delivery = createDelivery(config, () => {}, {
+      structuredHost: {
+        status() { return { configured: true, available: true, reason: null }; },
+        destroy() {},
+      },
+    });
+    await assert.rejects(
+      delivery.ensurePersistenceReady(),
+      (error) => error?.code === 'delivery_queue_lock_protocol_migration_required',
+    );
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')).token,
+      token,
+    );
+    assert.equal(fs.statSync(lockPath).isDirectory(), true);
+    delivery.destroy();
+  }
+});
+
+test('one-shot flock exits before the operation while the parent descriptor serializes contenders', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-contention-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = deliveryConfig(dir, {
+    deliveryQueueLockTimeoutMs: 60,
+  });
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  let acquirerExited = false;
+  let acquirerCount = 0;
+  const trackedSpawn = (command, args, options) => {
+    acquirerCount += 1;
+    assert.equal(command, '/usr/bin/flock');
+    assert.deepEqual(args, ['--exclusive', '--timeout', '0.06', '3']);
+    const child = spawn(command, args, options);
+    child.once('exit', () => { acquirerExited = true; });
+    return child;
+  };
+  const first = createDelivery(config, () => {}, {
+    spawn: trackedSpawn,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  const second = createDelivery(config, () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  let unlock;
+  let markLocked;
+  const locked = new Promise((resolve) => { markLocked = resolve; });
+  const waitForUnlock = new Promise((resolve) => { unlock = resolve; });
+  const firstOperation = first.coordinateReceiverOwnership(async () => {
+    assert.equal(acquirerExited, true);
+    assert.equal(acquirerCount, 1);
+    markLocked();
+    await waitForUnlock;
+  });
+  await locked;
+  const before = fs.statSync(lockPath);
+
+  await assert.rejects(
+    second.ensurePersistenceReady(),
+    /Timed out waiting for Discord delivery queue lock/,
+  );
+  assert.equal(fs.statSync(lockPath).ino, before.ino);
+  unlock();
+  await firstOperation;
+  assert.equal(fs.statSync(lockPath).ino, before.ino);
+  await second.ensurePersistenceReady();
+  first.destroy();
+  second.destroy();
+});
+
+test('parent crash releases its retained flock for a successor', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-parent-crash-'));
+  const fixture = path.join(__dirname, '..', 'fixtures', 'hold-delivery-queue-lock.js');
+  const child = spawn(process.execPath, [fixture, dir], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`lock holder did not start: ${stderr}`)), 3000);
+    child.stdout.once('data', (chunk) => {
+      if (!String(chunk).includes('LOCKED')) {
+        clearTimeout(timer);
+        reject(new Error(`unexpected lock holder output: ${chunk}`));
+        return;
+      }
+      clearTimeout(timer);
+      resolve();
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      reject(new Error(`lock holder exited early code=${code} signal=${signal}: ${stderr}`));
+    });
+  });
+
+  const contender = createDelivery(deliveryConfig(dir, {
+    deliveryQueueLockTimeoutMs: 60,
+  }), () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await assert.rejects(
+    contender.ensurePersistenceReady(),
+    /Timed out waiting for Discord delivery queue lock/,
+  );
+
+  child.kill('SIGKILL');
+  const [code, signal] = await new Promise((resolve) => {
+    child.once('exit', (...args) => resolve(args));
+  });
+  assert.equal(code, null);
+  assert.equal(signal, 'SIGKILL');
+  await contender.ensurePersistenceReady();
+  contender.destroy();
+});
+
+test('distinct delivery queues lock distinct verified inodes', async (t) => {
+  const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-isolation-a-'));
+  const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-isolation-b-'));
+  t.after(() => fs.rmSync(firstDir, { recursive: true, force: true }));
+  t.after(() => fs.rmSync(secondDir, { recursive: true, force: true }));
+  const firstConfig = deliveryConfig(firstDir, { deliveryQueueLockTimeoutMs: 100 });
+  const secondConfig = deliveryConfig(secondDir, { deliveryQueueLockTimeoutMs: 100 });
+  const host = {
+    status() { return { configured: true, available: true, reason: null }; },
+    destroy() {},
+  };
+  const first = createDelivery(firstConfig, () => {}, { structuredHost: host });
+  const second = createDelivery(secondConfig, () => {}, { structuredHost: host });
+  let unlock;
+  let markLocked;
+  const locked = new Promise((resolve) => { markLocked = resolve; });
+  const waitForUnlock = new Promise((resolve) => { unlock = resolve; });
+  const firstOperation = first.coordinateReceiverOwnership(async () => {
+    markLocked();
+    await waitForUnlock;
+  });
+  await locked;
+
+  await second.ensurePersistenceReady();
+  assert.notEqual(
+    fs.statSync(`${firstConfig.paths.deliveryQueuePath}.lock`).ino,
+    fs.statSync(`${secondConfig.paths.deliveryQueuePath}.lock`).ino,
+  );
+  assert.equal(fs.existsSync(path.join(firstDir, '3')), false);
+  assert.equal(fs.existsSync(path.join(secondDir, '3')), false);
+  unlock();
+  await firstOperation;
+  first.destroy();
+  second.destroy();
+});
+
+test('queue lock release failure is a visible operation error', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-release-failure-'));
+  let lockDescriptor;
+  t.after(() => {
+    if (lockDescriptor !== undefined) {
+      try { fs.closeSync(lockDescriptor); } catch {}
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const spawn = () => {
+    const child = new EventEmitter();
+    child.stderr = new EventEmitter();
+    queueMicrotask(() => child.emit('exit', 0, null));
+    return child;
+  };
+  const fsProxy = {
+    ...fs,
+    openSync(...args) {
+      lockDescriptor = fs.openSync(...args);
+      return lockDescriptor;
+    },
+    closeSync(descriptor) {
+      assert.equal(descriptor, lockDescriptor);
+      const error = new Error('injected close failure');
+      error.code = 'EIO';
+      throw error;
+    },
+  };
+  const config = deliveryConfig(dir);
+  const delivery = createDelivery(config, () => {}, {
+    fs: fsProxy,
+    spawn,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(
+    delivery.coordinateReceiverOwnership(() => 'committed'),
+    (error) => error?.code === 'delivery_queue_lock_release_failed',
+  );
+  assert.equal(fs.statSync(`${config.paths.deliveryQueuePath}.lock`).isFile(), true);
+  delivery.destroy();
+});
+
+test('queue lock acquisition spawn failure closes the verified parent descriptor', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-spawn-failure-'));
+  let lockDescriptor;
+  let closeCalls = 0;
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fsProxy = {
+    ...fs,
+    openSync(...args) {
+      lockDescriptor = fs.openSync(...args);
+      return lockDescriptor;
+    },
+    closeSync(descriptor) {
+      closeCalls += 1;
+      return fs.closeSync(descriptor);
+    },
+  };
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    fs: fsProxy,
+    spawn() { throw new Error('injected spawn failure'); },
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(delivery.ensurePersistenceReady(), /injected spawn failure/);
+  assert.equal(closeCalls, 1);
+  assert.throws(() => fs.fstatSync(lockDescriptor), (error) => error?.code === 'EBADF');
+  delivery.destroy();
+});
+
+test('queue lock validation preserves both the primary and cleanup failures', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-validation-cleanup-'));
+  let lockDescriptor;
+  t.after(() => {
+    if (lockDescriptor !== undefined) {
+      try { fs.closeSync(lockDescriptor); } catch {}
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const validationError = new Error('injected lock validation failure');
+  validationError.code = 'EIO';
+  const cleanupError = new Error('injected validation cleanup failure');
+  cleanupError.code = 'EIO';
+  const fsProxy = {
+    ...fs,
+    openSync(...args) {
+      lockDescriptor = fs.openSync(...args);
+      return lockDescriptor;
+    },
+    lstatSync() { throw validationError; },
+    closeSync(descriptor) {
+      assert.equal(descriptor, lockDescriptor);
+      throw cleanupError;
+    },
+  };
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    fs: fsProxy,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(delivery.ensurePersistenceReady(), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.deepEqual(error.errors, [validationError, cleanupError]);
+    return true;
+  });
+  delivery.destroy();
+});
+
+test('queue lock open-time pathname replacement is rejected without deleting the replacement', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-open-aba-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = deliveryConfig(dir);
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  fs.writeFileSync(lockPath, 'owner-a\n', { mode: 0o600 });
+  let swapped = false;
+  const fsProxy = {
+    ...fs,
+    lstatSync(target, options) {
+      if (!swapped && target === lockPath) {
+        swapped = true;
+        fs.unlinkSync(lockPath);
+        fs.writeFileSync(lockPath, 'owner-b\n', { mode: 0o600 });
+      }
+      return fs.lstatSync(target, options);
+    },
+  };
+  const delivery = createDelivery(config, () => {}, {
+    fs: fsProxy,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(delivery.ensurePersistenceReady(), /Unsafe Discord delivery queue lock/);
+  assert.equal(swapped, true);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'owner-b\n');
+  delivery.destroy();
+});
+
+test('queue lock replacement before flock acquisition is rejected before the operation', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-acquire-aba-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = deliveryConfig(dir, { deliveryQueueLockTimeoutMs: 100 });
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  const oldPath = `${lockPath}.old`;
+  let replaced = false;
+  let operationEntered = false;
+  const replaceBeforeFlock = (command, args, options) => {
+    assert.equal(command, '/usr/bin/flock');
+    assert.equal(replaced, false);
+    fs.renameSync(lockPath, oldPath);
+    fs.writeFileSync(lockPath, 'replacement\n', { mode: 0o600 });
+    replaced = true;
+    return spawn(command, args, options);
+  };
+  const delivery = createDelivery(config, () => {}, {
+    spawn: replaceBeforeFlock,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(
+    delivery.coordinateReceiverOwnership(() => { operationEntered = true; }),
+    (error) => error?.code === 'delivery_queue_lock_identity_changed',
+  );
+  assert.equal(replaced, true);
+  assert.equal(operationEntered, false);
+  assert.notEqual(fs.statSync(oldPath).ino, fs.statSync(lockPath).ino);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'replacement\n');
+
+  const successor = createDelivery(config, () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await successor.ensurePersistenceReady();
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'replacement\n');
+  delivery.destroy();
+  successor.destroy();
 });
 
 test('escapeAttr escapes unsafe attribute characters', () => {
@@ -1721,8 +2103,9 @@ test('persisted message retries autonomously after a loaded child thread closes'
   assert.equal(childClosedListener, null);
 });
 
-test('concurrent receivers persist and submit a Discord identity only once', async () => {
+test('concurrent receivers persist and submit a Discord identity only once', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-structured-concurrent-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const config = deliveryConfig(dir);
   const requests = [];
   let release;
@@ -1747,19 +2130,30 @@ test('concurrent receivers persist and submit a Discord identity only once', asy
   };
   const first = createDelivery(config, () => {}, { structuredHost: host });
   const second = createDelivery(config, () => {}, { structuredHost: host });
+  t.after(() => first.destroy());
+  t.after(() => second.destroy());
 
   const deliveries = [
     first.deliver(discordMessage('m-once', 'once')),
     second.deliver(discordMessage('m-once', 'once')),
   ];
-  const startedBeforeTimeout = await Promise.race([
-    started.then(() => true),
-    new Promise((resolve) => setTimeout(() => resolve(false), 250)),
-  ]);
-  release();
+  let watchdog;
+  try {
+    await Promise.race([
+      started,
+      new Promise((_, reject) => {
+        watchdog = setTimeout(
+          () => reject(new Error('concurrent delivery did not start within watchdog interval')),
+          5000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(watchdog);
+    release();
+  }
   const results = await Promise.all(deliveries);
 
-  assert.equal(startedBeforeTimeout, true);
   assert.equal(results.some((result) => result.status === 'delivered'), true);
   assert.equal(requests.length, 1);
   assert.deepEqual(readQueue(dir).completed.map((item) => item.messageId), ['m-once']);
@@ -1826,6 +2220,8 @@ test('receiver handoff waits for the incumbent delivery lease before committing 
     pid: process.pid,
     generation: 'incumbent-generation',
     claimedAt: '2026-07-20T00:00:00.000Z',
+    deliveryQueueLockProtocol: 'flock-v1',
+    deliveryQueueLockIdentity: `${config.paths.deliveryQueuePath}.lock`,
     fallback: null,
   };
   fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(incumbent)}\n`);
@@ -2739,12 +3135,17 @@ test('production source contains no raw TTY or terminal-control injection path',
   const source = productionFiles
     .map((file) => fs.readFileSync(file, 'utf8'))
     .join('\n');
-  // The startup relay supervises only its native app-server child. Delivery
-  // modules remain unable to spawn processes; the TTY restrictions cover all.
+  // Process spawning is restricted to the native app-server permission relay
+  // and the one-shot descriptor-only queue-lock acquirer. The TTY restrictions
+  // still cover every production source file.
+  const allowedChildProcessUsers = new Set([
+    path.join(root, 'src', 'delivery.js'),
+    path.join(root, 'src', 'remote-permissions.js'),
+  ]);
   for (const file of productionFiles) {
-    if (file === path.join(root, 'src', 'remote-permissions.js')) continue;
+    if (allowedChildProcessUsers.has(file)) continue;
     assert.equal(fs.readFileSync(file, 'utf8').includes('node:child_process'), false,
-      `process spawning is confined to the native app-server relay: ${file}`);
+      `process spawning is confined to the permission relay and queue-lock acquirer: ${file}`);
   }
   for (const forbidden of [
     'TIOCSTI',
@@ -2767,4 +3168,23 @@ test('production source contains no raw TTY or terminal-control injection path',
   ]) {
     assert.equal(source.includes(forbidden), false, `forbidden delivery primitive remains: ${forbidden}`);
   }
+});
+
+test('delivery child-process use is limited to the one-shot descriptor-only flock acquirer', () => {
+  const root = path.resolve(__dirname, '..', '..');
+  const sourceFiles = fs.readdirSync(path.join(root, 'src'))
+    .filter((name) => name.endsWith('.js'));
+  const users = sourceFiles.filter((name) => (
+    fs.readFileSync(path.join(root, 'src', name), 'utf8').includes('node:child_process')
+  ));
+  assert.deepEqual(users.sort(), ['delivery.js', 'remote-permissions.js']);
+  const source = fs.readFileSync(path.join(root, 'src', 'delivery.js'), 'utf8');
+  assert.equal((source.match(/spawnImpl\(/g) || []).length, 1);
+  assert.match(source, /deps\.flockCommand \|\| '\/usr\/bin\/flock'/);
+  assert.match(source, /String\(Math\.max\(1, timeoutMs\) \/ 1000\),\s*'3'/);
+  assert.match(source, /stdio: \['ignore', 'ignore', 'pipe', descriptor\]/);
+  assert.equal(source.includes('/proc/self/fd/3'), false);
+  assert.equal(source.includes('LOCK_HELPER_SOURCE'), false);
+  assert.equal(source.includes('shell: true'), false);
+  assert.equal(source.includes('stdio: \'inherit\''), false);
 });

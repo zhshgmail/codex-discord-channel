@@ -127,7 +127,7 @@ test('a restarted host follows live recency instead of a persisted session or th
   second.destroy();
 });
 
-test('Codex 0.150 list_turns rejection falls back to the live thread without turns', async (t) => {
+test('Codex 0.150 target discovery does not request full turn hydration', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-state-dir-list-turns-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const client = new FakeClient((method, params) => {
@@ -153,7 +153,6 @@ test('Codex 0.150 list_turns rejection falls back to the live thread without tur
   });
   assert.deepEqual(client.requests.map(({ method, params }) => [method, Boolean(params.includeTurns)]), [
     ['thread/loaded/list', false],
-    ['thread/read', true],
     ['thread/read', false],
   ]);
   host.destroy();

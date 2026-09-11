@@ -4,9 +4,12 @@ const { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require('./
 const { normalizeDiscordMessage } = require('./delivery');
 const { discordClientResourceOptions } = require('./gateway-resources');
 const {
+  DELIVERY_QUEUE_LOCK_PROTOCOL,
+  assertReceiverOwnershipProtocolCompatible,
   commitReceiverOwnership,
   createReceiverOwnership,
   effectiveReceiverOwnership,
+  getDeliveryQueueLockIdentity,
   isActiveDiscordReceiver,
   isCurrentReceiverOwnership,
   readReceiverAuthoritySnapshot,
@@ -201,6 +204,16 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
   }
   const receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps);
   const shouldReceive = claimReceiver || receiver.active;
+  const deliveryQueueLockIdentity = getDeliveryQueueLockIdentity(config);
+  // Refuse an incompatible queue-lock binding before Discord login or any
+  // queue pathname access. Otherwise two live gateways could lock different
+  // inodes while sharing one receiver authority path.
+  if (shouldReceive) {
+    assertReceiverOwnershipProtocolCompatible(effectiveOwnership, {
+      deliveryQueueLockProtocol: DELIVERY_QUEUE_LOCK_PROTOCOL,
+      deliveryQueueLockIdentity,
+    });
+  }
 
   const {
     Client,
@@ -245,6 +258,7 @@ async function startDiscordClient({ config, delivery, logger, claimReceiver = fa
       const candidate = createReceiverOwnership(effectiveOwnership, {
         ...deps,
         stateDir: config.paths?.stateDir || '',
+        deliveryQueueLockIdentity,
       });
       receiverOwnership = await delivery.coordinateReceiverOwnership(() => {
         const handler = createDiscordMessageHandler({

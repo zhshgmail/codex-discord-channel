@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const { createAppServerHost } = require('./app-server-host');
 const {
   contentDigest,
@@ -171,45 +172,52 @@ function getDeliveryQueueLockPath(config = {}) {
   return queuePath ? `${queuePath}.lock` : '';
 }
 
-function readLockOwner(lockPath, fsImpl) {
-  try {
-    const parsed = JSON.parse(fsImpl.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function removeLockDirectory(lockPath, fsImpl) {
-  fsImpl.rmSync(lockPath, { recursive: true, force: true });
-}
-
-function tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl) {
-  const staleMs = Number(config.deliveryQueueLockStaleMs) || 45000;
-  let ageMs;
-  try {
-    ageMs = Date.now() - fsImpl.statSync(lockPath).mtimeMs;
-  } catch (error) {
-    if (error?.code === 'ENOENT') return true;
+function assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl) {
+  const held = fsImpl.fstatSync(descriptor, { bigint: true });
+  const named = fsImpl.lstatSync(lockPath, { bigint: true });
+  if (
+    !held.isFile()
+    || !named.isFile()
+    || named.isSymbolicLink()
+    || held.nlink !== 1n
+    || named.nlink !== 1n
+    || held.dev !== named.dev
+    || held.ino !== named.ino
+  ) {
+    const error = new Error(`Unsafe Discord delivery queue lock: ${lockPath}`);
+    error.code = 'delivery_queue_lock_identity_changed';
     throw error;
   }
-  if (ageMs < staleMs) return false;
+}
 
-  const owner = readLockOwner(lockPath, fsImpl);
-  const ownerPid = Number(owner?.pid) || 0;
-  const ownerAlive = ownerPid > 0 && (deps.isProcessAlive || isProcessAlive)(ownerPid);
-  const liveLeaseMs = Number(config.deliveryQueueLockLiveLeaseMs) || 55000;
-  if (ownerAlive && ageMs < liveLeaseMs) return false;
-
-  const stalePath = `${lockPath}.stale.${process.pid}.${Date.now()}`;
+function openDeliveryQueueLock(lockPath, fsImpl) {
+  const flags = fs.constants.O_CREAT | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0);
+  let descriptor;
   try {
-    fsImpl.renameSync(lockPath, stalePath);
+    descriptor = fsImpl.openSync(lockPath, flags, 0o600);
+    assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl);
+    return descriptor;
   } catch (error) {
-    if (error?.code === 'ENOENT') return true;
-    return false;
+    let primaryError = error;
+    if (error?.code === 'EISDIR') {
+      const migration = new Error(
+        `Discord delivery queue lock protocol migration requires a quiesced gateway and manual removal of the legacy lock directory: ${lockPath}`,
+      );
+      migration.code = 'delivery_queue_lock_protocol_migration_required';
+      primaryError = migration;
+    }
+    if (descriptor !== undefined) {
+      try {
+        fsImpl.closeSync(descriptor);
+      } catch (closeError) {
+        throw new AggregateError(
+          [primaryError, closeError],
+          'Discord delivery queue lock validation and descriptor cleanup both failed.',
+        );
+      }
+    }
+    throw primaryError;
   }
-  removeLockDirectory(stalePath, fsImpl);
-  return true;
 }
 
 function sleep(ms) {
@@ -220,49 +228,123 @@ async function acquireDeliveryQueueLock(config = {}, deps = {}) {
   const lockPath = getDeliveryQueueLockPath(config);
   if (!lockPath) throw new Error('Discord delivery queue path is not configured.');
   const fsImpl = deps.fs || fs;
+  const spawnImpl = deps.spawn || spawn;
   const timeoutMs = Number(config.deliveryQueueLockTimeoutMs) || 60000;
-  const retryMs = Number(config.deliveryQueueLockRetryMs) || 20;
-  const startedAt = Date.now();
-  const token = `${process.pid}-${startedAt}-${Math.random().toString(16).slice(2)}`;
   fsImpl.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-
-  while (true) {
+  const descriptor = openDeliveryQueueLock(lockPath, fsImpl);
+  let child;
+  try {
+    child = spawnImpl(
+      deps.flockCommand || '/usr/bin/flock',
+      [
+        '--exclusive',
+        '--timeout',
+        String(Math.max(1, timeoutMs) / 1000),
+        '3',
+      ],
+      {
+        stdio: ['ignore', 'ignore', 'pipe', descriptor],
+        windowsHide: true,
+      },
+    );
+  } catch (error) {
     try {
-      fsImpl.mkdirSync(lockPath, { mode: 0o700 });
-      try {
-        fsImpl.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
-          pid: process.pid,
-          token,
-          acquiredAt: new Date().toISOString(),
-        })}\n`, { mode: 0o600 });
-      } catch (error) {
-        removeLockDirectory(lockPath, fsImpl);
-        throw error;
-      }
-      return () => {
-        try {
-          const owner = readLockOwner(lockPath, fsImpl);
-          if (owner?.token === token) removeLockDirectory(lockPath, fsImpl);
-        } catch {}
-      };
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-      if (tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl)) continue;
-      if (Date.now() - startedAt >= timeoutMs) {
-        throw new Error(`Timed out waiting for Discord delivery queue lock: ${lockPath}`);
-      }
-      await sleep(retryMs);
+      fsImpl.closeSync(descriptor);
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        'Discord delivery queue lock process failed to start and its descriptor could not be closed.',
+      );
     }
+    throw error;
   }
+
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-4096);
+  });
+  const outcome = await new Promise((resolve) => {
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    child.once('error', (error) => settle({ error }));
+    child.once('exit', (code, signal) => settle({ code, signal }));
+  });
+  if (outcome.error || outcome.code !== 0) {
+    const acquisitionError = outcome.error || new Error(
+      outcome.code === 1
+        ? `Timed out waiting for Discord delivery queue lock: ${lockPath}`
+        : `Discord delivery queue lock process failed (code=${outcome.code}, signal=${outcome.signal || 'none'}): ${stderr.trim()}`,
+    );
+    try {
+      fsImpl.closeSync(descriptor);
+    } catch (closeError) {
+      throw new AggregateError(
+        [acquisitionError, closeError],
+        'Discord delivery queue lock acquisition and descriptor cleanup both failed.',
+      );
+    }
+    throw acquisitionError;
+  }
+
+  try {
+    // The pathname may have been replaced after open-time validation but
+    // before flock(2) acquired this descriptor. Revalidate only after the
+    // one-shot acquirer has succeeded, before any queue operation can begin.
+    assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl);
+  } catch (identityError) {
+    try {
+      fsImpl.closeSync(descriptor);
+    } catch (closeError) {
+      throw new AggregateError(
+        [identityError, closeError],
+        'Discord delivery queue lock identity changed and its descriptor could not be closed.',
+      );
+    }
+    throw identityError;
+  }
+
+  let released = false;
+  return async () => {
+    if (released) return;
+    // close(2) errors do not make retrying the numeric descriptor safe: the
+    // descriptor may already be closed and reused. Surface the failure once.
+    released = true;
+    try {
+      fsImpl.closeSync(descriptor);
+    } catch (cause) {
+      const error = new Error('Discord delivery queue lock release failed.', { cause });
+      error.code = 'delivery_queue_lock_release_failed';
+      throw error;
+    }
+  };
 }
 
 async function withDeliveryQueueLock(config, deps, operation) {
   const release = await acquireDeliveryQueueLock(config, deps);
+  let result;
+  let operationError;
   try {
-    return await operation();
-  } finally {
-    release();
+    result = await operation();
+  } catch (error) {
+    operationError = error;
   }
+  try {
+    await release();
+  } catch (releaseError) {
+    if (operationError) {
+      throw new AggregateError(
+        [operationError, releaseError],
+        'Discord delivery queue operation and lock release both failed.',
+      );
+    }
+    throw releaseError;
+  }
+  if (operationError) throw operationError;
+  return result;
 }
 
 function emptyDeliveryQueue() {
