@@ -11,6 +11,7 @@ const { createDelivery, normalizeDiscordMessage } = require('../../src/delivery'
 const {
   commitReceiverOwnership,
   createReceiverOwnership,
+  getDeliveryQueueLockIdentity,
   readReceiverAuthoritySnapshot,
 } = require('../../src/receiver-state');
 const {
@@ -486,10 +487,19 @@ test('accepted Discord events persist in FIFO order while an earlier delivery bl
 test('receiver authority commit stores PID and generation in one atomic record', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-receiver-generation-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
-  fs.writeFileSync(gatewayPidPath, `${process.pid}\n`);
-  const config = { paths: { gatewayPidPath } };
+  const config = {
+    paths: {
+      stateDir: dir,
+      gatewayPidPath,
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
+  };
   const generations = ['generation-a', 'generation-b'];
-  const deps = { fs, randomUUID: () => generations.shift() };
+  const deps = {
+    fs,
+    randomUUID: () => generations.shift(),
+    deliveryQueueLockIdentity: getDeliveryQueueLockIdentity(config),
+  };
 
   const firstSnapshot = readReceiverAuthoritySnapshot(config, deps);
   const first = createReceiverOwnership(firstSnapshot.record, deps);
@@ -693,12 +703,14 @@ function gatewayDiscordDeps(Client) {
 function incumbentGatewayFixture() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-gateway-takeover-'));
   const gatewayPidPath = path.join(dir, 'session-gateway.pid');
+  const deliveryQueuePath = path.join(dir, 'pending-delivery.json');
   const ownership = {
     version: 2,
     pid: process.pid,
     generation: 'incumbent-generation',
     claimedAt: '2026-07-20T00:00:00.000Z',
     deliveryQueueLockProtocol: 'flock-v1',
+    deliveryQueueLockIdentity: `${deliveryQueuePath}.lock`,
     fallback: null,
   };
   fs.writeFileSync(gatewayPidPath, `${JSON.stringify(ownership)}\n`);
@@ -708,12 +720,47 @@ function incumbentGatewayFixture() {
       loginDisabled: false,
       token: 'test-token',
       botUserId: 'bot',
-      paths: { gatewayPidPath },
+      paths: { stateDir: dir, gatewayPidPath, deliveryQueuePath },
     },
     gatewayPidPath,
     ownership,
   };
 }
+
+test('live incumbent with a different queue identity is rejected before login or queue access', async () => {
+  const { config, gatewayPidPath, ownership } = incumbentGatewayFixture();
+  config.paths.deliveryQueuePath = path.join(config.paths.stateDir, 'different-queue.json');
+  let clients = 0;
+  let logins = 0;
+  let persistenceChecks = 0;
+  const { EventEmitter } = require('node:events');
+  class MustNotStartDiscordClient extends EventEmitter {
+    constructor() {
+      super();
+      clients += 1;
+    }
+    async login() { logins += 1; }
+  }
+
+  await assert.rejects(
+    startDiscordClient({
+      config,
+      claimReceiver: true,
+      delivery: {
+        async ensurePersistenceReady() { persistenceChecks += 1; },
+      },
+      logger: () => {},
+      deps: { discord: gatewayDiscordDeps(MustNotStartDiscordClient) },
+    }),
+    (error) => error?.code === 'delivery_queue_lock_identity_quiescence_required',
+  );
+
+  assert.equal(clients, 0);
+  assert.equal(logins, 0);
+  assert.equal(persistenceChecks, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(gatewayPidPath, 'utf8')), ownership);
+  assert.equal(fs.existsSync(`${config.paths.deliveryQueuePath}.lock`), false);
+});
 
 test('successor Discord login failure preserves incumbent durable receiver ownership', async () => {
   const { config, gatewayPidPath, ownership } = incumbentGatewayFixture();
@@ -820,6 +867,9 @@ test('a dead receiver record is replaced automatically with an actionable warnin
     generation: 'replacement-generation',
     claimedAt: readReceiverAuthoritySnapshot(config).record.claimedAt,
     deliveryQueueLockProtocol: 'flock-v1',
+    deliveryQueueLockIdentity: getDeliveryQueueLockIdentity(config),
+    stateDir: config.paths.stateDir,
+    role: 'gateway',
     fallback: null,
   });
   assert.deepEqual(logs.find((entry) => entry.message.includes('reclaiming stale')), {
@@ -887,6 +937,9 @@ test('successor replaces durable receiver ownership only after login and app-ser
     generation: 'successor-generation',
     claimedAt: readReceiverAuthoritySnapshot(config).record.claimedAt,
     deliveryQueueLockProtocol: 'flock-v1',
+    deliveryQueueLockIdentity: getDeliveryQueueLockIdentity(config),
+    stateDir: config.paths.stateDir,
+    role: 'gateway',
     fallback: ownership,
   });
 });
@@ -899,7 +952,11 @@ test('concurrent sole gateways atomically select one listener and one generation
     loginDisabled: false,
     token: 'test-token',
     botUserId: 'bot',
-    paths: { gatewayPidPath },
+    paths: {
+      stateDir: dir,
+      gatewayPidPath,
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
   };
   const clients = [];
   const { EventEmitter } = require('node:events');
@@ -965,7 +1022,11 @@ test('logger failure cannot tear down a listener after atomic authority commit',
     loginDisabled: false,
     token: 'test-token',
     botUserId: 'bot',
-    paths: { gatewayPidPath: path.join(dir, 'session-gateway.pid') },
+    paths: {
+      stateDir: dir,
+      gatewayPidPath: path.join(dir, 'session-gateway.pid'),
+      deliveryQueuePath: path.join(dir, 'pending-delivery.json'),
+    },
   };
   const { EventEmitter } = require('node:events');
   let destroyed = false;
@@ -1054,6 +1115,8 @@ test('same Discord event crossing authority commit is persisted exactly once', a
     pid: 30001,
     generation: 'incumbent-generation',
     claimedAt: '2026-07-20T00:00:00.000Z',
+    deliveryQueueLockProtocol: 'flock-v1',
+    deliveryQueueLockIdentity: getDeliveryQueueLockIdentity(config),
     fallback: null,
   };
   fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(incumbent)}\n`);
@@ -1113,6 +1176,7 @@ test('same Discord event crossing authority commit is persisted exactly once', a
   const successor = createReceiverOwnership(incumbent, {
     pid: 30002,
     randomUUID: () => 'successor-generation',
+    deliveryQueueLockIdentity: getDeliveryQueueLockIdentity(config),
   });
   commitReceiverOwnership(config, snapshot, successor, { pid: 30002 });
   await makeHandler(successor, successor.pid)({ ...message, reference: null, fetchReference: undefined });

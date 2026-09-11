@@ -32,15 +32,17 @@ target readiness, armed its listener, and committed that replacement. The new
 record retains the incumbent as fallback, so an A7 incumbent becomes effective
 again if the committed successor process dies.
 
-Pure same-protocol handoffs store one-line version-2 JSON in
-`session-gateway.pid` and may retain a live fallback. A queue-lock protocol
-change is different: the successor refuses to commit while an incompatible
-incumbent is live, before touching the queue lock pathname. The operator must
-stop and verify the old gateway before starting the successor. This quiesced
-transition is mandatory because an already-running legacy binary cannot be
-taught not to reclaim or delete the new writer's lock. The authority record
-carries `deliveryQueueLockProtocol` so the runtime enforces this boundary
-instead of relying on deployment convention.
+Pure compatible handoffs store one-line version-2 JSON in
+`session-gateway.pid` and may retain a live fallback. Compatibility binds both
+the queue-lock protocol and the normalized persistent lock pathname. A change
+to either is different: the successor refuses to log in or touch the queue
+while an incompatible incumbent is live. The operator must stop and verify the
+old gateway before starting the successor. This quiesced transition is
+mandatory because independently configurable authority and queue paths could
+otherwise let two live gateways lock different inodes while sharing one
+authority record. The record carries both `deliveryQueueLockProtocol` and
+`deliveryQueueLockIdentity`; a missing legacy identity is incompatible rather
+than guessed from the successor's configuration.
 
 When no live incumbent exists, target readiness is not a receive-startup gate.
 The first gateway logs in, proves queue persistence, arms its listener, and
@@ -181,6 +183,11 @@ parent retains the same open file description, so the kernel keeps the
 descriptor; it never removes the shared lock pathname, so owner-write rollback
 and release have no pathname check/delete ABA window or long-lived
 helper-process failure window.
+The writer compares the descriptor and pathname device/inode/link identity
+both when opening the persistent file and again after `flock(2)` succeeds,
+before running the protected operation. Replacement in that interval closes
+the descriptor and fails the operation instead of allowing writers to lock two
+different inodes.
 Acquisition timeout and release failure are surfaced as operation errors. A
 legacy directory at the lock pathname is a fail-closed migration error and may
 be removed only after the gateway is quiesced and the exact path has been

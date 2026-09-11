@@ -6,6 +6,20 @@ const path = require('node:path');
 
 const DELIVERY_QUEUE_LOCK_PROTOCOL = 'flock-v1';
 
+function getDeliveryQueueLockIdentity(config = {}) {
+  const queuePath = config.paths?.deliveryQueuePath || (
+    config.paths?.stateDir ? path.join(config.paths.stateDir, 'pending-delivery.json') : ''
+  );
+  return queuePath ? path.resolve(`${queuePath}.lock`) : '';
+}
+
+function validDeliveryQueueLockIdentity(value) {
+  return typeof value === 'string'
+    && value !== ''
+    && path.isAbsolute(value)
+    && path.resolve(value) === value;
+}
+
 function localPid(deps = {}) {
   const pid = Number(deps.pid);
   return Number.isInteger(pid) && pid > 0 ? pid : process.pid;
@@ -270,12 +284,19 @@ function createReceiverOwnership(previous, deps = {}) {
   const nowValue = typeof deps.now === 'function' ? deps.now() : Date.now();
   const processStartTicks = deps.processStartTicks || readLinuxProcessStartTicks(pid, deps.fs || fs);
   const stateDir = typeof deps.stateDir === 'string' ? deps.stateDir : '';
+  const deliveryQueueLockIdentity = deps.deliveryQueueLockIdentity;
+  if (!validDeliveryQueueLockIdentity(deliveryQueueLockIdentity)) {
+    const error = new Error('Discord receiver candidate has no canonical delivery queue-lock identity.');
+    error.code = 'receiver_ownership_queue_lock_identity_invalid';
+    throw error;
+  }
   return {
     version: 2,
     pid,
     generation: (deps.randomUUID || randomUUID)(),
     claimedAt: new Date(nowValue).toISOString(),
     deliveryQueueLockProtocol: DELIVERY_QUEUE_LOCK_PROTOCOL,
+    deliveryQueueLockIdentity,
     ...(processStartTicks ? { processStartTicks } : {}),
     ...(stateDir ? { stateDir, role: 'gateway' } : {}),
     fallback: previous && previous.pid !== pid ? fallbackRecord(previous) : null,
@@ -303,8 +324,19 @@ function snapshotsMatch(left, right) {
 
 function assertReceiverOwnershipProtocolCompatible(
   incumbent,
-  candidateProtocol = DELIVERY_QUEUE_LOCK_PROTOCOL,
+  candidate,
 ) {
+  const candidateProtocol = candidate?.deliveryQueueLockProtocol;
+  if (candidateProtocol !== DELIVERY_QUEUE_LOCK_PROTOCOL) {
+    const error = new Error('Discord receiver candidate has no supported delivery queue-lock protocol.');
+    error.code = 'receiver_ownership_protocol_invalid';
+    throw error;
+  }
+  if (!validDeliveryQueueLockIdentity(candidate?.deliveryQueueLockIdentity)) {
+    const error = new Error('Discord receiver candidate has no canonical delivery queue-lock identity.');
+    error.code = 'receiver_ownership_queue_lock_identity_invalid';
+    throw error;
+  }
   if (
     incumbent
     && incumbent.deliveryQueueLockProtocol !== candidateProtocol
@@ -313,6 +345,18 @@ function assertReceiverOwnershipProtocolCompatible(
       'Discord gateway upgrade requires the incompatible incumbent queue-lock protocol to be quiesced first.',
     );
     error.code = 'delivery_queue_lock_protocol_quiescence_required';
+    throw error;
+  }
+  if (
+    incumbent
+    && (
+      incumbent.deliveryQueueLockIdentity !== candidate.deliveryQueueLockIdentity
+    )
+  ) {
+    const error = new Error(
+      'Discord gateway upgrade requires the incumbent with a different or unknown queue-lock identity to be quiesced first.',
+    );
+    error.code = 'delivery_queue_lock_identity_quiescence_required';
     throw error;
   }
 }
@@ -327,6 +371,16 @@ function commitReceiverOwnership(config, expectedSnapshot, candidate, deps = {})
     error.code = 'receiver_ownership_protocol_invalid';
     throw error;
   }
+  if (!validDeliveryQueueLockIdentity(candidate.deliveryQueueLockIdentity)) {
+    const error = new Error('Discord receiver candidate has no canonical delivery queue-lock identity.');
+    error.code = 'receiver_ownership_queue_lock_identity_invalid';
+    throw error;
+  }
+  if (candidate.deliveryQueueLockIdentity !== getDeliveryQueueLockIdentity(config)) {
+    const error = new Error('Discord receiver candidate queue-lock identity does not match its runtime configuration.');
+    error.code = 'receiver_ownership_queue_lock_identity_invalid';
+    throw error;
+  }
   const current = readReceiverAuthoritySnapshot(config, deps);
   if (!current.valid || !snapshotsMatch(current, expectedSnapshot)) {
     const error = new Error('Discord receiver ownership changed before atomic commit.');
@@ -334,13 +388,10 @@ function commitReceiverOwnership(config, expectedSnapshot, candidate, deps = {})
     throw error;
   }
   const incumbent = effectiveReceiverOwnership(current, deps);
-  if (
-    incumbent
-    && incumbent.record.pid !== candidate.pid
-  ) {
+  if (incumbent) {
     assertReceiverOwnershipProtocolCompatible(
       incumbent.record,
-      candidate.deliveryQueueLockProtocol,
+      candidate,
     );
   }
   const targetPath = current.source === 'legacy' && candidate.fallback?.version === 1
@@ -381,11 +432,13 @@ function releaseReceiverOwnership(config, expected, deps = {}) {
 }
 
 module.exports = {
+  DELIVERY_QUEUE_LOCK_PROTOCOL,
   assertReceiverOwnershipProtocolCompatible,
   commitReceiverOwnership,
   createReceiverOwnership,
   effectiveReceiverOwnership,
   getReceiverAuthorityPath,
+  getDeliveryQueueLockIdentity,
   getStagedReceiverAuthorityPath,
   isActiveDiscordReceiver,
   isCurrentReceiverOwnership,

@@ -368,6 +368,58 @@ test('one-shot flock exits before the operation while the parent descriptor seri
   second.destroy();
 });
 
+test('parent crash releases its retained flock for a successor', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-parent-crash-'));
+  const fixture = path.join(__dirname, '..', 'fixtures', 'hold-delivery-queue-lock.js');
+  const child = spawn(process.execPath, [fixture, dir], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`lock holder did not start: ${stderr}`)), 3000);
+    child.stdout.once('data', (chunk) => {
+      if (!String(chunk).includes('LOCKED')) {
+        clearTimeout(timer);
+        reject(new Error(`unexpected lock holder output: ${chunk}`));
+        return;
+      }
+      clearTimeout(timer);
+      resolve();
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      reject(new Error(`lock holder exited early code=${code} signal=${signal}: ${stderr}`));
+    });
+  });
+
+  const contender = createDelivery(deliveryConfig(dir, {
+    deliveryQueueLockTimeoutMs: 60,
+  }), () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await assert.rejects(
+    contender.ensurePersistenceReady(),
+    /Timed out waiting for Discord delivery queue lock/,
+  );
+
+  child.kill('SIGKILL');
+  const [code, signal] = await new Promise((resolve) => {
+    child.once('exit', (...args) => resolve(args));
+  });
+  assert.equal(code, null);
+  assert.equal(signal, 'SIGKILL');
+  await contender.ensurePersistenceReady();
+  contender.destroy();
+});
+
 test('distinct delivery queues lock distinct verified inodes', async (t) => {
   const firstDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-isolation-a-'));
   const secondDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-isolation-b-'));
@@ -481,6 +533,47 @@ test('queue lock acquisition spawn failure closes the verified parent descriptor
   delivery.destroy();
 });
 
+test('queue lock validation preserves both the primary and cleanup failures', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-validation-cleanup-'));
+  let lockDescriptor;
+  t.after(() => {
+    if (lockDescriptor !== undefined) {
+      try { fs.closeSync(lockDescriptor); } catch {}
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const validationError = new Error('injected lock validation failure');
+  validationError.code = 'EIO';
+  const cleanupError = new Error('injected validation cleanup failure');
+  cleanupError.code = 'EIO';
+  const fsProxy = {
+    ...fs,
+    openSync(...args) {
+      lockDescriptor = fs.openSync(...args);
+      return lockDescriptor;
+    },
+    lstatSync() { throw validationError; },
+    closeSync(descriptor) {
+      assert.equal(descriptor, lockDescriptor);
+      throw cleanupError;
+    },
+  };
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    fs: fsProxy,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(delivery.ensurePersistenceReady(), (error) => {
+    assert.equal(error instanceof AggregateError, true);
+    assert.deepEqual(error.errors, [validationError, cleanupError]);
+    return true;
+  });
+  delivery.destroy();
+});
+
 test('queue lock open-time pathname replacement is rejected without deleting the replacement', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-open-aba-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -511,6 +604,51 @@ test('queue lock open-time pathname replacement is rejected without deleting the
   assert.equal(swapped, true);
   assert.equal(fs.readFileSync(lockPath, 'utf8'), 'owner-b\n');
   delivery.destroy();
+});
+
+test('queue lock replacement before flock acquisition is rejected before the operation', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-acquire-aba-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = deliveryConfig(dir, { deliveryQueueLockTimeoutMs: 100 });
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  const oldPath = `${lockPath}.old`;
+  let replaced = false;
+  let operationEntered = false;
+  const replaceBeforeFlock = (command, args, options) => {
+    assert.equal(command, '/usr/bin/flock');
+    assert.equal(replaced, false);
+    fs.renameSync(lockPath, oldPath);
+    fs.writeFileSync(lockPath, 'replacement\n', { mode: 0o600 });
+    replaced = true;
+    return spawn(command, args, options);
+  };
+  const delivery = createDelivery(config, () => {}, {
+    spawn: replaceBeforeFlock,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(
+    delivery.coordinateReceiverOwnership(() => { operationEntered = true; }),
+    (error) => error?.code === 'delivery_queue_lock_identity_changed',
+  );
+  assert.equal(replaced, true);
+  assert.equal(operationEntered, false);
+  assert.notEqual(fs.statSync(oldPath).ino, fs.statSync(lockPath).ino);
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'replacement\n');
+
+  const successor = createDelivery(config, () => {}, {
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+  await successor.ensurePersistenceReady();
+  assert.equal(fs.readFileSync(lockPath, 'utf8'), 'replacement\n');
+  delivery.destroy();
+  successor.destroy();
 });
 
 test('escapeAttr escapes unsafe attribute characters', () => {
@@ -2083,6 +2221,7 @@ test('receiver handoff waits for the incumbent delivery lease before committing 
     generation: 'incumbent-generation',
     claimedAt: '2026-07-20T00:00:00.000Z',
     deliveryQueueLockProtocol: 'flock-v1',
+    deliveryQueueLockIdentity: `${config.paths.deliveryQueuePath}.lock`,
     fallback: null,
   };
   fs.writeFileSync(config.paths.gatewayPidPath, `${JSON.stringify(incumbent)}\n`);

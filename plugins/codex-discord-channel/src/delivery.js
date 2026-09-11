@@ -172,35 +172,51 @@ function getDeliveryQueueLockPath(config = {}) {
   return queuePath ? `${queuePath}.lock` : '';
 }
 
+function assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl) {
+  const held = fsImpl.fstatSync(descriptor, { bigint: true });
+  const named = fsImpl.lstatSync(lockPath, { bigint: true });
+  if (
+    !held.isFile()
+    || !named.isFile()
+    || named.isSymbolicLink()
+    || held.nlink !== 1n
+    || named.nlink !== 1n
+    || held.dev !== named.dev
+    || held.ino !== named.ino
+  ) {
+    const error = new Error(`Unsafe Discord delivery queue lock: ${lockPath}`);
+    error.code = 'delivery_queue_lock_identity_changed';
+    throw error;
+  }
+}
+
 function openDeliveryQueueLock(lockPath, fsImpl) {
   const flags = fs.constants.O_CREAT | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0);
   let descriptor;
   try {
     descriptor = fsImpl.openSync(lockPath, flags, 0o600);
-    const held = fsImpl.fstatSync(descriptor, { bigint: true });
-    const named = fsImpl.lstatSync(lockPath, { bigint: true });
-    if (
-      !held.isFile()
-      || !named.isFile()
-      || named.isSymbolicLink()
-      || held.nlink !== 1n
-      || named.nlink !== 1n
-      || held.dev !== named.dev
-      || held.ino !== named.ino
-    ) {
-      throw new Error(`Unsafe Discord delivery queue lock: ${lockPath}`);
-    }
+    assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl);
     return descriptor;
   } catch (error) {
-    if (descriptor !== undefined) fsImpl.closeSync(descriptor);
+    let primaryError = error;
     if (error?.code === 'EISDIR') {
       const migration = new Error(
         `Discord delivery queue lock protocol migration requires a quiesced gateway and manual removal of the legacy lock directory: ${lockPath}`,
       );
       migration.code = 'delivery_queue_lock_protocol_migration_required';
-      throw migration;
+      primaryError = migration;
     }
-    throw error;
+    if (descriptor !== undefined) {
+      try {
+        fsImpl.closeSync(descriptor);
+      } catch (closeError) {
+        throw new AggregateError(
+          [primaryError, closeError],
+          'Discord delivery queue lock validation and descriptor cleanup both failed.',
+        );
+      }
+    }
+    throw primaryError;
   }
 }
 
@@ -272,6 +288,23 @@ async function acquireDeliveryQueueLock(config = {}, deps = {}) {
       );
     }
     throw acquisitionError;
+  }
+
+  try {
+    // The pathname may have been replaced after open-time validation but
+    // before flock(2) acquired this descriptor. Revalidate only after the
+    // one-shot acquirer has succeeded, before any queue operation can begin.
+    assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl);
+  } catch (identityError) {
+    try {
+      fsImpl.closeSync(descriptor);
+    } catch (closeError) {
+      throw new AggregateError(
+        [identityError, closeError],
+        'Discord delivery queue lock identity changed and its descriptor could not be closed.',
+      );
+    }
+    throw identityError;
   }
 
   let released = false;
