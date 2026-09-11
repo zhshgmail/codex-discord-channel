@@ -5,6 +5,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const nodeTest = require('node:test');
 const { stateDirContractTest } = require('./retired-session-bound-contracts');
 const test = stateDirContractTest(nodeTest);
@@ -318,7 +319,18 @@ test('one-shot flock exits before the operation while the parent descriptor seri
     deliveryQueueLockTimeoutMs: 60,
   });
   const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  let acquirerExited = false;
+  let acquirerCount = 0;
+  const trackedSpawn = (command, args, options) => {
+    acquirerCount += 1;
+    assert.equal(command, '/usr/bin/flock');
+    assert.deepEqual(args, ['--exclusive', '--timeout', '0.06', '3']);
+    const child = spawn(command, args, options);
+    child.once('exit', () => { acquirerExited = true; });
+    return child;
+  };
   const first = createDelivery(config, () => {}, {
+    spawn: trackedSpawn,
     structuredHost: {
       status() { return { configured: true, available: true, reason: null }; },
       destroy() {},
@@ -335,6 +347,8 @@ test('one-shot flock exits before the operation while the parent descriptor seri
   const locked = new Promise((resolve) => { markLocked = resolve; });
   const waitForUnlock = new Promise((resolve) => { unlock = resolve; });
   const firstOperation = first.coordinateReceiverOwnership(async () => {
+    assert.equal(acquirerExited, true);
+    assert.equal(acquirerCount, 1);
     markLocked();
     await waitForUnlock;
   });
