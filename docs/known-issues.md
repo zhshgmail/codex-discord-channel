@@ -299,6 +299,32 @@ reused app identity, a foreign group member or listener, multiple listeners,
 and socket-inode replacement all retain status 73 and touch nothing. Do not
 turn those refusals into manual socket deletion; verify the exact owner first.
 
+## Active Input Is Visible In Native History But The FIFO Still Waits
+
+The source-level delivery verifier used to consult only local rollout files.
+An exact native `userMessage` carrying the submitted `clientId` could therefore
+already exist while a delayed rollout flush left the FIFO head in
+`delivery_proof_pending`. This is a proof-reconciliation defect, not evidence
+that every delayed steer has the same cause.
+
+The verifier now keeps rollout proof first, then reads one descending
+`thread/items/list` page, limited to 32 items, from the currently selected user
+root on this instance's app-server connection. Only an exact `userMessage` and
+client ID match completes the source. A changed connection or selection,
+oversized page, unavailable read, or nonmatching item does not complete it.
+It never follows a page cursor or hydrates the full thread for this fallback.
+The ACK-without-proof retry guard and stable Discord-source deduplication are
+unchanged.
+
+Submission and acknowledgment diagnostics record the RPC method, target status,
+expected and accepted turn IDs, and stable client ID without recording input
+text. An ACK still means accepted input, not model consumption. An isolated
+Codex 0.153.3 fixture with a held sampling response and another with a synchronous
+tool both consumed steers at the next boundary, before the active turn ended.
+These backend fixtures do not prove visible TUI rendering or explain all
+historical multi-minute delays. Deployment and visible acceptance must be
+verified separately for the affected alias.
+
 ## Installed Plugin Changes Do Not Appear In An Existing Session
 
 An already-open MCP transport does not hot-load replaced plugin code. Exit the

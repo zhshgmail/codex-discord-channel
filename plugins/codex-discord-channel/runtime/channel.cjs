@@ -3388,7 +3388,7 @@ var require_ws = __commonJS({
 var require_app_server_host = __commonJS({
   "src/app-server-host.js"(exports2, module2) {
     "use strict";
-    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_EMITTED_ASSISTANT_FINALS = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
+    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_RECENT_SOURCE_PROOF_ITEMS = 32, MAX_EMITTED_ASSISTANT_FINALS = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
     function parseTargetCheckpoint(raw) {
       let record;
       try {
@@ -4451,8 +4451,14 @@ var require_app_server_host = __commonJS({
             ...params,
             threadId: candidate.threadId,
             ...candidate.activeTurnId ? { expectedTurnId: candidate.activeTurnId } : {}
-          } : { ...params, threadId: candidate.threadId };
-          if (typeof this.client.requestOnConnection == "function") {
+          } : { ...params, threadId: candidate.threadId }, observation = {
+            clientUserMessageId: params.clientUserMessageId,
+            method,
+            targetStatus: candidate.status,
+            threadId: candidate.threadId,
+            expectedTurnId: requestParams.expectedTurnId || null
+          };
+          if (this.logger("INFO", "Submitting Discord input to current app-server target", observation), typeof this.client.requestOnConnection == "function") {
             let response = await this.client.requestOnConnection(
               method,
               requestParams,
@@ -4460,15 +4466,22 @@ var require_app_server_host = __commonJS({
               null,
               !0
             );
-            return {
+            return this.logger("INFO", "App-server acknowledged Discord input", {
+              ...observation,
+              acceptedTurnId: response.result?.turn?.id || response.result?.turnId || null
+            }), {
               method,
               result: response.result,
               acceptedGeneration: response.generation
             };
           }
-          return {
+          let result = await this.client.request(method, requestParams);
+          return this.logger("INFO", "App-server acknowledged Discord input", {
+            ...observation,
+            acceptedTurnId: result?.turn?.id || result?.turnId || null
+          }), {
             method,
-            result: await this.client.request(method, requestParams),
+            result,
             acceptedGeneration: null
           };
         }, submitted;
@@ -4632,17 +4645,29 @@ var require_app_server_host = __commonJS({
         let candidates = [...new Set([
           this.currentThreadId,
           ...this.knownLoadedThreadIds
-        ].filter((threadId) => CANONICAL_THREAD_ID.test(threadId || "")))];
-        for (let threadId of candidates) {
+        ].filter((threadId2) => CANONICAL_THREAD_ID.test(threadId2 || "")))];
+        for (let threadId2 of candidates) {
           let verified = !1;
           try {
-            verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
+            verified = await this.verifyRolloutDelivery(threadId2, clientUserMessageId);
           } catch {
           }
           if (verified)
-            return this.rememberVerifiedUserMessage(threadId, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0;
+            return this.rememberVerifiedUserMessage(threadId2, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0;
         }
-        return !1;
+        let threadId = this.currentThreadId;
+        if (!this.loadedInventoryProven || !candidates.includes(threadId)) return !1;
+        let selectionRevision = this.threadSelectionRevision, params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: "desc" }, page;
+        try {
+          page = typeof this.client.requestOnConnection == "function" ? (await this.client.requestOnConnection(
+            "thread/items/list",
+            params,
+            this.client.connectionGeneration
+          )).result : await this.client.request("thread/items/list", params);
+        } catch {
+          return !1;
+        }
+        return this.threadSelectionRevision !== selectionRevision || this.currentThreadId !== threadId || !Array.isArray(page?.data) || page.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS || !page.data.some((entry) => entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId) ? !1 : (this.rememberVerifiedUserMessage(threadId, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0);
       }
       onThreadIdle(listener) {
         return this.on("idle", listener), () => this.off("idle", listener);
