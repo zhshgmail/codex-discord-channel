@@ -9,7 +9,7 @@ const {
   receiptPath,
   replyNonce,
 } = require('./reply-delivery');
-const { isProcessAlive } = require('./receiver-state');
+const { isProcessAlive, readLinuxProcessStartTicks } = require('./receiver-state');
 
 const DELIVERY_QUEUE_ERROR_MESSAGE = 'Unable to read persistent Discord delivery queue.';
 const DELIVERY_QUEUE_VERSION = 5;
@@ -184,32 +184,17 @@ function removeLockDirectory(lockPath, fsImpl) {
   fsImpl.rmSync(lockPath, { recursive: true, force: true });
 }
 
-function tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl) {
-  const staleMs = Number(config.deliveryQueueLockStaleMs) || 45000;
-  let ageMs;
+function validateExistingQueueLock(lockPath, fsImpl) {
   try {
-    ageMs = Date.now() - fsImpl.statSync(lockPath).mtimeMs;
+    const stat = fsImpl.lstatSync(lockPath);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Unsafe Discord delivery queue lock: ${lockPath}`);
+    }
+    return true;
   } catch (error) {
-    if (error?.code === 'ENOENT') return true;
+    if (error?.code === 'ENOENT') return false;
     throw error;
   }
-  if (ageMs < staleMs) return false;
-
-  const owner = readLockOwner(lockPath, fsImpl);
-  const ownerPid = Number(owner?.pid) || 0;
-  const ownerAlive = ownerPid > 0 && (deps.isProcessAlive || isProcessAlive)(ownerPid);
-  const liveLeaseMs = Number(config.deliveryQueueLockLiveLeaseMs) || 55000;
-  if (ownerAlive && ageMs < liveLeaseMs) return false;
-
-  const stalePath = `${lockPath}.stale.${process.pid}.${Date.now()}`;
-  try {
-    fsImpl.renameSync(lockPath, stalePath);
-  } catch (error) {
-    if (error?.code === 'ENOENT') return true;
-    return false;
-  }
-  removeLockDirectory(stalePath, fsImpl);
-  return true;
 }
 
 function sleep(ms) {
@@ -232,6 +217,7 @@ async function acquireDeliveryQueueLock(config = {}, deps = {}) {
       try {
         fsImpl.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
           pid: process.pid,
+          processStartTicks: readLinuxProcessStartTicks(process.pid),
           token,
           acquiredAt: new Date().toISOString(),
         })}\n`, { mode: 0o600 });
@@ -247,7 +233,11 @@ async function acquireDeliveryQueueLock(config = {}, deps = {}) {
       };
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
-      if (tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl)) continue;
+      // Never reclaim an existing lock automatically. A pathname-level
+      // inspect-then-rename/delete sequence has an ABA window that can remove
+      // a different writer's newly acquired live lock. An abandoned lock is a
+      // fail-closed condition requiring a quiesced, explicit manual audit.
+      validateExistingQueueLock(lockPath, fsImpl);
       if (Date.now() - startedAt >= timeoutMs) {
         throw new Error(`Timed out waiting for Discord delivery queue lock: ${lockPath}`);
       }

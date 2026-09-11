@@ -269,6 +269,98 @@ test('queue lock cleanup failure cannot negate an already committed ownership op
   delivery.destroy();
 });
 
+test('old queue locks are never reclaimed automatically from live or abandoned owners', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-no-reclaim-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  for (const [kind, pid, processStartTicks] of [
+    ['live', process.pid, 'current-process'],
+    ['abandoned', 2147483647, '1'],
+  ]) {
+    const dir = path.join(root, kind);
+    fs.mkdirSync(dir);
+    const config = deliveryConfig(dir, {
+      deliveryQueueLockTimeoutMs: 60,
+      deliveryQueueLockRetryMs: 5,
+    });
+    const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+    const token = `${kind}-old-owner`;
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
+      pid,
+      processStartTicks,
+      token,
+    })}\n`, { mode: 0o600 });
+    const old = new Date(Date.now() - 120000);
+    fs.utimesSync(lockPath, old, old);
+
+    const delivery = createDelivery(config, () => {}, {
+      structuredHost: {
+        status() { return { configured: true, available: true, reason: null }; },
+        destroy() {},
+      },
+    });
+    await assert.rejects(
+      delivery.ensurePersistenceReady(),
+      /Timed out waiting for Discord delivery queue lock/,
+    );
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')).token,
+      token,
+    );
+    assert.equal(fs.statSync(lockPath).isDirectory(), true);
+    delivery.destroy();
+  }
+});
+
+test('queue lock contention cannot ABA-delete a replacement owner', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-aba-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = deliveryConfig(dir, {
+    deliveryQueueLockTimeoutMs: 60,
+    deliveryQueueLockRetryMs: 5,
+  });
+  const lockPath = `${config.paths.deliveryQueuePath}.lock`;
+  fs.mkdirSync(lockPath, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(lockPath, 'owner.json'), '{"token":"owner-a"}\n', { mode: 0o600 });
+
+  let swapped = false;
+  const fsProxy = {
+    ...fs,
+    lstatSync(target) {
+      if (!swapped && target === lockPath) {
+        swapped = true;
+        fs.rmSync(lockPath, { recursive: true, force: true });
+        fs.mkdirSync(lockPath, { mode: 0o700 });
+        fs.writeFileSync(path.join(lockPath, 'owner.json'), `${JSON.stringify({
+          pid: process.pid,
+          processStartTicks: 'replacement-owner',
+          token: 'owner-b',
+        })}\n`, { mode: 0o600 });
+      }
+      return fs.lstatSync(target);
+    },
+  };
+  const delivery = createDelivery(config, () => {}, {
+    fs: fsProxy,
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(
+    delivery.ensurePersistenceReady(),
+    /Timed out waiting for Discord delivery queue lock/,
+  );
+  assert.equal(swapped, true);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8')).token,
+    'owner-b',
+  );
+  delivery.destroy();
+});
+
 test('escapeAttr escapes unsafe attribute characters', () => {
   assert.equal(escapeAttr('"x<&'), '&quot;x&lt;&amp;');
 });

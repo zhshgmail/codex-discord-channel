@@ -5227,7 +5227,7 @@ var require_delivery = __commonJS({
       readReceipt,
       receiptPath,
       replyNonce
-    } = require_reply_delivery(), { isProcessAlive } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 5, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_PROOF_PENDING = "delivery_proof_pending", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", LEGACY_ACK_UNCERTAIN_ARCHIVE = "legacy_ack_uncertain_no_auto_replay", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, DEFAULT_DELIVERY_PROOF_RETRY_DELAY_MS = 2e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
+    } = require_reply_delivery(), { isProcessAlive, readLinuxProcessStartTicks } = require_receiver_state(), DELIVERY_QUEUE_ERROR_MESSAGE = "Unable to read persistent Discord delivery queue.", DELIVERY_QUEUE_VERSION = 5, DELIVERY_IN_PROGRESS = "structured_delivery_in_progress", DELIVERY_PROOF_PENDING = "delivery_proof_pending", DELIVERY_ACK_UNCERTAIN = "structured_ack_uncertain", LEGACY_ACK_UNCERTAIN_ARCHIVE = "legacy_ack_uncertain_no_auto_replay", DELIVERY_LEASE_RETRY_AT = /* @__PURE__ */ Symbol("deliveryLeaseRetryAt"), MAX_TIMER_DELAY_MS = 2 ** 31 - 1, DEFAULT_UNCERTAIN_RETRY_MAX_MS = 300 * 1e3, DEFAULT_DELIVERY_PROOF_RETRY_DELAY_MS = 2e3, activeDeliveryAttempts = /* @__PURE__ */ new Set();
     function currentTimeMs(deps = {}) {
       let value = typeof deps.now == "function" ? Number(deps.now()) : Date.now();
       return Number.isFinite(value) ? value : Date.now();
@@ -5332,24 +5332,16 @@ ${body}
     function removeLockDirectory(lockPath, fsImpl) {
       fsImpl.rmSync(lockPath, { recursive: !0, force: !0 });
     }
-    function tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl) {
-      let staleMs = Number(config.deliveryQueueLockStaleMs) || 45e3, ageMs;
+    function validateExistingQueueLock(lockPath, fsImpl) {
       try {
-        ageMs = Date.now() - fsImpl.statSync(lockPath).mtimeMs;
+        let stat = fsImpl.lstatSync(lockPath);
+        if (stat.isSymbolicLink() || !stat.isDirectory())
+          throw new Error(`Unsafe Discord delivery queue lock: ${lockPath}`);
+        return !0;
       } catch (error) {
-        if (error?.code === "ENOENT") return !0;
+        if (error?.code === "ENOENT") return !1;
         throw error;
       }
-      if (ageMs < staleMs) return !1;
-      let owner = readLockOwner(lockPath, fsImpl), ownerPid = Number(owner?.pid) || 0, ownerAlive = ownerPid > 0 && (deps.isProcessAlive || isProcessAlive)(ownerPid), liveLeaseMs = Number(config.deliveryQueueLockLiveLeaseMs) || 55e3;
-      if (ownerAlive && ageMs < liveLeaseMs) return !1;
-      let stalePath = `${lockPath}.stale.${process.pid}.${Date.now()}`;
-      try {
-        fsImpl.renameSync(lockPath, stalePath);
-      } catch (error) {
-        return error?.code === "ENOENT";
-      }
-      return removeLockDirectory(stalePath, fsImpl), !0;
     }
     function sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -5364,6 +5356,7 @@ ${body}
           try {
             fsImpl.writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({
               pid: process.pid,
+              processStartTicks: readLinuxProcessStartTicks(process.pid),
               token,
               acquiredAt: (/* @__PURE__ */ new Date()).toISOString()
             })}
@@ -5379,8 +5372,7 @@ ${body}
           };
         } catch (error) {
           if (error?.code !== "EEXIST") throw error;
-          if (tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl)) continue;
-          if (Date.now() - startedAt >= timeoutMs)
+          if (validateExistingQueueLock(lockPath, fsImpl), Date.now() - startedAt >= timeoutMs)
             throw new Error(`Timed out waiting for Discord delivery queue lock: ${lockPath}`);
           await sleep(retryMs);
         }
