@@ -11,6 +11,8 @@ const MAX_FRESH_THREAD_READS = 32;
 const MAX_LOADED_THREAD_PAGES = 32;
 const MAX_TARGET_RESOLUTION_RESTARTS = 4;
 const MAX_VERIFIED_USER_MESSAGES = 256;
+const MAX_RECENT_TARGET_TURNS = 8;
+const MAX_RECENT_SOURCE_PROOF_ITEMS = 32;
 const MAX_EMITTED_ASSISTANT_FINALS = 256;
 const MAX_ROLLOUT_SEARCH_DEPTH = 4;
 const MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096;
@@ -1430,10 +1432,10 @@ class AppServerHost extends EventEmitter {
       for (const candidateId of orderedIds) {
         const candidateResponse = await request('thread/read', {
           threadId: candidateId,
-          includeTurns: true,
-        }).catch(async (error) => {
-          if (!includeTurnsUnsupported(error)) throw error;
-          return request('thread/read', { threadId: candidateId });
+          // Target discovery needs only identity, topology, and status.  A
+          // full-history read can exceed the websocket frame limit on a
+          // long-running Discord TUI and disconnect the entire ingress path.
+          includeTurns: false,
         });
         const candidate = candidateResponse?.thread;
         if (
@@ -1471,10 +1473,34 @@ class AppServerHost extends EventEmitter {
       this.threadStatuses.set(threadId, status);
       const target = { available: true, threadId, status };
       if (status === 'active') {
-        const activeTurnId = (Array.isArray(thread.turns) ? thread.turns : [])
+        let turns = Array.isArray(thread.turns) ? thread.turns : [];
+        let turnsNewestFirst = false;
+        if (turns.length === 0) {
+          const turnPage = await request('thread/turns/list', {
+            threadId,
+            limit: MAX_RECENT_TARGET_TURNS,
+            sortDirection: 'desc',
+            itemsView: 'notLoaded',
+          });
+          if (!Array.isArray(turnPage?.data) || turnPage.data.length > MAX_RECENT_TARGET_TURNS) {
+            const reason = 'shared_app_server_active_turn_unavailable';
+            this.lastStatus = { configured: true, available: false, reason };
+            return { available: false, reason, status: 'unavailable' };
+          }
+          turns = turnPage.data;
+          turnsNewestFirst = true;
+        }
+        const activeTurnIds = turns
           .filter((turn) => turn?.status === 'inProgress' && typeof turn.id === 'string' && turn.id)
-          .map((turn) => turn.id)
-          .at(-1) || this.activeTurnIds.get(threadId) || '';
+          .map((turn) => turn.id);
+        const activeTurnId = (
+          turnsNewestFirst ? activeTurnIds[0] : activeTurnIds.at(-1)
+        ) || this.activeTurnIds.get(threadId) || '';
+        if (!activeTurnId) {
+          const reason = 'shared_app_server_active_turn_unavailable';
+          this.lastStatus = { configured: true, available: false, reason };
+          return { available: false, reason, status: 'unavailable' };
+        }
         if (activeTurnId) {
           this.activeTurnIds.set(threadId, activeTurnId);
           target.activeTurnId = activeTurnId;
@@ -1838,8 +1864,20 @@ class AppServerHost extends EventEmitter {
       try {
         response = await requestForTarget('thread/read', {
           threadId,
-          includeTurns: true,
+          includeTurns: false,
         });
+        if (response?.thread?.status?.type === 'active') {
+          const page = await requestForTarget('thread/turns/list', {
+            threadId,
+            limit: MAX_RECENT_TARGET_TURNS,
+            sortDirection: 'desc',
+            itemsView: 'notLoaded',
+          });
+          if (!Array.isArray(page?.data) || page.data.length > MAX_RECENT_TARGET_TURNS) {
+            throw deliveryError('Active turn page is unavailable.', 'shared_app_server_active_turn_unavailable');
+          }
+          response = { thread: { ...response.thread, turns: [...page.data].reverse() } };
+        }
       } catch (error) {
         if (ephemeralIncludeTurnsUnsupported(error)) {
           try {
@@ -1934,6 +1972,14 @@ class AppServerHost extends EventEmitter {
             ...(candidate.activeTurnId ? { expectedTurnId: candidate.activeTurnId } : {}),
           }
         : { ...params, threadId: candidate.threadId };
+      const observation = {
+        clientUserMessageId: params.clientUserMessageId,
+        method,
+        targetStatus: candidate.status,
+        threadId: candidate.threadId,
+        expectedTurnId: requestParams.expectedTurnId || null,
+      };
+      this.logger('INFO', 'Submitting Discord input to current app-server target', observation);
       if (typeof this.client.requestOnConnection === 'function') {
         const response = await this.client.requestOnConnection(
           method,
@@ -1942,15 +1988,24 @@ class AppServerHost extends EventEmitter {
           null,
           true,
         );
+        this.logger('INFO', 'App-server acknowledged Discord input', {
+          ...observation,
+          acceptedTurnId: response.result?.turn?.id || response.result?.turnId || null,
+        });
         return {
           method,
           result: response.result,
           acceptedGeneration: response.generation,
         };
       }
+      const result = await this.client.request(method, requestParams);
+      this.logger('INFO', 'App-server acknowledged Discord input', {
+        ...observation,
+        acceptedTurnId: result?.turn?.id || result?.turnId || null,
+      });
       return {
         method,
-        result: await this.client.request(method, requestParams),
+        result,
         acceptedGeneration: null,
       };
     };
@@ -1976,7 +2031,7 @@ class AppServerHost extends EventEmitter {
   }
 
   async readDeliveredUserMessage(threadId, clientUserMessageId, signal = null) {
-    const params = { threadId, includeTurns: true };
+    const params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: 'desc' };
     let threadSelectionRevision;
     let response;
     if (typeof this.client.requestOnConnection === 'function') {
@@ -1984,7 +2039,7 @@ class AppServerHost extends EventEmitter {
       threadSelectionRevision = this.threadSelectionRevision;
       try {
         response = (await this.client.requestOnConnection(
-          'thread/read',
+          'thread/items/list',
           params,
           this.client.connectionGeneration,
           null,
@@ -2000,7 +2055,7 @@ class AppServerHost extends EventEmitter {
     } else {
       threadSelectionRevision = this.threadSelectionRevision;
       try {
-        response = await this.client.request('thread/read', params);
+        response = await this.client.request('thread/items/list', params);
       } catch (error) {
         if (includeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
           return false;
@@ -2014,12 +2069,12 @@ class AppServerHost extends EventEmitter {
         'shared_app_server_thread_changed',
       );
     }
-    const thread = response?.thread;
-    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return false;
-    return thread.turns.some((turn) => (
-      (Array.isArray(turn?.items) ? turn.items : []).some((item) => (
-        item?.type === 'userMessage' && item.clientId === clientUserMessageId
-      ))
+    if (!Array.isArray(response?.data) || response.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS) {
+      return false;
+    }
+    return response.data.some((entry) => (
+      typeof entry?.turnId === 'string' && entry.turnId !== '' &&
+      entry?.item?.type === 'userMessage' && entry.item.clientId === clientUserMessageId
     ));
   }
 
@@ -2030,11 +2085,29 @@ class AppServerHost extends EventEmitter {
     ) {
       return null;
     }
-    let response;
+    let turns;
+    let items;
     try {
-      response = await this.client.request('thread/read', {
+      turns = await this.client.request('thread/turns/list', {
         threadId,
-        includeTurns: true,
+        limit: MAX_RECENT_TARGET_TURNS,
+        sortDirection: 'desc',
+        itemsView: 'notLoaded',
+      });
+      if (!Array.isArray(turns?.data) || turns.data.length > MAX_RECENT_TARGET_TURNS) return null;
+      const matches = turns.data.filter((turn) => turn?.id === turnId);
+      if (matches.length !== 1 || matches[0].status !== 'completed') return null;
+      items = await this.client.request('thread/items/list', {
+        threadId, turnId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: 'desc',
+      });
+      // Exact-final recovery is unavailable if the bounded turn page is
+      // incomplete; a partial page cannot exclude a second final item.
+      if (
+        !Array.isArray(items?.data) || items.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS ||
+        items.nextCursor != null || items.data.some((entry) => entry?.turnId !== turnId)
+      ) return null;
+      return exactAssistantFinal(threadId, turnId, {
+        ...matches[0], items: items.data.map((entry) => entry.item),
       });
     } catch (error) {
       if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId)) {
@@ -2042,11 +2115,6 @@ class AppServerHost extends EventEmitter {
       }
       throw error;
     }
-    const thread = response?.thread;
-    if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
-    const matches = thread.turns.filter((turn) => turn?.id === turnId);
-    if (matches.length !== 1) return null;
-    return exactAssistantFinal(threadId, turnId, matches[0]);
   }
 
   async hasDelivered(threadId, clientUserMessageId) {
@@ -2220,7 +2288,38 @@ class AppServerHost extends EventEmitter {
       this.rememberVerifiedSourceMessage(clientUserMessageId);
       return true;
     }
-    return false;
+    // A just-consumed UserMessage may be visible through the state-dir's
+    // current native app-server before its rollout flush completes. Read one
+    // bounded recent-item page for that already-selected top-level user root;
+    // never hydrate full history or accept another root's RPC proof.
+    const threadId = this.currentThreadId;
+    if (!this.loadedInventoryProven || !candidates.includes(threadId)) return false;
+    const selectionRevision = this.threadSelectionRevision;
+    const params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: 'desc' };
+    let page;
+    try {
+      page = typeof this.client.requestOnConnection === 'function'
+        ? (await this.client.requestOnConnection(
+          'thread/items/list', params, this.client.connectionGeneration,
+        )).result
+        : await this.client.request('thread/items/list', params);
+    } catch {
+      return false;
+    }
+    if (
+      this.threadSelectionRevision !== selectionRevision ||
+      this.currentThreadId !== threadId ||
+      !Array.isArray(page?.data) ||
+      page.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS ||
+      !page.data.some((entry) => (
+        typeof entry?.turnId === 'string' && entry.turnId !== '' &&
+        entry?.item?.type === 'userMessage' &&
+        entry.item.clientId === clientUserMessageId
+      ))
+    ) return false;
+    this.rememberVerifiedUserMessage(threadId, clientUserMessageId);
+    this.rememberVerifiedSourceMessage(clientUserMessageId);
+    return true;
   }
 
   onThreadIdle(listener) {

@@ -3388,7 +3388,7 @@ var require_ws = __commonJS({
 var require_app_server_host = __commonJS({
   "src/app-server-host.js"(exports2, module2) {
     "use strict";
-    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_EMITTED_ASSISTANT_FINALS = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
+    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_RECENT_TARGET_TURNS = 8, MAX_RECENT_SOURCE_PROOF_ITEMS = 32, MAX_EMITTED_ASSISTANT_FINALS = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
     function parseTargetCheckpoint(raw) {
       let record;
       try {
@@ -4154,10 +4154,10 @@ var require_app_server_host = __commonJS({
           for (let candidateId of orderedIds) {
             let candidateResponse = await request("thread/read", {
               threadId: candidateId,
-              includeTurns: !0
-            }).catch(async (error) => {
-              if (!includeTurnsUnsupported(error)) throw error;
-              return request("thread/read", { threadId: candidateId });
+              // Target discovery needs only identity, topology, and status.  A
+              // full-history read can exceed the websocket frame limit on a
+              // long-running Discord TUI and disconnect the entire ingress path.
+              includeTurns: !1
             }), candidate = candidateResponse?.thread;
             if (candidate?.id === candidateId && candidate.parentThreadId == null && !isSystemBackgroundThread(candidate)) {
               response = candidateResponse, threadId = candidateId;
@@ -4177,7 +4177,25 @@ var require_app_server_host = __commonJS({
           this.knownLoadedThreadIds = new Set(orderedIds), this.loadedInventoryProven = !0, this.currentThreadId = threadId, this.threadStatuses.set(threadId, status);
           let target = { available: !0, threadId, status };
           if (status === "active") {
-            let activeTurnId = (Array.isArray(thread.turns) ? thread.turns : []).filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id).at(-1) || this.activeTurnIds.get(threadId) || "";
+            let turns = Array.isArray(thread.turns) ? thread.turns : [], turnsNewestFirst = !1;
+            if (turns.length === 0) {
+              let turnPage = await request("thread/turns/list", {
+                threadId,
+                limit: MAX_RECENT_TARGET_TURNS,
+                sortDirection: "desc",
+                itemsView: "notLoaded"
+              });
+              if (!Array.isArray(turnPage?.data) || turnPage.data.length > MAX_RECENT_TARGET_TURNS) {
+                let reason = "shared_app_server_active_turn_unavailable";
+                return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+              }
+              turns = turnPage.data, turnsNewestFirst = !0;
+            }
+            let activeTurnIds = turns.filter((turn) => turn?.status === "inProgress" && typeof turn.id == "string" && turn.id).map((turn) => turn.id), activeTurnId = (turnsNewestFirst ? activeTurnIds[0] : activeTurnIds.at(-1)) || this.activeTurnIds.get(threadId) || "";
+            if (!activeTurnId) {
+              let reason = "shared_app_server_active_turn_unavailable";
+              return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
+            }
             activeTurnId && (this.activeTurnIds.set(threadId, activeTurnId), target.activeTurnId = activeTurnId);
           } else
             this.activeTurnIds.delete(threadId);
@@ -4375,10 +4393,20 @@ var require_app_server_host = __commonJS({
           }
         }), !response || response?.thread?.status?.type === "active" && !cachedActiveTurnId)
           try {
-            response = await requestForTarget("thread/read", {
+            if (response = await requestForTarget("thread/read", {
               threadId,
-              includeTurns: !0
-            });
+              includeTurns: !1
+            }), response?.thread?.status?.type === "active") {
+              let page = await requestForTarget("thread/turns/list", {
+                threadId,
+                limit: MAX_RECENT_TARGET_TURNS,
+                sortDirection: "desc",
+                itemsView: "notLoaded"
+              });
+              if (!Array.isArray(page?.data) || page.data.length > MAX_RECENT_TARGET_TURNS)
+                throw deliveryError("Active turn page is unavailable.", "shared_app_server_active_turn_unavailable");
+              response = { thread: { ...response.thread, turns: [...page.data].reverse() } };
+            }
           } catch (error) {
             if (ephemeralIncludeTurnsUnsupported(error))
               try {
@@ -4433,8 +4461,14 @@ var require_app_server_host = __commonJS({
             ...params,
             threadId: candidate.threadId,
             ...candidate.activeTurnId ? { expectedTurnId: candidate.activeTurnId } : {}
-          } : { ...params, threadId: candidate.threadId };
-          if (typeof this.client.requestOnConnection == "function") {
+          } : { ...params, threadId: candidate.threadId }, observation = {
+            clientUserMessageId: params.clientUserMessageId,
+            method,
+            targetStatus: candidate.status,
+            threadId: candidate.threadId,
+            expectedTurnId: requestParams.expectedTurnId || null
+          };
+          if (this.logger("INFO", "Submitting Discord input to current app-server target", observation), typeof this.client.requestOnConnection == "function") {
             let response = await this.client.requestOnConnection(
               method,
               requestParams,
@@ -4442,15 +4476,22 @@ var require_app_server_host = __commonJS({
               null,
               !0
             );
-            return {
+            return this.logger("INFO", "App-server acknowledged Discord input", {
+              ...observation,
+              acceptedTurnId: response.result?.turn?.id || response.result?.turnId || null
+            }), {
               method,
               result: response.result,
               acceptedGeneration: response.generation
             };
           }
-          return {
+          let result = await this.client.request(method, requestParams);
+          return this.logger("INFO", "App-server acknowledged Discord input", {
+            ...observation,
+            acceptedTurnId: result?.turn?.id || result?.turnId || null
+          }), {
             method,
-            result: await this.client.request(method, requestParams),
+            result,
             acceptedGeneration: null
           };
         }, submitted;
@@ -4469,12 +4510,12 @@ var require_app_server_host = __commonJS({
         ), submitted.result;
       }
       async readDeliveredUserMessage(threadId, clientUserMessageId, signal = null) {
-        let params = { threadId, includeTurns: !0 }, threadSelectionRevision, response;
+        let params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: "desc" }, threadSelectionRevision, response;
         if (typeof this.client.requestOnConnection == "function") {
           await this.client.ensureConnected(), threadSelectionRevision = this.threadSelectionRevision;
           try {
             response = (await this.client.requestOnConnection(
-              "thread/read",
+              "thread/items/list",
               params,
               this.client.connectionGeneration,
               null,
@@ -4489,7 +4530,7 @@ var require_app_server_host = __commonJS({
         } else {
           threadSelectionRevision = this.threadSelectionRevision;
           try {
-            response = await this.client.request("thread/read", params);
+            response = await this.client.request("thread/items/list", params);
           } catch (error) {
             if (includeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
               return !1;
@@ -4501,27 +4542,34 @@ var require_app_server_host = __commonJS({
             "The current app-server thread changed during delivery reconciliation.",
             "shared_app_server_thread_changed"
           );
-        let thread = response?.thread;
-        return thread?.id !== threadId || !Array.isArray(thread.turns) ? !1 : thread.turns.some((turn) => (Array.isArray(turn?.items) ? turn.items : []).some((item) => item?.type === "userMessage" && item.clientId === clientUserMessageId));
+        return !Array.isArray(response?.data) || response.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS ? !1 : response.data.some((entry) => typeof entry?.turnId == "string" && entry.turnId !== "" && entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId);
       }
       async readAssistantFinal(threadId, turnId) {
         if (typeof threadId != "string" || threadId === "" || typeof turnId != "string" || turnId === "")
           return null;
-        let response;
+        let turns, items;
         try {
-          response = await this.client.request("thread/read", {
+          if (turns = await this.client.request("thread/turns/list", {
             threadId,
-            includeTurns: !0
+            limit: MAX_RECENT_TARGET_TURNS,
+            sortDirection: "desc",
+            itemsView: "notLoaded"
+          }), !Array.isArray(turns?.data) || turns.data.length > MAX_RECENT_TARGET_TURNS) return null;
+          let matches = turns.data.filter((turn) => turn?.id === turnId);
+          return matches.length !== 1 || matches[0].status !== "completed" || (items = await this.client.request("thread/items/list", {
+            threadId,
+            turnId,
+            limit: MAX_RECENT_SOURCE_PROOF_ITEMS,
+            sortDirection: "desc"
+          }), !Array.isArray(items?.data) || items.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS || items.nextCursor != null || items.data.some((entry) => entry?.turnId !== turnId)) ? null : exactAssistantFinal(threadId, turnId, {
+            ...matches[0],
+            items: items.data.map((entry) => entry.item)
           });
         } catch (error) {
           if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
             return null;
           throw error;
         }
-        let thread = response?.thread;
-        if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
-        let matches = thread.turns.filter((turn) => turn?.id === turnId);
-        return matches.length !== 1 ? null : exactAssistantFinal(threadId, turnId, matches[0]);
       }
       async hasDelivered(threadId, clientUserMessageId) {
         if (typeof threadId != "string" || threadId === "" || typeof clientUserMessageId != "string" || clientUserMessageId === "")
@@ -4614,17 +4662,29 @@ var require_app_server_host = __commonJS({
         let candidates = [...new Set([
           this.currentThreadId,
           ...this.knownLoadedThreadIds
-        ].filter((threadId) => CANONICAL_THREAD_ID.test(threadId || "")))];
-        for (let threadId of candidates) {
+        ].filter((threadId2) => CANONICAL_THREAD_ID.test(threadId2 || "")))];
+        for (let threadId2 of candidates) {
           let verified = !1;
           try {
-            verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
+            verified = await this.verifyRolloutDelivery(threadId2, clientUserMessageId);
           } catch {
           }
           if (verified)
-            return this.rememberVerifiedUserMessage(threadId, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0;
+            return this.rememberVerifiedUserMessage(threadId2, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0;
         }
-        return !1;
+        let threadId = this.currentThreadId;
+        if (!this.loadedInventoryProven || !candidates.includes(threadId)) return !1;
+        let selectionRevision = this.threadSelectionRevision, params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: "desc" }, page;
+        try {
+          page = typeof this.client.requestOnConnection == "function" ? (await this.client.requestOnConnection(
+            "thread/items/list",
+            params,
+            this.client.connectionGeneration
+          )).result : await this.client.request("thread/items/list", params);
+        } catch {
+          return !1;
+        }
+        return this.threadSelectionRevision !== selectionRevision || this.currentThreadId !== threadId || !Array.isArray(page?.data) || page.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS || !page.data.some((entry) => typeof entry?.turnId == "string" && entry.turnId !== "" && entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId) ? !1 : (this.rememberVerifiedUserMessage(threadId, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0);
       }
       onThreadIdle(listener) {
         return this.on("idle", listener), () => this.off("idle", listener);

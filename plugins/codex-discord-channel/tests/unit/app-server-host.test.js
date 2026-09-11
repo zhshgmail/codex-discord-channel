@@ -565,11 +565,15 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
   const client = new FakeRpcClient(async (method, params) => {
     if (method === 'thread/loaded/list') return { data: [loadedThreadId], nextCursor: null };
     if (method === 'thread/read') {
+      const active = params.threadId.includes('before');
       return {
         thread: {
           id: params.threadId,
           parentThreadId: null,
-          status: { type: params.threadId.includes('before') ? 'active' : 'idle' },
+          status: { type: active ? 'active' : 'idle' },
+          turns: active
+            ? [{ id: 'turn-before-compaction', status: 'inProgress', items: [] }]
+            : [],
         },
       };
     }
@@ -581,6 +585,7 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
     available: true,
     threadId: 'thread-before-compaction',
     status: 'active',
+    activeTurnId: 'turn-before-compaction',
   });
   loadedThreadId = 'thread-after-compaction';
   assert.deepEqual(await host.resolveTarget(), {
@@ -592,6 +597,60 @@ test('host resolves the only loaded thread and refreshes it after thread rotatio
     client.requests.filter((request) => request.method === 'thread/loaded/list').length,
     2,
   );
+  assert.deepEqual(
+    client.requests
+      .filter((request) => request.method === 'thread/read')
+      .map((request) => request.params.includeTurns),
+    [false, false],
+    'target discovery must not hydrate an unbounded thread history',
+  );
+});
+
+test('target discovery survives a thread whose full history exceeds the websocket limit', async () => {
+  const client = new FakeRpcClient(async (method, params) => {
+    if (method === 'thread/loaded/list') {
+      return { data: ['thread-large'], nextCursor: null };
+    }
+    if (method === 'thread/read') {
+      if (params.includeTurns !== false) {
+        const error = new Error('Max payload size exceeded');
+        error.code = 'shared_app_server_disconnected';
+        throw error;
+      }
+      return {
+        thread: {
+          id: params.threadId,
+          parentThreadId: null,
+          status: { type: 'active' },
+        },
+      };
+    }
+    if (method === 'thread/turns/list') {
+      assert.deepEqual(params, {
+        threadId: 'thread-large',
+        limit: 8,
+        sortDirection: 'desc',
+        itemsView: 'notLoaded',
+      });
+      return {
+        data: [{ id: 'turn-large-active', status: 'inProgress', items: [] }],
+        nextCursor: null,
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  });
+  const host = createAppServerHost(
+    { appServerUrl: 'ws://127.0.0.1:4500' },
+    () => {},
+    { client },
+  );
+
+  assert.deepEqual(await host.resolveTarget(), {
+    available: true,
+    threadId: 'thread-large',
+    status: 'active',
+    activeTurnId: 'turn-large-active',
+  });
 });
 
 test('fresh recovery selects the unique top-level root among loaded subagent threads', async () => {
@@ -3112,7 +3171,7 @@ test('active goal turn recovered from thread/read accepts input with an exact tu
   const target = await host.resolveTarget();
   assert.equal(
     client.requests.filter((request) => request.method === 'thread/read').at(-1).params.includeTurns,
-    true,
+    false,
   );
   assert.equal(target.activeTurnId, 'goal-continuation-2');
   client.requests.length = 0;
@@ -3813,8 +3872,8 @@ test('lifecycle signal without durable rollout evidence does not prove delivery'
   const clientId = 'discord:c1:m-signal-only';
   const { codexHome } = createRolloutFixture(t, [sessionMeta()]);
   const client = new FakeRpcClient(async (method, params) => {
-    assert.equal(method, 'thread/read');
-    return { thread: { id: params.threadId, turns: [] } };
+    assert.equal(method, 'thread/items/list');
+    return { data: [], nextCursor: null };
   });
   const host = createLocalRolloutHost(client, codexHome);
   t.after(() => host.destroy());
@@ -3826,18 +3885,18 @@ test('lifecycle signal without durable rollout evidence does not prove delivery'
 
   assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, clientId), false);
   assert.deepEqual(client.requests, [{
-    method: 'thread/read',
-    params: { threadId: DELIVERY_THREAD_ID, includeTurns: true },
+    method: 'thread/items/list',
+    params: { threadId: DELIVERY_THREAD_ID, limit: 32, sortDirection: 'desc' },
   }]);
 });
 
-test('late lifecycle signal verifies new rollout proof while thread/read hangs', async (t) => {
+test('late lifecycle signal verifies new rollout proof while thread/items/list hangs', async (t) => {
   const clientId = 'discord:c1:m-late-proof';
   const { codexHome, rolloutPath } = createRolloutFixture(t, [sessionMeta()]);
   let readStarted;
   const started = new Promise((resolve) => { readStarted = resolve; });
   const client = new FakeRpcClient(async (method) => {
-    if (method === 'thread/read') {
+    if (method === 'thread/items/list') {
       readStarted();
       return new Promise(() => {});
     }
@@ -3864,7 +3923,7 @@ test('late lifecycle signal verifies new rollout proof while thread/read hangs',
   assert.equal(client.requests.length, 1);
 });
 
-test('lifecycle signal before rollout append retries durable proof while thread/read hangs', async (t) => {
+test('lifecycle signal before rollout append retries durable proof while thread/items/list hangs', async (t) => {
   const clientId = 'discord:c1:m-event-before-append';
   const { codexHome, rolloutPath } = createRolloutFixture(t, [sessionMeta()]);
   let rolloutCloseCount = 0;
@@ -3890,7 +3949,7 @@ test('lifecycle signal before rollout append retries durable proof while thread/
   let readStarted;
   const started = new Promise((resolve) => { readStarted = resolve; });
   const client = new FakeRpcClient(async (method) => {
-    assert.equal(method, 'thread/read');
+    assert.equal(method, 'thread/items/list');
     readStarted();
     return new Promise(() => {});
   });
@@ -3925,7 +3984,7 @@ test('late lifecycle signal without rollout proof cannot complete a hanging read
   let readStarted;
   const started = new Promise((resolve) => { readStarted = resolve; });
   const client = new FakeRpcClient(async (method) => {
-    assert.equal(method, 'thread/read');
+    assert.equal(method, 'thread/items/list');
     readStarted();
     return new Promise(() => {});
   });
@@ -3956,7 +4015,7 @@ test('one lifecycle signal has a strict durable-verification attempt cap', async
   let readStarted;
   const started = new Promise((resolve) => { readStarted = resolve; });
   const client = new FakeRpcClient(async (method) => {
-    assert.equal(method, 'thread/read');
+    assert.equal(method, 'thread/items/list');
     readStarted();
     return new Promise(() => {});
   });
@@ -3995,7 +4054,7 @@ test('unrelated client ids, threads, and non-user lifecycle items do not wake ex
   let readStarted;
   const started = new Promise((resolve) => { readStarted = resolve; });
   const client = new FakeRpcClient(async (method) => {
-    assert.equal(method, 'thread/read');
+    assert.equal(method, 'thread/items/list');
     readStarted();
     return new Promise(() => {});
   });
@@ -4461,7 +4520,7 @@ test('system rollout cannot prove source delivery but the visible TUI rollout ca
   assert.deepEqual(client.requests, []);
 });
 
-test('restored ephemeral target retries thread/read without includeTurns', async (t) => {
+test('restored ephemeral target uses metadata-only thread discovery', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-ephemeral-target-'));
   t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
   const config = {
@@ -4497,8 +4556,7 @@ test('restored ephemeral target retries thread/read without includeTurns', async
   assert.deepEqual(
     client.requests.filter((request) => request.method === 'thread/read').map((request) => request.params),
     [
-      { threadId: 'thread-a', includeTurns: true },
-      { threadId: 'thread-a' },
+      { threadId: 'thread-a', includeTurns: false },
     ],
   );
 });
@@ -4559,6 +4617,7 @@ test('unavailable ephemeral thread cannot authorize lifecycle delivery proof', a
         },
       };
     }
+    if (method === 'thread/items/list') return { data: [], nextCursor: null };
     throw new Error(`unexpected method ${method}`);
   });
   const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, {
@@ -4654,17 +4713,13 @@ test('missing or stale TUI lease cannot authorize ephemeral lifecycle delivery p
   assert.equal(await host.hasDelivered(DELIVERY_THREAD_ID, staleClientId), false);
 });
 
-test('hasDelivered falls back to exact structured thread/read after a missed notification', async () => {
+test('hasDelivered falls back to exact structured thread/items/list after a missed notification', async () => {
   const client = new FakeRpcClient(async (method, params) => {
-    assert.equal(method, 'thread/read');
-    assert.deepEqual(params, { threadId: 'thread-a', includeTurns: true });
+    assert.equal(method, 'thread/items/list');
+    assert.deepEqual(params, { threadId: 'thread-a', limit: 32, sortDirection: 'desc' });
     return {
-      thread: {
-        id: 'thread-a',
-        turns: [
-          { items: [{ type: 'userMessage', clientId: 'discord:c1:m1' }] },
-        ],
-      },
+      data: [{ turnId: 'turn-a', item: { type: 'userMessage', clientId: 'discord:c1:m1' } }],
+      nextCursor: null,
     };
   });
   const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
@@ -4675,9 +4730,9 @@ test('hasDelivered falls back to exact structured thread/read after a missed not
 test('hasDelivered rejects malformed or unsupported recovery instead of producing proof', async () => {
   let unsupported = false;
   const client = new FakeRpcClient(async (method) => {
-    assert.equal(method, 'thread/read');
+    assert.equal(method, 'thread/items/list');
     if (unsupported) {
-      const error = new Error('Unsupported method: thread/read');
+      const error = new Error('Unsupported method: thread/items/list');
       error.code = 'shared_app_server_request_rejected';
       throw error;
     }
@@ -4703,14 +4758,10 @@ test('hasDelivered rejects malformed or unsupported recovery instead of producin
 test('hasDelivered reconciles on the first connection without invalidating its own read', async (t) => {
   const { WebSocket } = createFakeWebSocket(async (request) => {
     if (request.method === 'initialize') return {};
-    if (request.method === 'thread/read') {
+    if (request.method === 'thread/items/list') {
       return {
-        thread: {
-          id: request.params.threadId,
-          turns: [{
-            items: [{ type: 'userMessage', clientId: 'discord:c1:m-first-connect' }],
-          }],
-        },
+        data: [{ turnId: 'turn-a', item: { type: 'userMessage', clientId: 'discord:c1:m-first-connect' } }],
+        nextCursor: null,
       };
     }
     throw new Error(`unexpected method ${request.method}`);
