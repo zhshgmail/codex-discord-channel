@@ -86,6 +86,39 @@ test('runAppServer replaces itself with Codex under the isolated environment', (
   assert.equal(observed.env.DISCORD_CONFIG_DIR, config.paths.stateDir);
 });
 
+test('explicit launcher YOLO uses the native request relay and does not leak its control into the child', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-yolo-relay-'));
+  const config = createInstance(root, 'codex03', '.codex-account-03', '33333333333333333');
+  config.env.CODEX_DISCORD_REMOTE_PERMISSIONS = 'yolo';
+  let called = false;
+  runAppServer(config, { runPermissionRelay(launch, endpoint, permissions) {
+    called = true;
+    assert.equal(endpoint, config.appServerUrl);
+    assert.deepEqual(permissions, { approvalPolicy: 'never', sandbox: 'danger-full-access' });
+    assert.equal(launch.env.CODEX_DISCORD_REMOTE_PERMISSIONS, undefined);
+    assert.deepEqual(launch.args, ['/opt/codex/bin/codex.js', 'app-server', '--listen', endpoint],
+      'request forwarding must not alter backend defaults for other clients or later requests');
+  } });
+  assert.equal(called, true);
+});
+
+test('a no-YOLO app launch ignores Discord env permission markers and preserves native defaults', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-no-yolo-'));
+  const initial = createInstance(root, 'codex03', '.codex-account-03', '33333333333333333');
+  fs.appendFileSync(initial.paths.envFile, '\nCODEX_DISCORD_REMOTE_PERMISSIONS=yolo\n');
+  const config = loadConfig({ ...initial.env, CODEX_DISCORD_REMOTE_PERMISSIONS: 'none' }, { loadDiscordEnv: false });
+  let observed;
+  runAppServer(config, {
+    runPermissionRelay() { assert.fail('a config file cannot request launch-only YOLO'); },
+    execve(command, args, env) { observed = { command, args, env }; },
+  });
+  assert.deepEqual(observed.args, ['/opt/node/bin/node', '/opt/codex/bin/codex.js', 'app-server', '--listen', config.appServerUrl]);
+  assert.equal(observed.env.CODEX_DISCORD_REMOTE_PERMISSIONS, undefined);
+  fs.appendFileSync(config.paths.accountEnvPath, '\nCODEX_DISCORD_REMOTE_PERMISSIONS=yolo\n');
+  assert.throws(() => loadConfig({ ...initial.env, CODEX_DISCORD_REMOTE_PERMISSIONS: 'none' }, { loadDiscordEnv: false }),
+    error => error.code === 'environment_key_not_allowed');
+});
+
 test('instance doctor reports account and Discord state separation without secrets', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-instance-doctor-'));
   const config = createInstance(root, 'codex02', '.codex-account-02', '22222222222222222');

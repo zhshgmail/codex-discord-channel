@@ -231,9 +231,9 @@ those symptoms by replaying the queue or killing unrelated processes.
 
 - Reuses one Discord bot instance and state directory per configured instance.
 - Uses one atomically replaced structured authority record in
-  `session-gateway.pid` as the active receive gate. During a staged takeover
-  from a legacy gateway, its unchanged PID/generation files remain intact and
-  the current receiver CAS lives in `session-gateway.pid.v2`.
+  `session-gateway.pid` as the active receive gate. A live receiver whose
+  queue-lock protocol or normalized lock path is missing or different must be
+  quiesced before a successor can log in or touch the queue.
 - Keeps `owner.json` for status and handoff metadata only; thread or session ids
   never gate individual Discord messages.
 - Persists accepted messages in a cross-process locked, deduplicated ready FIFO
@@ -253,12 +253,11 @@ the app-server target is unavailable. A takeover of a live receiver additionally
 requires target readiness, arms the successor listener, and then transfers
 authority with one atomic record replacement.
 
-During a staged legacy-to-current takeover, both gateway listeners can remain
-eligible because the legacy binary cannot react to successor process death.
-The cross-process queue lock and Discord identity deduplication keep that
-compatibility overlap to one persisted event and one structured turn. Current
-receivers prefer the staged authority, so legacy shutdown cannot clear their
-generation.
+There is no live incompatible queue-lock-binding overlap. Stop and verify the
+legacy gateway first, then remove any audited legacy lock directory if needed
+and start the successor. Compatible current-version handoffs may retain a live
+fallback only when both records bind the same protocol and normalized
+persistent queue-lock pathname.
 
 ## Structured Delivery
 
@@ -731,6 +730,11 @@ $HOME/.codex/channels/discord/codex01/app-server.sock
 Do not commit `.env` or print Discord tokens.
 
 ## Operations And Troubleshooting
+
+Codex 0.154 rejects permission overrides on a remote resume or fork. The
+instance launcher supports `--dangerously-bypass-approvals-and-sandbox` and
+`--yolo` through a launch-scoped native request relay and preserves the requested
+resume/fork command. See the [compatibility details](plugins/codex-discord-channel/README.md#codex-0154-remote-resume).
 
 Useful non-secret checks:
 

@@ -5100,7 +5100,14 @@ var require_reply_delivery = __commonJS({
 var require_receiver_state = __commonJS({
   "src/receiver-state.js"(exports2, module2) {
     "use strict";
-    var { randomUUID } = require("node:crypto"), fs = require("node:fs"), path = require("node:path");
+    var { randomUUID } = require("node:crypto"), fs = require("node:fs"), path = require("node:path"), DELIVERY_QUEUE_LOCK_PROTOCOL = "flock-v1";
+    function getDeliveryQueueLockIdentity(config = {}) {
+      let queuePath = config.paths?.deliveryQueuePath || (config.paths?.stateDir ? path.join(config.paths.stateDir, "pending-delivery.json") : "");
+      return queuePath ? path.resolve(`${queuePath}.lock`) : "";
+    }
+    function validDeliveryQueueLockIdentity(value) {
+      return typeof value == "string" && value !== "" && path.isAbsolute(value) && path.resolve(value) === value;
+    }
     function localPid(deps = {}) {
       let pid = Number(deps.pid);
       return Number.isInteger(pid) && pid > 0 ? pid : process.pid;
@@ -5277,12 +5284,18 @@ var require_receiver_state = __commonJS({
       return record ? record.version === 2 ? { ...record, fallback: null } : { ...record } : null;
     }
     function createReceiverOwnership(previous, deps = {}) {
-      let pid = localPid(deps), nowValue = typeof deps.now == "function" ? deps.now() : Date.now(), processStartTicks = deps.processStartTicks || readLinuxProcessStartTicks(pid, deps.fs || fs), stateDir = typeof deps.stateDir == "string" ? deps.stateDir : "";
+      let pid = localPid(deps), nowValue = typeof deps.now == "function" ? deps.now() : Date.now(), processStartTicks = deps.processStartTicks || readLinuxProcessStartTicks(pid, deps.fs || fs), stateDir = typeof deps.stateDir == "string" ? deps.stateDir : "", deliveryQueueLockIdentity = deps.deliveryQueueLockIdentity;
+      if (!validDeliveryQueueLockIdentity(deliveryQueueLockIdentity)) {
+        let error = new Error("Discord receiver candidate has no canonical delivery queue-lock identity.");
+        throw error.code = "receiver_ownership_queue_lock_identity_invalid", error;
+      }
       return {
         version: 2,
         pid,
         generation: (deps.randomUUID || randomUUID)(),
         claimedAt: new Date(nowValue).toISOString(),
+        deliveryQueueLockProtocol: DELIVERY_QUEUE_LOCK_PROTOCOL,
+        deliveryQueueLockIdentity,
         ...processStartTicks ? { processStartTicks } : {},
         ...stateDir ? { stateDir, role: "gateway" } : {},
         fallback: previous && previous.pid !== pid ? fallbackRecord(previous) : null
@@ -5305,12 +5318,52 @@ var require_receiver_state = __commonJS({
     function snapshotsMatch(left, right) {
       return left?.path === right?.path && left?.token === right?.token;
     }
+    function assertReceiverOwnershipProtocolCompatible(incumbent, candidate) {
+      let candidateProtocol = candidate?.deliveryQueueLockProtocol;
+      if (candidateProtocol !== DELIVERY_QUEUE_LOCK_PROTOCOL) {
+        let error = new Error("Discord receiver candidate has no supported delivery queue-lock protocol.");
+        throw error.code = "receiver_ownership_protocol_invalid", error;
+      }
+      if (!validDeliveryQueueLockIdentity(candidate?.deliveryQueueLockIdentity)) {
+        let error = new Error("Discord receiver candidate has no canonical delivery queue-lock identity.");
+        throw error.code = "receiver_ownership_queue_lock_identity_invalid", error;
+      }
+      if (incumbent && incumbent.deliveryQueueLockProtocol !== candidateProtocol) {
+        let error = new Error(
+          "Discord gateway upgrade requires the incompatible incumbent queue-lock protocol to be quiesced first."
+        );
+        throw error.code = "delivery_queue_lock_protocol_quiescence_required", error;
+      }
+      if (incumbent && incumbent.deliveryQueueLockIdentity !== candidate.deliveryQueueLockIdentity) {
+        let error = new Error(
+          "Discord gateway upgrade requires the incumbent with a different or unknown queue-lock identity to be quiesced first."
+        );
+        throw error.code = "delivery_queue_lock_identity_quiescence_required", error;
+      }
+    }
     function commitReceiverOwnership(config, expectedSnapshot, candidate, deps = {}) {
+      if (!candidate || candidate.version !== 2 || candidate.deliveryQueueLockProtocol !== DELIVERY_QUEUE_LOCK_PROTOCOL) {
+        let error = new Error("Discord receiver candidate has no supported delivery queue-lock protocol.");
+        throw error.code = "receiver_ownership_protocol_invalid", error;
+      }
+      if (!validDeliveryQueueLockIdentity(candidate.deliveryQueueLockIdentity)) {
+        let error = new Error("Discord receiver candidate has no canonical delivery queue-lock identity.");
+        throw error.code = "receiver_ownership_queue_lock_identity_invalid", error;
+      }
+      if (candidate.deliveryQueueLockIdentity !== getDeliveryQueueLockIdentity(config)) {
+        let error = new Error("Discord receiver candidate queue-lock identity does not match its runtime configuration.");
+        throw error.code = "receiver_ownership_queue_lock_identity_invalid", error;
+      }
       let current = readReceiverAuthoritySnapshot(config, deps);
       if (!current.valid || !snapshotsMatch(current, expectedSnapshot)) {
         let error = new Error("Discord receiver ownership changed before atomic commit.");
         throw error.code = "receiver_ownership_changed", error;
       }
+      let incumbent = effectiveReceiverOwnership(current, deps);
+      incumbent && assertReceiverOwnershipProtocolCompatible(
+        incumbent.record,
+        candidate
+      );
       let targetPath = current.source === "legacy" && candidate.fallback?.version === 1 ? getStagedReceiverAuthorityPath(config) : current.path;
       return writeAuthorityAtomically(targetPath, candidate, deps), candidate;
     }
@@ -5325,10 +5378,13 @@ var require_receiver_state = __commonJS({
       return current.version === 2 && sameReceiverOwnership(current.fallback, expected) ? (writeAuthorityAtomically(snapshot.path, { ...current, fallback: null }, deps), !0) : !1;
     }
     module2.exports = {
+      DELIVERY_QUEUE_LOCK_PROTOCOL,
+      assertReceiverOwnershipProtocolCompatible,
       commitReceiverOwnership,
       createReceiverOwnership,
       effectiveReceiverOwnership,
       getReceiverAuthorityPath,
+      getDeliveryQueueLockIdentity,
       getStagedReceiverAuthorityPath,
       isActiveDiscordReceiver,
       isCurrentReceiverOwnership: isCurrentReceiverOwnership2,
@@ -5346,7 +5402,7 @@ var require_receiver_state = __commonJS({
 var require_delivery = __commonJS({
   "src/delivery.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), path = require("node:path"), { createAppServerHost } = require_app_server_host(), {
+    var fs = require("node:fs"), path = require("node:path"), { spawn } = require("node:child_process"), { createAppServerHost } = require_app_server_host(), {
       contentDigest,
       readReceipt,
       receiptPath,
@@ -5445,35 +5501,36 @@ ${body}
       let queuePath = getDeliveryQueuePath(config);
       return queuePath ? `${queuePath}.lock` : "";
     }
-    function readLockOwner(lockPath, fsImpl) {
-      try {
-        let parsed = JSON.parse(fsImpl.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
-        return parsed && typeof parsed == "object" ? parsed : null;
-      } catch {
-        return null;
+    function assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl) {
+      let held = fsImpl.fstatSync(descriptor, { bigint: !0 }), named = fsImpl.lstatSync(lockPath, { bigint: !0 });
+      if (!held.isFile() || !named.isFile() || named.isSymbolicLink() || held.nlink !== 1n || named.nlink !== 1n || held.dev !== named.dev || held.ino !== named.ino) {
+        let error = new Error(`Unsafe Discord delivery queue lock: ${lockPath}`);
+        throw error.code = "delivery_queue_lock_identity_changed", error;
       }
     }
-    function removeLockDirectory(lockPath, fsImpl) {
-      fsImpl.rmSync(lockPath, { recursive: !0, force: !0 });
-    }
-    function tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl) {
-      let staleMs = Number(config.deliveryQueueLockStaleMs) || 45e3, ageMs;
+    function openDeliveryQueueLock(lockPath, fsImpl) {
+      let flags = fs.constants.O_CREAT | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0), descriptor;
       try {
-        ageMs = Date.now() - fsImpl.statSync(lockPath).mtimeMs;
+        return descriptor = fsImpl.openSync(lockPath, flags, 384), assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl), descriptor;
       } catch (error) {
-        if (error?.code === "ENOENT") return !0;
-        throw error;
+        let primaryError = error;
+        if (error?.code === "EISDIR") {
+          let migration = new Error(
+            `Discord delivery queue lock protocol migration requires a quiesced gateway and manual removal of the legacy lock directory: ${lockPath}`
+          );
+          migration.code = "delivery_queue_lock_protocol_migration_required", primaryError = migration;
+        }
+        if (descriptor !== void 0)
+          try {
+            fsImpl.closeSync(descriptor);
+          } catch (closeError) {
+            throw new AggregateError(
+              [primaryError, closeError],
+              "Discord delivery queue lock validation and descriptor cleanup both failed."
+            );
+          }
+        throw primaryError;
       }
-      if (ageMs < staleMs) return !1;
-      let owner = readLockOwner(lockPath, fsImpl), ownerPid = Number(owner?.pid) || 0, ownerAlive = ownerPid > 0 && (deps.isProcessAlive || isProcessAlive)(ownerPid), liveLeaseMs = Number(config.deliveryQueueLockLiveLeaseMs) || 55e3;
-      if (ownerAlive && ageMs < liveLeaseMs) return !1;
-      let stalePath = `${lockPath}.stale.${process.pid}.${Date.now()}`;
-      try {
-        fsImpl.renameSync(lockPath, stalePath);
-      } catch (error) {
-        return error?.code === "ENOENT";
-      }
-      return removeLockDirectory(stalePath, fsImpl), !0;
     }
     function sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -5481,41 +5538,101 @@ ${body}
     async function acquireDeliveryQueueLock(config = {}, deps = {}) {
       let lockPath = getDeliveryQueueLockPath(config);
       if (!lockPath) throw new Error("Discord delivery queue path is not configured.");
-      let fsImpl = deps.fs || fs, timeoutMs = Number(config.deliveryQueueLockTimeoutMs) || 6e4, retryMs = Number(config.deliveryQueueLockRetryMs) || 20, startedAt = Date.now(), token = `${process.pid}-${startedAt}-${Math.random().toString(16).slice(2)}`;
-      for (fsImpl.mkdirSync(path.dirname(lockPath), { recursive: !0, mode: 448 }); ; )
-        try {
-          fsImpl.mkdirSync(lockPath, { mode: 448 });
-          try {
-            fsImpl.writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({
-              pid: process.pid,
-              token,
-              acquiredAt: (/* @__PURE__ */ new Date()).toISOString()
-            })}
-`, { mode: 384 });
-          } catch (error) {
-            throw removeLockDirectory(lockPath, fsImpl), error;
+      let fsImpl = deps.fs || fs, spawnImpl = deps.spawn || spawn, timeoutMs = Number(config.deliveryQueueLockTimeoutMs) || 6e4;
+      fsImpl.mkdirSync(path.dirname(lockPath), { recursive: !0, mode: 448 });
+      let descriptor = openDeliveryQueueLock(lockPath, fsImpl), child;
+      try {
+        child = spawnImpl(
+          deps.flockCommand || "/usr/bin/flock",
+          [
+            "--exclusive",
+            "--timeout",
+            String(Math.max(1, timeoutMs) / 1e3),
+            "3"
+          ],
+          {
+            stdio: ["ignore", "ignore", "pipe", descriptor],
+            windowsHide: !0
           }
-          return () => {
-            try {
-              readLockOwner(lockPath, fsImpl)?.token === token && removeLockDirectory(lockPath, fsImpl);
-            } catch {
-            }
-          };
-        } catch (error) {
-          if (error?.code !== "EEXIST") throw error;
-          if (tryReclaimStaleQueueLock(lockPath, config, deps, fsImpl)) continue;
-          if (Date.now() - startedAt >= timeoutMs)
-            throw new Error(`Timed out waiting for Discord delivery queue lock: ${lockPath}`);
-          await sleep(retryMs);
+        );
+      } catch (error) {
+        try {
+          fsImpl.closeSync(descriptor);
+        } catch (closeError) {
+          throw new AggregateError(
+            [error, closeError],
+            "Discord delivery queue lock process failed to start and its descriptor could not be closed."
+          );
         }
+        throw error;
+      }
+      let stderr = "";
+      child.stderr?.on("data", (chunk) => {
+        stderr = `${stderr}${chunk}`.slice(-4096);
+      });
+      let outcome = await new Promise((resolve) => {
+        let settled = !1, settle = (value) => {
+          settled || (settled = !0, resolve(value));
+        };
+        child.once("error", (error) => settle({ error })), child.once("exit", (code, signal) => settle({ code, signal }));
+      });
+      if (outcome.error || outcome.code !== 0) {
+        let acquisitionError = outcome.error || new Error(
+          outcome.code === 1 ? `Timed out waiting for Discord delivery queue lock: ${lockPath}` : `Discord delivery queue lock process failed (code=${outcome.code}, signal=${outcome.signal || "none"}): ${stderr.trim()}`
+        );
+        try {
+          fsImpl.closeSync(descriptor);
+        } catch (closeError) {
+          throw new AggregateError(
+            [acquisitionError, closeError],
+            "Discord delivery queue lock acquisition and descriptor cleanup both failed."
+          );
+        }
+        throw acquisitionError;
+      }
+      try {
+        assertDeliveryQueueLockMatchesPath(descriptor, lockPath, fsImpl);
+      } catch (identityError) {
+        try {
+          fsImpl.closeSync(descriptor);
+        } catch (closeError) {
+          throw new AggregateError(
+            [identityError, closeError],
+            "Discord delivery queue lock identity changed and its descriptor could not be closed."
+          );
+        }
+        throw identityError;
+      }
+      let released = !1;
+      return async () => {
+        if (!released) {
+          released = !0;
+          try {
+            fsImpl.closeSync(descriptor);
+          } catch (cause) {
+            let error = new Error("Discord delivery queue lock release failed.", { cause });
+            throw error.code = "delivery_queue_lock_release_failed", error;
+          }
+        }
+      };
     }
     async function withDeliveryQueueLock(config, deps, operation) {
-      let release = await acquireDeliveryQueueLock(config, deps);
+      let release = await acquireDeliveryQueueLock(config, deps), result, operationError;
       try {
-        return await operation();
-      } finally {
-        release();
+        result = await operation();
+      } catch (error) {
+        operationError = error;
       }
+      try {
+        await release();
+      } catch (releaseError) {
+        throw operationError ? new AggregateError(
+          [operationError, releaseError],
+          "Discord delivery queue operation and lock release both failed."
+        ) : releaseError;
+      }
+      if (operationError) throw operationError;
+      return result;
     }
     function emptyDeliveryQueue() {
       return {
@@ -94638,9 +94755,12 @@ var require_discord_client = __commonJS({
   "src/discord-client.js"(exports2, module2) {
     "use strict";
     var { decideAccess, decideGuildEnvelopeAccess, loadAccessState } = require_access_state(), { normalizeDiscordMessage } = require_delivery(), { discordClientResourceOptions } = require_gateway_resources(), {
+      DELIVERY_QUEUE_LOCK_PROTOCOL,
+      assertReceiverOwnershipProtocolCompatible,
       commitReceiverOwnership,
       createReceiverOwnership,
       effectiveReceiverOwnership,
+      getDeliveryQueueLockIdentity,
       isActiveDiscordReceiver,
       isCurrentReceiverOwnership: isCurrentReceiverOwnership2,
       readReceiverAuthoritySnapshot,
@@ -94780,7 +94900,12 @@ var require_discord_client = __commonJS({
         authorityPath: authoritySnapshot.path,
         action: "replace_after_discord_login"
       });
-      let receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps), shouldReceive = claimReceiver || receiver.active, {
+      let receiver = (deps.isActiveDiscordReceiver || isActiveDiscordReceiver)(config, deps), shouldReceive = claimReceiver || receiver.active, deliveryQueueLockIdentity = getDeliveryQueueLockIdentity(config);
+      shouldReceive && assertReceiverOwnershipProtocolCompatible(effectiveOwnership, {
+        deliveryQueueLockProtocol: DELIVERY_QUEUE_LOCK_PROTOCOL,
+        deliveryQueueLockIdentity
+      });
+      let {
         Client: Client2,
         Events: Events2,
         GatewayIntentBits,
@@ -94811,7 +94936,8 @@ var require_discord_client = __commonJS({
           }
           let candidate = createReceiverOwnership(effectiveOwnership, {
             ...deps,
-            stateDir: config.paths?.stateDir || ""
+            stateDir: config.paths?.stateDir || "",
+            deliveryQueueLockIdentity
           });
           receiverOwnership = await delivery.coordinateReceiverOwnership(() => {
             let handler = createDiscordMessageHandler({
@@ -95496,6 +95622,130 @@ var require_owner_state = __commonJS({
   }
 });
 
+// src/remote-permissions.js
+var require_remote_permissions = __commonJS({
+  "src/remote-permissions.js"(exports2, module2) {
+    "use strict";
+    var fs = require("node:fs"), http = require("node:http"), { randomBytes } = require("node:crypto"), { spawn } = require("node:child_process"), { setTimeout: delay } = require("node:timers/promises"), WebSocket = require_ws(), MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+    function permissionRequest(data, isTui, permissions) {
+      let message;
+      try {
+        message = JSON.parse(data.toString());
+      } catch {
+        return data;
+      }
+      return !isTui || !message || typeof message != "object" || Array.isArray(message) || message.id === void 0 || !["thread/start", "thread/resume", "thread/fork"].includes(message.method) || !message.params || typeof message.params != "object" || Array.isArray(message.params) ? data : JSON.stringify({ ...message, params: { ...message.params, ...permissions } });
+    }
+    function connectRelay(front, backendUrl, permissions, startupState = { applied: !1 }) {
+      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: 134217728 }), wirePrefix = `codex-permission:${randomBytes(16).toString("hex")}:`, attempt = 0, isWireId = (id) => typeof id == "string" && id.startsWith(wirePrefix), isTui = !1, pendingRequest, closed = !1, queued = [], queuedBytes = 0, close = () => {
+        closed || (closed = !0, pendingRequest && startupState.pending === pendingRequest && (startupState.applied = !0, startupState.pending = null), pendingRequest = void 0, queued = [], queuedBytes = 0, front.terminate(), back.terminate());
+      }, forward = (socket, data, binary) => {
+        if (closed || socket.readyState !== WebSocket.OPEN) return !1;
+        if (socket.bufferedAmount + Buffer.byteLength(data) > MAX_BUFFERED_BYTES)
+          return close(), !1;
+        try {
+          socket.send(data, { binary }, (error) => {
+            error && close();
+          }), socket.bufferedAmount > MAX_BUFFERED_BYTES && close();
+        } catch {
+          close();
+        }
+        return !closed;
+      };
+      front.on("error", close), back.on("error", close), front.on("close", close), back.on("close", close), front.on("message", (data, binary) => {
+        if (closed) return;
+        let message;
+        try {
+          message = JSON.parse(data.toString());
+        } catch {
+        }
+        if (message?.method === "initialize" && (isTui = ["codex-tui", "codex_cli_rs"].includes(message.params?.clientInfo?.name)), typeof message?.method == "string" && (isWireId(message.id) || pendingRequest && message.id === pendingRequest.id)) {
+          close();
+          return;
+        }
+        let outgoing = permissionRequest(data, isTui && !startupState.applied && !startupState.pending, permissions);
+        if (outgoing !== data) {
+          if (attempt === Number.MAX_SAFE_INTEGER) {
+            close();
+            return;
+          }
+          pendingRequest = { id: message.id, wireId: `${wirePrefix}${++attempt}` }, startupState.pending = pendingRequest, outgoing = JSON.stringify({ ...JSON.parse(outgoing), id: pendingRequest.wireId });
+        }
+        back.readyState === WebSocket.OPEN ? forward(back, outgoing, binary) : back.readyState === WebSocket.CONNECTING && (queuedBytes += Buffer.byteLength(outgoing), queuedBytes > MAX_BUFFERED_BYTES ? close() : queued.push([outgoing, binary]));
+      }), back.on("open", () => {
+        for (let [data, binary] of queued)
+          if (!forward(back, data, binary)) break;
+        queued = [], queuedBytes = 0;
+      }), back.on("message", (data, binary) => {
+        if (closed) return;
+        let message;
+        try {
+          message = JSON.parse(data.toString());
+        } catch {
+        }
+        let outgoing = data;
+        if (message?.method === void 0 && isWireId(message?.id)) {
+          if (!pendingRequest || message.id !== pendingRequest.wireId) return;
+          outgoing = JSON.stringify({ ...message, id: pendingRequest.id });
+        }
+        if (pendingRequest && startupState.pending === pendingRequest && message?.id === pendingRequest.wireId && message.method === void 0) {
+          let hasResult = Object.hasOwn(message, "result"), hasError = Object.hasOwn(message, "error"), explicitError = hasError && message.error && !Array.isArray(message.error) && Number.isInteger(message.error.code) && typeof message.error.message == "string";
+          (hasResult && !hasError || explicitError && !hasResult) && (hasResult && (startupState.applied = !0), startupState.pending = null, pendingRequest = void 0);
+        }
+        forward(front, outgoing, binary);
+      });
+    }
+    async function runPermissionRelay(launch, endpoint, permissions) {
+      if (!endpoint.startsWith("unix://")) throw new Error("Permission forwarding requires the instance Unix socket");
+      let socket = endpoint.slice(7), nativeSocket = `${socket}.${process.pid}-${randomBytes(4).toString("hex")}`;
+      if (Buffer.byteLength(nativeSocket) >= 108) throw new Error("Instance socket path is too long for permission forwarding");
+      if (fs.existsSync(nativeSocket)) throw new Error("Native permission-forwarding socket already exists");
+      let args = launch.args.map((arg) => arg === endpoint ? `unix://${nativeSocket}` : arg), child = spawn(launch.command, args, { env: launch.env, stdio: "inherit" }), server = http.createServer(), sockets = new WebSocket.Server({ server, perMessageDeflate: !1, maxPayload: 128 * 1024 * 1024 }), nativeIdentity, publicIdentity, childError, childExit = new Promise((resolve) => {
+        child.once("error", (error) => {
+          childError = error, resolve(1);
+        }), child.once("exit", (code) => resolve(code ?? 1));
+      }), resolveShutdown, shutdownRequested = !1, shutdown = new Promise((resolve) => {
+        resolveShutdown = resolve;
+      }), stop = () => {
+        shutdownRequested = !0, child.kill("SIGTERM"), resolveShutdown(0);
+      };
+      process.on("SIGTERM", stop), process.on("SIGINT", stop);
+      let identity = (file) => {
+        try {
+          let s = fs.statSync(file);
+          return `${s.dev}:${s.ino}`;
+        } catch {
+          return null;
+        }
+      };
+      try {
+        let deadline = Date.now() + 1e4;
+        for (; !fs.existsSync(nativeSocket); ) {
+          if (shutdownRequested) throw new Error("Native app server startup cancelled");
+          if (childError || child.exitCode !== null || child.signalCode !== null) throw childError || new Error("Native app server exited during startup");
+          if (Date.now() >= deadline) throw new Error("Native app server socket startup timed out");
+          await delay(25);
+        }
+        nativeIdentity = identity(nativeSocket);
+        let startupState = { applied: !1 };
+        return sockets.on("connection", (front) => connectRelay(front, `ws+unix://${nativeSocket}:/rpc`, permissions, startupState)), await new Promise((resolve, reject) => {
+          server.once("error", reject), server.listen(socket, resolve);
+        }), publicIdentity = identity(socket), fs.chmodSync(socket, 384), await Promise.race([childExit, shutdown]);
+      } finally {
+        for (let client of sockets.clients) client.terminate();
+        sockets.close();
+        let replacedPublicSocket = publicIdentity && identity(socket) !== publicIdentity;
+        publicIdentity && !replacedPublicSocket ? server.close() : (server.closeAllConnections(), server.unref()), stop(), await Promise.race([childExit, delay(2e3, void 0, { ref: !1 })]), child.exitCode === null && child.signalCode === null && (child.kill("SIGKILL"), await childExit);
+        for (let [file, expected] of [[nativeSocket, nativeIdentity], [socket, publicIdentity]])
+          expected && identity(file) === expected && fs.unlinkSync(file);
+        process.removeListener("SIGTERM", stop), process.removeListener("SIGINT", stop), replacedPublicSocket && (fs.writeSync(2, `Permission relay socket changed; preserved replacement and stopped owned backend.
+`), process.exit(1));
+      }
+    }
+    module2.exports = { permissionRequest, connectRelay, runPermissionRelay };
+  }
+});
+
 // src/app-server-runtime.js
 var require_app_server_runtime = __commonJS({
   "src/app-server-runtime.js"(exports2, module2) {
@@ -95560,7 +95810,10 @@ var require_app_server_runtime = __commonJS({
       };
     }
     function runAppServer2(config, dependencies = {}) {
-      let launch = buildAppServerLaunch(config), execve = dependencies.execve || process.execve;
+      let launch = buildAppServerLaunch(config);
+      if (config.env.CODEX_DISCORD_REMOTE_PERMISSIONS === "yolo")
+        return (dependencies.runPermissionRelay || require_remote_permissions().runPermissionRelay)(launch, config.appServerUrl, { approvalPolicy: "never", sandbox: "danger-full-access" });
+      let execve = dependencies.execve || process.execve;
       if (typeof execve != "function") {
         let error = new Error("Node 22.15 or newer is required for process.execve");
         throw error.code = "node_execve_required", error;
