@@ -175,9 +175,12 @@ head and retry with exponential backoff from the configured base interval to a
 configured maximum. The defaults are 1 second and 30 seconds. Timer, app-server
 event, and restart drains all use the same serialized queue lock, in-progress
 lease, and acknowledgement boundary. The current lock is a persistent regular
-file held by the kernel through `flock(2)` for the complete operation. Release
-closes the holding process; it never removes the shared lock pathname, so
-owner-write rollback and release have no pathname check/delete ABA window.
+file. A one-shot `flock(1)` child locks an inherited descriptor and exits; the
+parent retains the same open file description, so the kernel keeps the
+`flock(2)` lock for the complete operation. Release closes the parent
+descriptor; it never removes the shared lock pathname, so owner-write rollback
+and release have no pathname check/delete ABA window or long-lived
+helper-process failure window.
 Acquisition timeout and release failure are surfaced as operation errors. A
 legacy directory at the lock pathname is a fail-closed migration error and may
 be removed only after the gateway is quiesced and the exact path has been

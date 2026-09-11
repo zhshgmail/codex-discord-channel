@@ -311,7 +311,7 @@ test('legacy directory queue locks require quiesced migration and remain untouch
   }
 });
 
-test('persistent flock serializes contenders without deleting the shared pathname', async (t) => {
+test('one-shot flock exits before the operation while the parent descriptor serializes contenders', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-contention-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const config = deliveryConfig(dir, {
@@ -349,6 +349,7 @@ test('persistent flock serializes contenders without deleting the shared pathnam
   unlock();
   await firstOperation;
   assert.equal(fs.statSync(lockPath).ino, before.ino);
+  await second.ensurePersistenceReady();
   first.destroy();
   second.destroy();
 });
@@ -391,21 +392,35 @@ test('distinct delivery queues lock distinct verified inodes', async (t) => {
 
 test('queue lock release failure is a visible operation error', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-release-failure-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let lockDescriptor;
+  t.after(() => {
+    if (lockDescriptor !== undefined) {
+      try { fs.closeSync(lockDescriptor); } catch {}
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
   const spawn = () => {
     const child = new EventEmitter();
-    child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
-    child.stdin = {
-      end() {
-        queueMicrotask(() => child.emit('exit', 9, null));
-      },
-    };
-    queueMicrotask(() => child.stdout.emit('data', Buffer.from('LOCKED\n')));
+    queueMicrotask(() => child.emit('exit', 0, null));
     return child;
+  };
+  const fsProxy = {
+    ...fs,
+    openSync(...args) {
+      lockDescriptor = fs.openSync(...args);
+      return lockDescriptor;
+    },
+    closeSync(descriptor) {
+      assert.equal(descriptor, lockDescriptor);
+      const error = new Error('injected close failure');
+      error.code = 'EIO';
+      throw error;
+    },
   };
   const config = deliveryConfig(dir);
   const delivery = createDelivery(config, () => {}, {
+    fs: fsProxy,
     spawn,
     structuredHost: {
       status() { return { configured: true, available: true, reason: null }; },
@@ -418,6 +433,37 @@ test('queue lock release failure is a visible operation error', async (t) => {
     (error) => error?.code === 'delivery_queue_lock_release_failed',
   );
   assert.equal(fs.statSync(`${config.paths.deliveryQueuePath}.lock`).isFile(), true);
+  delivery.destroy();
+});
+
+test('queue lock acquisition spawn failure closes the verified parent descriptor', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-lock-spawn-failure-'));
+  let lockDescriptor;
+  let closeCalls = 0;
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const fsProxy = {
+    ...fs,
+    openSync(...args) {
+      lockDescriptor = fs.openSync(...args);
+      return lockDescriptor;
+    },
+    closeSync(descriptor) {
+      closeCalls += 1;
+      return fs.closeSync(descriptor);
+    },
+  };
+  const delivery = createDelivery(deliveryConfig(dir), () => {}, {
+    fs: fsProxy,
+    spawn() { throw new Error('injected spawn failure'); },
+    structuredHost: {
+      status() { return { configured: true, available: true, reason: null }; },
+      destroy() {},
+    },
+  });
+
+  await assert.rejects(delivery.ensurePersistenceReady(), /injected spawn failure/);
+  assert.equal(closeCalls, 1);
+  assert.throws(() => fs.fstatSync(lockDescriptor), (error) => error?.code === 'EBADF');
   delivery.destroy();
 });
 
@@ -2959,7 +3005,7 @@ test('production source contains no raw TTY or terminal-control injection path',
   }
 });
 
-test('delivery child-process use is limited to the descriptor-only flock holder', () => {
+test('delivery child-process use is limited to the one-shot descriptor-only flock acquirer', () => {
   const root = path.resolve(__dirname, '..', '..');
   const sourceFiles = fs.readdirSync(path.join(root, 'src'))
     .filter((name) => name.endsWith('.js'));
@@ -2970,9 +3016,10 @@ test('delivery child-process use is limited to the descriptor-only flock holder'
   const source = fs.readFileSync(path.join(root, 'src', 'delivery.js'), 'utf8');
   assert.equal((source.match(/spawnImpl\(/g) || []).length, 1);
   assert.match(source, /deps\.flockCommand \|\| '\/usr\/bin\/flock'/);
-  assert.match(source, /'\/proc\/self\/fd\/3'/);
-  assert.match(source, /cwd: path\.dirname\(lockPath\)/);
-  assert.match(source, /stdio: \['pipe', 'pipe', 'pipe', descriptor\]/);
+  assert.match(source, /String\(Math\.max\(1, timeoutMs\) \/ 1000\),\s*'3'/);
+  assert.match(source, /stdio: \['ignore', 'ignore', 'pipe', descriptor\]/);
+  assert.equal(source.includes('/proc/self/fd/3'), false);
+  assert.equal(source.includes('LOCK_HELPER_SOURCE'), false);
   assert.equal(source.includes('shell: true'), false);
   assert.equal(source.includes('stdio: \'inherit\''), false);
 });

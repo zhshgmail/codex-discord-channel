@@ -5340,12 +5340,6 @@ ${body}
       let queuePath = getDeliveryQueuePath(config);
       return queuePath ? `${queuePath}.lock` : "";
     }
-    var LOCK_HELPER_SOURCE = [
-      "'use strict';",
-      "process.stdout.write('LOCKED\\n');",
-      "process.stdin.resume();",
-      "process.stdin.once('end', () => process.exit(0));"
-    ].join("");
     function openDeliveryQueueLock(lockPath, fsImpl) {
       let flags = fs.constants.O_CREAT | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0), descriptor;
       try {
@@ -5380,50 +5374,58 @@ ${body}
             "--exclusive",
             "--timeout",
             String(Math.max(1, timeoutMs) / 1e3),
-            "/proc/self/fd/3",
-            process.execPath,
-            "-e",
-            LOCK_HELPER_SOURCE
+            "3"
           ],
           {
-            cwd: path.dirname(lockPath),
-            stdio: ["pipe", "pipe", "pipe", descriptor],
+            stdio: ["ignore", "ignore", "pipe", descriptor],
             windowsHide: !0
           }
         );
-      } finally {
-        fsImpl.closeSync(descriptor);
+      } catch (error) {
+        try {
+          fsImpl.closeSync(descriptor);
+        } catch (closeError) {
+          throw new AggregateError(
+            [error, closeError],
+            "Discord delivery queue lock process failed to start and its descriptor could not be closed."
+          );
+        }
+        throw error;
       }
       let stderr = "";
       child.stderr?.on("data", (chunk) => {
         stderr = `${stderr}${chunk}`.slice(-4096);
       });
-      let acquired = !1, exitPromise = new Promise((resolve) => {
-        child.once("exit", (code, signal) => resolve({ code, signal }));
-      });
-      await new Promise((resolve, reject) => {
-        let stdout = "", fail = (error) => {
-          acquired || (acquired = !0, reject(error));
+      let outcome = await new Promise((resolve) => {
+        let settled = !1, settle = (value) => {
+          settled || (settled = !0, resolve(value));
         };
-        child.once("error", fail), child.stdout?.on("data", (chunk) => {
-          stdout += chunk, !acquired && stdout.includes(`LOCKED
-`) && (acquired = !0, resolve());
-        }), exitPromise.then(({ code, signal }) => {
-          fail(new Error(
-            code === 1 ? `Timed out waiting for Discord delivery queue lock: ${lockPath}` : `Discord delivery queue lock helper exited before acquisition (code=${code}, signal=${signal || "none"}): ${stderr.trim()}`
-          ));
-        });
+        child.once("error", (error) => settle({ error })), child.once("exit", (code, signal) => settle({ code, signal }));
       });
+      if (outcome.error || outcome.code !== 0) {
+        let acquisitionError = outcome.error || new Error(
+          outcome.code === 1 ? `Timed out waiting for Discord delivery queue lock: ${lockPath}` : `Discord delivery queue lock process failed (code=${outcome.code}, signal=${outcome.signal || "none"}): ${stderr.trim()}`
+        );
+        try {
+          fsImpl.closeSync(descriptor);
+        } catch (closeError) {
+          throw new AggregateError(
+            [acquisitionError, closeError],
+            "Discord delivery queue lock acquisition and descriptor cleanup both failed."
+          );
+        }
+        throw acquisitionError;
+      }
       let released = !1;
       return async () => {
-        if (released) return;
-        released = !0, child.stdin.end();
-        let { code, signal } = await exitPromise;
-        if (code !== 0) {
-          let error = new Error(
-            `Discord delivery queue lock release failed (code=${code}, signal=${signal || "none"}): ${stderr.trim()}`
-          );
-          throw error.code = "delivery_queue_lock_release_failed", error;
+        if (!released) {
+          released = !0;
+          try {
+            fsImpl.closeSync(descriptor);
+          } catch (cause) {
+            let error = new Error("Discord delivery queue lock release failed.", { cause });
+            throw error.code = "delivery_queue_lock_release_failed", error;
+          }
         }
       };
     }

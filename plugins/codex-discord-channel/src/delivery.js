@@ -172,13 +172,6 @@ function getDeliveryQueueLockPath(config = {}) {
   return queuePath ? `${queuePath}.lock` : '';
 }
 
-const LOCK_HELPER_SOURCE = [
-  "'use strict';",
-  "process.stdout.write('LOCKED\\n');",
-  'process.stdin.resume();',
-  "process.stdin.once('end', () => process.exit(0));",
-].join('');
-
 function openDeliveryQueueLock(lockPath, fsImpl) {
   const flags = fs.constants.O_CREAT | fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0);
   let descriptor;
@@ -231,63 +224,66 @@ async function acquireDeliveryQueueLock(config = {}, deps = {}) {
         '--exclusive',
         '--timeout',
         String(Math.max(1, timeoutMs) / 1000),
-        '/proc/self/fd/3',
-        process.execPath,
-        '-e',
-        LOCK_HELPER_SOURCE,
+        '3',
       ],
       {
-        cwd: path.dirname(lockPath),
-        stdio: ['pipe', 'pipe', 'pipe', descriptor],
+        stdio: ['ignore', 'ignore', 'pipe', descriptor],
         windowsHide: true,
       },
     );
-  } finally {
-    fsImpl.closeSync(descriptor);
+  } catch (error) {
+    try {
+      fsImpl.closeSync(descriptor);
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        'Discord delivery queue lock process failed to start and its descriptor could not be closed.',
+      );
+    }
+    throw error;
   }
 
   let stderr = '';
   child.stderr?.on('data', (chunk) => {
     stderr = `${stderr}${chunk}`.slice(-4096);
   });
-  let acquired = false;
-  const exitPromise = new Promise((resolve) => {
-    child.once('exit', (code, signal) => resolve({ code, signal }));
-  });
-  await new Promise((resolve, reject) => {
-    let stdout = '';
-    const fail = (error) => {
-      if (acquired) return;
-      acquired = true;
-      reject(error);
+  const outcome = await new Promise((resolve) => {
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
     };
-    child.once('error', fail);
-    child.stdout?.on('data', (chunk) => {
-      stdout += chunk;
-      if (!acquired && stdout.includes('LOCKED\n')) {
-        acquired = true;
-        resolve();
-      }
-    });
-    exitPromise.then(({ code, signal }) => {
-      fail(new Error(
-        code === 1
-          ? `Timed out waiting for Discord delivery queue lock: ${lockPath}`
-          : `Discord delivery queue lock helper exited before acquisition (code=${code}, signal=${signal || 'none'}): ${stderr.trim()}`,
-      ));
-    });
+    child.once('error', (error) => settle({ error }));
+    child.once('exit', (code, signal) => settle({ code, signal }));
   });
+  if (outcome.error || outcome.code !== 0) {
+    const acquisitionError = outcome.error || new Error(
+      outcome.code === 1
+        ? `Timed out waiting for Discord delivery queue lock: ${lockPath}`
+        : `Discord delivery queue lock process failed (code=${outcome.code}, signal=${outcome.signal || 'none'}): ${stderr.trim()}`,
+    );
+    try {
+      fsImpl.closeSync(descriptor);
+    } catch (closeError) {
+      throw new AggregateError(
+        [acquisitionError, closeError],
+        'Discord delivery queue lock acquisition and descriptor cleanup both failed.',
+      );
+    }
+    throw acquisitionError;
+  }
 
   let released = false;
   return async () => {
     if (released) return;
+    // close(2) errors do not make retrying the numeric descriptor safe: the
+    // descriptor may already be closed and reused. Surface the failure once.
     released = true;
-    child.stdin.end();
-    const { code, signal } = await exitPromise;
-    if (code !== 0) {
-      const error = new Error(
-        `Discord delivery queue lock release failed (code=${code}, signal=${signal || 'none'}): ${stderr.trim()}`,
-      );
+    try {
+      fsImpl.closeSync(descriptor);
+    } catch (cause) {
+      const error = new Error('Discord delivery queue lock release failed.', { cause });
       error.code = 'delivery_queue_lock_release_failed';
       throw error;
     }
