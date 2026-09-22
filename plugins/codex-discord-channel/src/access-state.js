@@ -121,11 +121,22 @@ function decideAccess(state, message) {
   const group = guildPolicy(state, message);
   const currentMessageMentionsBot = message.mentionsEveryone === true ||
     mentionsBot(message.content, message.botUserId, state.mentionPatterns);
-  const replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+  const isReply = message.isReply === true || Boolean(message.repliedToAuthorId);
+  const replyToBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+  // Never let two reply-required bot gateways admit each other's unmentioned
+  // receipts forever, including in channels that otherwise do not require a
+  // mention. A peer bot must address this bot in the current message before a
+  // reply to this bot is admitted.
+  if (message.authorIsBot && isReply && !currentMessageMentionsBot) {
+    return { allowed: false, reason: 'guild_bot_reply_mention_required' };
+  }
+  // A human can still continue a conversation by replying without repeating
+  // a visible mention.
+  const humanReplyToBot = !message.authorIsBot && replyToBot;
   if (
     group.requireMention &&
     !currentMessageMentionsBot &&
-    !replyAuthorIsBot
+    !humanReplyToBot
   ) {
     return { allowed: false, reason: 'guild_mention_required' };
   }
