@@ -384,8 +384,11 @@ var require_access_state = __commonJS({
         return state.dmPolicy === "open" ? { allowed: !0, reason: "dm_open" } : state.allowFrom.includes(message.authorId) ? { allowed: !0, reason: "dm_allowlisted" } : state.dmPolicy === "pairing" ? { allowed: !1, reason: "dm_pairing_required", requiresPairingCode: !0 } : { allowed: !1, reason: "dm_closed" };
       let envelopeDecision = decideGuildEnvelopeAccess(state, message);
       if (!envelopeDecision.allowed) return envelopeDecision;
-      let group = guildPolicy(state, message), currentMessageMentionsBot = message.mentionsEveryone === !0 || mentionsBot(message.content, message.botUserId, state.mentionPatterns), replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
-      return group.requireMention && !currentMessageMentionsBot && !replyAuthorIsBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
+      let group = guildPolicy(state, message), currentMessageMentionsBot = message.mentionsEveryone === !0 || mentionsBot(message.content, message.botUserId, state.mentionPatterns), isReply = message.isReply === !0 || !!message.repliedToAuthorId, replyToBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+      if (message.authorIsBot && isReply && !currentMessageMentionsBot)
+        return { allowed: !1, reason: "guild_bot_reply_mention_required" };
+      let humanReplyToBot = !message.authorIsBot && replyToBot;
+      return group.requireMention && !currentMessageMentionsBot && !humanReplyToBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
     }
     var GUILD_HISTORY_CHANNEL_TYPES = /* @__PURE__ */ new Set([0, 5, 10, 11, 12]), GUILD_THREAD_CHANNEL_TYPES = /* @__PURE__ */ new Set([10, 11, 12]);
     function historyGuildPolicy(state, target) {
@@ -5414,6 +5417,7 @@ var require_delivery = __commonJS({
         authorName: message.author?.username || message.authorName || "",
         authorIsBot: !!(message.author?.bot || message.authorIsBot),
         mentionsEveryone: !!message.mentions?.everyone,
+        isReply: hasReference,
         repliedToAuthorId: hasReference ? String(referencedMessage?.author?.id || "") : "",
         repliedToContent: hasReference && typeof referencedMessage?.content == "string" ? referencedMessage.content : "",
         createdAt: Number.isFinite(createdTimestamp) ? new Date(createdTimestamp).toISOString() : null,

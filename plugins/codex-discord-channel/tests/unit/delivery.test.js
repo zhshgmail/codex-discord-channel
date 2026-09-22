@@ -317,6 +317,7 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
     author: { id: 'u0' },
     content: 'parent',
   });
+  assert.equal(normalized.isReply, true);
   assert.equal(normalized.repliedToAuthorId, 'u0');
   assert.equal(normalized.repliedToContent, 'parent');
   assert.equal(normalized.createdAt, '2026-07-21T20:00:00.000Z');
@@ -329,6 +330,7 @@ test('normalizeDiscordMessage records resolved reply metadata only for an actual
     content: 'plain',
     attachments: [],
   }, { author: { id: 'must-not-leak' }, content: 'must-not-leak' });
+  assert.equal(withoutReference.isReply, false);
   assert.equal(withoutReference.repliedToAuthorId, '');
   assert.equal(withoutReference.repliedToContent, '');
   assert.equal(withoutReference.mentionsEveryone, false);

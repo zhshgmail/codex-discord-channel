@@ -348,6 +348,54 @@ test('reference resolver does not fetch outside enabled guild channels', async (
   assert.equal(fetchCount, 0);
 });
 
+test('handler drops unmentioned bot replies but admits explicitly mentioned bot replies', async () => {
+  const delivered = [];
+  const logs = [];
+  let fetchCount = 0;
+  const handler = createDiscordMessageHandler({
+    config: { botUserId: 'bot' },
+    client: { user: { id: 'bot' } },
+    delivery: {
+      async enqueue(normalized) {
+        delivered.push(normalized.messageId);
+        return { status: 'accepted', reason: 'discord_message_persisted' };
+      },
+      async flush() { return { status: 'delivered', reason: 'turn_accepted' }; },
+    },
+    logger: (level, message, meta) => logs.push({ level, message, meta }),
+    deps: {
+      isActiveDiscordReceiver: () => ({ active: true, reason: 'gateway_pid_match' }),
+      loadAccessState: () => normalizeAccessState({
+        groups: { c1: { requireMention: false, allowBots: true, allowFrom: ['peer-bot'] } },
+      }),
+    },
+  });
+  const makeMessage = (id, content) => ({
+    guildId: 'g1',
+    channelId: 'c1',
+    id,
+    author: { id: 'peer-bot', username: 'PeerBot', bot: true },
+    content,
+    attachments: [],
+    reference: { messageId: `parent-${id}` },
+    async fetchReference() {
+      fetchCount += 1;
+      return { author: { id: 'bot' }, content: 'prior outbound message' };
+    },
+  });
+
+  await handler(makeMessage('receipt', 'OWNER_STOP.'));
+  await handler(makeMessage('material', '<@bot> material update'));
+
+  assert.equal(fetchCount, 2);
+  assert.deepEqual(delivered, ['material']);
+  assert.equal(
+    logs.some((entry) => entry.meta?.messageId === 'receipt' &&
+      entry.meta?.reason === 'guild_bot_reply_mention_required'),
+    true,
+  );
+});
+
 test('concurrent reference fetch preserves Discord event delivery order', async () => {
   let releaseReference;
   let markReferenceStarted;
