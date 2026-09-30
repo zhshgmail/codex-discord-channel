@@ -3444,8 +3444,11 @@ var require_app_server_host = __commonJS({
     function deliveryProofKey(threadId, clientUserMessageId) {
       return JSON.stringify([threadId, clientUserMessageId]);
     }
+    function isBackgroundThreadSource(source) {
+      return typeof source == "string" && source !== "user";
+    }
     function isSystemBackgroundThread(thread) {
-      return thread?.threadSource === "system";
+      return isBackgroundThreadSource(thread?.threadSource);
     }
     function assistantFinalKey(threadId, turnId) {
       return JSON.stringify([threadId, turnId]);
@@ -3551,8 +3554,8 @@ var require_app_server_host = __commonJS({
         // id in diagnostic text or a copied UserMessage.  It is not the visible
         // TUI consumer and therefore cannot prove delivery.  Keep legacy
         // rollouts (which predate thread_source) readable, but fail closed for
-        // the explicit system classification emitted by current Codex.
-        rolloutThreadSource === "system" || expectedThreadId !== null && rolloutThreadId !== expectedThreadId)
+        // explicit non-user classifications emitted by current Codex.
+        isBackgroundThreadSource(rolloutThreadSource) || expectedThreadId !== null && rolloutThreadId !== expectedThreadId)
           return !1;
         let tailLength = Math.min(stat.size, MAX_ROLLOUT_TAIL_BYTES), tailOffset = stat.size - tailLength, tail = await readBoundedRange(handle, tailOffset, tailLength);
         if (!tail) return !1;
