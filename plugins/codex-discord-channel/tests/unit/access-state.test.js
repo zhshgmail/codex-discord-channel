@@ -80,6 +80,63 @@ test('guild reply to the active bot satisfies the mention requirement', () => {
   assert.equal(decision.reason, 'guild_allowed');
 });
 
+test('unmentioned bot reply to the active bot does not inherit the mention', () => {
+  const state = normalizeAccessState({
+    groups: { c1: { requireMention: false, allowBots: true, allowFrom: ['bot2'] } },
+  });
+  const decision = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'bot2',
+    authorIsBot: true,
+    content: 'receipt without a visible mention',
+    botUserId: 'bot',
+    isReply: true,
+    repliedToAuthorId: 'bot',
+  });
+
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'guild_bot_reply_mention_required');
+});
+
+test('bot reply explicitly mentioning the active bot remains allowed', () => {
+  const state = normalizeAccessState({
+    groups: { c1: { allowBots: true, allowFrom: ['bot2'] } },
+  });
+  const decision = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'bot2',
+    authorIsBot: true,
+    content: '<@bot> material update',
+    botUserId: 'bot',
+    isReply: true,
+    repliedToAuthorId: 'bot',
+  });
+
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.reason, 'guild_allowed');
+});
+
+test('unresolved bot reply still requires a current-message mention', () => {
+  const state = normalizeAccessState({
+    groups: { c1: { requireMention: false, allowBots: true, allowFrom: ['bot2'] } },
+  });
+  const decision = decideAccess(state, {
+    source: 'guild',
+    channelId: 'c1',
+    authorId: 'bot2',
+    authorIsBot: true,
+    content: 'receipt with an unavailable parent',
+    botUserId: 'bot',
+    isReply: true,
+    repliedToAuthorId: '',
+  });
+
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'guild_bot_reply_mention_required');
+});
+
 test('guild reply to another author does not satisfy the mention requirement', () => {
   const state = normalizeAccessState({ groups: { c1: {} } });
   const decision = decideAccess(state, {

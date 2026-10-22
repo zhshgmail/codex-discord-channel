@@ -18,6 +18,7 @@ test('new receiver records bind PID reuse checks to process start ticks, not ses
     pid: 12345,
     processStartTicks: '998877',
     stateDir: '/tmp/codex02-state',
+    deliveryQueueLockIdentity: '/tmp/codex02-state/pending-delivery.json.lock',
     randomUUID: () => 'receiver-generation',
     now: () => Date.parse('2026-08-27T18:00:00.000Z'),
   });
@@ -26,6 +27,7 @@ test('new receiver records bind PID reuse checks to process start ticks, not ses
   assert.equal(record.processStartTicks, '998877');
   assert.equal(record.stateDir, '/tmp/codex02-state');
   assert.equal(record.role, 'gateway');
+  assert.equal(record.deliveryQueueLockIdentity, '/tmp/codex02-state/pending-delivery.json.lock');
   assert.equal('threadId' in record, false);
   assert.equal('sessionId' in record, false);
 });
