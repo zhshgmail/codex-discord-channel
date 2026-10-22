@@ -384,8 +384,11 @@ var require_access_state = __commonJS({
         return state.dmPolicy === "open" ? { allowed: !0, reason: "dm_open" } : state.allowFrom.includes(message.authorId) ? { allowed: !0, reason: "dm_allowlisted" } : state.dmPolicy === "pairing" ? { allowed: !1, reason: "dm_pairing_required", requiresPairingCode: !0 } : { allowed: !1, reason: "dm_closed" };
       let envelopeDecision = decideGuildEnvelopeAccess(state, message);
       if (!envelopeDecision.allowed) return envelopeDecision;
-      let group = guildPolicy(state, message), currentMessageMentionsBot = message.mentionsEveryone === !0 || mentionsBot(message.content, message.botUserId, state.mentionPatterns), replyAuthorIsBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
-      return group.requireMention && !currentMessageMentionsBot && !replyAuthorIsBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
+      let group = guildPolicy(state, message), currentMessageMentionsBot = message.mentionsEveryone === !0 || mentionsBot(message.content, message.botUserId, state.mentionPatterns), isReply = message.isReply === !0 || !!message.repliedToAuthorId, replyToBot = message.botUserId && message.repliedToAuthorId === message.botUserId;
+      if (message.authorIsBot && isReply && !currentMessageMentionsBot)
+        return { allowed: !1, reason: "guild_bot_reply_mention_required" };
+      let humanReplyToBot = !message.authorIsBot && replyToBot;
+      return group.requireMention && !currentMessageMentionsBot && !humanReplyToBot ? { allowed: !1, reason: "guild_mention_required" } : { allowed: !0, reason: "guild_allowed" };
     }
     var GUILD_HISTORY_CHANNEL_TYPES = /* @__PURE__ */ new Set([0, 5, 10, 11, 12]), GUILD_THREAD_CHANNEL_TYPES = /* @__PURE__ */ new Set([10, 11, 12]);
     function historyGuildPolicy(state, target) {
@@ -3388,7 +3391,7 @@ var require_ws = __commonJS({
 var require_app_server_host = __commonJS({
   "src/app-server-host.js"(exports2, module2) {
     "use strict";
-    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_EMITTED_ASSISTANT_FINALS = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
+    var { EventEmitter } = require("node:events"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), { parseTuiLease } = require_tui_recovery_target(), TARGET_GENERATION = /* @__PURE__ */ Symbol("appServerTargetGeneration"), MAX_FRESH_THREAD_READS = 32, MAX_LOADED_THREAD_PAGES = 32, MAX_TARGET_RESOLUTION_RESTARTS = 4, MAX_VERIFIED_USER_MESSAGES = 256, MAX_RECENT_TARGET_TURNS = 8, MAX_RECENT_SOURCE_PROOF_ITEMS = 32, MAX_EMITTED_ASSISTANT_FINALS = 256, MAX_ROLLOUT_SEARCH_DEPTH = 4, MAX_ROLLOUT_SEARCH_DIRECTORIES = 4096, MAX_ROLLOUT_SEARCH_ENTRIES = 65536, MAX_ROLLOUT_HEADER_BYTES = 1024 * 1024, MAX_ROLLOUT_TAIL_BYTES = 32 * 1024 * 1024, MAX_ROLLOUT_LINE_BYTES = 4 * 1024 * 1024, MAX_LIFECYCLE_PROOF_SIGNAL_BATCHES = 2, MAX_LIFECYCLE_PROOF_ATTEMPTS = 4, MAX_LIFECYCLE_PROOF_DELAY_MS = 250, DEFAULT_LIFECYCLE_PROOF_RETRY_DELAYS_MS = Object.freeze([0, 25, 75, 200]), TARGET_CHECKPOINT_VERSION = 3, CANONICAL_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, CANONICAL_TURN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, ACTIVE_TURN_MISMATCH = /^expected active turn id `([0-9a-f-]+)` but found `([0-9a-f-]+)`$/;
     function parseTargetCheckpoint(raw) {
       let record;
       try {
@@ -3444,8 +3447,11 @@ var require_app_server_host = __commonJS({
     function deliveryProofKey(threadId, clientUserMessageId) {
       return JSON.stringify([threadId, clientUserMessageId]);
     }
+    function isBackgroundThreadSource(source) {
+      return typeof source == "string" && source !== "user";
+    }
     function isSystemBackgroundThread(thread) {
-      return thread?.threadSource === "system";
+      return isBackgroundThreadSource(thread?.threadSource);
     }
     function assistantFinalKey(threadId, turnId) {
       return JSON.stringify([threadId, turnId]);
@@ -3551,8 +3557,8 @@ var require_app_server_host = __commonJS({
         // id in diagnostic text or a copied UserMessage.  It is not the visible
         // TUI consumer and therefore cannot prove delivery.  Keep legacy
         // rollouts (which predate thread_source) readable, but fail closed for
-        // the explicit system classification emitted by current Codex.
-        rolloutThreadSource === "system" || expectedThreadId !== null && rolloutThreadId !== expectedThreadId)
+        // explicit non-user classifications emitted by current Codex.
+        isBackgroundThreadSource(rolloutThreadSource) || expectedThreadId !== null && rolloutThreadId !== expectedThreadId)
           return !1;
         let tailLength = Math.min(stat.size, MAX_ROLLOUT_TAIL_BYTES), tailOffset = stat.size - tailLength, tail = await readBoundedRange(handle, tailOffset, tailLength);
         if (!tail) return !1;
@@ -3726,7 +3732,7 @@ var require_app_server_host = __commonJS({
             clientInfo: {
               name: "codex-discord-channel",
               title: "Discord Channel Gateway",
-              version: "0.3.25"
+              version: "0.3.26"
             },
             capabilities: {
               experimentalApi: !0,
@@ -4181,11 +4187,11 @@ var require_app_server_host = __commonJS({
             if (turns.length === 0) {
               let turnPage = await request("thread/turns/list", {
                 threadId,
-                limit: 8,
+                limit: MAX_RECENT_TARGET_TURNS,
                 sortDirection: "desc",
                 itemsView: "notLoaded"
               });
-              if (!Array.isArray(turnPage?.data)) {
+              if (!Array.isArray(turnPage?.data) || turnPage.data.length > MAX_RECENT_TARGET_TURNS) {
                 let reason = "shared_app_server_active_turn_unavailable";
                 return this.lastStatus = { configured: !0, available: !1, reason }, { available: !1, reason, status: "unavailable" };
               }
@@ -4393,10 +4399,20 @@ var require_app_server_host = __commonJS({
           }
         }), !response || response?.thread?.status?.type === "active" && !cachedActiveTurnId)
           try {
-            response = await requestForTarget("thread/read", {
+            if (response = await requestForTarget("thread/read", {
               threadId,
-              includeTurns: !0
-            });
+              includeTurns: !1
+            }), response?.thread?.status?.type === "active") {
+              let page = await requestForTarget("thread/turns/list", {
+                threadId,
+                limit: MAX_RECENT_TARGET_TURNS,
+                sortDirection: "desc",
+                itemsView: "notLoaded"
+              });
+              if (!Array.isArray(page?.data) || page.data.length > MAX_RECENT_TARGET_TURNS)
+                throw deliveryError("Active turn page is unavailable.", "shared_app_server_active_turn_unavailable");
+              response = { thread: { ...response.thread, turns: [...page.data].reverse() } };
+            }
           } catch (error) {
             if (ephemeralIncludeTurnsUnsupported(error))
               try {
@@ -4451,8 +4467,14 @@ var require_app_server_host = __commonJS({
             ...params,
             threadId: candidate.threadId,
             ...candidate.activeTurnId ? { expectedTurnId: candidate.activeTurnId } : {}
-          } : { ...params, threadId: candidate.threadId };
-          if (typeof this.client.requestOnConnection == "function") {
+          } : { ...params, threadId: candidate.threadId }, observation = {
+            clientUserMessageId: params.clientUserMessageId,
+            method,
+            targetStatus: candidate.status,
+            threadId: candidate.threadId,
+            expectedTurnId: requestParams.expectedTurnId || null
+          };
+          if (this.logger("INFO", "Submitting Discord input to current app-server target", observation), typeof this.client.requestOnConnection == "function") {
             let response = await this.client.requestOnConnection(
               method,
               requestParams,
@@ -4460,15 +4482,22 @@ var require_app_server_host = __commonJS({
               null,
               !0
             );
-            return {
+            return this.logger("INFO", "App-server acknowledged Discord input", {
+              ...observation,
+              acceptedTurnId: response.result?.turn?.id || response.result?.turnId || null
+            }), {
               method,
               result: response.result,
               acceptedGeneration: response.generation
             };
           }
-          return {
+          let result = await this.client.request(method, requestParams);
+          return this.logger("INFO", "App-server acknowledged Discord input", {
+            ...observation,
+            acceptedTurnId: result?.turn?.id || result?.turnId || null
+          }), {
             method,
-            result: await this.client.request(method, requestParams),
+            result,
             acceptedGeneration: null
           };
         }, submitted;
@@ -4487,12 +4516,12 @@ var require_app_server_host = __commonJS({
         ), submitted.result;
       }
       async readDeliveredUserMessage(threadId, clientUserMessageId, signal = null) {
-        let params = { threadId, includeTurns: !0 }, threadSelectionRevision, response;
+        let params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: "desc" }, threadSelectionRevision, response;
         if (typeof this.client.requestOnConnection == "function") {
           await this.client.ensureConnected(), threadSelectionRevision = this.threadSelectionRevision;
           try {
             response = (await this.client.requestOnConnection(
-              "thread/read",
+              "thread/items/list",
               params,
               this.client.connectionGeneration,
               null,
@@ -4507,7 +4536,7 @@ var require_app_server_host = __commonJS({
         } else {
           threadSelectionRevision = this.threadSelectionRevision;
           try {
-            response = await this.client.request("thread/read", params);
+            response = await this.client.request("thread/items/list", params);
           } catch (error) {
             if (includeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
               return !1;
@@ -4519,27 +4548,34 @@ var require_app_server_host = __commonJS({
             "The current app-server thread changed during delivery reconciliation.",
             "shared_app_server_thread_changed"
           );
-        let thread = response?.thread;
-        return thread?.id !== threadId || !Array.isArray(thread.turns) ? !1 : thread.turns.some((turn) => (Array.isArray(turn?.items) ? turn.items : []).some((item) => item?.type === "userMessage" && item.clientId === clientUserMessageId));
+        return !Array.isArray(response?.data) || response.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS ? !1 : response.data.some((entry) => typeof entry?.turnId == "string" && entry.turnId !== "" && entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId);
       }
       async readAssistantFinal(threadId, turnId) {
         if (typeof threadId != "string" || threadId === "" || typeof turnId != "string" || turnId === "")
           return null;
-        let response;
+        let turns, items;
         try {
-          response = await this.client.request("thread/read", {
+          if (turns = await this.client.request("thread/turns/list", {
             threadId,
-            includeTurns: !0
+            limit: MAX_RECENT_TARGET_TURNS,
+            sortDirection: "desc",
+            itemsView: "notLoaded"
+          }), !Array.isArray(turns?.data) || turns.data.length > MAX_RECENT_TARGET_TURNS) return null;
+          let matches = turns.data.filter((turn) => turn?.id === turnId);
+          return matches.length !== 1 || matches[0].status !== "completed" || (items = await this.client.request("thread/items/list", {
+            threadId,
+            turnId,
+            limit: MAX_RECENT_SOURCE_PROOF_ITEMS,
+            sortDirection: "desc"
+          }), !Array.isArray(items?.data) || items.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS || items.nextCursor != null || items.data.some((entry) => entry?.turnId !== turnId)) ? null : exactAssistantFinal(threadId, turnId, {
+            ...matches[0],
+            items: items.data.map((entry) => entry.item)
           });
         } catch (error) {
           if (ephemeralIncludeTurnsUnsupported(error) && this.ephemeralThreadIds.has(threadId))
             return null;
           throw error;
         }
-        let thread = response?.thread;
-        if (thread?.id !== threadId || !Array.isArray(thread.turns)) return null;
-        let matches = thread.turns.filter((turn) => turn?.id === turnId);
-        return matches.length !== 1 ? null : exactAssistantFinal(threadId, turnId, matches[0]);
       }
       async hasDelivered(threadId, clientUserMessageId) {
         if (typeof threadId != "string" || threadId === "" || typeof clientUserMessageId != "string" || clientUserMessageId === "")
@@ -4632,17 +4668,29 @@ var require_app_server_host = __commonJS({
         let candidates = [...new Set([
           this.currentThreadId,
           ...this.knownLoadedThreadIds
-        ].filter((threadId) => CANONICAL_THREAD_ID.test(threadId || "")))];
-        for (let threadId of candidates) {
+        ].filter((threadId2) => CANONICAL_THREAD_ID.test(threadId2 || "")))];
+        for (let threadId2 of candidates) {
           let verified = !1;
           try {
-            verified = await this.verifyRolloutDelivery(threadId, clientUserMessageId);
+            verified = await this.verifyRolloutDelivery(threadId2, clientUserMessageId);
           } catch {
           }
           if (verified)
-            return this.rememberVerifiedUserMessage(threadId, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0;
+            return this.rememberVerifiedUserMessage(threadId2, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0;
         }
-        return !1;
+        let threadId = this.currentThreadId;
+        if (!this.loadedInventoryProven || !candidates.includes(threadId)) return !1;
+        let selectionRevision = this.threadSelectionRevision, params = { threadId, limit: MAX_RECENT_SOURCE_PROOF_ITEMS, sortDirection: "desc" }, page;
+        try {
+          page = typeof this.client.requestOnConnection == "function" ? (await this.client.requestOnConnection(
+            "thread/items/list",
+            params,
+            this.client.connectionGeneration
+          )).result : await this.client.request("thread/items/list", params);
+        } catch {
+          return !1;
+        }
+        return this.threadSelectionRevision !== selectionRevision || this.currentThreadId !== threadId || !Array.isArray(page?.data) || page.data.length > MAX_RECENT_SOURCE_PROOF_ITEMS || !page.data.some((entry) => typeof entry?.turnId == "string" && entry.turnId !== "" && entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId) ? !1 : (this.rememberVerifiedUserMessage(threadId, clientUserMessageId), this.rememberVerifiedSourceMessage(clientUserMessageId), !0);
       }
       onThreadIdle(listener) {
         return this.on("idle", listener), () => this.off("idle", listener);
@@ -5428,6 +5476,7 @@ var require_delivery = __commonJS({
         authorName: message.author?.username || message.authorName || "",
         authorIsBot: !!(message.author?.bot || message.authorIsBot),
         mentionsEveryone: !!message.mentions?.everyone,
+        isReply: hasReference,
         repliedToAuthorId: hasReference ? String(referencedMessage?.author?.id || "") : "",
         repliedToContent: hasReference && typeof referencedMessage?.content == "string" ? referencedMessage.content : "",
         createdAt: Number.isFinite(createdTimestamp) ? new Date(createdTimestamp).toISOString() : null,
@@ -8374,8 +8423,16 @@ var require_request = __commonJS({
           return this.abort(err), !1;
         }
       }
-      onUpgrade(statusCode, headers, socket) {
-        return assert(!this.aborted), assert(!this.completed), this[kHandler].onUpgrade(statusCode, headers, socket);
+      /**
+       * @param {number} statusCode
+       * @param {Buffer[]|string[]} headers
+       * @param {import('node:stream').Duplex} socket
+       * @param {string} [statusText]
+       */
+      onUpgrade(statusCode, headers, socket, statusText = "") {
+        this.onFinally(), assert(!this.aborted), assert(!this.completed), channels.headers.hasSubscribers && channels.headers.publish({ request: this, response: { statusCode, headers, statusText } });
+        let result = this[kHandler].onUpgrade(statusCode, headers, socket);
+        return this.aborted || (this.completed = !0, channels.trailers.hasSubscribers && channels.trailers.publish({ request: this, trailers: [] })), result;
       }
       onComplete(trailers) {
         this.onFinally(), assert(!this.aborted), assert(!this.completed), this.completed = !0, channels.trailers.hasSubscribers && channels.trailers.publish({ request: this, trailers });
@@ -11705,7 +11762,11 @@ var require_client_h1 = __commonJS({
       kClosed
     } = require_symbols(), constants = require_constants3(), EMPTY_BUF = Buffer.alloc(0), FastBuffer = Buffer[Symbol.species], removeAllListeners = util.removeAllListeners, kIdleSocketValidation = /* @__PURE__ */ Symbol("kIdleSocketValidation"), kIdleSocketValidationTimeout = /* @__PURE__ */ Symbol("kIdleSocketValidationTimeout"), kSocketUsed = /* @__PURE__ */ Symbol("kSocketUsed"), extractBody;
     function lazyllhttp() {
-      let llhttpWasmData = process.env.JEST_WORKER_ID ? require_llhttp_wasm() : void 0, mod, useWasmSIMD = process.arch !== "ppc64";
+      let llhttpWasmData = process.env.JEST_WORKER_ID ? require_llhttp_wasm() : void 0, mod, useWasmSIMD = !0;
+      if (process.arch === "ppc64") {
+        let [major, minor] = process.versions.node.split(".").map((n) => parseInt(n, 10));
+        (major < 24 || major === 24 && minor < 12) && (useWasmSIMD = !1);
+      }
       if (process.env.UNDICI_NO_WASM_SIMD === "1" ? useWasmSIMD = !1 : process.env.UNDICI_NO_WASM_SIMD === "0" && (useWasmSIMD = !0), useWasmSIMD)
         try {
           mod = new WebAssembly.Module(require_llhttp_simd_wasm());
@@ -11910,14 +11971,14 @@ var require_client_h1 = __commonJS({
        * @param {Buffer} head
        */
       onUpgrade(head) {
-        let { upgrade, client, socket, headers, statusCode } = this;
+        let { upgrade, client, socket, headers, statusCode, statusText } = this;
         assert(upgrade), assert(client[kSocket] === socket), assert(!socket.destroyed), assert(!this.paused), assert((headers.length & 1) === 0);
         let request = client[kQueue][client[kRunningIdx]];
         assert(request), assert(request.upgrade || request.method === "CONNECT"), this.statusCode = 0, this.statusText = "", this.shouldKeepAlive = !1, this.headers = [], this.headersSize = 0, socket.unshift(head), socket[kParser].destroy(), socket[kParser] = null, socket[kClient] = null, socket[kError] = null, removeAllListeners(socket), client[kSocket] = null, client[kHTTPContext] = null, client[kQueue][client[kRunningIdx]++] = null, client.emit("disconnect", client[kUrl], [client], new InformationalError("upgrade"));
         try {
-          request.onUpgrade(statusCode, headers, socket);
+          request.onUpgrade(statusCode, headers, socket, statusText);
         } catch (err) {
-          util.destroy(socket, err);
+          util.errorRequest(client, request, err), util.destroy(socket, err);
         }
         client[kResume]();
       }
@@ -12086,12 +12147,12 @@ var require_client_h1 = __commonJS({
       this[kClosed] = !0;
     }
     function clearIdleSocketValidation(socket) {
-      socket[kIdleSocketValidationTimeout] && (clearTimeout(socket[kIdleSocketValidationTimeout]), socket[kIdleSocketValidationTimeout] = null), socket[kIdleSocketValidation] = 0;
+      socket[kIdleSocketValidationTimeout] && (clearImmediate(socket[kIdleSocketValidationTimeout]), socket[kIdleSocketValidationTimeout] = null), socket[kIdleSocketValidation] = 0;
     }
     function scheduleIdleSocketValidation(client, socket) {
-      socket[kIdleSocketValidation] = 1, socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+      socket[kIdleSocketValidation] = 1, socket[kIdleSocketValidationTimeout] = setImmediate(() => {
         socket[kIdleSocketValidationTimeout] = null, socket[kIdleSocketValidation] = 2, client[kSocket] === socket && !socket.destroyed && client[kResume]();
-      }, 0), socket[kIdleSocketValidationTimeout].unref?.();
+      });
     }
     function resumeH1(client) {
       let socket = client[kSocket];
@@ -12339,7 +12400,9 @@ var require_client_h2 = __commonJS({
       RequestAbortedError,
       SocketError,
       InformationalError,
-      InvalidArgumentError
+      InvalidArgumentError,
+      HeadersTimeoutError,
+      BodyTimeoutError
     } = require_errors(), {
       kUrl,
       kReset,
@@ -12363,6 +12426,7 @@ var require_client_h2 = __commonJS({
       kHTTPContext,
       kClosed,
       kBodyTimeout,
+      kHeadersTimeout,
       kEnableConnectProtocol,
       kRemoteSettings,
       kHTTP2Stream,
@@ -12457,7 +12521,7 @@ var require_client_h2 = __commonJS({
     }
     function resumeH2(client) {
       let socket = client[kSocket];
-      socket?.destroyed === !1 && (client[kSize] === 0 || client[kMaxConcurrentStreams] === 0 ? (socket.unref(), client[kHTTP2Session].unref()) : (socket.ref(), client[kHTTP2Session].ref()));
+      socket?.destroyed === !1 && (client[kSize] === 0 ? (socket.unref(), client[kHTTP2Session].unref()) : (socket.ref(), client[kHTTP2Session].ref()));
     }
     function applyConnectionWindowSize(connectionWindowSize) {
       try {
@@ -12502,11 +12566,20 @@ var require_client_h2 = __commonJS({
       let err = new SocketError("other side closed", util.getSocketInfo(this[kSocket]));
       this.destroy(err), util.destroy(this[kSocket], err);
     }
+    function completeRequest(client, request, resetPendingIdx = !1) {
+      let queue = client[kQueue], runningIdx = client[kRunningIdx];
+      if (runningIdx < client[kPendingIdx] && queue[runningIdx] === request) {
+        queue[runningIdx] = null, client[kRunningIdx] = runningIdx + 1;
+        return;
+      }
+      let index = queue.indexOf(request, runningIdx);
+      index === -1 || index >= client[kPendingIdx] || (queue.splice(index, 1), client[kPendingIdx]--, resetPendingIdx && client[kPendingIdx] < client[kRunningIdx] && (client[kPendingIdx] = client[kRunningIdx]));
+    }
     function onHttp2SessionGoAway(errorCode) {
       let err = this[kError] || new SocketError(`HTTP/2: "GOAWAY" frame received with code ${errorCode}`, util.getSocketInfo(this[kSocket])), client = this[kClient];
       if (client[kSocket] = null, client[kHTTPContext] = null, this.close(), this[kHTTP2Session] = null, util.destroy(this[kSocket], err), client[kRunningIdx] < client[kQueue].length) {
         let request = client[kQueue][client[kRunningIdx]];
-        client[kQueue][client[kRunningIdx]++] = null, util.errorRequest(client, request, err), client[kPendingIdx] = client[kRunningIdx];
+        client[kQueue][client[kRunningIdx]++] = null, request != null && util.errorRequest(client, request, err), client[kPendingIdx] = client[kRunningIdx];
       }
       assert(client[kRunning] === 0), client.emit("disconnect", client[kUrl], [client], err), client.emit("connectionError", client[kUrl], [client], err), client[kResume]();
     }
@@ -12517,7 +12590,7 @@ var require_client_h2 = __commonJS({
         let requests = client[kQueue].splice(client[kRunningIdx]);
         for (let i = 0; i < requests.length; i++) {
           let request = requests[i];
-          util.errorRequest(client, request, err);
+          request != null && util.errorRequest(client, request, err);
         }
       }
     }
@@ -12538,7 +12611,7 @@ var require_client_h2 = __commonJS({
       return method !== "GET" && method !== "HEAD" && method !== "OPTIONS" && method !== "TRACE" && method !== "CONNECT";
     }
     function writeH2(client, request) {
-      let requestTimeout = request.bodyTimeout ?? client[kBodyTimeout], session = client[kHTTP2Session], { method, path, host, upgrade, expectContinue, signal, protocol, headers: reqHeaders } = request, { body } = request;
+      let headersTimeout = request.headersTimeout ?? client[kHeadersTimeout], bodyTimeout = request.bodyTimeout ?? client[kBodyTimeout], session = client[kHTTP2Session], { method, path, host, upgrade, expectContinue, signal, protocol, headers: reqHeaders } = request, { body } = request;
       if (upgrade != null && upgrade !== "websocket")
         return util.errorRequest(client, request, new InvalidArgumentError(`Custom upgrade "${upgrade}" not supported over HTTP/2`)), !1;
       let headers = {};
@@ -12556,7 +12629,7 @@ var require_client_h2 = __commonJS({
       let stream = null, { hostname, port } = client[kUrl];
       headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ""}`, headers[HTTP2_HEADER_METHOD] = method;
       let abort = (err) => {
-        request.aborted || request.completed || (err = err || new RequestAbortedError(), util.errorRequest(client, request, err), stream != null && (stream.removeAllListeners("data"), stream.close(), client[kOnError](err), client[kResume]()), util.destroy(body, err));
+        request.aborted || request.completed || (err = err || new RequestAbortedError(), util.errorRequest(client, request, err), stream != null && (stream.removeAllListeners("data"), stream.close(), client[kOnError](err), completeRequest(client, request), client[kResume]()), util.destroy(body, err));
       };
       try {
         request.onConnect(abort);
@@ -12566,19 +12639,31 @@ var require_client_h2 = __commonJS({
       if (request.aborted)
         return !1;
       if (upgrade || method === "CONNECT")
-        return session.ref(), upgrade === "websocket" ? session[kEnableConnectProtocol] === !1 ? (util.errorRequest(client, request, new InformationalError("HTTP/2: Extended CONNECT protocol not supported by server")), session.unref(), !1) : (headers[HTTP2_HEADER_METHOD] = "CONNECT", headers[HTTP2_HEADER_PROTOCOL] = "websocket", headers[HTTP2_HEADER_PATH] = path, protocol === "ws:" || protocol === "wss:" ? headers[HTTP2_HEADER_SCHEME] = protocol === "ws:" ? "http" : "https" : headers[HTTP2_HEADER_SCHEME] = protocol === "http:" ? "http" : "https", stream = session.request(headers, { endStream: !1, signal }), stream[kHTTP2Stream] = !0, stream.once("response", (headers2, _flags) => {
+        return session.ref(), upgrade === "websocket" ? session[kEnableConnectProtocol] === !1 ? (util.errorRequest(client, request, new InformationalError("HTTP/2: Extended CONNECT protocol not supported by server")), session.unref(), !1) : (headers[HTTP2_HEADER_METHOD] = "CONNECT", headers[HTTP2_HEADER_PROTOCOL] = "websocket", headers[HTTP2_HEADER_PATH] = path, protocol === "ws:" || protocol === "wss:" ? headers[HTTP2_HEADER_SCHEME] = protocol === "ws:" ? "http" : "https" : headers[HTTP2_HEADER_SCHEME] = protocol === "http:" ? "http" : "https", stream = session.request(headers, { endStream: !1, signal }), stream[kHTTP2Stream] = !0, ++session[kOpenStreams], stream.once("response", (headers2, _flags) => {
           let { [HTTP2_HEADER_STATUS]: statusCode, ...realHeaders } = headers2;
-          request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream), ++session[kOpenStreams], client[kQueue][client[kRunningIdx]++] = null;
+          try {
+            request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream);
+          } catch (err) {
+            abort(err);
+            return;
+          }
+          completeRequest(client, request);
         }), stream.on("error", () => {
           (stream.rstCode === NGHTTP2_REFUSED_STREAM || stream.rstCode === NGHTTP2_CANCEL) && abort(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`));
         }), stream.once("close", () => {
           session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref();
-        }), stream.setTimeout(requestTimeout), !0) : (stream = session.request(headers, { endStream: !1, signal }), stream[kHTTP2Stream] = !0, stream.on("response", (headers2) => {
+        }), stream.setTimeout(headersTimeout), !0) : (stream = session.request(headers, { endStream: !1, signal }), stream[kHTTP2Stream] = !0, ++session[kOpenStreams], stream.on("response", (headers2) => {
           let { [HTTP2_HEADER_STATUS]: statusCode, ...realHeaders } = headers2;
-          request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream), ++session[kOpenStreams], client[kQueue][client[kRunningIdx]++] = null;
-        }), stream.once("close", () => {
+          try {
+            request.onUpgrade(statusCode, parseH2Headers(realHeaders), stream);
+          } catch (err) {
+            abort(err);
+            return;
+          }
+          completeRequest(client, request);
+        }), stream.on("error", abort), stream.once("close", () => {
           session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref();
-        }), stream.setTimeout(requestTimeout), !0);
+        }), stream.setTimeout(headersTimeout), !0);
       headers[HTTP2_HEADER_PATH] = path, headers[HTTP2_HEADER_SCHEME] = protocol === "http:" ? "http" : "https";
       let expectsPayload = method === "PUT" || method === "POST" || method === "PATCH";
       body && typeof body.read == "function" && body.read(0);
@@ -12604,11 +12689,11 @@ var require_client_h2 = __commonJS({
       expectContinue ? (headers[HTTP2_HEADER_EXPECT] = "100-continue", stream = session.request(headers, { endStream: shouldEndStream, signal }), stream[kHTTP2Stream] = !0, stream.once("continue", writeBodyH2)) : (stream = session.request(headers, {
         endStream: shouldEndStream,
         signal
-      }), stream[kHTTP2Stream] = !0, writeBodyH2()), ++session[kOpenStreams], stream.setTimeout(requestTimeout);
+      }), stream[kHTTP2Stream] = !0, writeBodyH2()), ++session[kOpenStreams], stream.setTimeout(headersTimeout);
       let responseReceived = !1;
       return stream.once("response", (headers2) => {
         let { [HTTP2_HEADER_STATUS]: statusCode, ...realHeaders } = headers2;
-        if (request.onResponseStarted(), responseReceived = !0, request.aborted) {
+        if (request.onResponseStarted(), responseReceived = !0, stream.setTimeout(bodyTimeout), request.aborted) {
           stream.removeAllListeners("data");
           return;
         }
@@ -12616,9 +12701,9 @@ var require_client_h2 = __commonJS({
           request.aborted || request.completed || request.onData(chunk) === !1 && stream.pause();
         });
       }), stream.once("end", () => {
-        stream.removeAllListeners("data"), responseReceived ? (!request.aborted && !request.completed && request.onComplete({}), client[kQueue][client[kRunningIdx]++] = null, client[kResume]()) : (abort(new InformationalError("HTTP/2: stream half-closed (remote)")), client[kQueue][client[kRunningIdx]++] = null, client[kPendingIdx] = client[kRunningIdx], client[kResume]());
+        stream.removeAllListeners("data"), responseReceived ? (!request.aborted && !request.completed && request.onComplete({}), completeRequest(client, request), client[kResume]()) : (abort(new InformationalError("HTTP/2: stream half-closed (remote)")), completeRequest(client, request, !0), client[kResume]());
       }), stream.once("close", () => {
-        stream.removeAllListeners("data"), session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref();
+        stream.removeAllListeners("data"), session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref(), !request.aborted && !request.completed && abort(new InformationalError("HTTP/2: stream closed before the response was complete"));
       }), stream.once("error", function(err) {
         stream.removeAllListeners("data"), abort(err);
       }), stream.once("frameError", (type, code) => {
@@ -12626,7 +12711,7 @@ var require_client_h2 = __commonJS({
       }), stream.on("aborted", () => {
         stream.removeAllListeners("data");
       }), stream.on("timeout", () => {
-        let err = new InformationalError(`HTTP/2: "stream timeout after ${requestTimeout}"`);
+        let err = responseReceived ? new BodyTimeoutError(`HTTP/2: "body timeout after ${bodyTimeout}"`) : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${headersTimeout}"`);
         stream.removeAllListeners("data"), session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref(), abort(err);
       }), stream.once("trailers", (trailers) => {
         request.aborted || request.completed || (stream.removeAllListeners("data"), request.onComplete(trailers));
@@ -12962,7 +13047,7 @@ var require_client = __commonJS({
           let requests = this[kQueue].splice(this[kPendingIdx]);
           for (let i = 0; i < requests.length; i++) {
             let request = requests[i];
-            util.errorRequest(this, request, err);
+            request != null && util.errorRequest(this, request, err);
           }
           let callback = () => {
             this[kClosedResolve] && (this[kClosedResolve](), this[kClosedResolve] = null), resolve(null);
@@ -12977,7 +13062,7 @@ var require_client = __commonJS({
         let requests = client[kQueue].splice(client[kRunningIdx]);
         for (let i = 0; i < requests.length; i++) {
           let request = requests[i];
-          util.errorRequest(client, request, err);
+          request != null && util.errorRequest(client, request, err);
         }
         assert(client[kSize] === 0);
       }
@@ -13397,10 +13482,10 @@ var require_balanced_pool = __commonJS({
       return new Pool(origin, opts);
     }
     var BalancedPool = class extends PoolBase {
-      constructor(upstreams = [], { factory = defaultFactory, ...opts } = {}) {
+      constructor(upstreams = [], { factory = defaultFactory, connect, tls, ...opts } = {}) {
         if (typeof factory != "function")
           throw new InvalidArgumentError("factory must be a function.");
-        super(opts), this[kOptions] = { ...util.deepClone(opts) }, this[kOptions].interceptors = opts.interceptors ? { ...opts.interceptors } : void 0, this[kIndex] = -1, this[kCurrentWeight] = 0, this[kMaxWeightPerServer] = this[kOptions].maxWeightPerServer || 100, this[kErrorPenalty] = this[kOptions].errorPenalty || 15, Array.isArray(upstreams) || (upstreams = [upstreams]), this[kFactory] = factory;
+        super(opts), connect && typeof connect != "function" && (connect = { ...connect }), tls && typeof tls != "function" && (tls = { ...tls }), this[kOptions] = { ...util.deepClone(opts), connect, tls }, this[kOptions].interceptors = opts.interceptors ? { ...opts.interceptors } : void 0, this[kIndex] = -1, this[kCurrentWeight] = 0, this[kMaxWeightPerServer] = this[kOptions].maxWeightPerServer || 100, this[kErrorPenalty] = this[kOptions].errorPenalty || 15, Array.isArray(upstreams) || (upstreams = [upstreams]), this[kFactory] = factory;
         for (let upstream of upstreams)
           this.addUpstream(upstream);
         this._updateBalancedPoolStats();
@@ -14378,7 +14463,46 @@ var require_retry_handler = __commonJS({
           data: { count: retryCount }
         });
     }
-    var RetryHandler = class _RetryHandler {
+    var RetryController = class {
+      #paused = !1;
+      #target = null;
+      set target(target) {
+        this.#target = target, this.#paused && target?.pause();
+      }
+      get target() {
+        return this.#target;
+      }
+      pause() {
+        this.#paused = !0, this.#target?.pause();
+      }
+      resume() {
+        this.#paused = !1, this.#target?.resume();
+      }
+      abort(reason) {
+        this.#target?.abort(reason);
+      }
+      get paused() {
+        return this.#paused || (this.#target?.paused ?? !1);
+      }
+      get aborted() {
+        return this.#target?.aborted ?? !1;
+      }
+      get reason() {
+        return this.#target?.reason ?? null;
+      }
+      get rawHeaders() {
+        return this.#target?.rawHeaders ?? null;
+      }
+      set rawHeaders(value) {
+        this.#target && (this.#target.rawHeaders = value);
+      }
+      get rawTrailers() {
+        return this.#target?.rawTrailers ?? null;
+      }
+      set rawTrailers(value) {
+        this.#target && (this.#target.rawTrailers = value);
+      }
+    }, RetryHandler = class _RetryHandler {
       constructor(opts, { dispatch, handler }) {
         let { retryOptions, ...dispatchOpts } = opts, {
           // Retry scoped
@@ -14420,20 +14544,20 @@ var require_retry_handler = __commonJS({
             "EPIPE",
             "UND_ERR_SOCKET"
           ]
-        }, this.retryCount = 0, this.retryCountCheckpoint = 0, this.headersSent = !1, this.start = 0, this.end = null, this.etag = null;
+        }, this.retryCount = 0, this.retryCountCheckpoint = 0, this.headersSent = !1, this.start = 0, this.end = null, this.etag = null, this.controllerProxy = new RetryController();
       }
       onResponseStartWithRetry(controller, statusCode, headers, statusMessage, err) {
         if (this.retryOpts.throwOnError) {
-          this.retryOpts.statusCodes.includes(statusCode) === !1 ? (this.headersSent = !0, this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage)) : this.error = err;
+          this.retryOpts.statusCodes.includes(statusCode) === !1 ? this.headersSent ? this.handler.onResponseError?.(this.controllerProxy, err) : (this.headersSent = !0, this.checkpointResponseEnd(headers), this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)) : this.error = err;
           return;
         }
         if (isDisturbed(this.opts.body)) {
-          this.headersSent = !0, this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage);
+          this.headersSent = !0, this.checkpointResponseEnd(headers), this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage);
           return;
         }
         function shouldRetry(passedErr) {
           if (passedErr) {
-            this.headersSent = !0, this.handler.onResponseStart?.(controller, statusCode, headers, statusMessage), controller.resume();
+            this.headersSent ? this.handler.onResponseError?.(this.controllerProxy, passedErr) : (this.headersSent = !0, this.checkpointResponseEnd(headers), this.handler.onResponseStart?.(this.controllerProxy, statusCode, headers, statusMessage)), controller.resume();
             return;
           }
           this.error = err, controller.resume();
@@ -14447,11 +14571,20 @@ var require_retry_handler = __commonJS({
           shouldRetry.bind(this)
         );
       }
-      onRequestStart(controller, context) {
-        this.headersSent || this.handler.onRequestStart?.(controller, context);
+      checkpointResponseEnd(headers) {
+        if (this.end == null && this.opts.method !== "HEAD") {
+          let contentLength = headers["content-length"];
+          this.end = contentLength != null ? Number(contentLength) - 1 : null, assert(
+            this.end == null || Number.isFinite(this.end),
+            "invalid content-length"
+          ), this.resume = this.end != null;
+        }
       }
-      onRequestUpgrade(controller, statusCode, headers, socket) {
-        this.handler.onRequestUpgrade?.(controller, statusCode, headers, socket);
+      onRequestStart(controller, context) {
+        this.controllerProxy.target = controller, this.headersSent || this.handler.onRequestStart?.(this.controllerProxy, context);
+      }
+      onRequestUpgrade(_controller, statusCode, headers, socket) {
+        this.handler.onRequestUpgrade?.(this.controllerProxy, statusCode, headers, socket);
       }
       static [kRetryHandlerDefaultRetry](err, { state, opts }, cb) {
         let { statusCode, code, headers } = err, { method, retryOptions } = opts, {
@@ -14514,7 +14647,11 @@ var require_retry_handler = __commonJS({
             });
           validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount);
           let { start, size, end = size ? size - 1 : null } = contentRange;
-          assert(this.start === start, "content-range mismatch"), assert(this.end == null || this.end === end, "content-range mismatch");
+          if (this.start !== start || this.end != null && this.end !== end)
+            throw new RequestRetryError("Content-Range mismatch", statusCode, {
+              headers,
+              data: { count: this.retryCount }
+            });
           return;
         }
         if (this.end == null) {
@@ -14522,7 +14659,7 @@ var require_retry_handler = __commonJS({
             let range = parseRangeHeader(headers["content-range"]);
             if (range == null) {
               this.headersSent = !0, this.handler.onResponseStart?.(
-                controller,
+                this.controllerProxy,
                 statusCode,
                 headers,
                 statusMessage
@@ -14544,7 +14681,7 @@ var require_retry_handler = __commonJS({
             this.end == null || Number.isFinite(this.end),
             "invalid content-length"
           ), this.resume = !0, this.etag = headers.etag != null ? headers.etag : null, this.etag != null && this.etag[0] === "W" && this.etag[1] === "/" && (this.etag = null), this.headersSent = !0, this.handler.onResponseStart?.(
-            controller,
+            this.controllerProxy,
             statusCode,
             headers,
             statusMessage
@@ -14555,17 +14692,17 @@ var require_retry_handler = __commonJS({
             data: { count: this.retryCount }
           });
       }
-      onResponseData(controller, chunk) {
-        this.error || (this.start += chunk.length, this.handler.onResponseData?.(controller, chunk));
+      onResponseData(_controller, chunk) {
+        this.error || (this.start += chunk.length, this.handler.onResponseData?.(this.controllerProxy, chunk));
       }
-      onResponseEnd(controller, trailers) {
+      onResponseEnd(_controller, trailers) {
         if (this.error && this.retryOpts.throwOnError)
           throw this.error;
         if (!this.error)
-          return this.retryCount = 0, this.handler.onResponseEnd?.(controller, trailers);
-        this.retry(controller);
+          return this.retryCount = 0, this.handler.onResponseEnd?.(this.controllerProxy, trailers);
+        this.retry();
       }
-      retry(controller) {
+      retry() {
         if (this.start !== 0) {
           let headers = { range: `bytes=${this.start}-${this.end ?? ""}` };
           this.etag != null && (headers["if-match"] = this.etag), this.opts = {
@@ -14579,20 +14716,20 @@ var require_retry_handler = __commonJS({
         try {
           this.retryCountCheckpoint = this.retryCount, this.dispatch(this.opts, this);
         } catch (err) {
-          this.handler.onResponseError?.(controller, err);
+          this.handler.onResponseError?.(this.controllerProxy, err);
         }
       }
       onResponseError(controller, err) {
-        if (controller?.aborted || isDisturbed(this.opts.body)) {
-          this.handler.onResponseError?.(controller, err);
+        if (controller?.aborted || isDisturbed(this.opts.body) || this.headersSent && !this.resume) {
+          this.handler.onResponseError?.(this.controllerProxy, err);
           return;
         }
         function shouldRetry(returnedErr) {
           if (!returnedErr) {
-            this.retry(controller);
+            this.retry();
             return;
           }
-          this.handler?.onResponseError?.(controller, returnedErr);
+          this.handler?.onResponseError?.(this.controllerProxy, returnedErr);
         }
         this.retryCount - this.retryCountCheckpoint > 0 ? this.retryCount = this.retryCountCheckpoint + (this.retryCount - this.retryCountCheckpoint) : this.retryCount += 1, this.retryOpts.retry(
           err,
@@ -17120,7 +17257,6 @@ var require_dump = __commonJS({
       #maxSize = 1024 * 1024;
       #dumped = !1;
       #size = 0;
-      #controller = null;
       aborted = !1;
       reason = !1;
       constructor({ maxSize, signal }, handler) {
@@ -17132,7 +17268,7 @@ var require_dump = __commonJS({
         this.aborted = !0, this.reason = reason;
       }
       onRequestStart(controller, context) {
-        return controller.abort = this.#abort.bind(this), this.#controller = controller, super.onRequestStart(controller, context);
+        return controller.abort = this.#abort.bind(this), super.onRequestStart(controller, context);
       }
       onResponseStart(controller, statusCode, headers, statusMessage) {
         let contentLength = headers["content-length"];
@@ -17143,19 +17279,21 @@ var require_dump = __commonJS({
         return this.aborted === !0 ? !0 : super.onResponseStart(controller, statusCode, headers, statusMessage);
       }
       onResponseError(controller, err) {
-        this.#dumped || (err = this.#controller?.reason ?? err, super.onResponseError(controller, err));
+        super.onResponseError(controller, this.aborted === !0 ? this.reason : err);
       }
       onResponseData(controller, chunk) {
-        return this.#size = this.#size + chunk.length, this.#size >= this.#maxSize && (this.#dumped = !0, this.aborted === !0 ? super.onResponseError(controller, this.reason) : super.onResponseEnd(controller, {})), !0;
+        if (this.#size = this.#size + chunk.length, this.#size > this.#maxSize)
+          throw new RequestAbortedError(
+            `Response size (${this.#size}) larger than maxSize (${this.#maxSize})`
+          );
+        return this.#size === this.#maxSize && (this.#dumped = !0), !0;
       }
       onResponseEnd(controller, trailers) {
-        if (!this.#dumped) {
-          if (this.#controller.aborted === !0) {
-            super.onResponseError(controller, this.reason);
-            return;
-          }
-          super.onResponseEnd(controller, trailers);
+        if (this.aborted === !0) {
+          super.onResponseError(controller, this.reason);
+          return;
         }
+        super.onResponseEnd(controller, this.#dumped ? {} : trailers);
       }
     };
     function createDumpInterceptor({ maxSize: defaultMaxSize } = {
@@ -18328,11 +18466,13 @@ var require_cache_handler = __commonJS({
         ), handler = this;
         if (!arrayIncludes(util.safeHTTPMethods, this.#cacheKey.method) && statusCode >= 200 && statusCode <= 399)
           return invalidateUnsafeRequest(this.#store, this.#cacheKey, resHeaders), downstreamOnHeaders();
-        let cacheControlHeader = resHeaders["cache-control"], heuristicallyCacheable = resHeaders["last-modified"] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode);
+        let cacheControlHeader = resHeaders["cache-control"], cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {};
+        if (revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives))
+          return deleteCachedValue(this.#store, this.#cacheKey), downstreamOnHeaders();
+        let heuristicallyCacheable = resHeaders["last-modified"] && arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode);
         if (!cacheControlHeader && !resHeaders.expires && !heuristicallyCacheable && !this.#cacheByDefault)
           return statusCode === 304 && resHeaders.vary && isInvalidOrWildcardVaryHeader(resHeaders.vary) && deleteCachedValue(this.#store, this.#cacheKey), downstreamOnHeaders();
-        let cacheControlDirectives = cacheControlHeader ? parseCacheControlHeader(cacheControlHeader) : {};
-        if (!canCacheResponse(this.#cacheType, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers))
+        if (!canCacheResponse(this.#cacheType, this.#cacheKey.method, statusCode, resHeaders, cacheControlDirectives, this.#cacheKey.headers))
           return statusCode === 304 && (cacheControlHeader || revalidationResponseDisallowsCachedReuse(this.#cacheType, resHeaders, cacheControlDirectives)) && deleteCachedValue(this.#store, this.#cacheKey), downstreamOnHeaders();
         let now = Date.now(), resAge = Object.hasOwn(resHeaders, "age") ? getAge(resHeaders.age) : void 0;
         if (resAge !== void 0 && resAge >= MAX_RESPONSE_AGE)
@@ -18422,11 +18562,11 @@ var require_cache_handler = __commonJS({
       statusCode === 304 && deleteCachedValue(store, cacheKey);
     }
     function revalidationResponseDisallowsCachedReuse(cacheType, resHeaders, cacheControlDirectives) {
-      return cacheControlDirectives["no-store"] === !0 || cacheType === "shared" && cacheControlDirectives.private === !0 || (resHeaders.vary ? isInvalidOrWildcardVaryHeader(resHeaders.vary) : !1);
+      return cacheControlDirectives["no-store"] === !0 || cacheType === "shared" && (cacheControlDirectives.private === !0 || Object.hasOwn(resHeaders, "set-cookie")) || (resHeaders.vary ? isInvalidOrWildcardVaryHeader(resHeaders.vary) : !1);
     }
-    function canCacheResponse(cacheType, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
-      return !(statusCode < 200 || arrayIncludes(NOT_UNDERSTOOD_STATUS_CODES, statusCode) || !arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode) && !resHeaders.expires && !cacheControlDirectives.public && cacheControlDirectives["max-age"] === void 0 && // RFC 9111: a private response directive, if the cache is not shared
-      !(cacheControlDirectives.private && cacheType === "private") && !(cacheControlDirectives["s-maxage"] !== void 0 && cacheType === "shared") || cacheControlDirectives["no-store"] || cacheType === "shared" && cacheControlDirectives.private === !0 || resHeaders.vary && hasVaryStar(resHeaders.vary) || reqHeaders != null && Object.hasOwn(reqHeaders, "authorization") && (!cacheControlDirectives.public && !cacheControlDirectives["s-maxage"] && !cacheControlDirectives["must-revalidate"] || typeof reqHeaders.authorization != "string" || Array.isArray(cacheControlDirectives["no-cache"]) && arrayIncludes(cacheControlDirectives["no-cache"], "authorization") || Array.isArray(cacheControlDirectives.private) && arrayIncludes(cacheControlDirectives.private, "authorization")));
+    function canCacheResponse(cacheType, method, statusCode, resHeaders, cacheControlDirectives, reqHeaders) {
+      return !(!arrayIncludes(util.safeHTTPMethods, method) || statusCode < 200 || arrayIncludes(NOT_UNDERSTOOD_STATUS_CODES, statusCode) || !arrayIncludes(HEURISTICALLY_CACHEABLE_STATUS_CODES, statusCode) && !resHeaders.expires && !cacheControlDirectives.public && cacheControlDirectives["max-age"] === void 0 && // RFC 9111: a private response directive, if the cache is not shared
+      !(cacheControlDirectives.private && cacheType === "private") && !(cacheControlDirectives["s-maxage"] !== void 0 && cacheType === "shared") || cacheControlDirectives["no-store"] || cacheType === "shared" && (cacheControlDirectives.private === !0 || Object.hasOwn(resHeaders, "set-cookie")) || resHeaders.vary && hasVaryStar(resHeaders.vary) || reqHeaders != null && Object.hasOwn(reqHeaders, "authorization") && (!cacheControlDirectives.public && !cacheControlDirectives["s-maxage"] && !cacheControlDirectives["must-revalidate"] || typeof reqHeaders.authorization != "string" || Array.isArray(cacheControlDirectives["no-cache"]) && arrayIncludes(cacheControlDirectives["no-cache"], "authorization") || Array.isArray(cacheControlDirectives.private) && arrayIncludes(cacheControlDirectives.private, "authorization")));
     }
     function getDate(dateHeader) {
       let dateValue = dateHeader;
@@ -18788,7 +18928,7 @@ var require_cache2 = __commonJS({
       result.cacheControlDirectives?.["s-maxage"] !== void 0);
     }
     function revalidationResponseDisallowsCachedReuse(cacheType, headers) {
-      if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary))
+      if (headers.vary && isInvalidOrWildcardVaryHeader(headers.vary) || cacheType === "shared" && Object.hasOwn(headers, "set-cookie"))
         return !0;
       let cacheControl = headers["cache-control"];
       if (!cacheControl)
@@ -18899,6 +19039,8 @@ var require_cache2 = __commonJS({
     function handleResult(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl, result) {
       if (!result)
         return handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl);
+      if (globalOpts.type === "shared" && Object.hasOwn(result.headers, "set-cookie"))
+        return util.isStream(result.body) && result.body.on("error", nop).destroy(), deleteCachedValue(globalOpts.store, cacheKey), handleUncachedResponse(dispatch, globalOpts, cacheKey, handler, opts, reqCacheControl);
       let now = Date.now();
       if (now > result.deleteAt)
         return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler));
@@ -19011,7 +19153,10 @@ var require_cache2 = __commonJS({
         let reqCacheControl = opts2.headers?.["cache-control"] ? parseCacheControlHeader(opts2.headers["cache-control"]) : hasPragmaNoCache(opts2.headers) ? { "no-cache": !0 } : void 0;
         if (reqCacheControl?.["no-store"])
           return dispatch(opts2, handler);
-        let cacheKey = makeCacheKey(opts2), result = store.get(cacheKey);
+        let cacheKey = makeCacheKey(opts2);
+        if (!arrayIncludes(util.safeHTTPMethods, opts2.method))
+          return dispatch(opts2, new CacheHandler(globalOpts, cacheKey, handler));
+        let result = store.get(cacheKey);
         return result && typeof result.then == "function" ? result.then((result2) => handleResult(
           dispatch,
           globalOpts,
@@ -19038,7 +19183,45 @@ var require_cache2 = __commonJS({
 var require_decompress = __commonJS({
   "node_modules/undici/lib/interceptor/decompress.js"(exports2, module2) {
     "use strict";
-    var { createInflate, createGunzip, createBrotliDecompress, createZstdDecompress } = require("node:zlib"), { pipeline } = require("node:stream"), DecoratorHandler = require_decorator_handler(), { runtimeFeatures } = require_runtime_features(), supportedEncodings = {
+    var { createInflate, createGunzip, createBrotliDecompress, createZstdDecompress } = require("node:zlib"), { pipeline, Transform: TransformStream2 } = require("node:stream"), { InvalidArgumentError, ResponseExceededMaxSizeError } = require_errors(), DecoratorHandler = require_decorator_handler(), { runtimeFeatures } = require_runtime_features(), DecompressController = class {
+      #onPause;
+      #onResume;
+      #onAbort;
+      #paused = !1;
+      constructor(onPause, onResume, onAbort) {
+        this.#onPause = onPause, this.#onResume = onResume, this.#onAbort = onAbort, this.target = null;
+      }
+      pause() {
+        this.#paused || (this.#paused = !0, this.#onPause());
+      }
+      resume() {
+        this.#paused && (this.#paused = !1, this.#onResume());
+      }
+      abort(reason) {
+        this.target?.abort(reason), this.#onAbort(reason);
+      }
+      get paused() {
+        return this.#paused;
+      }
+      get aborted() {
+        return this.target?.aborted ?? !1;
+      }
+      get reason() {
+        return this.target?.reason ?? null;
+      }
+      get rawHeaders() {
+        return this.target?.rawHeaders ?? null;
+      }
+      set rawHeaders(value) {
+        this.target && (this.target.rawHeaders = value);
+      }
+      get rawTrailers() {
+        return this.target?.rawTrailers ?? null;
+      }
+      set rawTrailers(value) {
+        this.target && (this.target.rawTrailers = value);
+      }
+    }, supportedEncodings = {
       gzip: createGunzip,
       "x-gzip": createGunzip,
       br: createBrotliDecompress,
@@ -19049,18 +19232,116 @@ var require_decompress = __commonJS({
     }, defaultSkipStatusCodes = (
       /** @type {const} */
       [204, 304]
-    ), warningEmitted = (
+    ), defaultMaxSize = 0;
+    function createMaxSizeLimiter(maxSize) {
+      let size = 0;
+      return new TransformStream2({
+        transform(chunk, _encoding, callback) {
+          let decompressedSize = size + chunk.length;
+          if (decompressedSize > maxSize) {
+            callback(new ResponseExceededMaxSizeError(
+              `Decompressed response size (${decompressedSize}) exceeded maxSize (${maxSize})`
+            ));
+            return;
+          }
+          size = decompressedSize, callback(null, chunk);
+        }
+      });
+    }
+    var warningEmitted = (
       /** @type {boolean} */
       !1
     ), DecompressHandler = class extends DecoratorHandler {
       /** @type {Transform[]} */
       #decompressors = [];
+      /** @type {Record<string, string | string[]> | undefined} */
+      #trailers;
       /** @type {Readonly<number[]>} */
       #skipStatusCodes;
       /** @type {boolean} */
       #skipErrorResponses;
-      constructor(handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = !0 } = {}) {
-        super(handler), this.#skipStatusCodes = skipStatusCodes, this.#skipErrorResponses = skipErrorResponses;
+      /** @type {number} */
+      #maxSize;
+      /** @type {number} */
+      #decompressedSize = 0;
+      /** @type {boolean} */
+      #terminated = !1;
+      /** @type {boolean} */
+      #inputEnded = !1;
+      /** @type {boolean} */
+      #inputBackpressured = !1;
+      /** @type {boolean} */
+      #upstreamPaused = !1;
+      /** @type {boolean} */
+      #draining = !1;
+      /** @type {boolean} */
+      #drainRequested = !1;
+      /** @type {boolean} */
+      #completionPending = !1;
+      /** @type {DecompressorStream | undefined} */
+      #finalDecompressor;
+      /** @type {DecompressController} */
+      #controller;
+      constructor(handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = !0, maxSize = defaultMaxSize } = {}) {
+        if (!Number.isSafeInteger(maxSize) || maxSize < 0)
+          throw new InvalidArgumentError("maxSize must be a non-negative integer");
+        super(handler), this.#skipStatusCodes = skipStatusCodes, this.#skipErrorResponses = skipErrorResponses, this.#maxSize = maxSize, this.#controller = new DecompressController(
+          () => this.#onDownstreamPause(),
+          () => this.#onDownstreamResume(),
+          (reason) => {
+            this.#inputEnded && !this.#terminated && this.onResponseError(this.#controller, reason);
+          }
+        );
+      }
+      #onDownstreamPause() {
+        this.#pauseUpstream();
+      }
+      #onDownstreamResume() {
+        let drainWasDeferred = this.#draining;
+        this.#drainOutput(), drainWasDeferred || (this.#resumeUpstreamIfNeeded(), this.#finishIfReady());
+      }
+      #pauseUpstream() {
+        !this.#upstreamPaused && !this.#terminated && (this.#upstreamPaused = !0, this.#controller.target?.pause());
+      }
+      #resumeUpstreamIfNeeded() {
+        this.#upstreamPaused && !this.#controller.paused && !this.#inputBackpressured && (this.#upstreamPaused = !1, this.#inputEnded || this.#controller.target?.resume());
+      }
+      #drainOutput() {
+        if (!(this.#terminated || this.#controller.paused || !this.#finalDecompressor)) {
+          if (this.#draining) {
+            this.#drainRequested = !0;
+            return;
+          }
+          this.#draining = !0;
+          try {
+            do {
+              this.#drainRequested = !1;
+              let chunk;
+              for (; !this.#terminated && !this.#controller.paused && (chunk = this.#finalDecompressor.read()) !== null; ) {
+                if (this.#maxSize > 0) {
+                  let decompressedSize = this.#decompressedSize + chunk.length;
+                  if (decompressedSize > this.#maxSize) {
+                    this.#fail(new ResponseExceededMaxSizeError(
+                      `Decompressed response size (${decompressedSize}) exceeded maxSize (${this.#maxSize})`
+                    ));
+                    return;
+                  }
+                  this.#decompressedSize = decompressedSize;
+                }
+                super.onResponseData(this.#controller, chunk) === !1 && !this.#controller.paused && this.#controller.pause();
+              }
+            } while (this.#drainRequested && !this.#terminated && !this.#controller.paused);
+          } finally {
+            this.#draining = !1;
+          }
+          this.#resumeUpstreamIfNeeded(), this.#finishIfReady();
+        }
+      }
+      #finishIfReady() {
+        this.#terminated || !this.#completionPending || this.#controller.paused || this.#draining || (this.#terminated = !0, this.#cleanupDecompressors(), super.onResponseEnd(this.#controller, this.#trailers));
+      }
+      #onDecompressionEnd() {
+        this.#terminated || (this.#completionPending = !0, this.#drainOutput(), this.#finishIfReady());
       }
       /**
        * Determines if decompression should be skipped based on encoding and status code
@@ -19075,7 +19356,7 @@ var require_decompress = __commonJS({
        * Creates a chain of decompressors for multiple content encodings
        *
        * @param {string} encodings - Comma-separated list of content encodings
-       * @returns {Array<DecompressorStream>} - Array of decompressor streams
+       * @returns {Array<Transform>} - Array of decompressor and limiting streams
        * @throws {Error} - If the number of content-encodings exceeds the maximum allowed
        */
       #createDecompressionChain(encodings) {
@@ -19091,47 +19372,56 @@ var require_decompress = __commonJS({
             decompressors.push(supportedEncodings[encoding]());
           }
         }
-        return decompressors;
+        if (decompressors.length < 2)
+          return decompressors;
+        let streams = [];
+        for (let i = 0; i < decompressors.length; i++)
+          streams.push(decompressors[i]), i < decompressors.length - 1 && this.#maxSize > 0 && streams.push(createMaxSizeLimiter(this.#maxSize));
+        return streams;
       }
       /**
-       * Sets up event handlers for a decompressor stream using readable events
-       * @param {DecompressorStream} decompressor - The decompressor stream
-       * @param {Controller} controller - The controller to coordinate with
+       * Stops decompression and reports an error.
+       * @param {Error} error - The decompression error
        * @returns {void}
        */
-      #setupDecompressorEvents(decompressor, controller) {
-        decompressor.on("readable", () => {
-          let chunk;
-          for (; (chunk = decompressor.read()) !== null && super.onResponseData(controller, chunk) !== !1; )
-            ;
-        }), decompressor.on("error", (error) => {
-          super.onResponseError(controller, error);
-        });
+      #fail(error) {
+        this.#terminated || (this.#inputEnded ? this.onResponseError(this.#controller, error) : this.#controller.abort(error));
+      }
+      /**
+       * Sets up event handlers for the final decompressor stream.
+       * @param {DecompressorStream} decompressor - The decompressor stream
+       * @returns {void}
+       */
+      #setupDecompressorEvents(decompressor) {
+        this.#finalDecompressor = decompressor, decompressor.on("readable", () => this.#drainOutput()), decompressor.on("error", (error) => this.#fail(error));
       }
       /**
        * Sets up event handling for a single decompressor
-       * @param {Controller} controller - The controller to handle events
        * @returns {void}
        */
-      #setupSingleDecompressor(controller) {
+      #setupSingleDecompressor() {
         let decompressor = this.#decompressors[0];
-        this.#setupDecompressorEvents(decompressor, controller), decompressor.on("end", () => {
-          super.onResponseEnd(controller, {});
-        });
+        this.#setupDecompressorEvents(decompressor), decompressor.on("end", () => this.#onDecompressionEnd());
       }
       /**
        * Sets up event handling for multiple chained decompressors using pipeline
-       * @param {Controller} controller - The controller to handle events
        * @returns {void}
        */
-      #setupMultipleDecompressors(controller) {
+      #setupMultipleDecompressors() {
         let lastDecompressor = this.#decompressors[this.#decompressors.length - 1];
-        this.#setupDecompressorEvents(lastDecompressor, controller), pipeline(this.#decompressors, (err) => {
-          if (err) {
-            super.onResponseError(controller, err);
-            return;
+        this.#setupDecompressorEvents(lastDecompressor), pipeline(this.#decompressors, (err) => {
+          if (!this.#terminated) {
+            if (err) {
+              this.#fail(err);
+              return;
+            }
+            this.#onDecompressionEnd();
           }
-          super.onResponseEnd(controller, {});
+        });
+      }
+      #setupInputBackpressure() {
+        this.#decompressors[0].on("drain", () => {
+          this.#terminated || (this.#inputBackpressured = !1, this.#controller.paused || (this.#drainOutput(), this.#resumeUpstreamIfNeeded()));
         });
       }
       /**
@@ -19139,7 +19429,13 @@ var require_decompress = __commonJS({
        * @returns {void}
        */
       #cleanupDecompressors() {
-        this.#decompressors.length = 0;
+        this.#decompressors.length = 0, this.#finalDecompressor = void 0;
+      }
+      onRequestStart(controller, context) {
+        return this.#controller.target = controller, super.onRequestStart(this.#controller, context);
+      }
+      onRequestUpgrade(controller, statusCode, headers, socket) {
+        return super.onRequestUpgrade(this.#controller, statusCode, headers, socket);
       }
       /**
        * @param {Controller} controller
@@ -19151,13 +19447,28 @@ var require_decompress = __commonJS({
       onResponseStart(controller, statusCode, headers, statusMessage) {
         let contentEncoding = headers["content-encoding"];
         if (this.#shouldSkipDecompression(contentEncoding, statusCode))
-          return super.onResponseStart(controller, statusCode, headers, statusMessage);
+          return super.onResponseStart(this.#controller, statusCode, headers, statusMessage);
         let decompressors = this.#createDecompressionChain(contentEncoding.toLowerCase());
         if (decompressors.length === 0)
-          return this.#cleanupDecompressors(), super.onResponseStart(controller, statusCode, headers, statusMessage);
+          return this.#cleanupDecompressors(), super.onResponseStart(this.#controller, statusCode, headers, statusMessage);
         this.#decompressors = decompressors;
         let { "content-encoding": _, "content-length": __, ...newHeaders } = headers;
-        return this.#decompressors.length === 1 ? this.#setupSingleDecompressor(controller) : this.#setupMultipleDecompressors(controller), super.onResponseStart(controller, statusCode, newHeaders, statusMessage);
+        if (this.#controller.rawHeaders) {
+          let rawHeaders = this.#controller.rawHeaders;
+          if (Array.isArray(rawHeaders)) {
+            let filteredHeaders = [];
+            for (let i = 0; i < rawHeaders.length; i += 2) {
+              let headerName = rawHeaders[i], lowerName = (Buffer.isBuffer(headerName) ? headerName.toString("latin1") : `${headerName}`).toLowerCase();
+              lowerName === "content-encoding" || lowerName === "content-length" || filteredHeaders.push(rawHeaders[i], rawHeaders[i + 1]);
+            }
+            rawHeaders.splice(0, rawHeaders.length, ...filteredHeaders);
+          } else if (typeof rawHeaders == "object")
+            for (let name of Object.keys(rawHeaders)) {
+              let lowerName = name.toLowerCase();
+              (lowerName === "content-encoding" || lowerName === "content-length") && delete rawHeaders[name];
+            }
+        }
+        return this.#setupInputBackpressure(), this.#decompressors.length === 1 ? this.#setupSingleDecompressor() : this.#setupMultipleDecompressors(), super.onResponseStart(this.#controller, statusCode, newHeaders, statusMessage);
       }
       /**
        * @param {Controller} controller
@@ -19166,10 +19477,10 @@ var require_decompress = __commonJS({
        */
       onResponseData(controller, chunk) {
         if (this.#decompressors.length > 0) {
-          this.#decompressors[0].write(chunk);
+          this.#decompressors[0].write(chunk) || (this.#inputBackpressured = !0, this.#pauseUpstream());
           return;
         }
-        super.onResponseData(controller, chunk);
+        return super.onResponseData(this.#controller, chunk);
       }
       /**
        * @param {Controller} controller
@@ -19178,10 +19489,10 @@ var require_decompress = __commonJS({
        */
       onResponseEnd(controller, trailers) {
         if (this.#decompressors.length > 0) {
-          this.#decompressors[0].end(), this.#cleanupDecompressors();
+          this.#inputEnded = !0, this.#trailers = trailers, this.#decompressors[0].end();
           return;
         }
-        super.onResponseEnd(controller, trailers);
+        return super.onResponseEnd(this.#controller, trailers);
       }
       /**
        * @param {Controller} controller
@@ -19189,12 +19500,12 @@ var require_decompress = __commonJS({
        * @returns {void}
        */
       onResponseError(controller, err) {
-        if (this.#decompressors.length > 0) {
+        if (!this.#terminated) {
+          this.#terminated = !0;
           for (let decompressor of this.#decompressors)
-            decompressor.destroy(err);
-          this.#cleanupDecompressors();
+            decompressor.destroy();
+          this.#cleanupDecompressors(), super.onResponseError(this.#controller, err);
         }
-        super.onResponseError(controller, err);
       }
     };
     function createDecompressInterceptor(options = {}) {
@@ -23237,40 +23548,43 @@ var require_connection = __commonJS({
         processResponse(response) {
           if (response.type === "error" || response.status !== 101) {
             if (response.socket?.session == null) {
-              failWebsocketConnection(handler, 1002, "Received network error or non-101 status code.", response.error);
+              failHandshake(handler, response, 1002, "Received network error or non-101 status code.", response.error);
               return;
             }
             if (response.status !== 200) {
-              failWebsocketConnection(handler, 1002, "Received network error or non-200 status code.", response.error);
+              failHandshake(handler, response, 1002, "Received network error or non-200 status code.", response.error);
               return;
             }
           }
           if (warningEmitted === !1 && response.socket?.session != null && (process.emitWarning("WebSocket over HTTP2 is experimental, and subject to change.", "ExperimentalWarning"), warningEmitted = !0), protocols.length !== 0 && !response.headersList.get("Sec-WebSocket-Protocol")) {
-            failWebsocketConnection(handler, 1002, "Server did not respond with sent protocols.");
+            failHandshake(handler, response, 1002, "Server did not respond with sent protocols.");
             return;
           }
           if (response.socket.session == null && response.headersList.get("Upgrade")?.toLowerCase() !== "websocket") {
-            failWebsocketConnection(handler, 1002, 'Server did not set Upgrade header to "websocket".');
+            failHandshake(handler, response, 1002, 'Server did not set Upgrade header to "websocket".');
             return;
           }
           if (response.socket.session == null && response.headersList.get("Connection")?.toLowerCase() !== "upgrade") {
-            failWebsocketConnection(handler, 1002, 'Server did not set Connection header to "upgrade".');
+            failHandshake(handler, response, 1002, 'Server did not set Connection header to "upgrade".');
             return;
           }
           let secWSAccept = response.headersList.get("Sec-WebSocket-Accept"), digest = crypto.hash("sha1", keyValue + uid, "base64");
           if (secWSAccept !== digest) {
-            failWebsocketConnection(handler, 1002, "Incorrect hash received in Sec-WebSocket-Accept header.");
+            failHandshake(handler, response, 1002, "Incorrect hash received in Sec-WebSocket-Accept header.");
             return;
           }
           let secExtension = response.headersList.get("Sec-WebSocket-Extensions"), extensions;
           if (secExtension !== null && (extensions = parseExtensions(secExtension), !extensions.has("permessage-deflate"))) {
-            failWebsocketConnection(handler, 1002, "Sec-WebSocket-Extensions header does not match.");
+            failHandshake(handler, response, 1002, "Sec-WebSocket-Extensions header does not match.");
             return;
           }
           let secProtocol = response.headersList.get("Sec-WebSocket-Protocol");
-          if (secProtocol !== null && !getDecodeSplit("sec-websocket-protocol", request.headersList).includes(secProtocol)) {
-            failWebsocketConnection(handler, 1002, "Protocol was not set in the opening handshake.");
-            return;
+          if (secProtocol !== null) {
+            let requestProtocols = getDecodeSplit("sec-websocket-protocol", request.headersList);
+            if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
+              failHandshake(handler, response, 1002, "Protocol was not set in the opening handshake.");
+              return;
+            }
           }
           response.socket.on("data", handler.onSocketData), response.socket.on("close", handler.onSocketClose), response.socket.on("error", handler.onSocketError), handler.wasEverConnected = !0, handler.onConnectionEstablished(response, extensions);
         }
@@ -23285,6 +23599,9 @@ var require_connection = __commonJS({
           reason.length !== 0 && code === null && (code = 1e3), assert(code === null || Number.isInteger(code)), code === null && reason.length === 0 ? frame.frameData = emptyBuffer : code !== null && reason === null ? (frame.frameData = Buffer.allocUnsafe(2), frame.frameData.writeUInt16BE(code, 0)) : code !== null && reason !== null ? (frame.frameData = Buffer.allocUnsafe(2 + Buffer.byteLength(reason)), frame.frameData.writeUInt16BE(code, 0), frame.frameData.write(reason, 2, "utf-8")) : frame.frameData = emptyBuffer, object.socket.write(frame.createFrame(opcodes.CLOSE)), object.closeState.add(sentCloseFrameState.SENT), object.readyState = states.CLOSING;
         } else
           object.readyState = states.CLOSING;
+    }
+    function failHandshake(handler, response, code, reason, cause) {
+      response.socket?.session != null && !response.socket.destroyed && response.socket.destroy(), failWebsocketConnection(handler, code, reason, cause);
     }
     function failWebsocketConnection(handler, code, reason, cause) {
       isEstablished(handler.readyState) && closeWebSocketConnection(handler, code, reason, !1), handler.controller.abort(), isConnecting(handler.readyState) ? handler.onSocketClose() : handler.socket?.destroyed === !1 && handler.socket.destroy();
@@ -23336,7 +23653,7 @@ var require_permessage_deflate2 = __commonJS({
           }
           this.#inflate[kBuffer] = [], this.#inflate[kLength] = 0, this.#inflate.on("data", (data) => {
             if (this.#inflate[kLength] += data.length, this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
-              callback(new MessageSizeExceededError()), this.#inflate.removeAllListeners(), this.#inflate = null;
+              callback(new MessageSizeExceededError()), this.#inflate.removeAllListeners(), this.#inflate.destroy(), this.#inflate = null;
               return;
             }
             this.#inflate[kBuffer].push(data);
@@ -24078,9 +24395,9 @@ var require_websocketstream = __commonJS({
       #readableStream;
       /** @type {ReadableStreamDefaultController} */
       #readableStreamController;
-      // Each WebSocketStream object has an associated writable stream , which is a WritableStream .
-      /** @type {WritableStream} */
-      #writableStream;
+      // Retain the controller so the writable stream can be errored while locked.
+      /** @type {WritableStreamDefaultController} */
+      #writableStreamController;
       // Each WebSocketStream object has an associated boolean handshake aborted , which is initially false.
       #handshakeAborted = !1;
       /** @type {import('../websocket').Handler} */
@@ -24191,11 +24508,14 @@ var require_websocketstream = __commonJS({
           },
           cancel: (reason) => this.#cancel(reason)
         }), writable = new WritableStream({
+          start: (controller) => {
+            this.#writableStreamController = controller;
+          },
           write: (chunk) => this.#write(chunk),
           close: () => closeWebSocketConnection(this.#handler, null, null),
           abort: (reason) => this.#closeUsingReason(reason)
         });
-        this.#readableStream = readable, this.#writableStream = writable, this.#openedPromise.resolve({
+        this.#readableStream = readable, this.#openedPromise.resolve({
           extensions,
           protocol,
           readable,
@@ -24227,13 +24547,13 @@ var require_websocketstream = __commonJS({
         !this.#handler.closeState.has(sentCloseFrameState.SENT) && !this.#handler.closeState.has(sentCloseFrameState.RECEIVED) && (code = 1006);
         let reason = result?.reason == null ? "" : utf8DecodeBytes(Buffer.from(result.reason));
         if (wasClean)
-          this.#readableStreamController.close(), this.#writableStream.locked || this.#writableStream.abort(new DOMException("A closed WebSocketStream cannot be written to", "InvalidStateError")), this.#closedPromise.resolve({
+          this.#readableStreamController.close(), this.#writableStreamController.error(new DOMException("A closed WebSocketStream cannot be written to", "InvalidStateError")), this.#closedPromise.resolve({
             closeCode: code,
             reason
           });
         else {
           let error = createUnvalidatedWebSocketError("unclean close", code, reason);
-          this.#readableStreamController?.error(error), this.#writableStream?.abort(error), this.#closedPromise.reject(error);
+          this.#readableStreamController?.error(error), this.#writableStreamController?.error(error), this.#closedPromise.reject(error);
         }
       }
       #closeUsingReason(reason) {
@@ -24311,7 +24631,30 @@ var require_util6 = __commonJS({
 var require_eventsource_stream = __commonJS({
   "node_modules/undici/lib/web/eventsource/eventsource-stream.js"(exports2, module2) {
     "use strict";
-    var { Transform } = require("node:stream"), { isASCIINumber, isValidLastEventId } = require_util6(), BOM = [239, 187, 191], LF = 10, CR = 13, COLON = 58, SPACE = 32, EventSourceStream = class extends Transform {
+    var { Transform } = require("node:stream"), { isASCIINumber, isValidLastEventId } = require_util6(), BOM = [239, 187, 191], LF = 10, CR = 13, COLON = 58, SPACE = 32, DATA = Buffer.from("data"), EVENT = Buffer.from("event"), ID = Buffer.from("id"), RETRY = Buffer.from("retry");
+    function isASCIINumberBytes(buffer, start) {
+      if (start >= buffer.length)
+        return !1;
+      for (let i = start; i < buffer.length; i++)
+        if (buffer[i] < 48 || buffer[i] > 57)
+          return !1;
+      return !0;
+    }
+    function isValidLastEventIdBytes(buffer, start) {
+      for (let i = start; i < buffer.length; i++)
+        if (buffer[i] === 0)
+          return !1;
+      return !0;
+    }
+    function isFieldName(line, length, field) {
+      if (length !== field.length)
+        return !1;
+      for (let i = 0; i < length; i++)
+        if (line[i] !== field[i])
+          return !1;
+      return !0;
+    }
+    var EventSourceStream = class extends Transform {
       /**
        * @type {eventSourceSettings}
        */
@@ -24330,10 +24673,13 @@ var require_eventsource_stream = __commonJS({
        */
       eventEndCheck = !1;
       /**
-       * @type {Buffer|null}
+       * @type {Buffer[]}
        */
-      buffer = null;
+      chunks = [];
+      chunkIndex = 0;
       pos = 0;
+      lineChunkIndex = 0;
+      linePos = 0;
       event = {
         data: void 0,
         event: void 0,
@@ -24360,54 +24706,32 @@ var require_eventsource_stream = __commonJS({
           callback();
           return;
         }
-        if (this.buffer ? this.buffer = Buffer.concat([this.buffer, chunk]) : this.buffer = chunk, this.checkBOM)
-          switch (this.buffer.length) {
-            case 1:
-              if (this.buffer[0] === BOM[0]) {
-                callback();
-                return;
-              }
-              this.checkBOM = !1, callback();
-              return;
-            case 2:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1]) {
-                callback();
-                return;
-              }
-              this.checkBOM = !1;
-              break;
-            case 3:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2]) {
-                this.buffer = Buffer.alloc(0), this.checkBOM = !1, callback();
-                return;
-              }
-              this.checkBOM = !1;
-              break;
-            default:
-              this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2] && (this.buffer = this.buffer.subarray(3)), this.checkBOM = !1;
-              break;
-          }
-        for (; this.pos < this.buffer.length; ) {
+        if (this.chunks.push(chunk), this.checkBOM && this.handleBOM()) {
+          callback();
+          return;
+        }
+        for (; this.hasCurrentByte(); ) {
+          let byte = this.currentByte();
           if (this.eventEndCheck) {
             if (this.crlfCheck) {
-              if (this.buffer[this.pos] === LF) {
-                this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, this.crlfCheck = !1;
+              if (byte === LF) {
+                this.crlfCheck = !1, this.consumeCurrentByte();
                 continue;
               }
               this.crlfCheck = !1;
             }
-            if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-              this.buffer[this.pos] === CR && (this.crlfCheck = !0), this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, (this.event.data !== void 0 || this.event.event || this.event.id !== void 0 || this.event.retry) && this.processEvent(this.event), this.clearEvent();
+            if (byte === LF || byte === CR) {
+              byte === CR && (this.crlfCheck = !0), this.consumeCurrentByte(), this.hasPendingEvent() && this.processEvent(this.event), this.clearEvent();
               continue;
             }
             this.eventEndCheck = !1;
             continue;
           }
-          if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-            this.buffer[this.pos] === CR && (this.crlfCheck = !0), this.parseLine(this.buffer.subarray(0, this.pos), this.event), this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, this.eventEndCheck = !0;
+          if (byte === LF || byte === CR) {
+            byte === CR && (this.crlfCheck = !0), this.parseLine(this.readLine(), this.event), this.consumeCurrentByte(), this.eventEndCheck = !0;
             continue;
           }
-          this.pos++;
+          this.advanceCursor();
         }
         callback();
       }
@@ -24421,27 +24745,24 @@ var require_eventsource_stream = __commonJS({
         let colonPosition = line.indexOf(COLON);
         if (colonPosition === 0)
           return;
-        let field = "", value = "";
-        if (colonPosition !== -1) {
-          field = line.subarray(0, colonPosition).toString("utf8");
-          let valueStart = colonPosition + 1;
-          line[valueStart] === SPACE && ++valueStart, value = line.subarray(valueStart).toString("utf8");
-        } else
-          field = line.toString("utf8"), value = "";
-        switch (field) {
-          case "data":
-            event[field] === void 0 ? event[field] = value : event[field] += `
+        let fieldLength = line.length, valueStart = line.length;
+        if (colonPosition !== -1 && (fieldLength = colonPosition, valueStart = colonPosition + 1, line[valueStart] === SPACE && ++valueStart), isFieldName(line, fieldLength, DATA)) {
+          let value = line.toString("utf8", valueStart);
+          event.data === void 0 ? event.data = value : event.data += `
 ${value}`;
-            break;
-          case "retry":
-            isASCIINumber(value) && (event[field] = value);
-            break;
-          case "id":
-            isValidLastEventId(value) && (event[field] = value);
-            break;
-          case "event":
-            value.length > 0 && (event[field] = value);
-            break;
+          return;
+        }
+        if (isFieldName(line, fieldLength, RETRY)) {
+          isASCIINumberBytes(line, valueStart) && (event.retry = line.toString("utf8", valueStart));
+          return;
+        }
+        if (isFieldName(line, fieldLength, ID)) {
+          isValidLastEventIdBytes(line, valueStart) && (event.id = line.toString("utf8", valueStart));
+          return;
+        }
+        if (isFieldName(line, fieldLength, EVENT)) {
+          let value = line.toString("utf8", valueStart);
+          value.length > 0 && (event.event = value);
         }
       }
       /**
@@ -24458,12 +24779,61 @@ ${value}`;
         });
       }
       clearEvent() {
-        this.event = {
-          data: void 0,
-          event: void 0,
-          id: void 0,
-          retry: void 0
-        };
+        this.event.data = void 0, this.event.event = void 0, this.event.id = void 0, this.event.retry = void 0;
+      }
+      hasPendingEvent() {
+        return this.event.data !== void 0 || this.event.event !== void 0 || this.event.id !== void 0 || this.event.retry !== void 0;
+      }
+      hasCurrentByte() {
+        return this.chunkIndex < this.chunks.length && this.pos < this.chunks[this.chunkIndex].length;
+      }
+      currentByte() {
+        return this.chunks[this.chunkIndex][this.pos];
+      }
+      consumeCurrentByte() {
+        this.advanceCursor(), this.syncLineStartToCursor();
+      }
+      advanceCursor() {
+        for (this.pos++; this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length; )
+          this.chunkIndex++, this.pos = 0;
+      }
+      syncLineStartToCursor() {
+        this.lineChunkIndex = this.chunkIndex, this.linePos = this.pos, this.dropConsumedChunks();
+      }
+      dropConsumedChunks() {
+        for (; this.lineChunkIndex > 0; )
+          this.chunks.shift(), this.lineChunkIndex--, this.chunkIndex--;
+        this.chunkIndex === this.chunks.length && (this.chunks.length = 0, this.chunkIndex = 0, this.pos = 0, this.lineChunkIndex = 0, this.linePos = 0);
+      }
+      readLine() {
+        if (this.lineChunkIndex === this.chunkIndex)
+          return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos);
+        let chunks = [], length = 0;
+        for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+          let chunk = this.chunks[i], start = i === this.lineChunkIndex ? this.linePos : 0, end = i === this.chunkIndex ? this.pos : chunk.length, slice = chunk.subarray(start, end);
+          length += slice.length, chunks.push(slice);
+        }
+        return Buffer.concat(chunks, length);
+      }
+      peekBufferedByte(offset) {
+        let chunkIndex = this.lineChunkIndex, pos = this.linePos;
+        for (; chunkIndex < this.chunks.length; ) {
+          let chunk = this.chunks[chunkIndex], remaining = chunk.length - pos;
+          if (offset < remaining)
+            return chunk[pos + offset];
+          offset -= remaining, chunkIndex++, pos = 0;
+        }
+      }
+      discardLeadingBytes(count) {
+        for (; count > 0 && this.lineChunkIndex < this.chunks.length; ) {
+          let remaining = this.chunks[this.lineChunkIndex].length - this.linePos;
+          count < remaining ? (this.linePos += count, count = 0) : (count -= remaining, this.lineChunkIndex++, this.linePos = 0);
+        }
+        this.chunkIndex = this.lineChunkIndex, this.pos = this.linePos, this.dropConsumedChunks();
+      }
+      handleBOM() {
+        let first = this.peekBufferedByte(0), second = this.peekBufferedByte(1), third = this.peekBufferedByte(2);
+        return second === void 0 ? (first === BOM[0] || (this.checkBOM = !1), !0) : third === void 0 ? first === BOM[0] && second === BOM[1] ? !0 : (this.checkBOM = !1, !1) : (first === BOM[0] && second === BOM[1] && third === BOM[2] && this.discardLeadingBytes(3), this.checkBOM = !1, !this.hasCurrentByte());
       }
     };
     module2.exports = {
@@ -26608,8 +26978,42 @@ var require_request3 = __commonJS({
           return this.abort(err), !1;
         }
       }
-      onUpgrade(statusCode, headers, socket) {
-        return assert(!this.aborted), assert(!this.completed), this[kHandler].onUpgrade(statusCode, headers, socket);
+      /**
+       * @param {number|null} statusCode
+       * @param {Buffer[]|null} headers
+       * @param {import('node:stream').Duplex} socket
+       * @param {string} [statusText]
+       */
+      onUpgrade(statusCode, headers, socket, statusText = "") {
+        this.onFinally(), assert(!this.aborted), assert(!this.completed), statusCode !== null && this.#publishUpgradeHeaders(statusCode, headers, statusText);
+        let result = this[kHandler].onUpgrade(statusCode, headers, socket);
+        return this.aborted || (this.completed = !0, statusCode !== null && this.#publishUpgradeTrailers()), result;
+      }
+      /**
+       * @param {number} statusCode
+       * @param {import('node:http2').IncomingHttpHeaders} headers
+       * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+       * @param {string} [statusText]
+       */
+      onUpgradeResponse(statusCode, headers, parseHeaders, statusText = "") {
+        assert(!this.aborted), assert(this.completed), channels.headers.hasSubscribers && this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText), this.#publishUpgradeTrailers();
+      }
+      /**
+       * @param {Error} error
+       */
+      onUpgradeError(error) {
+        assert(!this.aborted), assert(this.completed), channels.error.hasSubscribers && channels.error.publish({ request: this, error });
+      }
+      /**
+       * @param {number} statusCode
+       * @param {Buffer[]} headers
+       * @param {string} statusText
+       */
+      #publishUpgradeHeaders(statusCode, headers, statusText) {
+        channels.headers.hasSubscribers && channels.headers.publish({ request: this, response: { statusCode, headers, statusText } });
+      }
+      #publishUpgradeTrailers() {
+        channels.trailers.hasSubscribers && channels.trailers.publish({ request: this, trailers: [] });
       }
       onComplete(trailers) {
         this.onFinally(), assert(!this.aborted), this.completed = !0, channels.trailers.hasSubscribers && channels.trailers.publish({ request: this, trailers });
@@ -29565,14 +29969,14 @@ var require_client_h12 = __commonJS({
         this.headersSize += len, this.headersSize >= this.headersMaxSize && util.destroy(this.socket, new HeadersOverflowError());
       }
       onUpgrade(head) {
-        let { upgrade, client, socket, headers, statusCode } = this;
+        let { upgrade, client, socket, headers, statusCode, statusText } = this;
         assert(upgrade), assert(client[kSocket] === socket), assert(!socket.destroyed), assert(!this.paused), assert((headers.length & 1) === 0);
         let request = client[kQueue][client[kRunningIdx]];
         assert(request), assert(request.upgrade || request.method === "CONNECT"), this.statusCode = null, this.statusText = "", this.shouldKeepAlive = null, this.headers = [], this.headersSize = 0, socket.unshift(head), socket[kParser].destroy(), socket[kParser] = null, socket[kClient] = null, socket[kError] = null, removeAllListeners(socket), client[kSocket] = null, client[kHTTPContext] = null, client[kQueue][client[kRunningIdx]++] = null, client.emit("disconnect", client[kUrl], [client], new InformationalError("upgrade"));
         try {
-          request.onUpgrade(statusCode, headers, socket);
-        } catch (err) {
-          util.destroy(socket, err);
+          request.onUpgrade(statusCode, headers, socket, statusText);
+        } catch (error) {
+          util.errorRequest(client, request, error), util.destroy(socket, error);
         }
         client[kResume]();
       }
@@ -29710,12 +30114,12 @@ var require_client_h12 = __commonJS({
       };
     }
     function clearIdleSocketValidation(socket) {
-      socket[kIdleSocketValidationTimeout] && (clearTimeout(socket[kIdleSocketValidationTimeout]), socket[kIdleSocketValidationTimeout] = null), socket[kIdleSocketValidation] = 0;
+      socket[kIdleSocketValidationTimeout] && (clearImmediate(socket[kIdleSocketValidationTimeout]), socket[kIdleSocketValidationTimeout] = null), socket[kIdleSocketValidation] = 0;
     }
     function scheduleIdleSocketValidation(client, socket) {
-      socket[kIdleSocketValidation] = 1, socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+      socket[kIdleSocketValidation] = 1, socket[kIdleSocketValidationTimeout] = setImmediate(() => {
         socket[kIdleSocketValidationTimeout] = null, socket[kIdleSocketValidation] = 2, client[kSocket] === socket && !socket.destroyed && client[kResume]();
-      }, 0), socket[kIdleSocketValidationTimeout].unref?.();
+      });
     }
     function resumeH1(client) {
       let socket = client[kSocket];
@@ -29763,8 +30167,14 @@ var require_client_h12 = __commonJS({
       }
       let socket = client[kSocket];
       clearIdleSocketValidation(socket);
-      let abort = (err) => {
-        request.aborted || request.completed || (util.errorRequest(client, request, err || new RequestAbortedError()), util.destroy(body), util.destroy(socket, new InformationalError("aborted")));
+      let abort = (error) => {
+        if (!request.aborted) {
+          if (request.completed) {
+            (request.upgrade || request.method === "CONNECT") && util.destroy(socket, new InformationalError("aborted"));
+            return;
+          }
+          util.errorRequest(client, request, error || new RequestAbortedError()), util.destroy(body), util.destroy(socket, new InformationalError("aborted"));
+        }
       };
       try {
         request.onConnect(abort);
@@ -29936,7 +30346,7 @@ ${len.toString(16)}\r
 var require_client_h22 = __commonJS({
   "node_modules/@discordjs/rest/node_modules/undici/lib/dispatcher/client-h2.js"(exports2, module2) {
     "use strict";
-    var assert = require("node:assert"), { pipeline } = require("node:stream"), util = require_util7(), {
+    var assert = require("node:assert"), { errorMonitor } = require("node:events"), { pipeline } = require("node:stream"), util = require_util7(), {
       RequestContentLengthMismatchError,
       RequestAbortedError,
       SocketError,
@@ -29985,6 +30395,10 @@ var require_client_h22 = __commonJS({
         else
           result.push(Buffer.from(name), Buffer.from(value));
       return result;
+    }
+    function parseH2ResponseHeaders(headers) {
+      let { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers;
+      return parseH2Headers(realHeaders);
     }
     async function connectH2(client, socket) {
       client[kSocket] = socket, h2ExperimentalWarned || (h2ExperimentalWarned = !0, process.emitWarning("H2 support is experimental, expect them to change at any time.", {
@@ -30078,8 +30492,14 @@ var require_client_h22 = __commonJS({
       }
       let stream, { hostname, port } = client[kUrl];
       headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ""}`, headers[HTTP2_HEADER_METHOD] = method;
-      let abort = (err) => {
-        request.aborted || request.completed || (err = err || new RequestAbortedError(), util.errorRequest(client, request, err), stream != null && util.destroy(stream, err), util.destroy(body, err), client[kQueue][client[kRunningIdx]++] = null, client[kResume]());
+      let abort = (error) => {
+        if (!request.aborted) {
+          if (request.completed) {
+            method === "CONNECT" && stream != null && util.destroy(stream, error || new RequestAbortedError());
+            return;
+          }
+          error = error || new RequestAbortedError(), util.errorRequest(client, request, error), stream != null && util.destroy(stream, error), util.destroy(body, error), client[kQueue][client[kRunningIdx]++] = null, client[kResume]();
+        }
       };
       try {
         request.onConnect(abort);
@@ -30088,12 +30508,25 @@ var require_client_h22 = __commonJS({
       }
       if (request.aborted)
         return !1;
-      if (method === "CONNECT")
-        return session.ref(), stream = session.request(headers, { endStream: !1, signal }), stream.id && !stream.pending ? (request.onUpgrade(null, null, stream), ++session[kOpenStreams], client[kQueue][client[kRunningIdx]++] = null) : stream.once("ready", () => {
-          request.onUpgrade(null, null, stream), ++session[kOpenStreams], client[kQueue][client[kRunningIdx]++] = null;
-        }), stream.once("close", () => {
-          session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref();
+      if (method === "CONNECT") {
+        session.ref(), stream = session.request(headers, { endStream: !1, signal });
+        let upgradeResponseFinished = !1, onResponse = (headers2) => {
+          upgradeResponseFinished = !0, stream.off(errorMonitor, onUpgradeError), request.onUpgradeResponse(Number(headers2[HTTP2_HEADER_STATUS]), headers2, parseH2ResponseHeaders);
+        }, onUpgradeError = (error) => {
+          upgradeResponseFinished = !0, stream.off("response", onResponse), request.onUpgradeError(error);
+        }, onReady = () => {
+          try {
+            request.onUpgrade(null, null, stream);
+          } catch (error) {
+            stream.off("response", onResponse), abort(error);
+            return;
+          }
+          request.aborted || (stream.off("error", abort), stream.once(errorMonitor, onUpgradeError), client[kQueue][client[kRunningIdx]++] = null);
+        };
+        return stream.once("response", onResponse), stream.once("error", abort), ++session[kOpenStreams], onReady(), stream.once("close", () => {
+          !upgradeResponseFinished && request.completed && (stream.off("response", onResponse), stream.off(errorMonitor, onUpgradeError), request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))), session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref();
         }), !0;
+      }
       headers[HTTP2_HEADER_PATH] = path, headers[HTTP2_HEADER_SCHEME] = "https";
       let expectsPayload = method === "PUT" || method === "POST" || method === "PATCH";
       body && typeof body.read == "function" && body.read(0);
@@ -31351,9 +31784,19 @@ var require_retry_handler2 = __commonJS({
             "EPIPE",
             "UND_ERR_SOCKET"
           ]
-        }, this.retryCount = 0, this.retryCountCheckpoint = 0, this.start = 0, this.end = null, this.etag = null, this.resume = null, this.handler.onConnect((reason) => {
+        }, this.retryCount = 0, this.retryCountCheckpoint = 0, this.start = 0, this.end = null, this.etag = null, this.resume = null, this.headersSent = !1, this.handler.onConnect((reason) => {
           this.aborted = !0, this.abort ? this.abort(reason) : this.reason = reason;
         });
+      }
+      checkpointResponseEnd(headers, resume) {
+        if (this.end == null && this.opts.method !== "HEAD") {
+          let contentLength = headers["content-length"];
+          this.end = contentLength != null ? Number(contentLength) - 1 : null, assert(
+            this.end == null || Number.isFinite(this.end),
+            "invalid content-length"
+          );
+        }
+        this.resume = this.end != null ? resume : null;
       }
       onRequestSent() {
         this.handler.onRequestSent && this.handler.onRequestSent();
@@ -31401,12 +31844,12 @@ var require_retry_handler2 = __commonJS({
       onHeaders(statusCode, rawHeaders, resume, statusMessage) {
         let headers = parseHeaders(rawHeaders);
         if (this.retryCount += 1, statusCode >= 300)
-          return this.retryOpts.statusCodes.includes(statusCode) === !1 ? this.handler.onHeaders(
+          return !this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === !1 ? (this.headersSent = !0, this.checkpointResponseEnd(headers, resume), this.handler.onHeaders(
             statusCode,
             rawHeaders,
             resume,
             statusMessage
-          ) : (this.abort(
+          )) : (this.abort(
             new RequestRetryError("Request failed", statusCode, {
               headers,
               data: {
@@ -31441,13 +31884,18 @@ var require_retry_handler2 = __commonJS({
           if (contentLengthError != null)
             return this.abort(contentLengthError), !1;
           let { start, size, end = size - 1 } = contentRange;
-          return assert(this.start === start, "content-range mismatch"), assert(this.end == null || this.end === end, "content-range mismatch"), this.resume = resume, !0;
+          return this.start !== start || this.end != null && this.end !== end ? (this.abort(
+            new RequestRetryError("Content-Range mismatch", statusCode, {
+              headers,
+              data: { count: this.retryCount }
+            })
+          ), !1) : (this.resume = resume, !0);
         }
         if (this.end == null) {
           if (statusCode === 206) {
             let range = parseRangeHeader(headers["content-range"]);
             if (range == null)
-              return this.handler.onHeaders(
+              return this.headersSent = !0, this.handler.onHeaders(
                 statusCode,
                 rawHeaders,
                 resume,
@@ -31469,7 +31917,7 @@ var require_retry_handler2 = __commonJS({
           return assert(Number.isFinite(this.start)), assert(
             this.end == null || Number.isFinite(this.end),
             "invalid content-length"
-          ), this.resume = resume, this.etag = headers.etag != null ? headers.etag : null, this.etag != null && this.etag.startsWith("W/") && (this.etag = null), this.handler.onHeaders(
+          ), this.resume = resume, this.headersSent = !0, this.etag = headers.etag != null ? headers.etag : null, this.etag != null && this.etag.startsWith("W/") && (this.etag = null), this.handler.onHeaders(
             statusCode,
             rawHeaders,
             resume,
@@ -31489,7 +31937,7 @@ var require_retry_handler2 = __commonJS({
         return this.retryCount = 0, this.handler.onComplete(rawTrailers);
       }
       onError(err) {
-        if (this.aborted || isDisturbed(this.opts.body))
+        if (this.aborted || isDisturbed(this.opts.body) || this.headersSent && this.resume == null)
           return this.handler.onError(err);
         this.retryCount - this.retryCountCheckpoint > 0 ? this.retryCount = this.retryCountCheckpoint + (this.retryCount - this.retryCountCheckpoint) : this.retryCount += 1, this.retryOpts.retry(
           err,
@@ -37069,9 +37517,12 @@ var require_connection2 = __commonJS({
             return;
           }
           let secProtocol = response.headersList.get("Sec-WebSocket-Protocol");
-          if (secProtocol !== null && !getDecodeSplit("sec-websocket-protocol", request.headersList).includes(secProtocol)) {
-            failWebsocketConnection(ws, "Protocol was not set in the opening handshake.");
-            return;
+          if (secProtocol !== null) {
+            let requestProtocols = getDecodeSplit("sec-websocket-protocol", request.headersList);
+            if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
+              failWebsocketConnection(ws, "Protocol was not set in the opening handshake.");
+              return;
+            }
           }
           response.socket.on("data", onSocketData), response.socket.on("close", onSocketClose), response.socket.on("error", onSocketError), channels.open.hasSubscribers && channels.open.publish({
             address: response.socket.address(),
@@ -37159,7 +37610,7 @@ var require_permessage_deflate3 = __commonJS({
           }
           this.#inflate[kBuffer] = [], this.#inflate[kLength] = 0, this.#inflate.on("data", (data) => {
             if (this.#inflate[kLength] += data.length, this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
-              callback(new MessageSizeExceededError()), this.#inflate.removeAllListeners(), this.#inflate = null;
+              callback(new MessageSizeExceededError()), this.#inflate.removeAllListeners(), this.#inflate.destroy(), this.#inflate = null;
               return;
             }
             this.#inflate[kBuffer].push(data);
@@ -37781,7 +38232,30 @@ var require_util14 = __commonJS({
 var require_eventsource_stream2 = __commonJS({
   "node_modules/@discordjs/rest/node_modules/undici/lib/web/eventsource/eventsource-stream.js"(exports2, module2) {
     "use strict";
-    var { Transform } = require("node:stream"), { isASCIINumber, isValidLastEventId } = require_util14(), BOM = [239, 187, 191], LF = 10, CR = 13, COLON = 58, SPACE = 32, EventSourceStream = class extends Transform {
+    var { Transform } = require("node:stream"), { isASCIINumber, isValidLastEventId } = require_util14(), BOM = [239, 187, 191], LF = 10, CR = 13, COLON = 58, SPACE = 32, DATA = Buffer.from("data"), EVENT = Buffer.from("event"), ID = Buffer.from("id"), RETRY = Buffer.from("retry");
+    function isASCIINumberBytes(buffer, start) {
+      if (start >= buffer.length)
+        return !1;
+      for (let i = start; i < buffer.length; i++)
+        if (buffer[i] < 48 || buffer[i] > 57)
+          return !1;
+      return !0;
+    }
+    function isValidLastEventIdBytes(buffer, start) {
+      for (let i = start; i < buffer.length; i++)
+        if (buffer[i] === 0)
+          return !1;
+      return !0;
+    }
+    function isFieldName(line, length, field) {
+      if (length !== field.length)
+        return !1;
+      for (let i = 0; i < length; i++)
+        if (line[i] !== field[i])
+          return !1;
+      return !0;
+    }
+    var EventSourceStream = class extends Transform {
       /**
        * @type {eventSourceSettings}
        */
@@ -37800,10 +38274,13 @@ var require_eventsource_stream2 = __commonJS({
        */
       eventEndCheck = !1;
       /**
-       * @type {Buffer}
+       * @type {Buffer[]}
        */
-      buffer = null;
+      chunks = [];
+      chunkIndex = 0;
       pos = 0;
+      lineChunkIndex = 0;
+      linePos = 0;
       event = {
         data: void 0,
         event: void 0,
@@ -37829,54 +38306,32 @@ var require_eventsource_stream2 = __commonJS({
           callback();
           return;
         }
-        if (this.buffer ? this.buffer = Buffer.concat([this.buffer, chunk]) : this.buffer = chunk, this.checkBOM)
-          switch (this.buffer.length) {
-            case 1:
-              if (this.buffer[0] === BOM[0]) {
-                callback();
-                return;
-              }
-              this.checkBOM = !1, callback();
-              return;
-            case 2:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1]) {
-                callback();
-                return;
-              }
-              this.checkBOM = !1;
-              break;
-            case 3:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2]) {
-                this.buffer = Buffer.alloc(0), this.checkBOM = !1, callback();
-                return;
-              }
-              this.checkBOM = !1;
-              break;
-            default:
-              this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2] && (this.buffer = this.buffer.subarray(3)), this.checkBOM = !1;
-              break;
-          }
-        for (; this.pos < this.buffer.length; ) {
+        if (this.chunks.push(chunk), this.checkBOM && this.handleBOM()) {
+          callback();
+          return;
+        }
+        for (; this.hasCurrentByte(); ) {
+          let byte = this.currentByte();
           if (this.eventEndCheck) {
             if (this.crlfCheck) {
-              if (this.buffer[this.pos] === LF) {
-                this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, this.crlfCheck = !1;
+              if (byte === LF) {
+                this.crlfCheck = !1, this.consumeCurrentByte();
                 continue;
               }
               this.crlfCheck = !1;
             }
-            if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-              this.buffer[this.pos] === CR && (this.crlfCheck = !0), this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, (this.event.data !== void 0 || this.event.event || this.event.id || this.event.retry) && this.processEvent(this.event), this.clearEvent();
+            if (byte === LF || byte === CR) {
+              byte === CR && (this.crlfCheck = !0), this.consumeCurrentByte(), this.hasPendingEvent() && this.processEvent(this.event), this.clearEvent();
               continue;
             }
             this.eventEndCheck = !1;
             continue;
           }
-          if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-            this.buffer[this.pos] === CR && (this.crlfCheck = !0), this.parseLine(this.buffer.subarray(0, this.pos), this.event), this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, this.eventEndCheck = !0;
+          if (byte === LF || byte === CR) {
+            byte === CR && (this.crlfCheck = !0), this.parseLine(this.readLine(), this.event), this.consumeCurrentByte(), this.eventEndCheck = !0;
             continue;
           }
-          this.pos++;
+          this.advanceCursor();
         }
         callback();
       }
@@ -37890,27 +38345,24 @@ var require_eventsource_stream2 = __commonJS({
         let colonPosition = line.indexOf(COLON);
         if (colonPosition === 0)
           return;
-        let field = "", value = "";
-        if (colonPosition !== -1) {
-          field = line.subarray(0, colonPosition).toString("utf8");
-          let valueStart = colonPosition + 1;
-          line[valueStart] === SPACE && ++valueStart, value = line.subarray(valueStart).toString("utf8");
-        } else
-          field = line.toString("utf8"), value = "";
-        switch (field) {
-          case "data":
-            event[field] === void 0 ? event[field] = value : event[field] += `
+        let fieldLength = line.length, valueStart = line.length;
+        if (colonPosition !== -1 && (fieldLength = colonPosition, valueStart = colonPosition + 1, line[valueStart] === SPACE && ++valueStart), isFieldName(line, fieldLength, DATA)) {
+          let value = line.toString("utf8", valueStart);
+          event.data === void 0 ? event.data = value : event.data += `
 ${value}`;
-            break;
-          case "retry":
-            isASCIINumber(value) && (event[field] = value);
-            break;
-          case "id":
-            isValidLastEventId(value) && (event[field] = value);
-            break;
-          case "event":
-            value.length > 0 && (event[field] = value);
-            break;
+          return;
+        }
+        if (isFieldName(line, fieldLength, RETRY)) {
+          isASCIINumberBytes(line, valueStart) && (event.retry = line.toString("utf8", valueStart));
+          return;
+        }
+        if (isFieldName(line, fieldLength, ID)) {
+          isValidLastEventIdBytes(line, valueStart) && (event.id = line.toString("utf8", valueStart));
+          return;
+        }
+        if (isFieldName(line, fieldLength, EVENT)) {
+          let value = line.toString("utf8", valueStart);
+          value.length > 0 && (event.event = value);
         }
       }
       /**
@@ -37927,12 +38379,61 @@ ${value}`;
         });
       }
       clearEvent() {
-        this.event = {
-          data: void 0,
-          event: void 0,
-          id: void 0,
-          retry: void 0
-        };
+        this.event.data = void 0, this.event.event = void 0, this.event.id = void 0, this.event.retry = void 0;
+      }
+      hasPendingEvent() {
+        return this.event.data !== void 0 || this.event.event !== void 0 || this.event.id !== void 0 || this.event.retry !== void 0;
+      }
+      hasCurrentByte() {
+        return this.chunkIndex < this.chunks.length && this.pos < this.chunks[this.chunkIndex].length;
+      }
+      currentByte() {
+        return this.chunks[this.chunkIndex][this.pos];
+      }
+      consumeCurrentByte() {
+        this.advanceCursor(), this.syncLineStartToCursor();
+      }
+      advanceCursor() {
+        for (this.pos++; this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length; )
+          this.chunkIndex++, this.pos = 0;
+      }
+      syncLineStartToCursor() {
+        this.lineChunkIndex = this.chunkIndex, this.linePos = this.pos, this.dropConsumedChunks();
+      }
+      dropConsumedChunks() {
+        for (; this.lineChunkIndex > 0; )
+          this.chunks.shift(), this.lineChunkIndex--, this.chunkIndex--;
+        this.chunkIndex === this.chunks.length && (this.chunks.length = 0, this.chunkIndex = 0, this.pos = 0, this.lineChunkIndex = 0, this.linePos = 0);
+      }
+      readLine() {
+        if (this.lineChunkIndex === this.chunkIndex)
+          return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos);
+        let chunks = [], length = 0;
+        for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+          let chunk = this.chunks[i], start = i === this.lineChunkIndex ? this.linePos : 0, end = i === this.chunkIndex ? this.pos : chunk.length, slice = chunk.subarray(start, end);
+          length += slice.length, chunks.push(slice);
+        }
+        return Buffer.concat(chunks, length);
+      }
+      peekBufferedByte(offset) {
+        let chunkIndex = this.lineChunkIndex, pos = this.linePos;
+        for (; chunkIndex < this.chunks.length; ) {
+          let chunk = this.chunks[chunkIndex], remaining = chunk.length - pos;
+          if (offset < remaining)
+            return chunk[pos + offset];
+          offset -= remaining, chunkIndex++, pos = 0;
+        }
+      }
+      discardLeadingBytes(count) {
+        for (; count > 0 && this.lineChunkIndex < this.chunks.length; ) {
+          let remaining = this.chunks[this.lineChunkIndex].length - this.linePos;
+          count < remaining ? (this.linePos += count, count = 0) : (count -= remaining, this.lineChunkIndex++, this.linePos = 0);
+        }
+        this.chunkIndex = this.lineChunkIndex, this.pos = this.linePos, this.dropConsumedChunks();
+      }
+      handleBOM() {
+        let first = this.peekBufferedByte(0), second = this.peekBufferedByte(1), third = this.peekBufferedByte(2);
+        return second === void 0 ? (first === BOM[0] || (this.checkBOM = !1), !0) : third === void 0 ? first === BOM[0] && second === BOM[1] ? !0 : (this.checkBOM = !1, !1) : (first === BOM[0] && second === BOM[1] && third === BOM[2] && this.discardLeadingBytes(3), this.checkBOM = !1, !this.hasCurrentByte());
       }
     };
     module2.exports = {
@@ -48896,8 +49397,42 @@ var require_request5 = __commonJS({
           return this.abort(err), !1;
         }
       }
-      onUpgrade(statusCode, headers, socket) {
-        return assert(!this.aborted), assert(!this.completed), this[kHandler].onUpgrade(statusCode, headers, socket);
+      /**
+       * @param {number|null} statusCode
+       * @param {Buffer[]|null} headers
+       * @param {import('node:stream').Duplex} socket
+       * @param {string} [statusText]
+       */
+      onUpgrade(statusCode, headers, socket, statusText = "") {
+        this.onFinally(), assert(!this.aborted), assert(!this.completed), statusCode !== null && this.#publishUpgradeHeaders(statusCode, headers, statusText);
+        let result = this[kHandler].onUpgrade(statusCode, headers, socket);
+        return this.aborted || (this.completed = !0, statusCode !== null && this.#publishUpgradeTrailers()), result;
+      }
+      /**
+       * @param {number} statusCode
+       * @param {import('node:http2').IncomingHttpHeaders} headers
+       * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+       * @param {string} [statusText]
+       */
+      onUpgradeResponse(statusCode, headers, parseHeaders, statusText = "") {
+        assert(!this.aborted), assert(this.completed), channels.headers.hasSubscribers && this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText), this.#publishUpgradeTrailers();
+      }
+      /**
+       * @param {Error} error
+       */
+      onUpgradeError(error) {
+        assert(!this.aborted), assert(this.completed), channels.error.hasSubscribers && channels.error.publish({ request: this, error });
+      }
+      /**
+       * @param {number} statusCode
+       * @param {Buffer[]} headers
+       * @param {string} statusText
+       */
+      #publishUpgradeHeaders(statusCode, headers, statusText) {
+        channels.headers.hasSubscribers && channels.headers.publish({ request: this, response: { statusCode, headers, statusText } });
+      }
+      #publishUpgradeTrailers() {
+        channels.trailers.hasSubscribers && channels.trailers.publish({ request: this, trailers: [] });
       }
       onComplete(trailers) {
         this.onFinally(), assert(!this.aborted), this.completed = !0, channels.trailers.hasSubscribers && channels.trailers.publish({ request: this, trailers });
@@ -51853,14 +52388,14 @@ var require_client_h13 = __commonJS({
         this.headersSize += len, this.headersSize >= this.headersMaxSize && util.destroy(this.socket, new HeadersOverflowError());
       }
       onUpgrade(head) {
-        let { upgrade, client, socket, headers, statusCode } = this;
+        let { upgrade, client, socket, headers, statusCode, statusText } = this;
         assert(upgrade), assert(client[kSocket] === socket), assert(!socket.destroyed), assert(!this.paused), assert((headers.length & 1) === 0);
         let request = client[kQueue][client[kRunningIdx]];
         assert(request), assert(request.upgrade || request.method === "CONNECT"), this.statusCode = null, this.statusText = "", this.shouldKeepAlive = null, this.headers = [], this.headersSize = 0, socket.unshift(head), socket[kParser].destroy(), socket[kParser] = null, socket[kClient] = null, socket[kError] = null, removeAllListeners(socket), client[kSocket] = null, client[kHTTPContext] = null, client[kQueue][client[kRunningIdx]++] = null, client.emit("disconnect", client[kUrl], [client], new InformationalError("upgrade"));
         try {
-          request.onUpgrade(statusCode, headers, socket);
-        } catch (err) {
-          util.destroy(socket, err);
+          request.onUpgrade(statusCode, headers, socket, statusText);
+        } catch (error) {
+          util.errorRequest(client, request, error), util.destroy(socket, error);
         }
         client[kResume]();
       }
@@ -51998,12 +52533,12 @@ var require_client_h13 = __commonJS({
       };
     }
     function clearIdleSocketValidation(socket) {
-      socket[kIdleSocketValidationTimeout] && (clearTimeout(socket[kIdleSocketValidationTimeout]), socket[kIdleSocketValidationTimeout] = null), socket[kIdleSocketValidation] = 0;
+      socket[kIdleSocketValidationTimeout] && (clearImmediate(socket[kIdleSocketValidationTimeout]), socket[kIdleSocketValidationTimeout] = null), socket[kIdleSocketValidation] = 0;
     }
     function scheduleIdleSocketValidation(client, socket) {
-      socket[kIdleSocketValidation] = 1, socket[kIdleSocketValidationTimeout] = setTimeout(() => {
+      socket[kIdleSocketValidation] = 1, socket[kIdleSocketValidationTimeout] = setImmediate(() => {
         socket[kIdleSocketValidationTimeout] = null, socket[kIdleSocketValidation] = 2, client[kSocket] === socket && !socket.destroyed && client[kResume]();
-      }, 0), socket[kIdleSocketValidationTimeout].unref?.();
+      });
     }
     function resumeH1(client) {
       let socket = client[kSocket];
@@ -52051,8 +52586,14 @@ var require_client_h13 = __commonJS({
       }
       let socket = client[kSocket];
       clearIdleSocketValidation(socket);
-      let abort = (err) => {
-        request.aborted || request.completed || (util.errorRequest(client, request, err || new RequestAbortedError()), util.destroy(body), util.destroy(socket, new InformationalError("aborted")));
+      let abort = (error) => {
+        if (!request.aborted) {
+          if (request.completed) {
+            (request.upgrade || request.method === "CONNECT") && util.destroy(socket, new InformationalError("aborted"));
+            return;
+          }
+          util.errorRequest(client, request, error || new RequestAbortedError()), util.destroy(body), util.destroy(socket, new InformationalError("aborted"));
+        }
       };
       try {
         request.onConnect(abort);
@@ -52224,7 +52765,7 @@ ${len.toString(16)}\r
 var require_client_h23 = __commonJS({
   "node_modules/discord.js/node_modules/undici/lib/dispatcher/client-h2.js"(exports2, module2) {
     "use strict";
-    var assert = require("node:assert"), { pipeline } = require("node:stream"), util = require_util15(), {
+    var assert = require("node:assert"), { errorMonitor } = require("node:events"), { pipeline } = require("node:stream"), util = require_util15(), {
       RequestContentLengthMismatchError,
       RequestAbortedError,
       SocketError,
@@ -52273,6 +52814,10 @@ var require_client_h23 = __commonJS({
         else
           result.push(Buffer.from(name), Buffer.from(value));
       return result;
+    }
+    function parseH2ResponseHeaders(headers) {
+      let { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers;
+      return parseH2Headers(realHeaders);
     }
     async function connectH2(client, socket) {
       client[kSocket] = socket, h2ExperimentalWarned || (h2ExperimentalWarned = !0, process.emitWarning("H2 support is experimental, expect them to change at any time.", {
@@ -52366,8 +52911,14 @@ var require_client_h23 = __commonJS({
       }
       let stream, { hostname, port } = client[kUrl];
       headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ""}`, headers[HTTP2_HEADER_METHOD] = method;
-      let abort = (err) => {
-        request.aborted || request.completed || (err = err || new RequestAbortedError(), util.errorRequest(client, request, err), stream != null && util.destroy(stream, err), util.destroy(body, err), client[kQueue][client[kRunningIdx]++] = null, client[kResume]());
+      let abort = (error) => {
+        if (!request.aborted) {
+          if (request.completed) {
+            method === "CONNECT" && stream != null && util.destroy(stream, error || new RequestAbortedError());
+            return;
+          }
+          error = error || new RequestAbortedError(), util.errorRequest(client, request, error), stream != null && util.destroy(stream, error), util.destroy(body, error), client[kQueue][client[kRunningIdx]++] = null, client[kResume]();
+        }
       };
       try {
         request.onConnect(abort);
@@ -52376,12 +52927,25 @@ var require_client_h23 = __commonJS({
       }
       if (request.aborted)
         return !1;
-      if (method === "CONNECT")
-        return session.ref(), stream = session.request(headers, { endStream: !1, signal }), stream.id && !stream.pending ? (request.onUpgrade(null, null, stream), ++session[kOpenStreams], client[kQueue][client[kRunningIdx]++] = null) : stream.once("ready", () => {
-          request.onUpgrade(null, null, stream), ++session[kOpenStreams], client[kQueue][client[kRunningIdx]++] = null;
-        }), stream.once("close", () => {
-          session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref();
+      if (method === "CONNECT") {
+        session.ref(), stream = session.request(headers, { endStream: !1, signal });
+        let upgradeResponseFinished = !1, onResponse = (headers2) => {
+          upgradeResponseFinished = !0, stream.off(errorMonitor, onUpgradeError), request.onUpgradeResponse(Number(headers2[HTTP2_HEADER_STATUS]), headers2, parseH2ResponseHeaders);
+        }, onUpgradeError = (error) => {
+          upgradeResponseFinished = !0, stream.off("response", onResponse), request.onUpgradeError(error);
+        }, onReady = () => {
+          try {
+            request.onUpgrade(null, null, stream);
+          } catch (error) {
+            stream.off("response", onResponse), abort(error);
+            return;
+          }
+          request.aborted || (stream.off("error", abort), stream.once(errorMonitor, onUpgradeError), client[kQueue][client[kRunningIdx]++] = null);
+        };
+        return stream.once("response", onResponse), stream.once("error", abort), ++session[kOpenStreams], onReady(), stream.once("close", () => {
+          !upgradeResponseFinished && request.completed && (stream.off("response", onResponse), stream.off(errorMonitor, onUpgradeError), request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))), session[kOpenStreams] -= 1, session[kOpenStreams] === 0 && session.unref();
         }), !0;
+      }
       headers[HTTP2_HEADER_PATH] = path, headers[HTTP2_HEADER_SCHEME] = "https";
       let expectsPayload = method === "PUT" || method === "POST" || method === "PATCH";
       body && typeof body.read == "function" && body.read(0);
@@ -53639,9 +54203,19 @@ var require_retry_handler3 = __commonJS({
             "EPIPE",
             "UND_ERR_SOCKET"
           ]
-        }, this.retryCount = 0, this.retryCountCheckpoint = 0, this.start = 0, this.end = null, this.etag = null, this.resume = null, this.handler.onConnect((reason) => {
+        }, this.retryCount = 0, this.retryCountCheckpoint = 0, this.start = 0, this.end = null, this.etag = null, this.resume = null, this.headersSent = !1, this.handler.onConnect((reason) => {
           this.aborted = !0, this.abort ? this.abort(reason) : this.reason = reason;
         });
+      }
+      checkpointResponseEnd(headers, resume) {
+        if (this.end == null && this.opts.method !== "HEAD") {
+          let contentLength = headers["content-length"];
+          this.end = contentLength != null ? Number(contentLength) - 1 : null, assert(
+            this.end == null || Number.isFinite(this.end),
+            "invalid content-length"
+          );
+        }
+        this.resume = this.end != null ? resume : null;
       }
       onRequestSent() {
         this.handler.onRequestSent && this.handler.onRequestSent();
@@ -53689,12 +54263,12 @@ var require_retry_handler3 = __commonJS({
       onHeaders(statusCode, rawHeaders, resume, statusMessage) {
         let headers = parseHeaders(rawHeaders);
         if (this.retryCount += 1, statusCode >= 300)
-          return this.retryOpts.statusCodes.includes(statusCode) === !1 ? this.handler.onHeaders(
+          return !this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === !1 ? (this.headersSent = !0, this.checkpointResponseEnd(headers, resume), this.handler.onHeaders(
             statusCode,
             rawHeaders,
             resume,
             statusMessage
-          ) : (this.abort(
+          )) : (this.abort(
             new RequestRetryError("Request failed", statusCode, {
               headers,
               data: {
@@ -53729,13 +54303,18 @@ var require_retry_handler3 = __commonJS({
           if (contentLengthError != null)
             return this.abort(contentLengthError), !1;
           let { start, size, end = size - 1 } = contentRange;
-          return assert(this.start === start, "content-range mismatch"), assert(this.end == null || this.end === end, "content-range mismatch"), this.resume = resume, !0;
+          return this.start !== start || this.end != null && this.end !== end ? (this.abort(
+            new RequestRetryError("Content-Range mismatch", statusCode, {
+              headers,
+              data: { count: this.retryCount }
+            })
+          ), !1) : (this.resume = resume, !0);
         }
         if (this.end == null) {
           if (statusCode === 206) {
             let range = parseRangeHeader(headers["content-range"]);
             if (range == null)
-              return this.handler.onHeaders(
+              return this.headersSent = !0, this.handler.onHeaders(
                 statusCode,
                 rawHeaders,
                 resume,
@@ -53757,7 +54336,7 @@ var require_retry_handler3 = __commonJS({
           return assert(Number.isFinite(this.start)), assert(
             this.end == null || Number.isFinite(this.end),
             "invalid content-length"
-          ), this.resume = resume, this.etag = headers.etag != null ? headers.etag : null, this.etag != null && this.etag.startsWith("W/") && (this.etag = null), this.handler.onHeaders(
+          ), this.resume = resume, this.headersSent = !0, this.etag = headers.etag != null ? headers.etag : null, this.etag != null && this.etag.startsWith("W/") && (this.etag = null), this.handler.onHeaders(
             statusCode,
             rawHeaders,
             resume,
@@ -53777,7 +54356,7 @@ var require_retry_handler3 = __commonJS({
         return this.retryCount = 0, this.handler.onComplete(rawTrailers);
       }
       onError(err) {
-        if (this.aborted || isDisturbed(this.opts.body))
+        if (this.aborted || isDisturbed(this.opts.body) || this.headersSent && this.resume == null)
           return this.handler.onError(err);
         this.retryCount - this.retryCountCheckpoint > 0 ? this.retryCount = this.retryCountCheckpoint + (this.retryCount - this.retryCountCheckpoint) : this.retryCount += 1, this.retryOpts.retry(
           err,
@@ -59357,9 +59936,12 @@ var require_connection3 = __commonJS({
             return;
           }
           let secProtocol = response.headersList.get("Sec-WebSocket-Protocol");
-          if (secProtocol !== null && !getDecodeSplit("sec-websocket-protocol", request.headersList).includes(secProtocol)) {
-            failWebsocketConnection(ws, "Protocol was not set in the opening handshake.");
-            return;
+          if (secProtocol !== null) {
+            let requestProtocols = getDecodeSplit("sec-websocket-protocol", request.headersList);
+            if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
+              failWebsocketConnection(ws, "Protocol was not set in the opening handshake.");
+              return;
+            }
           }
           response.socket.on("data", onSocketData), response.socket.on("close", onSocketClose), response.socket.on("error", onSocketError), channels.open.hasSubscribers && channels.open.publish({
             address: response.socket.address(),
@@ -59447,7 +60029,7 @@ var require_permessage_deflate4 = __commonJS({
           }
           this.#inflate[kBuffer] = [], this.#inflate[kLength] = 0, this.#inflate.on("data", (data) => {
             if (this.#inflate[kLength] += data.length, this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
-              callback(new MessageSizeExceededError()), this.#inflate.removeAllListeners(), this.#inflate = null;
+              callback(new MessageSizeExceededError()), this.#inflate.removeAllListeners(), this.#inflate.destroy(), this.#inflate = null;
               return;
             }
             this.#inflate[kBuffer].push(data);
@@ -60069,7 +60651,30 @@ var require_util22 = __commonJS({
 var require_eventsource_stream3 = __commonJS({
   "node_modules/discord.js/node_modules/undici/lib/web/eventsource/eventsource-stream.js"(exports2, module2) {
     "use strict";
-    var { Transform } = require("node:stream"), { isASCIINumber, isValidLastEventId } = require_util22(), BOM = [239, 187, 191], LF = 10, CR = 13, COLON = 58, SPACE = 32, EventSourceStream = class extends Transform {
+    var { Transform } = require("node:stream"), { isASCIINumber, isValidLastEventId } = require_util22(), BOM = [239, 187, 191], LF = 10, CR = 13, COLON = 58, SPACE = 32, DATA = Buffer.from("data"), EVENT = Buffer.from("event"), ID = Buffer.from("id"), RETRY = Buffer.from("retry");
+    function isASCIINumberBytes(buffer, start) {
+      if (start >= buffer.length)
+        return !1;
+      for (let i = start; i < buffer.length; i++)
+        if (buffer[i] < 48 || buffer[i] > 57)
+          return !1;
+      return !0;
+    }
+    function isValidLastEventIdBytes(buffer, start) {
+      for (let i = start; i < buffer.length; i++)
+        if (buffer[i] === 0)
+          return !1;
+      return !0;
+    }
+    function isFieldName(line, length, field) {
+      if (length !== field.length)
+        return !1;
+      for (let i = 0; i < length; i++)
+        if (line[i] !== field[i])
+          return !1;
+      return !0;
+    }
+    var EventSourceStream = class extends Transform {
       /**
        * @type {eventSourceSettings}
        */
@@ -60088,10 +60693,13 @@ var require_eventsource_stream3 = __commonJS({
        */
       eventEndCheck = !1;
       /**
-       * @type {Buffer}
+       * @type {Buffer[]}
        */
-      buffer = null;
+      chunks = [];
+      chunkIndex = 0;
       pos = 0;
+      lineChunkIndex = 0;
+      linePos = 0;
       event = {
         data: void 0,
         event: void 0,
@@ -60117,54 +60725,32 @@ var require_eventsource_stream3 = __commonJS({
           callback();
           return;
         }
-        if (this.buffer ? this.buffer = Buffer.concat([this.buffer, chunk]) : this.buffer = chunk, this.checkBOM)
-          switch (this.buffer.length) {
-            case 1:
-              if (this.buffer[0] === BOM[0]) {
-                callback();
-                return;
-              }
-              this.checkBOM = !1, callback();
-              return;
-            case 2:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1]) {
-                callback();
-                return;
-              }
-              this.checkBOM = !1;
-              break;
-            case 3:
-              if (this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2]) {
-                this.buffer = Buffer.alloc(0), this.checkBOM = !1, callback();
-                return;
-              }
-              this.checkBOM = !1;
-              break;
-            default:
-              this.buffer[0] === BOM[0] && this.buffer[1] === BOM[1] && this.buffer[2] === BOM[2] && (this.buffer = this.buffer.subarray(3)), this.checkBOM = !1;
-              break;
-          }
-        for (; this.pos < this.buffer.length; ) {
+        if (this.chunks.push(chunk), this.checkBOM && this.handleBOM()) {
+          callback();
+          return;
+        }
+        for (; this.hasCurrentByte(); ) {
+          let byte = this.currentByte();
           if (this.eventEndCheck) {
             if (this.crlfCheck) {
-              if (this.buffer[this.pos] === LF) {
-                this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, this.crlfCheck = !1;
+              if (byte === LF) {
+                this.crlfCheck = !1, this.consumeCurrentByte();
                 continue;
               }
               this.crlfCheck = !1;
             }
-            if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-              this.buffer[this.pos] === CR && (this.crlfCheck = !0), this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, (this.event.data !== void 0 || this.event.event || this.event.id || this.event.retry) && this.processEvent(this.event), this.clearEvent();
+            if (byte === LF || byte === CR) {
+              byte === CR && (this.crlfCheck = !0), this.consumeCurrentByte(), this.hasPendingEvent() && this.processEvent(this.event), this.clearEvent();
               continue;
             }
             this.eventEndCheck = !1;
             continue;
           }
-          if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
-            this.buffer[this.pos] === CR && (this.crlfCheck = !0), this.parseLine(this.buffer.subarray(0, this.pos), this.event), this.buffer = this.buffer.subarray(this.pos + 1), this.pos = 0, this.eventEndCheck = !0;
+          if (byte === LF || byte === CR) {
+            byte === CR && (this.crlfCheck = !0), this.parseLine(this.readLine(), this.event), this.consumeCurrentByte(), this.eventEndCheck = !0;
             continue;
           }
-          this.pos++;
+          this.advanceCursor();
         }
         callback();
       }
@@ -60178,27 +60764,24 @@ var require_eventsource_stream3 = __commonJS({
         let colonPosition = line.indexOf(COLON);
         if (colonPosition === 0)
           return;
-        let field = "", value = "";
-        if (colonPosition !== -1) {
-          field = line.subarray(0, colonPosition).toString("utf8");
-          let valueStart = colonPosition + 1;
-          line[valueStart] === SPACE && ++valueStart, value = line.subarray(valueStart).toString("utf8");
-        } else
-          field = line.toString("utf8"), value = "";
-        switch (field) {
-          case "data":
-            event[field] === void 0 ? event[field] = value : event[field] += `
+        let fieldLength = line.length, valueStart = line.length;
+        if (colonPosition !== -1 && (fieldLength = colonPosition, valueStart = colonPosition + 1, line[valueStart] === SPACE && ++valueStart), isFieldName(line, fieldLength, DATA)) {
+          let value = line.toString("utf8", valueStart);
+          event.data === void 0 ? event.data = value : event.data += `
 ${value}`;
-            break;
-          case "retry":
-            isASCIINumber(value) && (event[field] = value);
-            break;
-          case "id":
-            isValidLastEventId(value) && (event[field] = value);
-            break;
-          case "event":
-            value.length > 0 && (event[field] = value);
-            break;
+          return;
+        }
+        if (isFieldName(line, fieldLength, RETRY)) {
+          isASCIINumberBytes(line, valueStart) && (event.retry = line.toString("utf8", valueStart));
+          return;
+        }
+        if (isFieldName(line, fieldLength, ID)) {
+          isValidLastEventIdBytes(line, valueStart) && (event.id = line.toString("utf8", valueStart));
+          return;
+        }
+        if (isFieldName(line, fieldLength, EVENT)) {
+          let value = line.toString("utf8", valueStart);
+          value.length > 0 && (event.event = value);
         }
       }
       /**
@@ -60215,12 +60798,61 @@ ${value}`;
         });
       }
       clearEvent() {
-        this.event = {
-          data: void 0,
-          event: void 0,
-          id: void 0,
-          retry: void 0
-        };
+        this.event.data = void 0, this.event.event = void 0, this.event.id = void 0, this.event.retry = void 0;
+      }
+      hasPendingEvent() {
+        return this.event.data !== void 0 || this.event.event !== void 0 || this.event.id !== void 0 || this.event.retry !== void 0;
+      }
+      hasCurrentByte() {
+        return this.chunkIndex < this.chunks.length && this.pos < this.chunks[this.chunkIndex].length;
+      }
+      currentByte() {
+        return this.chunks[this.chunkIndex][this.pos];
+      }
+      consumeCurrentByte() {
+        this.advanceCursor(), this.syncLineStartToCursor();
+      }
+      advanceCursor() {
+        for (this.pos++; this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length; )
+          this.chunkIndex++, this.pos = 0;
+      }
+      syncLineStartToCursor() {
+        this.lineChunkIndex = this.chunkIndex, this.linePos = this.pos, this.dropConsumedChunks();
+      }
+      dropConsumedChunks() {
+        for (; this.lineChunkIndex > 0; )
+          this.chunks.shift(), this.lineChunkIndex--, this.chunkIndex--;
+        this.chunkIndex === this.chunks.length && (this.chunks.length = 0, this.chunkIndex = 0, this.pos = 0, this.lineChunkIndex = 0, this.linePos = 0);
+      }
+      readLine() {
+        if (this.lineChunkIndex === this.chunkIndex)
+          return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos);
+        let chunks = [], length = 0;
+        for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+          let chunk = this.chunks[i], start = i === this.lineChunkIndex ? this.linePos : 0, end = i === this.chunkIndex ? this.pos : chunk.length, slice = chunk.subarray(start, end);
+          length += slice.length, chunks.push(slice);
+        }
+        return Buffer.concat(chunks, length);
+      }
+      peekBufferedByte(offset) {
+        let chunkIndex = this.lineChunkIndex, pos = this.linePos;
+        for (; chunkIndex < this.chunks.length; ) {
+          let chunk = this.chunks[chunkIndex], remaining = chunk.length - pos;
+          if (offset < remaining)
+            return chunk[pos + offset];
+          offset -= remaining, chunkIndex++, pos = 0;
+        }
+      }
+      discardLeadingBytes(count) {
+        for (; count > 0 && this.lineChunkIndex < this.chunks.length; ) {
+          let remaining = this.chunks[this.lineChunkIndex].length - this.linePos;
+          count < remaining ? (this.linePos += count, count = 0) : (count -= remaining, this.lineChunkIndex++, this.linePos = 0);
+        }
+        this.chunkIndex = this.lineChunkIndex, this.pos = this.linePos, this.dropConsumedChunks();
+      }
+      handleBOM() {
+        let first = this.peekBufferedByte(0), second = this.peekBufferedByte(1), third = this.peekBufferedByte(2);
+        return second === void 0 ? (first === BOM[0] || (this.checkBOM = !1), !0) : third === void 0 ? first === BOM[0] && second === BOM[1] ? !0 : (this.checkBOM = !1, !1) : (first === BOM[0] && second === BOM[1] && third === BOM[2] && this.discardLeadingBytes(3), this.checkBOM = !1, !this.hasCurrentByte());
       }
     };
     module2.exports = {
@@ -95626,7 +96258,7 @@ var require_owner_state = __commonJS({
 var require_remote_permissions = __commonJS({
   "src/remote-permissions.js"(exports2, module2) {
     "use strict";
-    var fs = require("node:fs"), http = require("node:http"), { randomBytes } = require("node:crypto"), { spawn } = require("node:child_process"), { setTimeout: delay } = require("node:timers/promises"), WebSocket = require_ws(), MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+    var fs = require("node:fs"), http = require("node:http"), { randomBytes } = require("node:crypto"), { spawn } = require("node:child_process"), { setTimeout: delay } = require("node:timers/promises"), WebSocket = require_ws(), MAX_BUFFERED_BYTES = 128 * 1024 * 1024;
     function permissionRequest(data, isTui, permissions) {
       let message;
       try {
@@ -95637,7 +96269,7 @@ var require_remote_permissions = __commonJS({
       return !isTui || !message || typeof message != "object" || Array.isArray(message) || message.id === void 0 || !["thread/start", "thread/resume", "thread/fork"].includes(message.method) || !message.params || typeof message.params != "object" || Array.isArray(message.params) ? data : JSON.stringify({ ...message, params: { ...message.params, ...permissions } });
     }
     function connectRelay(front, backendUrl, permissions, startupState = { applied: !1 }) {
-      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: 134217728 }), wirePrefix = `codex-permission:${randomBytes(16).toString("hex")}:`, attempt = 0, isWireId = (id) => typeof id == "string" && id.startsWith(wirePrefix), isTui = !1, pendingRequest, closed = !1, queued = [], queuedBytes = 0, close = () => {
+      let back = new WebSocket(backendUrl, { perMessageDeflate: !1, maxPayload: MAX_BUFFERED_BYTES }), wirePrefix = `codex-permission:${randomBytes(16).toString("hex")}:`, attempt = 0, isWireId = (id) => typeof id == "string" && id.startsWith(wirePrefix), isTui = !1, pendingRequest, closed = !1, queued = [], queuedBytes = 0, close = () => {
         closed || (closed = !0, pendingRequest && startupState.pending === pendingRequest && (startupState.applied = !0, startupState.pending = null), pendingRequest = void 0, queued = [], queuedBytes = 0, front.terminate(), back.terminate());
       }, forward = (socket, data, binary) => {
         if (closed || socket.readyState !== WebSocket.OPEN) return !1;
@@ -95700,7 +96332,7 @@ var require_remote_permissions = __commonJS({
       let socket = endpoint.slice(7), nativeSocket = `${socket}.${process.pid}-${randomBytes(4).toString("hex")}`;
       if (Buffer.byteLength(nativeSocket) >= 108) throw new Error("Instance socket path is too long for permission forwarding");
       if (fs.existsSync(nativeSocket)) throw new Error("Native permission-forwarding socket already exists");
-      let args = launch.args.map((arg) => arg === endpoint ? `unix://${nativeSocket}` : arg), child = spawn(launch.command, args, { env: launch.env, stdio: "inherit" }), server = http.createServer(), sockets = new WebSocket.Server({ server, perMessageDeflate: !1, maxPayload: 128 * 1024 * 1024 }), nativeIdentity, publicIdentity, childError, childExit = new Promise((resolve) => {
+      let args = launch.args.map((arg) => arg === endpoint ? `unix://${nativeSocket}` : arg), child = spawn(launch.command, args, { env: launch.env, stdio: "inherit" }), server = http.createServer(), sockets = new WebSocket.Server({ server, perMessageDeflate: !1, maxPayload: MAX_BUFFERED_BYTES }), nativeIdentity, publicIdentity, childError, childExit = new Promise((resolve) => {
         child.once("error", (error) => {
           childError = error, resolve(1);
         }), child.once("exit", (code) => resolve(code ?? 1));
@@ -96100,7 +96732,7 @@ var require_mcp_server = __commonJS({
       reconcileDiscordMessage: reconcileDiscordMessage2,
       sendDiscordMessage: sendDiscordMessage2,
       startDiscordClient: startDiscordClient2
-    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.25", MAX_TOOL_RESULT_BYTES = 64 * 1024;
+    } = require_discord_client(), { readDiscordHistory } = require_history(), { claimOwner: claimOwner2, createOwner: createOwner2, readOwner } = require_owner_state(), { sendDiscordReplyOnce: sendDiscordReplyOnce2 } = require_reply_delivery(), { readGatewayHealthStatus } = require_gateway_health(), SERVER_NAME = "Codex Discord Channel", SERVER_VERSION = "0.3.26", MAX_TOOL_RESULT_BYTES = 64 * 1024;
     function makeLogger2() {
       return (level, message, meta) => {
         let suffix = meta === void 0 ? "" : ` ${JSON.stringify(meta)}`;
