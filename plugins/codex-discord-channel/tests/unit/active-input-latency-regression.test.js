@@ -5,12 +5,12 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { createAppServerHost } = require('../../src/app-server-host');
 const { createDelivery } = require('../../src/delivery');
 
-const ROOT = path.resolve(__dirname, '../..');
 const THREAD = '019f3763-d308-7871-bedc-e6489b02190e';
 const TURN = '019f3763-d308-7871-bedc-e6489b021910';
 const CLIENT = 'discord:fixture-channel:fixture-source';
@@ -19,7 +19,8 @@ function fixture(t, {
   nativeProof = false, proofEntries = null, rotateOnProof = false, proofThrows = false,
   closeAfterProof = false, nextCursor = null, rootKind = 'user', rolloutProof = false,
 } = {}) {
-  const dir = fs.mkdtempSync(path.join(ROOT, 'fixture-'));
+  // Keep changing fixtures outside the package tree copied by packaging tests.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-active-input-'));
   const sessions = path.join(dir, 'sessions/2026/09/10');
   fs.mkdirSync(sessions, { recursive: true });
   const rollout = path.join(sessions, `rollout-2026-09-10T00-00-00-${THREAD}.jsonl`);

@@ -28,9 +28,9 @@ function contentDigest(content) {
   return createHash('sha256').update(String(content), 'utf8').digest('hex');
 }
 
-function replyNonce(channelId, sourceMessageId) {
+function replyNonce(channelId, sourceMessageId, namespace = '') {
   const digest = createHash('sha256')
-    .update(`discord-reply\0${channelId}\0${sourceMessageId}`, 'utf8')
+    .update(`discord-reply\0${channelId}\0${sourceMessageId}${namespace ? `\0${namespace}` : ''}`, 'utf8')
     .digest('hex');
   return `cdr-${digest.slice(0, 21)}`;
 }
@@ -264,7 +264,7 @@ async function releaseProvenAbsentReply(config, state, identity, deps = {}) {
 async function beginReply(config, identity, content, deps = {}) {
   const file = receiptPath(config, identity.channelId, identity.sourceMessageId);
   const digest = contentDigest(content);
-  const nonce = replyNonce(identity.channelId, identity.sourceMessageId);
+  const nonce = replyNonce(identity.channelId, identity.sourceMessageId, config.scheduledReceiptNamespace || '');
   return withReceiptLock(file, config, deps, async () => {
     const fsImpl = deps.fs || fs;
     const existing = readReceipt(file, fsImpl);
@@ -451,6 +451,62 @@ async function sendAndConfirm({
   }
 }
 
+// Scheduled reports are separately authorized, occurrence-keyed guarded sends.
+// The ordinary source reply receipt and nonce are unchanged.
+function scheduledReceiptConfig(args, config, deps = {}) {
+  if (!Object.hasOwn(args, 'scheduledReport')) return config;
+  if (args.followup === true) throw new Error('Scheduled reports cannot use followup.');
+  const request = args.scheduledReport;
+  if (!request || typeof request !== 'object' || Array.isArray(request)
+      || typeof request.id !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(request.id)
+      || typeof request.occurrence !== 'string'
+      || Object.keys(request).some((key) => !['id', 'occurrence'].includes(key))) {
+    throw new Error('Invalid scheduled report identity.');
+  }
+  const fsImpl = deps.fs || fs;
+  const authorityPath = path.join(config.paths.stateDir, 'scheduled-reports.json');
+  let authority;
+  try { authority = JSON.parse(fsImpl.readFileSync(authorityPath, 'utf8')); }
+  catch { throw new Error('Scheduled report authority is unavailable.'); }
+  const rule = authority?.version === 1 ? authority.reports?.[request.id] : null;
+  if (!rule || rule.enabled !== true
+      || rule.channelId !== args.channelId || rule.replyTo !== args.replyTo
+      || !Number.isSafeInteger(rule.intervalMinutes) || rule.intervalMinutes <= 0
+      || rule.intervalMinutes > 1440) {
+    throw new Error('Scheduled report target is not authorized.');
+  }
+  const occurrence = Date.parse(request.occurrence);
+  const start = Date.parse(rule.startsAt);
+  const interval = rule.intervalMinutes * 60000;
+  const now = nowMs(deps);
+  if (!Number.isFinite(occurrence) || !Number.isFinite(start)
+      || new Date(occurrence).toISOString() !== request.occurrence
+      || occurrence < start || occurrence > now
+      || (occurrence - start) % interval !== 0) {
+    throw new Error('Scheduled report occurrence is not authorized.');
+  }
+  const namespace = `scheduled-report\0${request.id}\0${request.occurrence}`;
+  const key = createHash('sha256').update(namespace).digest('hex');
+  const reportConfig = {
+    ...config,
+    paths: { ...config.paths,
+      replyReceiptDir: path.join(config.paths.stateDir, 'scheduled-report-receipts', key) },
+  };
+  // Permit reconciliation of old claims, but do not flood missed historical slots.
+  if (now - occurrence >= interval
+      && !fsImpl.existsSync(receiptPath(reportConfig, args.channelId, args.replyTo))) {
+    throw new Error('Scheduled report occurrence is stale.');
+  }
+  return {
+    ...config,
+    scheduledReceiptNamespace: namespace,
+    paths: {
+      ...config.paths,
+      replyReceiptDir: path.join(config.paths.stateDir, 'scheduled-report-receipts', key),
+    },
+  };
+}
+
 async function sendDiscordReplyOnce({
   args = {},
   config,
@@ -462,6 +518,7 @@ async function sendDiscordReplyOnce({
   reconciliationOnly = false,
   deps = {},
 }) {
+  config = scheduledReceiptConfig(args, config, deps);
   const dispatch = replyDispatch(args, config);
   if (!dispatch.guarded) {
     const prepared = typeof preflight === 'function' ? await preflight(dispatch.target, {}) : undefined;
