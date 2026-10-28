@@ -124,6 +124,16 @@ function toolList() {
           channelId: { type: 'string', description: 'Exact Discord channel id. Required for replies and followups.' },
           content: { type: 'string', description: 'Message text to send.' },
           replyTo: { type: 'string', description: 'Exact source Discord message id. Required unless followup is true.' },
+          scheduledReport: {
+            type: 'object',
+            description: 'Owner-authorized recurring report id and canonical UTC occurrence; guarded per occurrence. Requires state-dir scheduled-reports.json authority.',
+            properties: {
+              id: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,100}$' },
+              occurrence: { type: 'string' },
+            },
+            required: ['id', 'occurrence'],
+            additionalProperties: false,
+          },
           followup: {
             type: 'boolean',
             default: false,

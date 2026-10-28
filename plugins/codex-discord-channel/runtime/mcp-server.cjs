@@ -4617,8 +4617,8 @@ var require_reply_delivery = __commonJS({
     function contentDigest(content) {
       return createHash("sha256").update(String(content), "utf8").digest("hex");
     }
-    function replyNonce(channelId, sourceMessageId) {
-      return `cdr-${createHash("sha256").update(`discord-reply\0${channelId}\0${sourceMessageId}`, "utf8").digest("hex").slice(0, 21)}`;
+    function replyNonce(channelId, sourceMessageId, namespace = "") {
+      return `cdr-${createHash("sha256").update(`discord-reply\0${channelId}\0${sourceMessageId}${namespace ? `\0${namespace}` : ""}`, "utf8").digest("hex").slice(0, 21)}`;
     }
     function receiptPath(config, channelId, sourceMessageId) {
       let dir = config.paths?.replyReceiptDir || path.join(config.paths?.stateDir || "", "reply-receipts");
@@ -4787,7 +4787,7 @@ var require_reply_delivery = __commonJS({
       return released !== null ? suppressResult(identity, released, "source_message_reply_uncertain").result : provenAbsentResult(identity);
     }
     async function beginReply(config, identity, content, deps = {}) {
-      let file = receiptPath(config, identity.channelId, identity.sourceMessageId), digest = contentDigest(content), nonce = replyNonce(identity.channelId, identity.sourceMessageId);
+      let file = receiptPath(config, identity.channelId, identity.sourceMessageId), digest = contentDigest(content), nonce = replyNonce(identity.channelId, identity.sourceMessageId, config.scheduledReceiptNamespace || "");
       return withReceiptLock(file, config, deps, async () => {
         let fsImpl = deps.fs || fs, existing = readReceipt(file, fsImpl);
         if (!existing && fsImpl.existsSync(file))
@@ -4924,6 +4924,42 @@ var require_reply_delivery = __commonJS({
         throw error?.definitiveNoSend === !0 ? await releaseReplyClaim(config, state, deps) : await markReplyUncertain(config, state, error, deps, error?.replySendIdentity), error;
       }
     }
+    function scheduledReceiptConfig(args, config, deps = {}) {
+      if (!Object.hasOwn(args, "scheduledReport")) return config;
+      if (args.followup === !0) throw new Error("Scheduled reports cannot use followup.");
+      let request = args.scheduledReport;
+      if (!request || typeof request != "object" || Array.isArray(request) || typeof request.id != "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(request.id) || typeof request.occurrence != "string" || Object.keys(request).some((key2) => !["id", "occurrence"].includes(key2)))
+        throw new Error("Invalid scheduled report identity.");
+      let fsImpl = deps.fs || fs, authorityPath = path.join(config.paths.stateDir, "scheduled-reports.json"), authority;
+      try {
+        authority = JSON.parse(fsImpl.readFileSync(authorityPath, "utf8"));
+      } catch {
+        throw new Error("Scheduled report authority is unavailable.");
+      }
+      let rule = authority?.version === 1 ? authority.reports?.[request.id] : null;
+      if (!rule || rule.enabled !== !0 || rule.channelId !== args.channelId || rule.replyTo !== args.replyTo || !Number.isSafeInteger(rule.intervalMinutes) || rule.intervalMinutes <= 0 || rule.intervalMinutes > 1440)
+        throw new Error("Scheduled report target is not authorized.");
+      let occurrence = Date.parse(request.occurrence), start = Date.parse(rule.startsAt), interval = rule.intervalMinutes * 6e4, now = nowMs(deps);
+      if (!Number.isFinite(occurrence) || !Number.isFinite(start) || new Date(occurrence).toISOString() !== request.occurrence || occurrence < start || occurrence > now || (occurrence - start) % interval !== 0)
+        throw new Error("Scheduled report occurrence is not authorized.");
+      let namespace = `scheduled-report\0${request.id}\0${request.occurrence}`, key = createHash("sha256").update(namespace).digest("hex"), reportConfig = {
+        ...config,
+        paths: {
+          ...config.paths,
+          replyReceiptDir: path.join(config.paths.stateDir, "scheduled-report-receipts", key)
+        }
+      };
+      if (now - occurrence >= interval && !fsImpl.existsSync(receiptPath(reportConfig, args.channelId, args.replyTo)))
+        throw new Error("Scheduled report occurrence is stale.");
+      return {
+        ...config,
+        scheduledReceiptNamespace: namespace,
+        paths: {
+          ...config.paths,
+          replyReceiptDir: path.join(config.paths.stateDir, "scheduled-report-receipts", key)
+        }
+      };
+    }
     async function sendDiscordReplyOnce2({
       args = {},
       config,
@@ -4935,6 +4971,7 @@ var require_reply_delivery = __commonJS({
       reconciliationOnly = !1,
       deps = {}
     }) {
+      config = scheduledReceiptConfig(args, config, deps);
       let dispatch = replyDispatch(args, config);
       if (!dispatch.guarded) {
         let prepared2 = typeof preflight == "function" ? await preflight(dispatch.target, {}) : void 0;
@@ -96229,6 +96266,16 @@ function toolList() {
           channelId: { type: "string", description: "Exact Discord channel id. Required for replies and followups." },
           content: { type: "string", description: "Message text to send." },
           replyTo: { type: "string", description: "Exact source Discord message id. Required unless followup is true." },
+          scheduledReport: {
+            type: "object",
+            description: "Owner-authorized recurring report id and canonical UTC occurrence; guarded per occurrence. Requires state-dir scheduled-reports.json authority.",
+            properties: {
+              id: { type: "string", pattern: "^[a-zA-Z0-9_-]{1,100}$" },
+              occurrence: { type: "string" }
+            },
+            required: ["id", "occurrence"],
+            additionalProperties: !1
+          },
           followup: {
             type: "boolean",
             default: !1,
