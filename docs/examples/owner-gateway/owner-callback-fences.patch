@@ -1,0 +1,49 @@
+--- a/docs/examples/native-assignment-continuation/autoport-owner-callbacks.cjs
++++ b/docs/examples/native-assignment-continuation/autoport-owner-callbacks.cjs
+@@ -55,6 +55,7 @@
+   const k=turn(arg);if(d.terminals[k]){assert(d.terminals[k].status===arg.status,'conflicting terminal');return save({action:'duplicate-terminal'});}
+   d.terminals[k]={threadId:arg.threadId,turnId:arg.turnId,status:arg.status};
+   for(const s of d.submissions)if(s.threadId===arg.threadId&&s.turnId===arg.turnId)s.returnedStatus=arg.status;
++  if(arg.defer===true)return save({action:'join',reason:'receiver deferred; terminal retained'});
+   // Continue to one atomic recheck. A terminal alone does not consume effects.
+  }
+  if(op==='terminal'||op==='recheck'){
+@@ -100,7 +101,7 @@
+  if(op==='recover'){if(s.status==='RESERVED')s.status='UNKNOWN';return save({action:'reconcile',submissionId:s.id,status:s.status});}
+  throw Error('unknown operation');
+ }
+-function createOwnerCallbacks(configPath,host){
++function createOwnerCallbacks(configPath,host,{beforeSubmit=()=>{}}={}){
+  const c=read(configPath);
+  let tail=Promise.resolve();
+  function tx(op,arg={}){
+@@ -115,6 +116,7 @@
+   const result=tail.then(run);tail=result.catch(()=>{});return result;
+  }
+  function beforeSend(submission){
++  beforeSubmit();
+   const latest=read(configPath),s=read(latest.ownerSnapshotPath);
+   assert(s.assignmentId===c.assignmentId&&s.executionId===c.executionId,'latest identity');
+   assert(Number.isFinite(s.deadlineMs)&&Number.isInteger(s.maxContinuations)&&Number.isInteger(s.usedContinuations),'latest budget identity');
+@@ -131,10 +133,12 @@
+   const id=outcome.submission.id;
+   if(c.deploymentEnabled!==true)return {...outcome,action:'prepared-not-submitted'};
+   try{
++   beforeSubmit();
+    const generation=host.client.connectionGeneration;
+    const target=await host.resolveTarget();
+    if(host.client.connectionGeneration!==generation)return {action:'join',reason:'connection generation changed; reservation not attempted',submissionId:id};
+    if(!target.available||target.status!=='idle')return {action:'join',submissionId:id};
++   beforeSubmit();
+    const b=await tx('begin',{submissionId:id,threadId:target.threadId});if(b.action!=='submit')return b;
+    const response=await host.client.requestOnConnection('turn/start',{threadId:target.threadId,clientUserMessageId:outcome.submission.clientId,input:[{type:'text',text:`Continue original Autoport assignment ${c.assignmentId}; execution ${c.executionId}. Read current owner state ${c.ownerSnapshotPath} and durable causes ${path.join(c.receiptDir,'owner-callbacks.json')}. Query SAME plan ${c.planPath} and state ${c.statePath}; reconcile handles/results/UNKNOWN and latest STOP/budget before original Agent selects work. Preserve original criteria/history/costs. Record actual query/receiver/outcome using: node ${__filename} consume-outcome ${configPath} <owned-receipt.json>; this prompt grants no new effects.`,text_elements:[]}]},generation,()=>beforeSend(outcome.submission),true,AbortSignal.timeout(Math.max(1,Math.min(30000,read(c.ownerSnapshotPath).deadlineMs-Date.now()))));
+    const turnId=response.result?.turn?.id||response.result?.turnId;
+@@ -156,7 +160,7 @@
+   recordUnbound:fact=>tx('diagnostic',{kind:'unbound',fact}),recordConnectionError:error=>tx('diagnostic',{kind:'connection-error',error:String(error)})
+  };
+ }
+-module.exports={createOwnerCallbacks,transaction};
++module.exports={createOwnerCallbacks,transaction,supportsSubmissionGuard:true,supportsDeferredTerminal:true};
+ if(require.main===module){
+  if(process.argv[2]==='consume-outcome')createOwnerCallbacks(process.argv[3],null).consumeOutcome(read(process.argv[4])).then(x=>console.log(JSON.stringify(x))).catch(e=>{console.error(e.message);process.exitCode=1;});
+  else {try{assert(process.argv[2]==='--locked','unsupported operation');console.log(JSON.stringify(transaction(process.argv[3],process.argv[4],JSON.parse(process.argv[5]))));}catch(e){console.error(e.message);process.exitCode=1;}}

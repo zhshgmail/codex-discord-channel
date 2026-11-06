@@ -5921,13 +5921,23 @@ ${body}
         });
       });
     }
-    function turnStartParams(next, threadId) {
-      let normalized = next.normalized;
-      return {
+    function turnStartParams(next, threadId, deps = {}) {
+      let normalized = next.normalized, params = {
         threadId,
         clientUserMessageId: `discord:${structuredSafeText(normalized.channelId)}:${structuredSafeText(normalized.messageId)}`,
         input: [{ type: "text", text: structuredSafeText(formatEnvelope(normalized)) }]
       };
+      if (typeof deps.getInputContext == "function") {
+        let context = deps.getInputContext({
+          threadId,
+          clientUserMessageId: params.clientUserMessageId,
+          channelId: normalized.channelId,
+          messageId: normalized.messageId
+        });
+        if (typeof context != "string") throw new Error("Input context must be a string.");
+        context && params.input.push({ type: "text", text: structuredSafeText(context) });
+      }
+      return params;
     }
     function unavailableTarget(error) {
       return {
@@ -6098,7 +6108,18 @@ ${body}
             queueDepth: claim.queueDepth
           }), blocked.result);
         }
-        let params = turnStartParams(next, target.threadId), prepared = await withDeliveryQueueLock(config, deps, () => {
+        let params;
+        try {
+          params = turnStartParams(next, target.threadId, deps);
+        } catch (error) {
+          try {
+            await releaseCurrentHeadForRetry(config, deps, next, attemptId, verifyReceiverOwnership);
+          } finally {
+            activeDeliveryAttempts.delete(attemptId);
+          }
+          throw error;
+        }
+        let prepared = await withDeliveryQueueLock(config, deps, () => {
           let queue = readDeliveryQueue(config, deps);
           if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId)
             return { retry: !0 };
@@ -6280,7 +6301,7 @@ ${body}
         usedLastInbound: !0
       };
     }
-    function createDelivery2(config, logger = () => {
+    function createDelivery(config, logger = () => {
     }, deps = {}) {
       let host = deps.structuredHost || createAppServerHost(config, logger, deps.appServer || {}), admissionOperations = Promise.resolve(), drainOperations = Promise.resolve(), destroyed = !1, unsubscribeIdle = null, unsubscribeActive = null, unsubscribeReconnect = null, unsubscribeThreadClosed = null, unsubscribeAssistantFinal = null, startupDrain = Promise.resolve(), receiverVerification = null, receiverActivated = !1, leaseWakeTimer = null, leaseWakeAt = 0, serializeAdmission = (operation) => {
         let result = admissionOperations.then(operation, operation);
@@ -6467,7 +6488,7 @@ ${body}
     }
     module2.exports = {
       buildReplyCommand,
-      createDelivery: createDelivery2,
+      createDelivery,
       escapeAttr,
       formatEnvelope,
       normalizeDiscordMessage,
@@ -95853,6 +95874,33 @@ var require_discord_rest_client = __commonJS({
   }
 });
 
+// src/gateway-delivery.js
+var require_gateway_delivery = __commonJS({
+  "src/gateway-delivery.js"(exports2, module2) {
+    "use strict";
+    var path = require("node:path"), { createRequire } = require("node:module"), { createDelivery, readDeliveryQueueStatus: readDeliveryQueueStatus2 } = require_delivery(), { createAppServerHost } = require_app_server_host();
+    function createGatewayDelivery2(config, logger, deliveryDeps = {}, deps = {}) {
+      let factory = deps.createDelivery || createDelivery, modulePath = config.env?.CODEX_DISCORD_GATEWAY_DELIVERY_MODULE, configPath = config.env?.CODEX_DISCORD_GATEWAY_DELIVERY_CONFIG;
+      if (!modulePath && !configPath) return factory(config, logger, deliveryDeps);
+      if (!path.isAbsolute(modulePath || "") || !path.isAbsolute(configPath || ""))
+        throw new Error("Gateway delivery module and config must both be absolute local paths.");
+      let adapter = createRequire(modulePath)(modulePath);
+      if (typeof adapter.createGatewayDelivery != "function")
+        throw new Error("Gateway delivery module must export createGatewayDelivery.");
+      return adapter.createGatewayDelivery({
+        config,
+        logger,
+        deliveryDeps,
+        configPath,
+        getQueueStatus: () => readDeliveryQueueStatus2(config, deliveryDeps),
+        createDelivery: factory,
+        createAppServerHost: deps.createAppServerHost || createAppServerHost
+      });
+    }
+    module2.exports = { createGatewayDelivery: createGatewayDelivery2 };
+  }
+});
+
 // src/gateway-health.js
 var require_gateway_health = __commonJS({
   "src/gateway-health.js"(exports2, module2) {
@@ -96723,7 +96771,7 @@ var require_mcp_server = __commonJS({
   "src/mcp-server.js"(exports2, module2) {
     "use strict";
     var readline = require("node:readline"), { loadConfig: loadConfig2 } = require_config(), {
-      createDelivery: createDelivery2,
+      createDelivery,
       readDeliveryQueueStatus: readDeliveryQueueStatus2,
       readLastInboundContext
     } = require_delivery(), {
@@ -96993,7 +97041,7 @@ var require_mcp_server = __commonJS({
     async function main2() {
       let logger = makeLogger2(), config = loadConfig2();
       claimOwner2(config.paths.ownerPath, createOwner2(config));
-      let delivery = createDelivery2(config, logger), discordState = await startDiscordClient2({ config, delivery, logger }).catch((error) => (logger("ERROR", "Discord startup failed", { error: error instanceof Error ? error.message : String(error) }), { started: !1, client: null, reason: "startup_failed" })), context = makeContext(config, discordState, delivery);
+      let delivery = createDelivery(config, logger), discordState = await startDiscordClient2({ config, delivery, logger }).catch((error) => (logger("ERROR", "Discord startup failed", { error: error instanceof Error ? error.message : String(error) }), { started: !1, client: null, reason: "startup_failed" })), context = makeContext(config, discordState, delivery);
       readline.createInterface({ input: process.stdin, crlfDelay: 1 / 0 }).on("line", (line) => {
         if (line.trim() === "") return;
         let message;
@@ -97028,7 +97076,7 @@ var { loadConfig } = require_config(), {
   releaseDiscordReceiverOwnership,
   sendDiscordMessage,
   startDiscordClient
-} = require_discord_client(), { createDiscordRestClient } = require_discord_rest_client(), { createDelivery, readDeliveryQueueStatus } = require_delivery(), { writeGatewayHealth } = require_gateway_health(), { sendDiscordReplyOnce } = require_reply_delivery(), { isCurrentReceiverOwnership } = require_receiver_state(), { startGatewayDrainLoop } = require_gateway_drain_loop(), {
+} = require_discord_client(), { createDiscordRestClient } = require_discord_rest_client(), { readDeliveryQueueStatus } = require_delivery(), { createGatewayDelivery } = require_gateway_delivery(), { writeGatewayHealth } = require_gateway_health(), { sendDiscordReplyOnce } = require_reply_delivery(), { isCurrentReceiverOwnership } = require_receiver_state(), { startGatewayDrainLoop } = require_gateway_drain_loop(), {
   gatewayResourceSnapshot,
   resourceRestartLimitBytes,
   startGatewayResourceMonitor
@@ -97177,16 +97225,16 @@ function makeLogger() {
 function enabled(value) {
   return /^(1|true|yes|on)$/i.test(String(value || "").trim());
 }
-async function runGateway(config = loadConfig()) {
-  let logger = makeLogger(), restClient = createDiscordRestClient({
+async function runGateway(config = loadConfig(), deps = {}) {
+  let logger = deps.logger || makeLogger(), restClient = (deps.createDiscordRestClient || createDiscordRestClient)({
     token: config.token,
     botUserId: config.botUserId,
     fetchImpl: globalThis.fetch
-  }), delivery = createDelivery(config, logger, {
+  }), delivery = createGatewayDelivery(config, logger, {
     sendAutomaticReply: createAutomaticReplySender(config, restClient)
-  }), discordState;
+  }, deps), discordState;
   try {
-    discordState = await startDiscordClient({ config, delivery, logger, claimReceiver: !0 });
+    discordState = await (deps.startDiscordClient || startDiscordClient)({ config, delivery, logger, claimReceiver: !0 });
   } catch (error) {
     throw delivery.destroy(), error;
   }
@@ -97353,6 +97401,7 @@ async function main() {
   throw new Error(`Unknown command: ${command}`);
 }
 module.exports = {
+  runGateway,
   createAutomaticReplySender,
   main,
   parseLiveCheckArgs,
