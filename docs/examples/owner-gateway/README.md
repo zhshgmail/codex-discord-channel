@@ -4,13 +4,14 @@ This candidate connects a trusted owner adapter to **`codex-discord-channel gate
 
 The communication code loads an owner-provided CommonJS module exporting `createGatewayDelivery(args)`. It receives the original `config`, `logger`, automatic-reply dependency, `createDelivery`, `createAppServerHost`, an absolute adapter config path and a read-only queue-status function. The adapter must return the original delivery interface and preserve its receiver/FIFO/receipt protections. This is trusted executable configuration, not a sandbox or a module name supplied by a message.
 
-`autoport-factory.cjs` is a concrete owner-side example using the [fixed original callbacks](https://gitcode.com/zhengshencn_hwca/npu-autoport-pipeline/blob/f901cf9cd1ea50a9ef49f37ca832ae72bb377119/docs/examples/native-assignment-continuation/OWNER_CALLBACKS.md). The owner keeps the assignment, Plan/STATE, explicit admissions, latest intent/STOP, handles/results/UNKNOWN and cumulative budget. No business selector is added to the communication plugin.
+`autoport-factory.cjs` is a concrete owner-side example using the [fixed original callbacks](https://gitcode.com/zhengshencn_hwca/npu-autoport-pipeline/blob/62d90de1f9b703f6a5306b61c6d8105814c3f252/docs/examples/native-assignment-continuation/OWNER_CALLBACKS.md). The owner keeps the assignment, Plan/STATE, explicit admissions, latest intent/STOP, handles/results/UNKNOWN and cumulative budget. No business selector is added to the communication plugin.
 
-The fixed callback needs the adjacent **proposed** `owner-callback-fences.patch` before using this adapter. It adds a synchronous `beforeSubmit` hook and deferred terminal recording. The adapter fails closed if either capability is missing. Apply this patch in an owned Autoport checkout at the fixed ref; it has not been applied to Autoport main by this work.
-
-```sh
-git apply /absolute/path/to/owner-callback-fences.patch
-```
+That fixed owner revision already exports `supportsSubmissionGuard` and
+`supportsDeferredTerminal`, implements the synchronous `beforeSubmit` hook and
+retains deferred terminals. Use its callback and connector together; do not
+apply the earlier proposal patch on top. The adapter still rejects a callback
+missing either capability. Callback SHA-256:
+`9f0252d31dac6ae69d73f6e1c5731a15ffdc2d23fe82c98fff0a2ee40128f6ae`.
 
 Use an owner-controlled adapter binding (absolute paths, no tokens):
 
@@ -35,6 +36,6 @@ Terminal handling uses the existing queue coordination lock. Pending/uncertain D
 
 ## Validation boundary
 
-Source tests cover the actual `runGateway` factory call and failure cleanup, default behavior, explicit module selection, ordinary/active input context and FIFO retention on context failure. The separate integration consumer connects this example, the fixed owner connector and the patched actual callbacks through the same injected host/client, including two observations before admission, one combined submission, STOP/budget/disabled state, pending FIFO, receiver loss, reconstruction deduplication and cleanup. No production Discord/WebSocket, real model, NPU, long unattended run or native Owner file consumption is certified by these controls.
+Source tests cover the actual `runGateway` factory call and failure cleanup, default behavior, explicit module selection, ordinary/active input context and FIFO retention on context failure. The separate integration consumer connects this example, the fixed owner connector and the actual callbacks at the fixed owner revision through the same injected host/client, including two observations before admission, one combined submission, STOP/budget/disabled state, pending FIFO, receiver loss, reconstruction deduplication and cleanup. No production Discord/WebSocket, real model, NPU, long unattended run or native Owner file consumption is certified by these controls.
 
 The existing installed version is 0.3.26. This candidate is based on its source `cfcd0e1`; the current remote default `a6f3705` is older (0.3.23). The patch must be integrated with the maintained release lineage without removing its intervening transport fixes. This branch does not release a version or change installed caches/generations.
