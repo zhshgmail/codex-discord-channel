@@ -795,13 +795,22 @@ async function releaseCurrentHeadForRetry(
   });
 }
 
-function turnStartParams(next, threadId) {
+function turnStartParams(next, threadId, deps = {}) {
   const normalized = next.normalized;
-  return {
+  const params = {
     threadId,
     clientUserMessageId: `discord:${structuredSafeText(normalized.channelId)}:${structuredSafeText(normalized.messageId)}`,
     input: [{ type: 'text', text: structuredSafeText(formatEnvelope(normalized)) }],
   };
+  if (typeof deps.getInputContext === 'function') {
+    const context = deps.getInputContext({
+      threadId, clientUserMessageId: params.clientUserMessageId,
+      channelId: normalized.channelId, messageId: normalized.messageId,
+    });
+    if (typeof context !== 'string') throw new Error('Input context must be a string.');
+    if (context) params.input.push({ type: 'text', text: structuredSafeText(context) });
+  }
+  return params;
 }
 
 function unavailableTarget(error) {
@@ -1056,7 +1065,19 @@ async function flushStructuredQueue(config, logger, deps, host, options = {}) {
       return blocked.result;
     }
 
-    const params = turnStartParams(next, target.threadId);
+    let params;
+    try {
+      params = turnStartParams(next, target.threadId, deps);
+    } catch (error) {
+      // No RPC has been attempted. Preserve the original FIFO item and release
+      // our lease so a corrected local context can be retried safely.
+      try {
+        await releaseCurrentHeadForRetry(config, deps, next, attemptId, verifyReceiverOwnership);
+      } finally {
+        activeDeliveryAttempts.delete(attemptId);
+      }
+      throw error;
+    }
     const prepared = await withDeliveryQueueLock(config, deps, () => {
       const queue = readDeliveryQueue(config, deps);
       if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId) {

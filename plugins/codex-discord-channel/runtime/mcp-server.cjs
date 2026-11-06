@@ -5794,13 +5794,23 @@ ${body}
         });
       });
     }
-    function turnStartParams(next, threadId) {
-      let normalized = next.normalized;
-      return {
+    function turnStartParams(next, threadId, deps = {}) {
+      let normalized = next.normalized, params = {
         threadId,
         clientUserMessageId: `discord:${structuredSafeText(normalized.channelId)}:${structuredSafeText(normalized.messageId)}`,
         input: [{ type: "text", text: structuredSafeText(formatEnvelope(normalized)) }]
       };
+      if (typeof deps.getInputContext == "function") {
+        let context = deps.getInputContext({
+          threadId,
+          clientUserMessageId: params.clientUserMessageId,
+          channelId: normalized.channelId,
+          messageId: normalized.messageId
+        });
+        if (typeof context != "string") throw new Error("Input context must be a string.");
+        context && params.input.push({ type: "text", text: structuredSafeText(context) });
+      }
+      return params;
     }
     function unavailableTarget(error) {
       return {
@@ -5971,7 +5981,18 @@ ${body}
             queueDepth: claim.queueDepth
           }), blocked.result);
         }
-        let params = turnStartParams(next, target.threadId), prepared = await withDeliveryQueueLock(config, deps, () => {
+        let params;
+        try {
+          params = turnStartParams(next, target.threadId, deps);
+        } catch (error) {
+          try {
+            await releaseCurrentHeadForRetry(config, deps, next, attemptId, verifyReceiverOwnership);
+          } finally {
+            activeDeliveryAttempts.delete(attemptId);
+          }
+          throw error;
+        }
+        let prepared = await withDeliveryQueueLock(config, deps, () => {
           let queue = readDeliveryQueue(config, deps);
           if (!queueHeadMatches(queue, next) || queue.blocked?.attemptId !== attemptId)
             return { retry: !0 };
