@@ -305,6 +305,16 @@ function matchingGenerationGroups(manifest, processes = listProcesses(), { allow
   for (const [pgid, group] of groups) {
     const allMembers = processes.filter((item) => item.pgid === pgid);
     const leader = allMembers.find((item) => item.pid === pgid);
+    if (!leader && allowMissingLeaders && group.role === 'app' && pgid !== manifest.app.pgid) {
+      // Commands launched through the app server inherit its generation
+      // environment.  If such a command creates a process group and its
+      // leader later exits, the surviving children cannot be authenticated as
+      // an app-server group.  The one real app group is recorded in the
+      // manifest, so preserve every other leaderless app-labelled group as
+      // product work instead of letting it block or authorize reclaim.
+      groups.delete(pgid);
+      continue;
+    }
     if (leader && !leaderArgvMatches(leader, manifest, group.role)) {
       // Generation variables are inherited by commands launched through the
       // app server.  A command that starts its own process group is not a

@@ -1,5 +1,9 @@
 # Discord Mixed-Binary Receiver Compatibility Design
 
+> Historical design, superseded by the fail-closed quiesced migration contract
+> in [`structured-delivery.md`](../../structured-delivery.md). Do not use the
+> live-overlap design for current deployments.
+
 ## Scope
 
 Repair only A6-incumbent to A7-successor receiver failback. Preserve the A7

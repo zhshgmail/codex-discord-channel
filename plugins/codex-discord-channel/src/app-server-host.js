@@ -123,8 +123,15 @@ function deliveryProofKey(threadId, clientUserMessageId) {
   return JSON.stringify([threadId, clientUserMessageId]);
 }
 
+function isBackgroundThreadSource(source) {
+  // Codex 0.159 uses thread_title for title generation; older versions used
+  // system. Only explicit user threads can consume visible TUI input.
+  // Legacy servers and rollouts without this field remain supported.
+  return typeof source === 'string' && source !== 'user';
+}
+
 function isSystemBackgroundThread(thread) {
-  return thread?.threadSource === 'system';
+  return isBackgroundThreadSource(thread?.threadSource);
 }
 
 function assistantFinalKey(threadId, turnId) {
@@ -343,8 +350,8 @@ async function rolloutContainsUserMessage(
       // id in diagnostic text or a copied UserMessage.  It is not the visible
       // TUI consumer and therefore cannot prove delivery.  Keep legacy
       // rollouts (which predate thread_source) readable, but fail closed for
-      // the explicit system classification emitted by current Codex.
-      rolloutThreadSource === 'system' ||
+      // explicit non-user classifications emitted by current Codex.
+      isBackgroundThreadSource(rolloutThreadSource) ||
       (expectedThreadId !== null && rolloutThreadId !== expectedThreadId)
     ) {
       return false;
@@ -625,7 +632,7 @@ class AppServerRpcClient extends EventEmitter {
         clientInfo: {
           name: 'codex-discord-channel',
           title: 'Discord Channel Gateway',
-          version: '0.3.23',
+          version: '0.3.26',
         },
         capabilities: {
           experimentalApi: true,
@@ -962,8 +969,8 @@ class AppServerHost extends EventEmitter {
       }
       if (notification?.method === 'thread/started') {
         const thread = notification.params?.thread;
-        // Codex 0.150 starts top-level ephemeral `threadSource=system`
-        // threads for background work such as session-title generation.  They
+        // Codex starts top-level ephemeral system/thread_title threads
+        // for background work such as session-title generation. They
         // share the state-dir app-server but are not the visible TUI input
         // target.  Ignore them as transient routing noise; no thread id is
         // persisted or used as instance/message identity here.

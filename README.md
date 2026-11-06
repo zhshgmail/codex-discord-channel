@@ -4,16 +4,16 @@ Standalone Codex plugin project for Discord session delivery. The plugin lives
 at `plugins/codex-discord-channel` and is exposed through the repository
 marketplace at `.agents/plugins/marketplace.json`.
 
-## v0.3.23 Team Install And Upgrade
+## v0.3.26 Team Install And Upgrade
 
-Source release candidate: v0.3.23. The tag and installed instances are not
-published or changed by this source update. The tag-based commands below apply
-after publication; a reviewed candidate deployment must use its exact commit.
+Pinned release: v0.3.26. Use the tag-based commands below after publication;
+an unpublished review candidate must use its exact commit.
 
-This candidate adds a cross-channel sender allowlist that also covers new
-threads. It includes the v0.3.22 reply reminders and v0.3.21 interrupt cleanup
-and terminal restoration. See [release notes](docs/releases/v0.3.23.md) for
-validation and deployment limits.
+This version fixes repeated TUI disconnects and terminal flickering when a
+normal plugin listing exceeds 16 MiB. The permission relay now uses the same
+128 MiB bound as its WebSocket transport. It also retains the deployed queue
+locking, bounded target discovery, system-thread filtering, bot reply-loop
+prevention, and transport dependency fixes. See [release notes](docs/releases/v0.3.26.md).
 
 The MCP manifest starts `node` from `PATH`, without a developer-specific path.
 Ensure Node 22.15 or newer is available to the shell launching Codex. The
@@ -65,10 +65,10 @@ Install the pinned tag from an ordinary shell:
 
 ```bash
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.23
+  zhshgmail/codex-discord-channel --ref v0.3.26
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.23"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.26"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 ```
 
@@ -91,7 +91,7 @@ start `app-server`, `gateway`, a bare `codex --remote`, or a new systemd unit
 separately. The launcher supplies the correct `CODEX_HOME`, instance, state
 directory, socket, and installed activation root to every child.
 
-### Upgrade To v0.3.23
+### Upgrade To v0.3.26
 
 Upgrade one alias at a time:
 
@@ -109,15 +109,15 @@ CODEX_HOME="$ACCOUNT_HOME" codex plugin list --json
 CODEX_HOME="$ACCOUNT_HOME" codex plugin remove codex-discord-channel@personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace remove personal
 CODEX_HOME="$ACCOUNT_HOME" codex plugin marketplace add \
-  zhshgmail/codex-discord-channel --ref v0.3.23
+  zhshgmail/codex-discord-channel --ref v0.3.26
 CODEX_HOME="$ACCOUNT_HOME" codex plugin add codex-discord-channel@personal
 
-PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.23"
+PLUGIN_ROOT="$ACCOUNT_HOME/plugins/cache/personal/codex-discord-channel/0.3.26"
 test -x "$PLUGIN_ROOT/bin/codex-discord-instance"
 "$PLUGIN_ROOT/bin/codex-discord-instance" "$INSTANCE" resume --last
 ```
 
-If the marketplace already points at `v0.3.23`, use
+If the marketplace already points at `v0.3.26`, use
 `codex plugin marketplace upgrade personal` instead of replacing it. Never
 install over a running alias: the installer may remove files used by that
 generation, and an open MCP transport cannot hot-reload the replacement.
@@ -231,9 +231,9 @@ those symptoms by replaying the queue or killing unrelated processes.
 
 - Reuses one Discord bot instance and state directory per configured instance.
 - Uses one atomically replaced structured authority record in
-  `session-gateway.pid` as the active receive gate. During a staged takeover
-  from a legacy gateway, its unchanged PID/generation files remain intact and
-  the current receiver CAS lives in `session-gateway.pid.v2`.
+  `session-gateway.pid` as the active receive gate. A live receiver whose
+  queue-lock protocol or normalized lock path is missing or different must be
+  quiesced before a successor can log in or touch the queue.
 - Keeps `owner.json` for status and handoff metadata only; thread or session ids
   never gate individual Discord messages.
 - Persists accepted messages in a cross-process locked, deduplicated ready FIFO
@@ -253,12 +253,11 @@ the app-server target is unavailable. A takeover of a live receiver additionally
 requires target readiness, arms the successor listener, and then transfers
 authority with one atomic record replacement.
 
-During a staged legacy-to-current takeover, both gateway listeners can remain
-eligible because the legacy binary cannot react to successor process death.
-The cross-process queue lock and Discord identity deduplication keep that
-compatibility overlap to one persisted event and one structured turn. Current
-receivers prefer the staged authority, so legacy shutdown cannot clear their
-generation.
+There is no live incompatible queue-lock-binding overlap. Stop and verify the
+legacy gateway first, then remove any audited legacy lock directory if needed
+and start the successor. Compatible current-version handoffs may retain a live
+fallback only when both records bind the same protocol and normalized
+persistent queue-lock pathname.
 
 ## Structured Delivery
 
@@ -388,7 +387,7 @@ Prerequisites:
 - one isolated `CODEX_HOME` and Discord state directory per alias.
 
 ```bash
-codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.23
+codex plugin marketplace add zhshgmail/codex-discord-channel --ref v0.3.26
 codex plugin add codex-discord-channel@personal
 ```
 
@@ -400,7 +399,7 @@ gateway/app-server worker therefore use committed self-contained bundles:
 `runtime/mcp-server.cjs` and `runtime/channel.cjs`. `npm ci` and
 `npm run build:runtime` are development steps, not installation requirements.
 
-For a review branch or pinned deployment, replace `v0.3.23` with the exact
+For a review branch or pinned deployment, replace `v0.3.26` with the exact
 branch, tag, or commit approved for that deployment. Do not assume an open MCP
 transport has hot-loaded a replaced plugin.
 

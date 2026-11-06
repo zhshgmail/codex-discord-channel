@@ -32,14 +32,17 @@ target readiness, armed its listener, and committed that replacement. The new
 record retains the incumbent as fallback, so an A7 incumbent becomes effective
 again if the committed successor process dies.
 
-Pure A7 handoffs store one-line version-2 JSON in `session-gateway.pid`. When
-the fallback is a running A6 gateway, A6's integer PID and `.generation` files
-remain unchanged and A7 atomically stores its generation-fenced CAS record in
-`session-gateway.pid.v2`. A7 readers prefer that staged record. Because A6
-cannot observe successor death, both listeners remain eligible during this
-interval; the process-safe queue lock and Discord identity deduplication remain
-the exactly-once boundary. A7 crash needs no state rewrite, A7 graceful release
-removes only `.v2`, and A6 graceful shutdown cannot delete A7 authority.
+Pure compatible handoffs store one-line version-2 JSON in
+`session-gateway.pid` and may retain a live fallback. Compatibility binds both
+the queue-lock protocol and the normalized persistent lock pathname. A change
+to either is different: the successor refuses to log in or touch the queue
+while an incompatible incumbent is live. The operator must stop and verify the
+old gateway before starting the successor. This quiesced transition is
+mandatory because independently configurable authority and queue paths could
+otherwise let two live gateways lock different inodes while sharing one
+authority record. The record carries both `deliveryQueueLockProtocol` and
+`deliveryQueueLockIdentity`; a missing legacy identity is incompatible rather
+than guessed from the successor's configuration.
 
 When no live incumbent exists, target readiness is not a receive-startup gate.
 The first gateway logs in, proves queue persistence, arms its listener, and
@@ -173,7 +176,22 @@ missing loaded threads, busy threads, and stale receiver authority retain the
 head and retry with exponential backoff from the configured base interval to a
 configured maximum. The defaults are 1 second and 30 seconds. Timer, app-server
 event, and restart drains all use the same serialized queue lock, in-progress
-lease, and acknowledgement boundary.
+lease, and acknowledgement boundary. The current lock is a persistent regular
+file. A one-shot `flock(1)` child locks an inherited descriptor and exits; the
+parent retains the same open file description, so the kernel keeps the
+`flock(2)` lock for the complete operation. Release closes the parent
+descriptor; it never removes the shared lock pathname, so owner-write rollback
+and release have no pathname check/delete ABA window or long-lived
+helper-process failure window.
+The writer compares the descriptor and pathname device/inode/link identity
+both when opening the persistent file and again after `flock(2)` succeeds,
+before running the protected operation. Replacement in that interval closes
+the descriptor and fails the operation instead of allowing writers to lock two
+different inodes.
+Acquisition timeout and release failure are surfaced as operation errors. A
+legacy directory at the lock pathname is a fail-closed migration error and may
+be removed only after the gateway is quiesced and the exact path has been
+audited.
 
 ## Turn Payload
 

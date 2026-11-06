@@ -69,11 +69,11 @@ still denied by the plugin and must not be expected to provide usable content.
 
 The Discord gateway is identified by the configured instance state directory
 and one atomic PID-plus-generation authority record in `session-gateway.pid`.
-Pure current-version handoffs use JSON. A staged takeover from a legacy gateway
-leaves that gateway's PID and `.generation` files unchanged and stores the
-current receiver CAS in `session-gateway.pid.v2`. `owner.json` is status and
-handoff metadata; it is not a per-message receive gate and may change after
-`/clear` without replacing the gateway.
+Compatible current-version handoffs use JSON and bind both the queue-lock
+protocol and normalized persistent lock pathname. A live record with a missing
+or different binding must be quiesced before its successor logs in or accesses
+the queue. `owner.json` is status and handoff metadata; it is not a per-message
+receive gate and may change after `/clear` without replacing the gateway.
 
 Access-approved Discord messages are atomically persisted to
 `pending-delivery.json`, cross-process locked, and deduplicated by Discord
@@ -156,11 +156,10 @@ armed listener are sufficient to claim reception; target delivery reconnects
 later. A live-receiver takeover also requires target readiness before its one
 atomic authority commit.
 
-The legacy and current listeners can both remain eligible during that staged
-handoff. Queue locking and Discord identity deduplication are therefore the
-exactly-once boundary until every running gateway uses the current format. The
-current reader prefers `.v2`, so legacy cleanup cannot remove successor
-authority.
+Legacy and current listeners must not overlap across an incompatible lock
+binding. Stop and verify the old gateway, audit any legacy lock directory, and
+only then start the successor. Same-binding current receivers can use the
+atomic live-fallback handoff.
 
 Launch the visible TUI through `codex-discord-instance INSTANCE ...`, which
 starts the matching app-server, gateway, and remote TUI from one installed cache

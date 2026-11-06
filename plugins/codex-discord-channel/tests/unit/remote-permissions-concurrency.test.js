@@ -11,7 +11,7 @@ const WebSocket = require('ws');
 const { connectRelay } = require('../../src/remote-permissions');
 
 const permissions = { approvalPolicy: 'never', sandbox: 'danger-full-access' };
-const LIMIT = 16 * 1024 * 1024;
+const LIMIT = 128 * 1024 * 1024;
 const request = (id, method = 'thread/resume') => ({ id, method, params: { threadId: `native-${id}`, sandbox: 'read-only' } });
 
 // Deterministic socket pressure and late-event injection. Production handlers

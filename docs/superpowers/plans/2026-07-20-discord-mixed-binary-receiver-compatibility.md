@@ -1,5 +1,9 @@
 # Discord Mixed-Binary Receiver Compatibility Implementation Plan
 
+> Historical plan, superseded by the fail-closed quiesced migration contract
+> in [`structured-delivery.md`](../../structured-delivery.md). Do not use the
+> live-overlap design for current deployments.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Keep an actual running A6 receiver eligible after an A7 successor commits and then crashes or releases gracefully.
