@@ -145,6 +145,9 @@ const drainLoop = {
 
 const originalLoad = Module._load;
 Module._load = function load(request, parent, isMain) {
+  if (parent?.filename?.endsWith(path.join('src', 'gateway-delivery.js')) && request === './delivery') {
+    return { createDelivery: () => delivery };
+  }
   if (parent?.filename?.endsWith(path.join('bin', 'codex-discord-channel'))) {
     if (request === '../src/config') return { loadConfig: () => config };
     if (request === '../src/discord-client') return discordClient;

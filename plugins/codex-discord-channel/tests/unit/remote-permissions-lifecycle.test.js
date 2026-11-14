@@ -9,6 +9,7 @@ const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const { setTimeout: delay } = require('node:timers/promises');
+const WebSocket = require('ws');
 
 const pluginRoot = process.env.CODEX_DISCORD_TEST_PLUGIN_ROOT || path.resolve(__dirname, '../..');
 const relayModule = path.join(pluginRoot, 'src/remote-permissions.js');
@@ -85,6 +86,21 @@ async function stopFixture(fixture) {
   return { elapsedMs: Date.now() - started, code, signal };
 }
 
+async function waitForPublicRelay(fixture) {
+  await waitFor(() => fs.existsSync(fixture.socket));
+  // bind() makes the path visible before the relay finishes startup. A real
+  // handshake establishes that the public listener is serving before we
+  // replace it or exercise shutdown of a running relay.
+  const connection = new WebSocket(`ws+unix://${fixture.socket}:/rpc`, {
+    handshakeTimeout: 4000,
+  });
+  try {
+    await once(connection, 'open');
+  } finally {
+    connection.terminate();
+  }
+}
+
 function assertBackendGone(fixture) {
   const backendPid = Number(fs.readFileSync(fixture.backendPidFile, 'utf8'));
   assert.equal(fs.existsSync(`/proc/${backendPid}`), false);
@@ -97,7 +113,7 @@ function assertSocketsGone(fixture) {
 
 test('permission relay removes owned sockets and reaps its backend', { timeout: 7000 }, async t => {
   const fixture = startFixture(t);
-  await waitFor(() => fs.existsSync(fixture.socket));
+  await waitForPublicRelay(fixture);
   const result = await stopFixture(fixture);
   assert.equal(result.code, 0, fixture.stderr());
   assert.ok(result.elapsedMs < 3500, JSON.stringify(result));
@@ -107,7 +123,7 @@ test('permission relay removes owned sockets and reaps its backend', { timeout: 
 
 test('permission relay preserves a replacement listener at its public socket path', { timeout: 7000 }, async t => {
   const fixture = startFixture(t);
-  await waitFor(() => fs.existsSync(fixture.socket));
+  await waitForPublicRelay(fixture);
   fs.renameSync(fixture.socket, `${fixture.socket}.owned`);
   const replacement = net.createServer(client => client.end('replacement listener'));
   replacement.listen(fixture.socket);
@@ -130,7 +146,7 @@ test('permission relay preserves a replacement listener at its public socket pat
 
 test('permission relay bounds shutdown when its backend ignores SIGTERM', { timeout: 7000 }, async t => {
   const fixture = startFixture(t, 'stubborn');
-  await waitFor(() => fs.existsSync(fixture.socket));
+  await waitForPublicRelay(fixture);
   const result = await stopFixture(fixture);
   assert.equal(result.code, 0, fixture.stderr());
   assert.ok(result.elapsedMs < 3500, JSON.stringify(result));

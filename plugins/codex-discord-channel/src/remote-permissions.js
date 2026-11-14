@@ -6,7 +6,9 @@ const { randomBytes } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { setTimeout: delay } = require('node:timers/promises');
 const WebSocket = require('ws');
-const MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+// Match the accepted WebSocket payload size. A normal plugin/list response can
+// exceed 16 MiB; rejecting it here disconnects the TUI on every reconnect.
+const MAX_BUFFERED_BYTES = 128 * 1024 * 1024;
 
 // The native TUI chooses the session. Never resolve --last ourselves or retain
 // a thread ID: permission flags belong to this invocation, not Discord identity.
@@ -21,7 +23,7 @@ function permissionRequest(data, isTui, permissions) {
 }
 
 function connectRelay(front, backendUrl, permissions, startupState = { applied: false }) {
-  const back = new WebSocket(backendUrl, { perMessageDeflate: false, maxPayload: 128 * 1024 * 1024 });
+  const back = new WebSocket(backendUrl, { perMessageDeflate: false, maxPayload: MAX_BUFFERED_BYTES });
   // A client may reuse its RPC id after an explicit error. Give each override
   // attempt a one-use backend id; the prefix retires old replies without an
   // ever-growing id history. This is transport state, never session identity.
@@ -137,7 +139,7 @@ async function runPermissionRelay(launch, endpoint, permissions) {
   const args = launch.args.map(arg => arg === endpoint ? `unix://${nativeSocket}` : arg);
   const child = spawn(launch.command, args, { env: launch.env, stdio: 'inherit' });
   const server = http.createServer();
-  const sockets = new WebSocket.Server({ server, perMessageDeflate: false, maxPayload: 128 * 1024 * 1024 });
+  const sockets = new WebSocket.Server({ server, perMessageDeflate: false, maxPayload: MAX_BUFFERED_BYTES });
   let nativeIdentity;
   let publicIdentity;
   let childError;

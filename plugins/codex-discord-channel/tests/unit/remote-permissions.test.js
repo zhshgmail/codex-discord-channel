@@ -56,6 +56,19 @@ async function attemptFixture(t) {
   return { client, send, deliver, state };
 }
 
+test('a plugin/list response above 16 MiB reaches the TUI without a reconnect', { timeout: 10000 }, async t => {
+  const fixture = await attemptFixture(t);
+  const client = await fixture.client();
+  const listing = await fixture.send(client, { id: 2, method: 'plugin/list', params: {} });
+  const response = { id: 2, result: { plugins: [{ description: 'x'.repeat(17 * 1024 * 1024) }] } };
+  await fixture.deliver(client, listing.back, response);
+  assert.deepEqual(client.received[0].message, response);
+  assert.equal(client.socket.readyState, WebSocket.OPEN);
+  const followup = await fixture.send(client, { id: 3, method: 'account/read', params: {} });
+  await fixture.deliver(client, followup.back, { id: 3, result: { account: null } });
+  assert.deepEqual(client.received[1].message, { id: 3, result: { account: null } });
+});
+
 for (const concurrent of [false, true]) {
   for (const id of [2, '2', null]) {
     test(`real WebSocket ${concurrent ? 'cross-connection' : 'same-connection'} retry isolates retired replies for ${JSON.stringify(id)}`, { timeout: 5000 }, async t => {

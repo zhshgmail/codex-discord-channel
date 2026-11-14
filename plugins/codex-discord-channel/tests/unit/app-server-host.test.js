@@ -1257,63 +1257,65 @@ test('latest top-level thread/started notification selects the rotated TUI threa
   );
 });
 
-test('top-level system background thread cannot replace the visible TUI delivery target', async () => {
-  const tuiThreadId = '01a04483-a23b-7141-90cc-c4f0a6778821';
-  const systemThreadId = '01a04483-c2ea-74f2-a377-1c1af8db3e1f';
-  const client = new FakeRpcClient(async (method, params) => {
-    if (method === 'thread/loaded/list') {
-      // Codex 0.150 reports the newer title-generation thread first.
-      return { data: [systemThreadId, tuiThreadId], nextCursor: null };
-    }
-    if (method === 'thread/read') {
-      if (params.threadId === systemThreadId) {
+for (const threadSource of ['system', 'thread_title']) {
+  test(`top-level ${threadSource} background thread cannot replace the visible TUI delivery target`, async () => {
+    const tuiThreadId = '01a04483-a23b-7141-90cc-c4f0a6778821';
+    const systemThreadId = '01a04483-c2ea-74f2-a377-1c1af8db3e1f';
+    const client = new FakeRpcClient(async (method, params) => {
+      if (method === 'thread/loaded/list') {
+        // Current and older Codex servers report the newer title thread first.
+        return { data: [systemThreadId, tuiThreadId], nextCursor: null };
+      }
+      if (method === 'thread/read') {
+        if (params.threadId === systemThreadId) {
+          return {
+            thread: {
+              id: systemThreadId,
+              parentThreadId: null,
+              ephemeral: true,
+              threadSource,
+              status: { type: 'active' },
+              turns: [],
+            },
+          };
+        }
         return {
           thread: {
-            id: systemThreadId,
+            id: tuiThreadId,
             parentThreadId: null,
-            ephemeral: true,
-            threadSource: 'system',
-            status: { type: 'active' },
+            ephemeral: false,
+            threadSource: 'user',
+            status: { type: 'idle' },
             turns: [],
           },
         };
       }
-      return {
+      throw new Error(`unexpected method ${method}`);
+    });
+    const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
+
+    client.emit('notification', {
+      method: 'thread/started',
+      params: {
         thread: {
-          id: tuiThreadId,
+          id: systemThreadId,
           parentThreadId: null,
-          ephemeral: false,
-          threadSource: 'user',
-          status: { type: 'idle' },
-          turns: [],
+          ephemeral: true,
+          threadSource,
+          status: { type: 'active' },
         },
-      };
-    }
-    throw new Error(`unexpected method ${method}`);
-  });
-  const host = createAppServerHost({ appServerUrl: 'ws://127.0.0.1:4500' }, () => {}, { client });
-
-  client.emit('notification', {
-    method: 'thread/started',
-    params: {
-      thread: {
-        id: systemThreadId,
-        parentThreadId: null,
-        ephemeral: true,
-        threadSource: 'system',
-        status: { type: 'active' },
       },
-    },
-  });
+    });
 
-  assert.deepEqual(await host.resolveTarget(), {
-    available: true,
-    threadId: tuiThreadId,
-    status: 'idle',
+    assert.deepEqual(await host.resolveTarget(), {
+      available: true,
+      threadId: tuiThreadId,
+      status: 'idle',
+    });
+    assert.equal(host.currentThreadId, tuiThreadId);
+    host.destroy();
   });
-  assert.equal(host.currentThreadId, tuiThreadId);
-  host.destroy();
-});
+}
 
 test('in-flight thread read cannot overwrite a newer top-level thread notification', async () => {
   let loadedThreadIds = ['thread-before-clear'];
@@ -4484,41 +4486,43 @@ test('source proof survives same-state top-level thread rotation through live in
   );
 });
 
-test('system rollout cannot prove source delivery but the visible TUI rollout can', async (t) => {
-  const clientId = 'discord:c1:m-system-proof-must-not-dequeue';
-  const systemThreadId = OTHER_DELIVERY_THREAD_ID;
-  const fixture = createRolloutFixture(t, [
-    {
-      type: 'session_meta',
-      payload: { id: systemThreadId, thread_source: 'system' },
-    },
-    deliveredUserMessage(clientId),
-  ], { filenameThreadId: systemThreadId });
-  const tuiRolloutPath = path.join(
-    fixture.sessionsDir,
-    `rollout-2026-07-31T00-00-01-${DELIVERY_THREAD_ID}.jsonl`,
-  );
-  fs.writeFileSync(
-    tuiRolloutPath,
-    `${JSON.stringify({
-      type: 'session_meta',
-      payload: { id: DELIVERY_THREAD_ID, thread_source: 'user', originator: 'codex-tui' },
-    })}\n`,
-  );
-  const client = new FakeRpcClient(async (method) => {
-    throw new Error(`system-proof discriminator must not request ${method}`);
+for (const threadSource of ['system', 'thread_title']) {
+  test(`${threadSource} rollout cannot prove source delivery but the visible TUI rollout can`, async (t) => {
+    const clientId = 'discord:c1:m-system-proof-must-not-dequeue';
+    const systemThreadId = OTHER_DELIVERY_THREAD_ID;
+    const fixture = createRolloutFixture(t, [
+      {
+        type: 'session_meta',
+        payload: { id: systemThreadId, thread_source: threadSource },
+      },
+      deliveredUserMessage(clientId),
+    ], { filenameThreadId: systemThreadId });
+    const tuiRolloutPath = path.join(
+      fixture.sessionsDir,
+      `rollout-2026-07-31T00-00-01-${DELIVERY_THREAD_ID}.jsonl`,
+    );
+    fs.writeFileSync(
+      tuiRolloutPath,
+      `${JSON.stringify({
+        type: 'session_meta',
+        payload: { id: DELIVERY_THREAD_ID, thread_source: 'user', originator: 'codex-tui' },
+      })}\n`,
+    );
+    const client = new FakeRpcClient(async (method) => {
+      throw new Error(`system-proof discriminator must not request ${method}`);
+    });
+    const host = createLocalRolloutHost(client, fixture.codexHome);
+    t.after(() => host.destroy());
+    host.knownLoadedThreadIds.add(systemThreadId);
+    host.knownLoadedThreadIds.add(DELIVERY_THREAD_ID);
+
+    assert.equal(await host.hasDeliveredSource(clientId), false);
+
+    fs.appendFileSync(tuiRolloutPath, `${JSON.stringify(deliveredUserMessage(clientId))}\n`);
+    assert.equal(await host.hasDeliveredSource(clientId), true);
+    assert.deepEqual(client.requests, []);
   });
-  const host = createLocalRolloutHost(client, fixture.codexHome);
-  t.after(() => host.destroy());
-  host.knownLoadedThreadIds.add(systemThreadId);
-  host.knownLoadedThreadIds.add(DELIVERY_THREAD_ID);
-
-  assert.equal(await host.hasDeliveredSource(clientId), false);
-
-  fs.appendFileSync(tuiRolloutPath, `${JSON.stringify(deliveredUserMessage(clientId))}\n`);
-  assert.equal(await host.hasDeliveredSource(clientId), true);
-  assert.deepEqual(client.requests, []);
-});
+}
 
 test('restored ephemeral target uses metadata-only thread discovery', async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-ephemeral-target-'));

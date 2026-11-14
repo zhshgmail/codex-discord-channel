@@ -12,7 +12,8 @@ const {
   startDiscordClient,
 } = require('../src/discord-client');
 const { createDiscordRestClient } = require('../src/discord-rest-client');
-const { createDelivery, readDeliveryQueueStatus } = require('../src/delivery');
+const { readDeliveryQueueStatus } = require('../src/delivery');
+const { createGatewayDelivery } = require('../src/gateway-delivery');
 const { writeGatewayHealth } = require('../src/gateway-health');
 const { sendDiscordReplyOnce } = require('../src/reply-delivery');
 const { isCurrentReceiverOwnership } = require('../src/receiver-state');
@@ -203,19 +204,19 @@ function enabled(value) {
   return /^(1|true|yes|on)$/i.test(String(value || '').trim());
 }
 
-async function runGateway(config = loadConfig()) {
-  const logger = makeLogger();
-  const restClient = createDiscordRestClient({
+async function runGateway(config = loadConfig(), deps = {}) {
+  const logger = deps.logger || makeLogger();
+  const restClient = (deps.createDiscordRestClient || createDiscordRestClient)({
     token: config.token,
     botUserId: config.botUserId,
     fetchImpl: globalThis.fetch,
   });
-  const delivery = createDelivery(config, logger, {
+  const delivery = createGatewayDelivery(config, logger, {
     sendAutomaticReply: createAutomaticReplySender(config, restClient),
-  });
+  }, deps);
   let discordState;
   try {
-    discordState = await startDiscordClient({ config, delivery, logger, claimReceiver: true });
+    discordState = await (deps.startDiscordClient || startDiscordClient)({ config, delivery, logger, claimReceiver: true });
   } catch (error) {
     delivery.destroy();
     throw error;
@@ -428,6 +429,7 @@ async function main() {
 }
 
 module.exports = {
+  runGateway,
   createAutomaticReplySender,
   main,
   parseLiveCheckArgs,
