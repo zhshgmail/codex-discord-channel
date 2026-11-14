@@ -124,6 +124,11 @@ function toolList() {
           channelId: { type: 'string', description: 'Exact Discord channel id. Required for replies and followups.' },
           content: { type: 'string', description: 'Message text to send.' },
           replyTo: { type: 'string', description: 'Exact source Discord message id. Required unless followup is true.' },
+          notificationId: {
+            type: 'string',
+            pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$',
+            description: 'Stable id for one authorized proactive notification, reused on retries. Requires no replyTo or followup; durable receipt, enforced nonce and exact readback remain required.',
+          },
           followup: {
             type: 'boolean',
             default: false,
@@ -133,6 +138,7 @@ function toolList() {
         required: ['channelId', 'content'],
         anyOf: [
           { required: ['replyTo'] },
+          { required: ['notificationId'] },
           {
             required: ['followup'],
             properties: { followup: { const: true } },
@@ -258,7 +264,7 @@ async function callTool(context, name, args = {}) {
       ),
     });
     const message = sent.duplicateSuppressed
-      ? `Suppressed duplicate Discord reply for source message ${sent.sourceMessageId}.`
+      ? `Suppressed duplicate Discord ${sent.notificationId ? 'notification' : 'reply'} ${sent.notificationId || sent.sourceMessageId}.`
       : `Sent Discord message ${sent.messageId}.`;
     return textResult(message, sent);
   }

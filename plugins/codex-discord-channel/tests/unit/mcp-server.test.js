@@ -118,18 +118,62 @@ test('history tool discovery exposes a strict bounded read-only schema', () => {
   });
 });
 
-test('send tool discovery requires an exact source or explicit followup', () => {
+test('send tool discovery requires an exact source, guarded notification id, or explicit followup', () => {
   const tool = toolList().find((item) => item.name === 'discord_channel_send');
 
   assert.deepEqual(tool.inputSchema.required, ['channelId', 'content']);
   assert.deepEqual(tool.inputSchema.anyOf, [
     { required: ['replyTo'] },
+    { required: ['notificationId'] },
     {
       required: ['followup'],
       properties: { followup: { const: true } },
     },
   ]);
 });
+
+for (const wrongAuthor of [false, true]) {
+  test(`proactive MCP uses actual transport/readback without a source; wrong author=${wrongAuthor}`, async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cdc-notify-mcp-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const messages = new Map();
+    let posts = 0;
+    const context = {
+      config: { paths: { stateDir: dir } },
+      discordState: { client: {
+        user: { id: BOT_ID },
+        channels: { async fetch(channelId) { return {
+          id: channelId,
+          messages: { async fetch(id) { return messages.get(id); } },
+          async send(payload) {
+            posts += 1;
+            assert.equal(payload.reply, undefined);
+            assert.equal(payload.enforceNonce, true);
+            assert.match(payload.nonce, /^cdn-[0-9a-f]{21}$/);
+            const message = { id: 'out-1', channelId, content: payload.content,
+              nonce: payload.nonce, author: { id: wrongAuthor ? USER_ID : BOT_ID } };
+            messages.set(message.id, message);
+            return message;
+          },
+        }; } },
+      } },
+    };
+    const args = { channelId: CHANNEL_ID, notificationId: 'project-20261114T0949Z', content: 'Measured status' };
+    if (wrongAuthor) {
+      await assert.rejects(callTool(context, 'discord_channel_send', args), /reply_confirmation_mismatch/);
+      const files = fs.readdirSync(path.join(dir, 'notification-receipts'));
+      const receipt = JSON.parse(fs.readFileSync(path.join(dir, 'notification-receipts', files[0])));
+      assert.equal(receipt.status, 'uncertain');
+    } else {
+      const result = await callTool(context, 'discord_channel_send', args);
+      assert.equal(result.structuredContent.messageId, 'out-1');
+      assert.equal(result.structuredContent.notificationId, args.notificationId);
+      const repeat = await callTool(context, 'discord_channel_send', args);
+      assert.equal(repeat.structuredContent.duplicateSuppressed, true);
+    }
+    assert.equal(posts, 1);
+  });
+}
 
 test('history tool returns structured authorized history for explicit arguments', async () => {
   const fixture = historyContext();
