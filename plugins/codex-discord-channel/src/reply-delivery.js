@@ -44,14 +44,31 @@ function receiptPath(config, channelId, sourceMessageId) {
   return path.join(dir, `${key}.json`);
 }
 
+function notificationReceiptPath(config, channelId, notificationId) {
+  const stateDir = config.paths?.stateDir;
+  if (!stateDir) throw new Error('Discord notification state directory is not configured.');
+  const key = createHash('sha256').update(`${channelId}\0${notificationId}`, 'utf8').digest('hex');
+  return path.join(stateDir, 'notification-receipts', `${key}.json`);
+}
+
+function identityPath(config, identity) {
+  return identity.notificationId === undefined
+    ? receiptPath(config, identity.channelId, identity.sourceMessageId)
+    : notificationReceiptPath(config, identity.channelId, identity.notificationId);
+}
+
+function identityMatches(receipt, identity) {
+  return receipt.channelId === identity.channelId
+    && receipt.sourceMessageId === identity.sourceMessageId
+    && receipt.notificationId === identity.notificationId;
+}
+
 function receiptIdentityMatches(config, file, receipt, identity, nonce) {
   if (receipt?.version !== RECEIPT_VERSION) return false;
-  if (receipt.channelId !== identity.channelId) return false;
-  if (receipt.sourceMessageId !== identity.sourceMessageId) return false;
+  if (!identityMatches(receipt, identity)) return false;
   if (receipt.nonce !== nonce) return false;
   try {
-    return path.resolve(receiptPath(config, receipt.channelId, receipt.sourceMessageId))
-      === path.resolve(file);
+    return path.resolve(identityPath(config, identity)) === path.resolve(file);
   } catch {
     return false;
   }
@@ -232,7 +249,7 @@ function suppressResult(identity, receipt, reason) {
     result: {
       channelId: identity.channelId,
       messageId: receipt?.outboundMessageId || null,
-      sourceMessageId: identity.sourceMessageId,
+      ...identity,
       duplicateSuppressed: true,
       reason,
       receiptStatus: receipt?.status || 'unreadable',
@@ -244,7 +261,7 @@ function provenAbsentResult(identity) {
   return {
     channelId: identity.channelId,
     messageId: null,
-    sourceMessageId: identity.sourceMessageId,
+    ...identity,
     duplicateSuppressed: true,
     reason: 'source_message_reply_proven_absent',
     receiptStatus: 'absent',
@@ -262,9 +279,13 @@ async function releaseProvenAbsentReply(config, state, identity, deps = {}) {
 }
 
 async function beginReply(config, identity, content, deps = {}) {
-  const file = receiptPath(config, identity.channelId, identity.sourceMessageId);
+  const file = identityPath(config, identity);
   const digest = contentDigest(content);
-  const nonce = replyNonce(identity.channelId, identity.sourceMessageId);
+  const nonce = identity.notificationId === undefined
+    ? replyNonce(identity.channelId, identity.sourceMessageId)
+    : `cdn-${createHash('sha256')
+      .update(`discord-notification\0${identity.channelId}\0${identity.notificationId}`, 'utf8')
+      .digest('hex').slice(0, 21)}`;
   return withReceiptLock(file, config, deps, async () => {
     const fsImpl = deps.fs || fs;
     const existing = readReceipt(file, fsImpl);
@@ -310,8 +331,7 @@ async function beginReply(config, identity, content, deps = {}) {
     const receipt = {
       version: RECEIPT_VERSION,
       status: 'in_flight',
-      channelId: identity.channelId,
-      sourceMessageId: identity.sourceMessageId,
+      ...identity,
       contentSha256: digest,
       nonce,
       operationId: id,
@@ -329,8 +349,7 @@ async function transitionReply(config, state, deps, update) {
     const current = readReceipt(state.file, deps.fs || fs);
     if (!current || current.operationId !== state.receipt.operationId) return current;
     if (
-      current.channelId !== state.receipt.channelId
-      || current.sourceMessageId !== state.receipt.sourceMessageId
+      !identityMatches(current, state.receipt)
       || current.nonce !== state.receipt.nonce
     ) return current;
     const next = update(current);
@@ -365,8 +384,7 @@ async function completeReply(config, state, sent, deps = {}) {
   }));
   if (
     completed?.status !== 'confirmed'
-    || completed.channelId !== state.receipt.channelId
-    || completed.sourceMessageId !== state.receipt.sourceMessageId
+    || !identityMatches(completed, state.receipt)
     || completed.nonce !== state.receipt.nonce
     || completed.outboundMessageId !== messageId
   ) {
@@ -392,6 +410,19 @@ async function markReplyUncertain(config, state, error, deps = {}, sent = null) 
 function replyDispatch(args, config) {
   const channelId = typeof args.channelId === 'string' ? args.channelId.trim() : '';
   const replyTo = typeof args.replyTo === 'string' ? args.replyTo.trim() : '';
+  if (Object.hasOwn(args, 'notificationId')) {
+    const notificationId = args.notificationId;
+    if (!channelId || typeof notificationId !== 'string'
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(notificationId)
+      || replyTo || args.followup === true) {
+      throw new Error('A guarded notification requires channelId and a stable notificationId, without replyTo or followup.');
+    }
+    return {
+      target: { channelId, replyTo: '', usedLastInbound: false },
+      notificationId,
+      guarded: true,
+    };
+  }
   if (args.followup === true) {
     if (!channelId) throw new Error('channelId is required for an explicit Discord followup.');
     return {
@@ -438,7 +469,9 @@ async function sendAndConfirm({
     await completeReply(config, state, confirmed, deps);
     return {
       ...confirmed,
-      sourceMessageId: state.receipt.sourceMessageId,
+      ...(state.receipt.notificationId === undefined
+        ? { sourceMessageId: state.receipt.sourceMessageId }
+        : { notificationId: state.receipt.notificationId }),
       duplicateSuppressed: false,
     };
   } catch (error) {
@@ -469,10 +502,9 @@ async function sendDiscordReplyOnce({
     return { ...sent, duplicateSuppressed: false, sourceMessageId: null };
   }
 
-  const identity = {
-    channelId: dispatch.target.channelId,
-    sourceMessageId: dispatch.sourceMessageId,
-  };
+  const identity = dispatch.notificationId === undefined
+    ? { channelId: dispatch.target.channelId, sourceMessageId: dispatch.sourceMessageId }
+    : { channelId: dispatch.target.channelId, notificationId: dispatch.notificationId };
   const state = await beginReply(config, identity, content, deps);
   if (state.mode === 'suppress') return state.result;
 
@@ -522,7 +554,7 @@ async function sendDiscordReplyOnce({
       return {
         channelId: reconciliation.channelId || identity.channelId,
         messageId: reconciliation.messageId,
-        sourceMessageId: identity.sourceMessageId,
+        ...identity,
         duplicateSuppressed: false,
         reconciled: true,
       };
@@ -557,6 +589,7 @@ module.exports = {
   completeReply,
   contentDigest,
   markReplyUncertain,
+  notificationReceiptPath,
   readReceipt,
   receiptPath,
   releaseReplyClaim,

@@ -31,6 +31,23 @@ being diagnosed.
 This reply workflow never authorizes installing or upgrading the plugin, or
 restarting, killing, or replacing its gateway, app server, or TUI.
 
+## Authorized proactive notifications
+
+For an already authorized proactive report without a Discord source, use the
+same receipt-aware sender with explicit `channelId`, `content`, and a stable
+`notificationId` for that one report. Reuse the exact id on retries; do not
+invent a new id to escape an uncertain or confirmed receipt. Never supply
+`replyTo` or `followup` with it, and never substitute it for a required source
+reply. The notification has no reply parent.
+
+The sender writes a separate `notification-receipts` claim before POST, uses
+an enforced deterministic nonce, and confirms exact channel, content, outbound
+id, absence of reply parent and own bot identity. Read back the returned id
+with `discord_channel_read_history` before claiming delivery. Ambiguous sends
+remain uncertain and reconcile under the original id and nonce window.
+This adds no timer, reporting authority, restart or permission to send others
+unsolicited messages.
+
 ## Non-negotiable identity model
 
 `DISCORD_STATE_DIR` (normally selected by the instance configuration) is the
